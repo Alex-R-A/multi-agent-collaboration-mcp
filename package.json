@@ -4,11 +4,13 @@
   "description": "MCP server: a shared chat room where AI agents coordinate via a SQLite-backed message log",
   "type": "module",
   "bin": {
-    "agent-chat-mcp": "dist/index.js"
+    "agent-chat-mcp": "dist/index.js",
+    "agent-chat-check": "dist/check.js"
   },
   "main": "dist/index.js",
   "files": [
-    "dist"
+    "dist",
+    "scripts"
   ],
   "scripts": {
     "build": "tsc",

@@ -2,10 +2,32 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { randomUUID } from "node:crypto";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import { ChatStore, SQLITE_MAX_LENGTH } from "./db.js";
 
 const store = new ChatStore();
+
+// Absolute path to the background poller, resolved from this compiled file
+// (dist/index.js -> ../scripts/wait-for-updates.sh) so it is correct regardless
+// of the launching process's working directory.
+const POLLER = join(
+  dirname(fileURLToPath(import.meta.url)),
+  "..",
+  "scripts",
+  "wait-for-updates.sh",
+);
+
+const INSTRUCTIONS = `Shared chat room for AI agents, backed by one SQLite file. Each agent runs its own copy of this server; the file is the coordination channel. Your identity and active room are remembered for the session.
+
+Typical flow: list_rooms -> join_room (capture the returned agent_id if you did not supply one; read the pinned intro) -> list_agents to see who is present -> catch_up (consumes the backlog and advances your read marker) or read_history (browse without advancing) -> post_message. Tag participants with the "to" list; reference an earlier message with reply_to_seq (replies come back with a reply_to preview). catch_up later returns only what is new.
+
+Waiting for activity without busy-looping tool calls: run this bash poller as a BACKGROUND task. It exits 0 the moment there is something new (so its exit IS your notification), prints a one-line JSON status (unread, unread_mentions, latest_seq), and otherwise quits after 20 minutes so it never hangs.
+
+  bash ${POLLER} --room <id|name> --agent <your_agent_id> [--mentions-only]
+
+Call catch_up first so your read marker is the baseline; the poller then fires on the next message (or, with --mentions-only, only when a message tags you). Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override). Exit codes: 0 = updates (read them with catch_up), 124 = timed out with nothing new, 2 = error.`;
 
 // One stdio server process serves one agent. We remember its identity and
 // active room for the session so the agent need not repeat them on every call.
@@ -44,10 +66,13 @@ function touchSession(): void {
   }
 }
 
-const server = new McpServer({
-  name: "agent-chat-mcp",
-  version: "0.3.0",
-});
+const server = new McpServer(
+  {
+    name: "agent-chat-mcp",
+    version: "0.3.0",
+  },
+  { instructions: INSTRUCTIONS },
+);
 
 server.registerTool(
   "create_room",

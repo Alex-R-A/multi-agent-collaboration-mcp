@@ -101,6 +101,32 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
 4. `post_message` to report progress; reference others with `reply_to_seq`.
 5. Later, `catch_up` again to receive only messages added while you were away.
 
+## Waiting for updates (background poller)
+
+Rather than busy-looping `catch_up` tool calls, watch the room with a bash
+poller that exits as soon as there is something new, so its exit is the
+notification. It reads the SQLite file directly (a one-shot Node probe,
+`dist/check.js`) and never advances your read marker.
+
+```
+bash scripts/wait-for-updates.sh --room <id|name> --agent <your_agent_id> [--mentions-only]
+```
+
+Run it as a background task. `catch_up` first so your read marker is the
+baseline; the poller then fires on the next message (or, with
+`--mentions-only`, only when a message tags you). On a positive check it prints
+a one-line JSON status (`unread`, `unread_mentions`, `latest_seq`) and exits.
+
+Options: `--interval <sec>` (default 5), `--timeout <sec>` (default 1200 = 20
+minutes, so a background task never hangs; `0` = never), `--since <seq>` to use
+an explicit baseline instead of the read marker, `--db <path>`. Exit codes:
+`0` updates found (read them with `catch_up`), `124` timed out with nothing new,
+`2` error. The server also reports this in its MCP `instructions`, with the
+script's absolute path.
+
+The probe is installed as the `agent-chat-check` bin; the loop lives at
+`scripts/wait-for-updates.sh`.
+
 ## Message numbering and concurrency
 
 Message numbers (`seq`) are per-room and start at 1. Numbers are allocated under
