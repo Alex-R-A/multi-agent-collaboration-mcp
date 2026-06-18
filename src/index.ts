@@ -46,7 +46,7 @@ function touchSession(): void {
 
 const server = new McpServer({
   name: "agent-chat-mcp",
-  version: "0.2.0",
+  version: "0.3.0",
 });
 
 server.registerTool(
@@ -69,7 +69,7 @@ server.registerTool(
   async ({ name, description, pinned }) => {
     try {
       touchSession();
-      if (store.resolveRoom(name)) {
+      if (store.getRoomByName(name)) {
         return fail(`a room named "${name}" already exists`);
       }
       const room = store.createRoom(name, description ?? null, pinned ?? null);
@@ -256,7 +256,9 @@ server.registerTool(
       "Post a message to the active room. `content` may be plain text or a JSON " +
       "object/array. `to` is an optional list of agent_ids this message is " +
       "directed at (mentions). `reply_to_seq` tags another message (e.g. reply " +
-      "to message 8). Returns the assigned message number (seq).",
+      "to message 8). Returns the assigned message number (seq) and " +
+      "`unknown_mentions`: any tagged ids that never joined this room (their tag " +
+      "reaches no one).",
     inputSchema: {
       content: z
         .union([z.string(), z.record(z.any()), z.array(z.any())])
@@ -296,7 +298,13 @@ server.registerTool(
         mentions,
         reply_to_seq ?? null,
       );
-      return ok({ seq, format: isText ? "text" : "json", to: mentions, reply_to_seq: reply_to_seq ?? null });
+      return ok({
+        seq,
+        format: isText ? "text" : "json",
+        to: mentions,
+        reply_to_seq: reply_to_seq ?? null,
+        unknown_mentions: mentions ? store.unknownMentions(roomId, mentions) : [],
+      });
     } catch (e) {
       return fail(asMessage(e));
     }
@@ -352,7 +360,9 @@ server.registerTool(
       "Browse messages WITHOUT changing your read marker. With no before_seq you " +
       "get the most recent `limit` messages (e.g. the last 5). To page backward " +
       "through older messages, pass before_seq = the oldest_seq from the previous " +
-      "call. Messages are returned oldest-first.",
+      "call. Set mentions_me=true to list only messages directed at you (across " +
+      "all of history, read or not). Messages are returned oldest-first; each " +
+      "message that replies to another carries a `reply_to` preview.",
     inputSchema: {
       limit: z
         .number()
@@ -367,13 +377,24 @@ server.registerTool(
         .positive()
         .optional()
         .describe("Return messages older than this seq (for pagination)"),
+      mentions_me: z
+        .boolean()
+        .optional()
+        .describe("Only messages whose `to` includes you"),
     },
   },
-  async ({ limit, before_seq }) => {
+  async ({ limit, before_seq, mentions_me }) => {
     try {
       touchSession();
-      const { roomId } = requireActive();
-      return ok(store.readHistory(roomId, limit ?? 50, before_seq));
+      const { agentId, roomId } = requireActive();
+      return ok(
+        store.readHistory(
+          roomId,
+          limit ?? 50,
+          before_seq,
+          mentions_me ? agentId : undefined,
+        ),
+      );
     } catch (e) {
       return fail(asMessage(e));
     }

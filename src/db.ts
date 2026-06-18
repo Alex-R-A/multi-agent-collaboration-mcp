@@ -43,6 +43,12 @@ export type AgentRow = {
   active: boolean;
 };
 
+export type ReplyRef = {
+  seq: number;
+  from: string | null;
+  preview: string;
+};
+
 export type MessageRow = {
   seq: number;
   from: string;
@@ -51,7 +57,7 @@ export type MessageRow = {
   format: "text" | "json";
   content: unknown;
   to: string[] | null;
-  reply_to_seq: number | null;
+  reply_to: ReplyRef | null;
   at: string;
 };
 
@@ -64,11 +70,19 @@ type RawMessage = {
   body: string;
   mentions: string | null;
   reply_to_seq: number | null;
+  reply_from: string | null;
+  reply_preview: string | null;
   created_at: string;
 };
 
+// A message row joined to its author and (for reply previews) its parent.
 const MESSAGE_COLS = `g.seq, g.agent_id, a.type AS from_type, a.role AS from_role,
-                      g.format, g.body, g.mentions, g.reply_to_seq, g.created_at`;
+                      g.format, g.body, g.mentions, g.reply_to_seq, g.created_at,
+                      p.agent_id AS reply_from, substr(p.body, 1, 101) AS reply_preview`;
+
+const MESSAGE_FROM = `messages g
+                      LEFT JOIN agents a ON a.id = g.agent_id
+                      LEFT JOIN messages p ON p.room_id = g.room_id AND p.seq = g.reply_to_seq`;
 
 export class ChatStore {
   readonly path: string;
@@ -124,16 +138,22 @@ export class ChatStore {
         created_at   TEXT NOT NULL DEFAULT (datetime('now')),
         UNIQUE (room_id, seq)
       );
-
-      CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages(room_id, seq);
-      CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(room_id, reply_to_seq);
     `);
 
-    // Upgrade older database files that predate these columns.
+    // Upgrade older database files that predate these columns. Run before
+    // creating any column-dependent index so the index never precedes its
+    // column on a legacy schema.
     this.ensureColumn("rooms", "pinned", "TEXT");
     this.ensureColumn("memberships", "last_seen", "TEXT");
     this.ensureColumn("memberships", "left_at", "TEXT");
+    this.ensureColumn("messages", "format", "TEXT NOT NULL DEFAULT 'text'");
+    this.ensureColumn("messages", "reply_to_seq", "INTEGER");
     this.ensureColumn("messages", "mentions", "TEXT");
+
+    this.db.exec(`
+      CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages(room_id, seq);
+      CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(room_id, reply_to_seq);
+    `);
   }
 
   private ensureColumn(table: string, column: string, type: string): void {
@@ -168,6 +188,13 @@ export class ChatStore {
 
   getRoom(roomId: number): RoomRow | undefined {
     return this.db.prepare("SELECT * FROM rooms WHERE id = ?").get(roomId) as
+      | RoomRow
+      | undefined;
+  }
+
+  /** Exact name lookup (never interprets the value as an id). */
+  getRoomByName(name: string): RoomRow | undefined {
+    return this.db.prepare("SELECT * FROM rooms WHERE name = ?").get(name) as
       | RoomRow
       | undefined;
   }
@@ -347,7 +374,14 @@ export class ChatStore {
       format: r.format,
       content: r.format === "json" ? safeParse(r.body) : r.body,
       to: r.mentions ? (safeParse(r.mentions) as string[]) : null,
-      reply_to_seq: r.reply_to_seq,
+      reply_to:
+        r.reply_to_seq === null
+          ? null
+          : {
+              seq: r.reply_to_seq,
+              from: r.reply_from,
+              preview: makePreview(r.reply_preview),
+            },
       at: r.created_at,
     };
   }
@@ -355,12 +389,25 @@ export class ChatStore {
   getMessage(roomId: number, seq: number): MessageRow | undefined {
     const r = this.db
       .prepare(
-        `SELECT ${MESSAGE_COLS} FROM messages g
-         LEFT JOIN agents a ON a.id = g.agent_id
+        `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
          WHERE g.room_id = ? AND g.seq = ?`,
       )
       .get(roomId, seq) as RawMessage | undefined;
     return r ? this.rowToMessage(r) : undefined;
+  }
+
+  /** Returns agent_ids from `ids` that have never joined this room. */
+  unknownMentions(roomId: number, ids: string[]): string[] {
+    if (ids.length === 0) return [];
+    const placeholders = ids.map(() => "?").join(",");
+    const known = this.db
+      .prepare(
+        `SELECT agent_id FROM memberships
+         WHERE room_id = ? AND agent_id IN (${placeholders})`,
+      )
+      .all(roomId, ...ids) as { agent_id: string }[];
+    const knownSet = new Set(known.map((r) => r.agent_id));
+    return ids.filter((id) => !knownSet.has(id));
   }
 
   /** A message plus its parent (if any) and direct replies. */
@@ -372,15 +419,13 @@ export class ChatStore {
     | undefined {
     const message = this.getMessage(roomId, seq);
     if (!message) return undefined;
+    const parentSeq = message.reply_to?.seq ?? null;
     const parent =
-      message.reply_to_seq !== null
-        ? (this.getMessage(roomId, message.reply_to_seq) ?? null)
-        : null;
+      parentSeq !== null ? (this.getMessage(roomId, parentSeq) ?? null) : null;
     const replies = (
       this.db
         .prepare(
-          `SELECT ${MESSAGE_COLS} FROM messages g
-           LEFT JOIN agents a ON a.id = g.agent_id
+          `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
            WHERE g.room_id = ? AND g.reply_to_seq = ?
            ORDER BY g.seq ASC`,
         )
@@ -424,8 +469,7 @@ export class ChatStore {
       filtered
         ? this.db
             .prepare(
-              `SELECT ${MESSAGE_COLS} FROM messages g
-               LEFT JOIN agents a ON a.id = g.agent_id
+              `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
                WHERE g.room_id = ? AND g.seq > ?
                  AND EXISTS (SELECT 1 FROM json_each(g.mentions) WHERE value = ?)
                ORDER BY g.seq ASC LIMIT ?`,
@@ -433,8 +477,7 @@ export class ChatStore {
             .all(roomId, from, mentionsMe, limit)
         : this.db
             .prepare(
-              `SELECT ${MESSAGE_COLS} FROM messages g
-               LEFT JOIN agents a ON a.id = g.agent_id
+              `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
                WHERE g.room_id = ? AND g.seq > ?
                ORDER BY g.seq ASC LIMIT ?`,
             )
@@ -446,9 +489,12 @@ export class ChatStore {
 
     if (!filtered) {
       if (lastSeq > from) {
+        // MAX guards against a concurrent same-identity session clobbering a
+        // newer (higher) marker with this call's older read position.
         this.db
           .prepare(
-            "UPDATE memberships SET last_read_seq = ? WHERE room_id = ? AND agent_id = ?",
+            `UPDATE memberships SET last_read_seq = MAX(last_read_seq, ?)
+             WHERE room_id = ? AND agent_id = ?`,
           )
           .run(lastSeq, roomId, agentId);
       }
@@ -476,39 +522,55 @@ export class ChatStore {
     };
   }
 
-  /** Read-only browse. No beforeSeq => latest `limit`; else older than beforeSeq. */
+  /**
+   * Read-only browse (never advances the read marker). No beforeSeq => latest
+   * `limit`; else older than beforeSeq. With mentionsMe, only messages directed
+   * at that agent.
+   */
   readHistory(
     roomId: number,
     limit: number,
     beforeSeq?: number,
+    mentionsMe?: string,
   ): { messages: MessageRow[]; oldest_seq: number | null; has_more: boolean } {
-    const rows = (
-      beforeSeq !== undefined
-        ? this.db
-            .prepare(
-              `SELECT ${MESSAGE_COLS} FROM messages g
-               LEFT JOIN agents a ON a.id = g.agent_id
-               WHERE g.room_id = ? AND g.seq < ?
-               ORDER BY g.seq DESC LIMIT ?`,
-            )
-            .all(roomId, beforeSeq, limit)
-        : this.db
-            .prepare(
-              `SELECT ${MESSAGE_COLS} FROM messages g
-               LEFT JOIN agents a ON a.id = g.agent_id
-               WHERE g.room_id = ?
-               ORDER BY g.seq DESC LIMIT ?`,
-            )
-            .all(roomId, limit)
-    ) as RawMessage[];
+    const conds = ["g.room_id = ?"];
+    const params: (number | string)[] = [roomId];
+    if (beforeSeq !== undefined) {
+      conds.push("g.seq < ?");
+      params.push(beforeSeq);
+    }
+    if (mentionsMe !== undefined) {
+      conds.push("EXISTS (SELECT 1 FROM json_each(g.mentions) WHERE value = ?)");
+      params.push(mentionsMe);
+    }
+    const where = conds.join(" AND ");
+    const rows = this.db
+      .prepare(
+        `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
+         WHERE ${where} ORDER BY g.seq DESC LIMIT ?`,
+      )
+      .all(...params, limit) as RawMessage[];
     // Fetched newest-first; present oldest-first for natural reading.
     const messages = rows.map((r) => this.rowToMessage(r)).reverse();
     const oldest = messages.length > 0 ? messages[0].seq : null;
-    const has_more =
-      oldest !== null &&
-      !!this.db
-        .prepare("SELECT 1 FROM messages WHERE room_id = ? AND seq < ? LIMIT 1")
-        .get(roomId, oldest);
+
+    // has_more: are there older messages matching the same filter?
+    let has_more = false;
+    if (oldest !== null) {
+      const moreConds = ["room_id = ?", "seq < ?"];
+      const moreParams: (number | string)[] = [roomId, oldest];
+      if (mentionsMe !== undefined) {
+        moreConds.push(
+          "EXISTS (SELECT 1 FROM json_each(mentions) WHERE value = ?)",
+        );
+        moreParams.push(mentionsMe);
+      }
+      has_more = !!this.db
+        .prepare(
+          `SELECT 1 FROM messages WHERE ${moreConds.join(" AND ")} LIMIT 1`,
+        )
+        .get(...moreParams);
+    }
     return { messages, oldest_seq: oldest, has_more };
   }
 
@@ -523,4 +585,11 @@ function safeParse(s: string): unknown {
   } catch {
     return s;
   }
+}
+
+/** One-line, length-capped preview of a referenced message body. */
+function makePreview(s: string | null): string {
+  if (!s) return "";
+  const flat = s.replace(/\s+/g, " ").trim();
+  return flat.length > 100 ? flat.slice(0, 100) + "..." : flat;
 }

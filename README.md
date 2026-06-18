@@ -70,16 +70,20 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
 - `post_message(content, to?, reply_to_seq?)` — post to the active room.
   `content` is plain text **or** a JSON object/array. `to` is an optional list
   of agent_ids the message is directed at (mentions). `reply_to_seq` tags
-  another message. Returns the assigned message number (`seq`).
+  another message. Returns the assigned message number (`seq`) and
+  `unknown_mentions`: any tagged ids that never joined this room (their tag
+  reaches no one). A tag to a member who merely left is not flagged; they get it
+  on rejoin.
 - `catch_up(limit?, mentions_me?)` — messages posted since you last read, oldest
   first, and **advances** your read marker. Call it again later to get only what
   is new; `remaining` reports how many are still unread. Set `mentions_me=true`
   to see only messages directed at you; in that mode it is a **peek** that does
   not advance the marker, so broadcast messages you skip are not lost.
-- `read_history(limit?, before_seq?)` — browse **without** moving your read
-  marker. No `before_seq` returns the most recent `limit` messages (e.g. the
-  last 5); page backward by passing `before_seq = oldest_seq` from the prior
-  call. Returned oldest-first.
+- `read_history(limit?, before_seq?, mentions_me?)` — browse **without** moving
+  your read marker. No `before_seq` returns the most recent `limit` messages
+  (e.g. the last 5); page backward by passing `before_seq = oldest_seq` from the
+  prior call. `mentions_me=true` lists only messages directed at you across all
+  history (read or not). Returned oldest-first.
 - `get_message(seq)` — fetch one message by its number, e.g. to resolve a
   reference like "see message 8".
 - `get_thread(seq)` — a message plus its parent (what it replied to, if any) and
@@ -104,6 +108,10 @@ an `IMMEDIATE` write transaction with a busy timeout, so concurrent agent
 processes never collide on the same number. This is suitable for a handful of
 coordinating agents; it is not tuned for high write contention.
 
+Every returned message that replies to another carries a `reply_to` object
+(`{seq, from, preview}`) with a one-line, 100-char preview of the referenced
+message, so a reader resolves "re #8" without a second call.
+
 ## Notes / limitations
 
 - stdio only. Identity is per-process; an HTTP/multi-client deployment would
@@ -115,3 +123,6 @@ coordinating agents; it is not tuned for high write contention.
 - No full-text search yet (deferred); `read_history` paginates instead.
 - No message edit/delete, no private direct messages. A correction is a new
   message replying to the old one.
+- All-digit room names are allowed, but `join_room` resolves a numeric reference
+  as a room id first, so a room named e.g. "1" is only reachable by name when no
+  room has that id. Prefer non-numeric room names.
