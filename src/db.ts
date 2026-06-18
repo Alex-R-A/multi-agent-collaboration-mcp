@@ -13,10 +13,14 @@ function resolveDbPath(): string {
   return join(homedir(), ".agent-chat-mcp", "chat.db");
 }
 
+/** SQLite's default maximum string/blob byte length (SQLITE_MAX_LENGTH). */
+export const SQLITE_MAX_LENGTH = 1_000_000_000;
+
 export type RoomRow = {
   id: number;
   name: string;
   description: string | null;
+  pinned: string | null;
   created_at: string;
 };
 
@@ -33,6 +37,10 @@ export type AgentRow = {
   description: string | null;
   joined_at: string;
   last_read_seq: number;
+  last_seen: string | null;
+  idle_seconds: number | null;
+  present: boolean;
+  active: boolean;
 };
 
 export type MessageRow = {
@@ -42,9 +50,25 @@ export type MessageRow = {
   from_role: string | null;
   format: "text" | "json";
   content: unknown;
+  to: string[] | null;
   reply_to_seq: number | null;
   at: string;
 };
+
+type RawMessage = {
+  seq: number;
+  agent_id: string;
+  from_type: string | null;
+  from_role: string | null;
+  format: "text" | "json";
+  body: string;
+  mentions: string | null;
+  reply_to_seq: number | null;
+  created_at: string;
+};
+
+const MESSAGE_COLS = `g.seq, g.agent_id, a.type AS from_type, a.role AS from_role,
+                      g.format, g.body, g.mentions, g.reply_to_seq, g.created_at`;
 
 export class ChatStore {
   readonly path: string;
@@ -66,6 +90,7 @@ export class ChatStore {
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
         name        TEXT NOT NULL UNIQUE,
         description TEXT,
+        pinned      TEXT,
         created_at  TEXT NOT NULL DEFAULT (datetime('now'))
       );
 
@@ -82,6 +107,8 @@ export class ChatStore {
         agent_id      TEXT NOT NULL REFERENCES agents(id),
         joined_at     TEXT NOT NULL DEFAULT (datetime('now')),
         last_read_seq INTEGER NOT NULL DEFAULT 0,
+        last_seen     TEXT,
+        left_at       TEXT,
         PRIMARY KEY (room_id, agent_id)
       );
 
@@ -92,31 +119,64 @@ export class ChatStore {
         agent_id     TEXT NOT NULL REFERENCES agents(id),
         format       TEXT NOT NULL DEFAULT 'text',
         body         TEXT NOT NULL,
+        mentions     TEXT,
         reply_to_seq INTEGER,
         created_at   TEXT NOT NULL DEFAULT (datetime('now')),
         UNIQUE (room_id, seq)
       );
 
       CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages(room_id, seq);
+      CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(room_id, reply_to_seq);
     `);
+
+    // Upgrade older database files that predate these columns.
+    this.ensureColumn("rooms", "pinned", "TEXT");
+    this.ensureColumn("memberships", "last_seen", "TEXT");
+    this.ensureColumn("memberships", "left_at", "TEXT");
+    this.ensureColumn("messages", "mentions", "TEXT");
+  }
+
+  private ensureColumn(table: string, column: string, type: string): void {
+    const cols = this.db
+      .prepare(`PRAGMA table_info(${table})`)
+      .all() as { name: string }[];
+    if (!cols.some((c) => c.name === column)) {
+      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+    }
   }
 
   // --- rooms -------------------------------------------------------------
 
-  createRoom(name: string, description: string | null): RoomRow {
+  createRoom(
+    name: string,
+    description: string | null,
+    pinned: string | null,
+  ): RoomRow {
     const info = this.db
-      .prepare("INSERT INTO rooms (name, description) VALUES (?, ?)")
-      .run(name, description);
+      .prepare("INSERT INTO rooms (name, description, pinned) VALUES (?, ?, ?)")
+      .run(name, description, pinned);
     return this.db
       .prepare("SELECT * FROM rooms WHERE id = ?")
       .get(info.lastInsertRowid) as RoomRow;
   }
 
+  setPinned(roomId: number, pinned: string | null): void {
+    this.db
+      .prepare("UPDATE rooms SET pinned = ? WHERE id = ?")
+      .run(pinned, roomId);
+  }
+
+  getRoom(roomId: number): RoomRow | undefined {
+    return this.db.prepare("SELECT * FROM rooms WHERE id = ?").get(roomId) as
+      | RoomRow
+      | undefined;
+  }
+
   listRooms(): RoomSummary[] {
     return this.db
       .prepare(
-        `SELECT r.id, r.name, r.description, r.created_at,
-                (SELECT COUNT(*) FROM memberships m WHERE m.room_id = r.id) AS members,
+        `SELECT r.id, r.name, r.description, r.pinned, r.created_at,
+                (SELECT COUNT(*) FROM memberships m WHERE m.room_id = r.id AND m.left_at IS NULL) AS members,
                 (SELECT COUNT(*) FROM messages g WHERE g.room_id = r.id) AS messages,
                 (SELECT MAX(created_at) FROM messages g WHERE g.room_id = r.id) AS last_activity
          FROM rooms r ORDER BY r.id`,
@@ -157,10 +217,37 @@ export class ChatStore {
       .run({ id, type, role, description });
   }
 
+  /** Join (or rejoin) a room: clears any prior leave and refreshes liveness. */
   joinRoom(roomId: number, agentId: string): void {
     this.db
       .prepare(
         "INSERT OR IGNORE INTO memberships (room_id, agent_id) VALUES (?, ?)",
+      )
+      .run(roomId, agentId);
+    this.db
+      .prepare(
+        `UPDATE memberships SET left_at = NULL, last_seen = datetime('now')
+         WHERE room_id = ? AND agent_id = ?`,
+      )
+      .run(roomId, agentId);
+  }
+
+  /** Soft leave: keep the row (and read position) but mark not present. */
+  leaveRoom(roomId: number, agentId: string): boolean {
+    const info = this.db
+      .prepare(
+        `UPDATE memberships SET left_at = datetime('now'), last_seen = datetime('now')
+         WHERE room_id = ? AND agent_id = ? AND left_at IS NULL`,
+      )
+      .run(roomId, agentId);
+    return info.changes > 0;
+  }
+
+  /** Bump liveness for an agent's active membership. */
+  touch(roomId: number, agentId: string): void {
+    this.db
+      .prepare(
+        "UPDATE memberships SET last_seen = datetime('now') WHERE room_id = ? AND agent_id = ?",
       )
       .run(roomId, agentId);
   }
@@ -168,35 +255,55 @@ export class ChatStore {
   getMembership(
     roomId: number,
     agentId: string,
-  ): { last_read_seq: number } | undefined {
+  ): { last_read_seq: number; left_at: string | null } | undefined {
     return this.db
       .prepare(
-        "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
+        "SELECT last_read_seq, left_at FROM memberships WHERE room_id = ? AND agent_id = ?",
       )
-      .get(roomId, agentId) as { last_read_seq: number } | undefined;
+      .get(roomId, agentId) as
+      | { last_read_seq: number; left_at: string | null }
+      | undefined;
   }
 
-  listAgents(roomId: number, filter?: string): AgentRow[] {
+  listAgents(
+    roomId: number,
+    activeWithinMinutes: number,
+    filter?: string,
+  ): AgentRow[] {
+    const base = `SELECT a.id, a.type, a.role, a.description, m.joined_at,
+                         m.last_read_seq, m.last_seen, m.left_at,
+                         (strftime('%s','now') - strftime('%s', m.last_seen)) AS idle_seconds
+                  FROM memberships m JOIN agents a ON a.id = m.agent_id
+                  WHERE m.room_id = ?`;
+    let rows: (Omit<AgentRow, "present" | "active"> & {
+      left_at: string | null;
+    })[];
     if (filter && filter.trim().length > 0) {
       const like = `%${filter.trim()}%`;
-      return this.db
+      rows = this.db
         .prepare(
-          `SELECT a.id, a.type, a.role, a.description, m.joined_at, m.last_read_seq
-           FROM memberships m JOIN agents a ON a.id = m.agent_id
-           WHERE m.room_id = ?
-             AND (IFNULL(a.role,'') LIKE ? OR IFNULL(a.type,'') LIKE ?
-                  OR IFNULL(a.description,'') LIKE ? OR a.id LIKE ?)
+          `${base} AND (IFNULL(a.role,'') LIKE ? OR IFNULL(a.type,'') LIKE ?
+                        OR IFNULL(a.description,'') LIKE ? OR a.id LIKE ?)
            ORDER BY m.joined_at`,
         )
-        .all(roomId, like, like, like, like) as AgentRow[];
+        .all(roomId, like, like, like, like) as typeof rows;
+    } else {
+      rows = this.db
+        .prepare(`${base} ORDER BY m.joined_at`)
+        .all(roomId) as typeof rows;
     }
-    return this.db
-      .prepare(
-        `SELECT a.id, a.type, a.role, a.description, m.joined_at, m.last_read_seq
-         FROM memberships m JOIN agents a ON a.id = m.agent_id
-         WHERE m.room_id = ? ORDER BY m.joined_at`,
-      )
-      .all(roomId) as AgentRow[];
+    const threshold = activeWithinMinutes * 60;
+    return rows.map((r) => {
+      const { left_at, ...rest } = r;
+      return {
+        ...rest,
+        present: left_at === null,
+        active:
+          left_at === null &&
+          r.idle_seconds !== null &&
+          r.idle_seconds <= threshold,
+      };
+    });
   }
 
   // --- messages ----------------------------------------------------------
@@ -207,8 +314,11 @@ export class ChatStore {
     agentId: string,
     body: string,
     format: "text" | "json",
+    mentions: string[] | null,
     replyToSeq: number | null,
   ): { id: number; seq: number } {
+    const mentionsJson =
+      mentions && mentions.length > 0 ? JSON.stringify(mentions) : null;
     const tx = this.db.transaction(() => {
       const { next } = this.db
         .prepare(
@@ -217,10 +327,10 @@ export class ChatStore {
         .get(roomId) as { next: number };
       const info = this.db
         .prepare(
-          `INSERT INTO messages (room_id, seq, agent_id, format, body, reply_to_seq)
-           VALUES (?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO messages (room_id, seq, agent_id, format, body, mentions, reply_to_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(roomId, next, agentId, format, body, replyToSeq);
+        .run(roomId, next, agentId, format, body, mentionsJson, replyToSeq);
       return { id: Number(info.lastInsertRowid), seq: next };
     });
     // IMMEDIATE acquires the write lock before reading MAX(seq), so concurrent
@@ -228,16 +338,7 @@ export class ChatStore {
     return tx.immediate();
   }
 
-  private rowToMessage(r: {
-    seq: number;
-    agent_id: string;
-    from_type: string | null;
-    from_role: string | null;
-    format: "text" | "json";
-    body: string;
-    reply_to_seq: number | null;
-    created_at: string;
-  }): MessageRow {
+  private rowToMessage(r: RawMessage): MessageRow {
     return {
       seq: r.seq,
       from: r.agent_id,
@@ -245,6 +346,7 @@ export class ChatStore {
       from_role: r.from_role,
       format: r.format,
       content: r.format === "json" ? safeParse(r.body) : r.body,
+      to: r.mentions ? (safeParse(r.mentions) as string[]) : null,
       reply_to_seq: r.reply_to_seq,
       at: r.created_at,
     };
@@ -253,13 +355,38 @@ export class ChatStore {
   getMessage(roomId: number, seq: number): MessageRow | undefined {
     const r = this.db
       .prepare(
-        `SELECT g.seq, g.agent_id, a.type AS from_type, a.role AS from_role,
-                g.format, g.body, g.reply_to_seq, g.created_at
-         FROM messages g LEFT JOIN agents a ON a.id = g.agent_id
+        `SELECT ${MESSAGE_COLS} FROM messages g
+         LEFT JOIN agents a ON a.id = g.agent_id
          WHERE g.room_id = ? AND g.seq = ?`,
       )
-      .get(roomId, seq) as Parameters<ChatStore["rowToMessage"]>[0] | undefined;
+      .get(roomId, seq) as RawMessage | undefined;
     return r ? this.rowToMessage(r) : undefined;
+  }
+
+  /** A message plus its parent (if any) and direct replies. */
+  getThread(
+    roomId: number,
+    seq: number,
+  ):
+    | { message: MessageRow; parent: MessageRow | null; replies: MessageRow[] }
+    | undefined {
+    const message = this.getMessage(roomId, seq);
+    if (!message) return undefined;
+    const parent =
+      message.reply_to_seq !== null
+        ? (this.getMessage(roomId, message.reply_to_seq) ?? null)
+        : null;
+    const replies = (
+      this.db
+        .prepare(
+          `SELECT ${MESSAGE_COLS} FROM messages g
+           LEFT JOIN agents a ON a.id = g.agent_id
+           WHERE g.room_id = ? AND g.reply_to_seq = ?
+           ORDER BY g.seq ASC`,
+        )
+        .all(roomId, seq) as RawMessage[]
+    ).map((r) => this.rowToMessage(r));
+    return { message, parent, replies };
   }
 
   unreadCount(roomId: number, lastReadSeq: number): number {
@@ -271,38 +398,81 @@ export class ChatStore {
     return c;
   }
 
-  /** Unread messages (seq > last_read_seq), oldest first, advancing the marker. */
+  /**
+   * Unread messages (seq > last_read_seq), oldest first.
+   * Without mentionsMe: advances the read marker.
+   * With mentionsMe: a filtered PEEK that does NOT advance the marker, so the
+   * broadcast messages it skips are not silently marked read.
+   */
   catchUp(
     roomId: number,
     agentId: string,
     limit: number,
-  ): { messages: MessageRow[]; new_last_read_seq: number; remaining: number } {
+    mentionsMe?: string,
+  ): {
+    messages: MessageRow[];
+    new_last_read_seq: number;
+    remaining: number;
+    advanced: boolean;
+  } {
     const membership = this.getMembership(roomId, agentId);
     if (!membership) throw new Error("not a member of this room");
     const from = membership.last_read_seq;
-    const rows = this.db
-      .prepare(
-        `SELECT g.seq, g.agent_id, a.type AS from_type, a.role AS from_role,
-                g.format, g.body, g.reply_to_seq, g.created_at
-         FROM messages g LEFT JOIN agents a ON a.id = g.agent_id
-         WHERE g.room_id = ? AND g.seq > ?
-         ORDER BY g.seq ASC LIMIT ?`,
-      )
-      .all(roomId, from, limit) as Parameters<ChatStore["rowToMessage"]>[0][];
+    const filtered = mentionsMe !== undefined;
+
+    const rows = (
+      filtered
+        ? this.db
+            .prepare(
+              `SELECT ${MESSAGE_COLS} FROM messages g
+               LEFT JOIN agents a ON a.id = g.agent_id
+               WHERE g.room_id = ? AND g.seq > ?
+                 AND EXISTS (SELECT 1 FROM json_each(g.mentions) WHERE value = ?)
+               ORDER BY g.seq ASC LIMIT ?`,
+            )
+            .all(roomId, from, mentionsMe, limit)
+        : this.db
+            .prepare(
+              `SELECT ${MESSAGE_COLS} FROM messages g
+               LEFT JOIN agents a ON a.id = g.agent_id
+               WHERE g.room_id = ? AND g.seq > ?
+               ORDER BY g.seq ASC LIMIT ?`,
+            )
+            .all(roomId, from, limit)
+    ) as RawMessage[];
     const messages = rows.map((r) => this.rowToMessage(r));
-    const newMarker =
+    const lastSeq =
       messages.length > 0 ? messages[messages.length - 1].seq : from;
-    if (newMarker > from) {
-      this.db
-        .prepare(
-          "UPDATE memberships SET last_read_seq = ? WHERE room_id = ? AND agent_id = ?",
-        )
-        .run(newMarker, roomId, agentId);
+
+    if (!filtered) {
+      if (lastSeq > from) {
+        this.db
+          .prepare(
+            "UPDATE memberships SET last_read_seq = ? WHERE room_id = ? AND agent_id = ?",
+          )
+          .run(lastSeq, roomId, agentId);
+      }
+      return {
+        messages,
+        new_last_read_seq: lastSeq,
+        remaining: this.unreadCount(roomId, lastSeq),
+        advanced: lastSeq > from,
+      };
     }
+
+    // Peek mode: count matching messages still beyond what we returned.
+    const { c } = this.db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM messages g
+         WHERE g.room_id = ? AND g.seq > ?
+           AND EXISTS (SELECT 1 FROM json_each(g.mentions) WHERE value = ?)`,
+      )
+      .get(roomId, lastSeq, mentionsMe) as { c: number };
     return {
       messages,
-      new_last_read_seq: newMarker,
-      remaining: this.unreadCount(roomId, newMarker),
+      new_last_read_seq: from,
+      remaining: c,
+      advanced: false,
     };
   }
 
@@ -316,35 +486,29 @@ export class ChatStore {
       beforeSeq !== undefined
         ? this.db
             .prepare(
-              `SELECT g.seq, g.agent_id, a.type AS from_type, a.role AS from_role,
-                      g.format, g.body, g.reply_to_seq, g.created_at
-               FROM messages g LEFT JOIN agents a ON a.id = g.agent_id
+              `SELECT ${MESSAGE_COLS} FROM messages g
+               LEFT JOIN agents a ON a.id = g.agent_id
                WHERE g.room_id = ? AND g.seq < ?
                ORDER BY g.seq DESC LIMIT ?`,
             )
             .all(roomId, beforeSeq, limit)
         : this.db
             .prepare(
-              `SELECT g.seq, g.agent_id, a.type AS from_type, a.role AS from_role,
-                      g.format, g.body, g.reply_to_seq, g.created_at
-               FROM messages g LEFT JOIN agents a ON a.id = g.agent_id
+              `SELECT ${MESSAGE_COLS} FROM messages g
+               LEFT JOIN agents a ON a.id = g.agent_id
                WHERE g.room_id = ?
                ORDER BY g.seq DESC LIMIT ?`,
             )
             .all(roomId, limit)
-    ) as Parameters<ChatStore["rowToMessage"]>[0][];
+    ) as RawMessage[];
     // Fetched newest-first; present oldest-first for natural reading.
     const messages = rows.map((r) => this.rowToMessage(r)).reverse();
     const oldest = messages.length > 0 ? messages[0].seq : null;
     const has_more =
       oldest !== null &&
-      (this.db
-        .prepare(
-          "SELECT 1 FROM messages WHERE room_id = ? AND seq < ? LIMIT 1",
-        )
-        .get(roomId, oldest)
-        ? true
-        : false);
+      !!this.db
+        .prepare("SELECT 1 FROM messages WHERE room_id = ? AND seq < ? LIMIT 1")
+        .get(roomId, oldest);
     return { messages, oldest_seq: oldest, has_more };
   }
 

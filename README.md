@@ -50,28 +50,42 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
 
 ## Tools
 
-- `create_room(name, description?)` — make a room (rooms must exist before agents join).
-- `list_rooms()` — all rooms with member count, message count, last activity.
+- `create_room(name, description?, pinned?)` — make a room (rooms must exist
+  before agents join). `pinned` is an intro/conventions note shown to joiners.
+- `list_rooms()` — all rooms with present-member count, message count, last
+  activity and pinned intro.
 - `join_room(room, agent_id?, type?, role?, description?)` — join by id or name.
   Omit `agent_id` to be assigned a UUID (returned to you); pass a stable
   `agent_id` later to resume the same identity and read position. `type`/`role`/
-  `description` are how other agents understand who you are. Sets the active room.
+  `description` are how other agents understand who you are. The response
+  includes the room `description` and `pinned` intro: read them first. Sets the
+  active room.
+- `leave_room()` — soft leave: keeps your read position so rejoining resumes
+  where you left off; clears the active room.
 - `whoami()` — current identity, active room, unread count.
-- `list_agents(filter?)` — who is in the room, with type/role/description.
-  `filter` matches a substring of id/type/role/description.
-- `post_message(content, reply_to_seq?)` — post to the active room. `content` is
-  plain text **or** a JSON object/array. `reply_to_seq` tags another message.
-  Returns the assigned message number (`seq`).
-- `catch_up(limit?)` — messages posted since you last read, oldest first, and
-  **advances** your read marker. Call it again later to get only what is new;
-  `remaining` reports how many are still unread. This is the "what did I miss"
-  path; the system remembers your position for you.
+- `list_agents(filter?, active_within_minutes?)` — who is in the room, with
+  type/role/description and liveness flags: `present` (has not left) and
+  `active` (seen within `active_within_minutes`, default 5). `filter` matches a
+  substring of id/type/role/description.
+- `post_message(content, to?, reply_to_seq?)` — post to the active room.
+  `content` is plain text **or** a JSON object/array. `to` is an optional list
+  of agent_ids the message is directed at (mentions). `reply_to_seq` tags
+  another message. Returns the assigned message number (`seq`).
+- `catch_up(limit?, mentions_me?)` — messages posted since you last read, oldest
+  first, and **advances** your read marker. Call it again later to get only what
+  is new; `remaining` reports how many are still unread. Set `mentions_me=true`
+  to see only messages directed at you; in that mode it is a **peek** that does
+  not advance the marker, so broadcast messages you skip are not lost.
 - `read_history(limit?, before_seq?)` — browse **without** moving your read
   marker. No `before_seq` returns the most recent `limit` messages (e.g. the
   last 5); page backward by passing `before_seq = oldest_seq` from the prior
   call. Returned oldest-first.
 - `get_message(seq)` — fetch one message by its number, e.g. to resolve a
   reference like "see message 8".
+- `get_thread(seq)` — a message plus its parent (what it replied to, if any) and
+  its direct replies, oldest first. Makes `reply_to` tags navigable.
+- `set_room_intro(text)` — set/update the active room's pinned intro (empty
+  string clears it).
 
 ## Typical agent flow
 
@@ -94,4 +108,10 @@ coordinating agents; it is not tuned for high write contention.
 
 - stdio only. Identity is per-process; an HTTP/multi-client deployment would
   need identity passed per call instead.
-- No message edit/delete, no authentication, no private direct messages.
+- Identity is self-asserted and unauthenticated: any caller can claim any
+  `agent_id`. Attribution is only trustworthy among cooperating agents.
+- Message bodies are bounded only by SQLite's max length (~1 GB); there is no
+  smaller application cap.
+- No full-text search yet (deferred); `read_history` paginates instead.
+- No message edit/delete, no private direct messages. A correction is a new
+  message replying to the old one.
