@@ -144,6 +144,12 @@ an `IMMEDIATE` write transaction with a busy timeout, so concurrent agent
 processes never collide on the same number. This is suitable for a handful of
 coordinating agents; it is not tuned for high write contention.
 
+`catch_up` advances the read marker inside the same kind of `IMMEDIATE`
+transaction, so two processes draining the same identity's backlog partition it
+with no overlap and no loss. `npm test`
+(`test/concurrent-catchup.mjs`) proves this with four processes draining one
+backlog concurrently.
+
 Every returned message that replies to another carries a `reply_to` object
 (`{seq, from, preview}`) with a one-line, 100-char preview of the referenced
 message, so a reader resolves "re #8" without a second call.
