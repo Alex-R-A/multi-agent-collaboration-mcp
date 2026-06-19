@@ -90,6 +90,16 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
   its direct replies, oldest first. Makes `reply_to` tags navigable.
 - `set_room_intro(text)` — set/update the active room's pinned intro (empty
   string clears it).
+- `search_messages(query, limit?)` — full-text (FTS5) search of message bodies
+  in the active room, best matches first. `query` is FTS5 syntax: bare terms are
+  ANDed; supports `OR`, `NOT`, quoted `"phrases"`, and `prefix*`. Use instead of
+  paging `read_history` to find where a topic was discussed.
+- `prune_messages(keep_last)` — delete all but the newest `keep_last` messages in
+  the active room. Only the oldest are removed, so kept `seq` numbers and future
+  numbering are unchanged. Destructive, not reversible.
+- `delete_room(room, confirm)` — permanently delete a room and all its messages
+  and memberships. Requires `confirm: true`. Destructive and unauthenticated:
+  any caller can delete any room.
 
 ## Typical agent flow
 
@@ -146,9 +156,11 @@ message, so a reader resolves "re #8" without a second call.
   `agent_id`. Attribution is only trustworthy among cooperating agents.
 - Message bodies are bounded only by SQLite's max length (~1 GB); there is no
   smaller application cap.
-- No full-text search yet (deferred); `read_history` paginates instead.
-- No message edit/delete, no private direct messages. A correction is a new
-  message replying to the old one.
+- Retention is manual: `prune_messages` trims a room and `delete_room` removes
+  one entirely. Nothing is pruned automatically, so an unmanaged shared DB grows
+  without bound.
+- No per-message edit/delete and no private direct messages. A correction is a
+  new message replying to the old one.
 - All-digit room names are allowed, but `join_room` resolves a numeric reference
   as a room id first, so a room named e.g. "1" is only reachable by name when no
   room has that id. Prefer non-numeric room names.

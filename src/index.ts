@@ -69,7 +69,7 @@ function touchSession(): void {
 const server = new McpServer(
   {
     name: "agent-chat-mcp",
-    version: "0.3.0",
+    version: "0.4.0",
   },
   { instructions: INSTRUCTIONS },
 );
@@ -492,6 +492,100 @@ server.registerTool(
       const value = text.length > 0 ? text : null;
       store.setPinned(roomId, value);
       return ok({ room_id: roomId, pinned: value });
+    } catch (e) {
+      return fail(asMessage(e));
+    }
+  },
+);
+
+server.registerTool(
+  "search_messages",
+  {
+    title: "Search messages",
+    description:
+      "Full-text search of message bodies in the active room, best matches " +
+      "first. `query` is FTS5 syntax: bare terms are ANDed; supports OR, NOT, " +
+      'quoted "phrases", and prefix* . Use this instead of paging read_history ' +
+      "to find where a topic was discussed.",
+    inputSchema: {
+      query: z.string().min(1).describe("FTS5 search query"),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .max(100)
+        .optional()
+        .describe("Max results (default 20)"),
+    },
+  },
+  async ({ query, limit }) => {
+    try {
+      touchSession();
+      const { roomId } = requireActive();
+      return ok({ matches: store.searchMessages(roomId, query, limit ?? 20) });
+    } catch (e) {
+      return fail(asMessage(e));
+    }
+  },
+);
+
+server.registerTool(
+  "prune_messages",
+  {
+    title: "Prune messages",
+    description:
+      "Delete old messages in the active room, keeping only the most recent " +
+      "`keep_last`. Only the oldest are removed, so message numbers (seq) of " +
+      "kept messages are unchanged and future numbers stay monotonic. " +
+      "Destructive and not reversible.",
+    inputSchema: {
+      keep_last: z
+        .number()
+        .int()
+        .positive()
+        .describe("How many of the newest messages to keep"),
+    },
+  },
+  async ({ keep_last }) => {
+    try {
+      touchSession();
+      const { roomId } = requireActive();
+      return ok({ room_id: roomId, ...store.pruneMessages(roomId, keep_last) });
+    } catch (e) {
+      return fail(asMessage(e));
+    }
+  },
+);
+
+server.registerTool(
+  "delete_room",
+  {
+    title: "Delete room",
+    description:
+      "Permanently delete a room (by id or name) and ALL of its messages and " +
+      "memberships. Requires confirm=true. Destructive, not reversible, and " +
+      "unauthenticated: any caller can delete any room. Returns the counts removed.",
+    inputSchema: {
+      room: z.string().min(1).describe("Room id or name to delete"),
+      confirm: z
+        .boolean()
+        .describe("Must be true; a guard against accidental deletion"),
+    },
+  },
+  async ({ room, confirm }) => {
+    try {
+      touchSession();
+      const target = store.resolveRoom(room);
+      if (!target) return fail(`no room "${room}"`);
+      if (confirm !== true) {
+        return fail(`pass confirm:true to delete room ${target.id} ("${target.name}")`);
+      }
+      const result = store.deleteRoom(target.id);
+      if (session.roomId === target.id) {
+        session.roomId = null;
+        session.agentId = null;
+      }
+      return ok({ deleted_room: target.id, name: target.name, ...result });
     } catch (e) {
       return fail(asMessage(e));
     }

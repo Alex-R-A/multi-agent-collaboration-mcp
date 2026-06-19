@@ -154,6 +154,33 @@ export class ChatStore {
       CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages(room_id, seq);
       CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(room_id, reply_to_seq);
     `);
+
+    // Full-text search over message bodies. External-content FTS5 mirrors
+    // messages.body keyed by messages.id; triggers keep it in sync.
+    const ftsExisted = !!this.db
+      .prepare("SELECT 1 FROM sqlite_master WHERE name = 'messages_fts'")
+      .get();
+    this.db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
+        USING fts5(body, content='messages', content_rowid='id');
+
+      CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+        INSERT INTO messages_fts(rowid, body) VALUES (new.id, new.body);
+      END;
+      CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+        INSERT INTO messages_fts(messages_fts, rowid, body)
+          VALUES ('delete', old.id, old.body);
+      END;
+    `);
+    if (!ftsExisted) {
+      const { c } = this.db
+        .prepare("SELECT COUNT(*) AS c FROM messages")
+        .get() as { c: number };
+      if (c > 0) {
+        // Backfill rows that existed before FTS was added.
+        this.db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+      }
+    }
   }
 
   private ensureColumn(table: string, column: string, type: string): void {
@@ -460,41 +487,53 @@ export class ChatStore {
     remaining: number;
     advanced: boolean;
   } {
-    const membership = this.getMembership(roomId, agentId);
-    if (!membership) throw new Error("not a member of this room");
-    const from = membership.last_read_seq;
-    const filtered = mentionsMe !== undefined;
+    if (mentionsMe !== undefined) {
+      // Peek mode: filtered, never advances the marker, so no atomicity needed.
+      const membership = this.getMembership(roomId, agentId);
+      if (!membership) throw new Error("not a member of this room");
+      const from = membership.last_read_seq;
+      const rows = this.db
+        .prepare(
+          `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
+           WHERE g.room_id = ? AND g.seq > ?
+             AND EXISTS (SELECT 1 FROM json_each(g.mentions) WHERE value = ?)
+           ORDER BY g.seq ASC LIMIT ?`,
+        )
+        .all(roomId, from, mentionsMe, limit) as RawMessage[];
+      const messages = rows.map((r) => this.rowToMessage(r));
+      const lastSeq =
+        messages.length > 0 ? messages[messages.length - 1].seq : from;
+      const { c } = this.db
+        .prepare(
+          `SELECT COUNT(*) AS c FROM messages g
+           WHERE g.room_id = ? AND g.seq > ?
+             AND EXISTS (SELECT 1 FROM json_each(g.mentions) WHERE value = ?)`,
+        )
+        .get(roomId, lastSeq, mentionsMe) as { c: number };
+      return { messages, new_last_read_seq: from, remaining: c, advanced: false };
+    }
 
-    const rows = (
-      filtered
-        ? this.db
-            .prepare(
-              `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
-               WHERE g.room_id = ? AND g.seq > ?
-                 AND EXISTS (SELECT 1 FROM json_each(g.mentions) WHERE value = ?)
-               ORDER BY g.seq ASC LIMIT ?`,
-            )
-            .all(roomId, from, mentionsMe, limit)
-        : this.db
-            .prepare(
-              `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
-               WHERE g.room_id = ? AND g.seq > ?
-               ORDER BY g.seq ASC LIMIT ?`,
-            )
-            .all(roomId, from, limit)
-    ) as RawMessage[];
-    const messages = rows.map((r) => this.rowToMessage(r));
-    const lastSeq =
-      messages.length > 0 ? messages[messages.length - 1].seq : from;
-
-    if (!filtered) {
+    // Advancing path: read the marker, fetch, and advance inside one IMMEDIATE
+    // transaction so a concurrent same-identity call serializes behind it and
+    // reads the updated marker instead of returning overlapping messages.
+    const tx = this.db.transaction(() => {
+      const membership = this.getMembership(roomId, agentId);
+      if (!membership) throw new Error("not a member of this room");
+      const from = membership.last_read_seq;
+      const rows = this.db
+        .prepare(
+          `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
+           WHERE g.room_id = ? AND g.seq > ?
+           ORDER BY g.seq ASC LIMIT ?`,
+        )
+        .all(roomId, from, limit) as RawMessage[];
+      const messages = rows.map((r) => this.rowToMessage(r));
+      const lastSeq =
+        messages.length > 0 ? messages[messages.length - 1].seq : from;
       if (lastSeq > from) {
-        // MAX guards against a concurrent same-identity session clobbering a
-        // newer (higher) marker with this call's older read position.
         this.db
           .prepare(
-            `UPDATE memberships SET last_read_seq = MAX(last_read_seq, ?)
-             WHERE room_id = ? AND agent_id = ?`,
+            "UPDATE memberships SET last_read_seq = ? WHERE room_id = ? AND agent_id = ?",
           )
           .run(lastSeq, roomId, agentId);
       }
@@ -504,22 +543,8 @@ export class ChatStore {
         remaining: this.unreadCount(roomId, lastSeq),
         advanced: lastSeq > from,
       };
-    }
-
-    // Peek mode: count matching messages still beyond what we returned.
-    const { c } = this.db
-      .prepare(
-        `SELECT COUNT(*) AS c FROM messages g
-         WHERE g.room_id = ? AND g.seq > ?
-           AND EXISTS (SELECT 1 FROM json_each(g.mentions) WHERE value = ?)`,
-      )
-      .get(roomId, lastSeq, mentionsMe) as { c: number };
-    return {
-      messages,
-      new_last_read_seq: from,
-      remaining: c,
-      advanced: false,
-    };
+    });
+    return tx.immediate();
   }
 
   /**
@@ -572,6 +597,67 @@ export class ChatStore {
         .get(...moreParams);
     }
     return { messages, oldest_seq: oldest, has_more };
+  }
+
+  /** Full-text search of message bodies in a room, best matches first. */
+  searchMessages(roomId: number, query: string, limit: number): MessageRow[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${MESSAGE_COLS}
+         FROM messages_fts f
+         JOIN messages g ON g.id = f.rowid
+         LEFT JOIN agents a ON a.id = g.agent_id
+         LEFT JOIN messages p ON p.room_id = g.room_id AND p.seq = g.reply_to_seq
+         WHERE f.body MATCH ? AND g.room_id = ?
+         ORDER BY rank LIMIT ?`,
+      )
+      .all(query, roomId, limit) as RawMessage[];
+    return rows.map((r) => this.rowToMessage(r));
+  }
+
+  /**
+   * Trim a room to its newest `keepLast` messages. Only the oldest are removed,
+   * so MAX(seq) is unchanged and future seq numbers stay monotonic.
+   */
+  pruneMessages(
+    roomId: number,
+    keepLast: number,
+  ): { deleted: number; kept: number } {
+    const tx = this.db.transaction(() => {
+      const { c: total } = this.db
+        .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = ?")
+        .get(roomId) as { c: number };
+      if (total <= keepLast) return { deleted: 0, kept: total };
+      const cutoff = this.db
+        .prepare(
+          "SELECT seq FROM messages WHERE room_id = ? ORDER BY seq DESC LIMIT 1 OFFSET ?",
+        )
+        .get(roomId, keepLast - 1) as { seq: number };
+      const info = this.db
+        .prepare("DELETE FROM messages WHERE room_id = ? AND seq < ?")
+        .run(roomId, cutoff.seq);
+      return { deleted: info.changes, kept: total - info.changes };
+    });
+    return tx();
+  }
+
+  /** Hard-delete a room and all of its messages and memberships. */
+  deleteRoom(roomId: number): { messages: number; members: number } {
+    const tx = this.db.transaction(() => {
+      const { c: messages } = this.db
+        .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = ?")
+        .get(roomId) as { c: number };
+      const { c: members } = this.db
+        .prepare("SELECT COUNT(*) AS c FROM memberships WHERE room_id = ?")
+        .get(roomId) as { c: number };
+      // Messages first so the FTS delete-trigger fires before the room row goes,
+      // and so foreign keys to rooms(id) are satisfied.
+      this.db.prepare("DELETE FROM messages WHERE room_id = ?").run(roomId);
+      this.db.prepare("DELETE FROM memberships WHERE room_id = ?").run(roomId);
+      this.db.prepare("DELETE FROM rooms WHERE id = ?").run(roomId);
+      return { messages, members };
+    });
+    return tx();
   }
 
   close(): void {
