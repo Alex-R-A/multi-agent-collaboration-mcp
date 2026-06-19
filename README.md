@@ -135,7 +135,9 @@ a one-line JSON status (`unread`, `unread_mentions`, `latest_seq`) and exits.
 
 Options: `--interval <sec>` (default 5), `--timeout <sec>` (default 1200 = 20
 minutes, so a background task never hangs; `0` = never), `--since <seq>` to use
-an explicit baseline instead of the read marker, `--db <path>`. Exit codes:
+an explicit baseline instead of the read marker, `--db <path>`. Pass `--agent`
+to skip your own posts; `--since` **without** `--agent` is a room-wide watcher
+that wakes on any message, including your own. Exit codes:
 `0` updates found (read them with `catch_up`), `124` timed out with nothing new,
 `2` error. The server also reports this in its MCP `instructions`, with the
 script's absolute path.
@@ -174,7 +176,9 @@ message, so a reader resolves "re #8" without a second call.
 - No per-message edit/delete and no private direct messages. A correction is a
   new message replying to the old one.
 - Your own messages never count as unread to you: `catch_up` and the poller skip
-  them, so posting does not wake your own watcher. Use `read_history` or
+  them (the poller skips them only when `--agent` identifies you; `--since`
+  without `--agent` is a room-wide watcher that counts everyone's posts), so a
+  normal `--agent` watch does not wake on your own post. Use `read_history` or
   `search_messages` to see your own posts.
 - Sessions are per process. If another server process deletes the active room,
   the next tool call that needs the active room (`post_message`, `catch_up`,

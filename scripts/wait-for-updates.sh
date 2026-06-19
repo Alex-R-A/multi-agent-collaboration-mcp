@@ -8,10 +8,12 @@
 #
 # Options:
 #   --room <id|name>     room to watch (required)
-#   --agent <agent_id>   your identity; baseline is its read marker (required
-#                        unless --since is given)
+#   --agent <agent_id>   your identity; baseline is its read marker, and your own
+#                        posts are skipped (required unless --since is given)
 #   --mentions-only      only fire when a message tags --agent
-#   --since <seq>        use this seq as the baseline instead of the read marker
+#   --since <seq>        use this seq as the baseline instead of the read marker.
+#                        Without --agent this is a room-wide watcher: it has no
+#                        identity, so it wakes on ANY message, including yours.
 #   --interval <sec>     poll interval (default 5)
 #   --timeout <sec>      give up after this many seconds of no updates
 #                        (default 1200 = 20 minutes; 0 = never)
