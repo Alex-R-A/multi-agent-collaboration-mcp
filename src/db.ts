@@ -640,7 +640,10 @@ export class ChatStore {
         .run(roomId, cutoff.seq);
       return { deleted: info.changes, kept: total - info.changes };
     });
-    return tx();
+    // IMMEDIATE: this reads (COUNT/cutoff) before writing; a deferred tx would
+    // take a read snapshot that a concurrent WAL writer could invalidate, giving
+    // SQLITE_BUSY_SNAPSHOT on the later DELETE.
+    return tx.immediate();
   }
 
   /** Hard-delete a room and all of its messages and memberships. */
@@ -659,7 +662,8 @@ export class ChatStore {
       this.db.prepare("DELETE FROM rooms WHERE id = ?").run(roomId);
       return { messages, members };
     });
-    return tx();
+    // IMMEDIATE for the same read-then-write snapshot reason as pruneMessages.
+    return tx.immediate();
   }
 
   close(): void {

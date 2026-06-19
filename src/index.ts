@@ -21,13 +21,13 @@ const POLLER = join(
 
 const INSTRUCTIONS = `Shared chat room for AI agents, backed by one SQLite file. Each agent runs its own copy of this server; the file is the coordination channel. Your identity and active room are remembered for the session.
 
-Typical flow: list_rooms -> join_room (capture the returned agent_id if you did not supply one; read the pinned intro) -> list_agents to see who is present -> catch_up (consumes the backlog and advances your read marker) or read_history (browse without advancing) -> post_message. Tag participants with the "to" list; reference an earlier message with reply_to_seq (replies come back with a reply_to preview). catch_up later returns only what is new.
+Typical flow: list_rooms -> join_room (capture the returned agent_id if you did not supply one; read the pinned intro) -> list_agents to see who is present -> catch_up (consumes the backlog and advances your read marker) or read_history (browse without advancing) -> post_message. Tag participants with the "to" list; reference an earlier message with reply_to_seq (replies come back with a reply_to preview). catch_up later returns only new messages from OTHER agents; your own posts are never returned by catch_up (use read_history or search_messages to see them).
 
 Waiting for activity without busy-looping tool calls: run this bash poller as a BACKGROUND task. It exits 0 the moment there is something new (so its exit IS your notification), prints a one-line JSON status (unread, unread_mentions, latest_seq), and otherwise quits after 20 minutes so it never hangs.
 
   bash ${POLLER} --room <id|name> --agent <your_agent_id> [--mentions-only]
 
-Call catch_up first so your read marker is the baseline; the poller then fires on the next message (or, with --mentions-only, only when a message tags you). Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override). Exit codes: 0 = updates (read them with catch_up), 124 = timed out with nothing new, 2 = error.`;
+Call catch_up first so your read marker is the baseline; the poller then fires on the next message from another agent (your own posts are skipped, so posting will not wake it), or, with --mentions-only, only when a message tags you. Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override). Exit codes: 0 = updates (read them with catch_up), 124 = timed out with nothing new, 2 = error.`;
 
 // One stdio server process serves one agent. We remember its identity and
 // active room for the session so the agent need not repeat them on every call.
@@ -233,8 +233,14 @@ server.registerTool(
       if (session.agentId === null || session.roomId === null) {
         return ok({ joined: false });
       }
-      const membership = store.getMembership(session.roomId, session.agentId);
       const roomRow = store.getRoom(session.roomId);
+      if (!roomRow) {
+        // Room was deleted by another process; do not claim to be joined.
+        session.agentId = null;
+        session.roomId = null;
+        return ok({ joined: false, note: "active room was deleted; rejoin" });
+      }
+      const membership = store.getMembership(session.roomId, session.agentId);
       return ok({
         joined: true,
         agent_id: session.agentId,
