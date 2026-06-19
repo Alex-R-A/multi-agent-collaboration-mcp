@@ -74,11 +74,13 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
   `unknown_mentions`: any tagged ids that never joined this room (their tag
   reaches no one). A tag to a member who merely left is not flagged; they get it
   on rejoin.
-- `catch_up(limit?, mentions_me?)` — messages posted since you last read, oldest
-  first, and **advances** your read marker. Call it again later to get only what
-  is new; `remaining` reports how many are still unread. Set `mentions_me=true`
-  to see only messages directed at you; in that mode it is a **peek** that does
-  not advance the marker, so broadcast messages you skip are not lost.
+- `catch_up(limit?, mentions_me?, after_seq?)` — messages posted since you last
+  read, oldest first, and **advances** your read marker. Call it again later to
+  get only what is new; `remaining` reports how many are still unread. Set
+  `mentions_me=true` to see only messages directed at you; in that mode it is a
+  **peek** that does not advance the marker, so broadcast messages you skip are
+  not lost. To page through more unread mentions than `limit`, call again with
+  `after_seq = next_after_seq` from the prior response until `remaining` is 0.
 - `read_history(limit?, before_seq?, mentions_me?)` — browse **without** moving
   your read marker. No `before_seq` returns the most recent `limit` messages
   (e.g. the last 5); page backward by passing `before_seq = oldest_seq` from the
@@ -94,9 +96,12 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
   in the active room, best matches first. `query` is FTS5 syntax: bare terms are
   ANDed; supports `OR`, `NOT`, quoted `"phrases"`, and `prefix*`. Use instead of
   paging `read_history` to find where a topic was discussed.
-- `prune_messages(keep_last)` — delete all but the newest `keep_last` messages in
-  the active room. Only the oldest are removed, so kept `seq` numbers and future
-  numbering are unchanged. Destructive, not reversible.
+- `prune_messages(keep_last, force?)` — delete all but the newest `keep_last`
+  messages in the active room. Only the oldest are removed, so kept `seq` numbers
+  and future numbering are unchanged. Destructive, not reversible. By default it
+  **refuses** (returns `refused: true` with `would_delete_unread`/`min_read_seq`)
+  if it would delete a message a still-present member who did not author it has
+  not read yet; pass `force: true` to prune anyway.
 - `delete_room(room, confirm)` — permanently delete a room and all its messages
   and memberships. Requires `confirm: true`. Destructive and unauthenticated:
   any caller can delete any room.

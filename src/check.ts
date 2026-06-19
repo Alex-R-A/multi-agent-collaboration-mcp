@@ -61,86 +61,97 @@ if (args.since !== undefined && !Number.isFinite(args.since)) {
 const path = resolveDbPath(args.db);
 if (!existsSync(path)) fail(`db not found: ${path}`);
 
-// Read-write open (not readonly): readonly connections to a WAL database fail
-// when the -wal/-shm sidecars are absent. We only run SELECTs.
-const db = new Database(path);
-db.pragma("busy_timeout = 2000");
+// Runtime wrapped so any unexpected DB error exits 2 (error), not 1. Exit 1 is
+// reserved for the legitimate "no updates" result; if a throw leaked, Node would
+// exit 1 and the poller would misread a broken probe as a quiet room.
+try {
+  // Read-write open (not readonly): readonly connections to a WAL database fail
+  // when the -wal/-shm sidecars are absent. We only run SELECTs.
+  const db = new Database(path);
+  db.pragma("busy_timeout = 2000");
 
-let room = /^\d+$/.test(args.room)
-  ? (db.prepare("SELECT id FROM rooms WHERE id = ?").get(Number(args.room)) as
+  let room = /^\d+$/.test(args.room)
+    ? (db.prepare("SELECT id FROM rooms WHERE id = ?").get(Number(args.room)) as
+        | { id: number }
+        | undefined)
+    : undefined;
+  if (!room) {
+    room = db.prepare("SELECT id FROM rooms WHERE name = ?").get(args.room) as
       | { id: number }
-      | undefined)
-  : undefined;
-if (!room) {
-  room = db.prepare("SELECT id FROM rooms WHERE name = ?").get(args.room) as
-    | { id: number }
-    | undefined;
-}
-if (!room) fail(`no room "${args.room}"`);
-const roomId = room.id;
-
-let baseline: number;
-if (args.since !== undefined) {
-  baseline = args.since;
-} else {
-  if (!args.agent) fail("--agent is required unless --since is given");
-  const m = db
-    .prepare(
-      "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
-    )
-    .get(roomId, args.agent) as { last_read_seq: number } | undefined;
-  if (!m) {
-    fail(
-      `agent "${args.agent}" is not a member of room ${roomId}; join first or pass --since`,
-    );
+      | undefined;
   }
-  baseline = m.last_read_seq;
-}
+  if (!room) fail(`no room "${args.room}"`);
+  const roomId = room.id;
 
-// Exclude the agent's own messages: posting should not make you "have updates".
-const unread = (
-  args.agent
-    ? (db
+  let baseline: number;
+  if (args.since !== undefined) {
+    baseline = args.since;
+  } else {
+    if (!args.agent) fail("--agent is required unless --since is given");
+    const m = db
+      .prepare(
+        "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
+      )
+      .get(roomId, args.agent) as { last_read_seq: number } | undefined;
+    if (!m) {
+      fail(
+        `agent "${args.agent}" is not a member of room ${roomId}; join first or pass --since`,
+      );
+    }
+    baseline = m.last_read_seq;
+  }
+
+  // Exclude the agent's own messages: posting should not make you "have updates".
+  const unread = (
+    args.agent
+      ? (db
+          .prepare(
+            "SELECT COUNT(*) AS c FROM messages WHERE room_id = ? AND seq > ? AND agent_id != ?",
+          )
+          .get(roomId, baseline, args.agent) as { c: number })
+      : (db
+          .prepare(
+            "SELECT COUNT(*) AS c FROM messages WHERE room_id = ? AND seq > ?",
+          )
+          .get(roomId, baseline) as { c: number })
+  ).c;
+
+  let unreadMentions = 0;
+  if (args.agent) {
+    unreadMentions = (
+      db
         .prepare(
-          "SELECT COUNT(*) AS c FROM messages WHERE room_id = ? AND seq > ? AND agent_id != ?",
+          `SELECT COUNT(*) AS c FROM messages
+           WHERE room_id = ? AND seq > ? AND agent_id != ?
+             AND EXISTS (SELECT 1 FROM json_each(mentions) WHERE value = ?)`,
         )
-        .get(roomId, baseline, args.agent) as { c: number })
-    : (db
-        .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = ? AND seq > ?")
-        .get(roomId, baseline) as { c: number })
-).c;
+        .get(roomId, baseline, args.agent, args.agent) as { c: number }
+    ).c;
+  }
 
-let unreadMentions = 0;
-if (args.agent) {
-  unreadMentions = (
+  const latest = (
     db
       .prepare(
-        `SELECT COUNT(*) AS c FROM messages
-         WHERE room_id = ? AND seq > ? AND agent_id != ?
-           AND EXISTS (SELECT 1 FROM json_each(mentions) WHERE value = ?)`,
+        "SELECT COALESCE(MAX(seq), 0) AS s FROM messages WHERE room_id = ?",
       )
-      .get(roomId, baseline, args.agent, args.agent) as { c: number }
-  ).c;
+      .get(roomId) as { s: number }
+  ).s;
+  db.close();
+
+  const hasUpdates = args.mentionsOnly ? unreadMentions > 0 : unread > 0;
+  process.stdout.write(
+    JSON.stringify({
+      room_id: roomId,
+      agent: args.agent ?? null,
+      baseline_seq: baseline,
+      latest_seq: latest,
+      unread,
+      unread_mentions: unreadMentions,
+      mentions_only: args.mentionsOnly,
+      has_updates: hasUpdates,
+    }) + "\n",
+  );
+  process.exit(hasUpdates ? 0 : 1);
+} catch (e) {
+  fail(`probe failed: ${e instanceof Error ? e.message : String(e)}`);
 }
-
-const latest = (
-  db
-    .prepare("SELECT COALESCE(MAX(seq), 0) AS s FROM messages WHERE room_id = ?")
-    .get(roomId) as { s: number }
-).s;
-db.close();
-
-const hasUpdates = args.mentionsOnly ? unreadMentions > 0 : unread > 0;
-process.stdout.write(
-  JSON.stringify({
-    room_id: roomId,
-    agent: args.agent ?? null,
-    baseline_seq: baseline,
-    latest_seq: latest,
-    unread,
-    unread_mentions: unreadMentions,
-    mentions_only: args.mentionsOnly,
-    has_updates: hasUpdates,
-  }) + "\n",
-);
-process.exit(hasUpdates ? 0 : 1);

@@ -28,15 +28,26 @@ interval=5
 timeout=1200   # 20 minutes; quit even if no updates so a background task never hangs
 probe_args=()
 
+need_value() {  # $1 = flag name; ensures a value follows before we read $2
+  [[ $# -ge 2 ]] || { echo "wait-for-updates: $1 needs a value" >&2; exit 2; }
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
-    --interval) interval="$2"; shift 2 ;;
-    --timeout)  timeout="$2";  shift 2 ;;
+    --interval) need_value "$@"; interval="$2"; shift 2 ;;
+    --timeout)  need_value "$@"; timeout="$2";  shift 2 ;;
     --interval=*) interval="${1#*=}"; shift ;;
     --timeout=*)  timeout="${1#*=}";  shift ;;
     *) probe_args+=("$1"); shift ;;
   esac
 done
+
+if ! [[ "$interval" =~ ^[0-9]+$ ]]; then
+  echo "wait-for-updates: --interval must be a non-negative integer" >&2; exit 2
+fi
+if ! [[ "$timeout" =~ ^[0-9]+$ ]]; then
+  echo "wait-for-updates: --timeout must be a non-negative integer" >&2; exit 2
+fi
 
 if [[ ! -f "$CHECK" ]]; then
   echo "wait-for-updates: $CHECK not found; run 'npm run build' first" >&2
@@ -50,8 +61,14 @@ while true; do
     exit 0
   else
     rc=$?
-    [[ $rc -eq 2 ]] && exit 2   # probe error (already reported on stderr)
-    # rc == 1 => no updates yet; fall through to sleep
+    # Only rc==1 means "no updates yet". Anything else (probe error 2, or the
+    # node process itself dying: 127/137/139/...) must surface, not be mistaken
+    # for a quiet room.
+    if [[ $rc -ne 1 ]]; then
+      echo "wait-for-updates: probe exited $rc" >&2
+      exit 2
+    fi
+    # fall through to sleep
   fi
 
   if [[ "$timeout" -gt 0 ]]; then

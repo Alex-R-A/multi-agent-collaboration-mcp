@@ -483,17 +483,22 @@ export class ChatStore {
     agentId: string,
     limit: number,
     mentionsMe?: string,
+    afterSeq?: number,
   ): {
     messages: MessageRow[];
     new_last_read_seq: number;
     remaining: number;
     advanced: boolean;
+    next_after_seq?: number;
   } {
     if (mentionsMe !== undefined) {
       // Peek mode: filtered, never advances the marker, so no atomicity needed.
       const membership = this.getMembership(roomId, agentId);
       if (!membership) throw new Error("not a member of this room");
       const from = membership.last_read_seq;
+      // Page forward through unread mentions without moving the marker:
+      // afterSeq (clamped to >= the marker) is the cursor for the next page.
+      const lower = afterSeq !== undefined ? Math.max(from, afterSeq) : from;
       const rows = this.db
         .prepare(
           `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
@@ -501,10 +506,10 @@ export class ChatStore {
              AND EXISTS (SELECT 1 FROM json_each(g.mentions) WHERE value = ?)
            ORDER BY g.seq ASC LIMIT ?`,
         )
-        .all(roomId, from, agentId, mentionsMe, limit) as RawMessage[];
+        .all(roomId, lower, agentId, mentionsMe, limit) as RawMessage[];
       const messages = rows.map((r) => this.rowToMessage(r));
       const lastSeq =
-        messages.length > 0 ? messages[messages.length - 1].seq : from;
+        messages.length > 0 ? messages[messages.length - 1].seq : lower;
       const { c } = this.db
         .prepare(
           `SELECT COUNT(*) AS c FROM messages g
@@ -512,7 +517,13 @@ export class ChatStore {
              AND EXISTS (SELECT 1 FROM json_each(g.mentions) WHERE value = ?)`,
         )
         .get(roomId, lastSeq, agentId, mentionsMe) as { c: number };
-      return { messages, new_last_read_seq: from, remaining: c, advanced: false };
+      return {
+        messages,
+        new_last_read_seq: from,
+        remaining: c,
+        advanced: false,
+        next_after_seq: lastSeq,
+      };
     }
 
     // Advancing path: read the marker, fetch, and advance inside one IMMEDIATE
@@ -624,7 +635,14 @@ export class ChatStore {
   pruneMessages(
     roomId: number,
     keepLast: number,
-  ): { deleted: number; kept: number } {
+    force: boolean,
+  ): {
+    deleted: number;
+    kept: number;
+    refused?: boolean;
+    would_delete_unread?: number;
+    min_read_seq?: number;
+  } {
     const tx = this.db.transaction(() => {
       const { c: total } = this.db
         .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = ?")
@@ -635,6 +653,36 @@ export class ChatStore {
           "SELECT seq FROM messages WHERE room_id = ? ORDER BY seq DESC LIMIT 1 OFFSET ?",
         )
         .get(roomId, keepLast - 1) as { seq: number };
+      if (!force) {
+        // Refuse to delete a message that a still-present member who did NOT
+        // author it has not yet read (its own author has implicitly "seen" it,
+        // matching catch_up's self-exclusion).
+        const { u } = this.db
+          .prepare(
+            `SELECT COUNT(*) AS u FROM messages g
+             WHERE g.room_id = ? AND g.seq < ?
+               AND EXISTS (
+                 SELECT 1 FROM memberships mm
+                 WHERE mm.room_id = g.room_id AND mm.left_at IS NULL
+                   AND mm.last_read_seq < g.seq AND mm.agent_id != g.agent_id
+               )`,
+          )
+          .get(roomId, cutoff.seq) as { u: number };
+        if (u > 0) {
+          const { m } = this.db
+            .prepare(
+              "SELECT MIN(last_read_seq) AS m FROM memberships WHERE room_id = ? AND left_at IS NULL",
+            )
+            .get(roomId) as { m: number | null };
+          return {
+            deleted: 0,
+            kept: total,
+            refused: true,
+            would_delete_unread: u,
+            min_read_seq: m ?? 0,
+          };
+        }
+      }
       const info = this.db
         .prepare("DELETE FROM messages WHERE room_id = ? AND seq < ?")
         .run(roomId, cutoff.seq);

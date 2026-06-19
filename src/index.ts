@@ -79,7 +79,7 @@ function touchSession(): void {
 const server = new McpServer(
   {
     name: "agent-chat-mcp",
-    version: "0.4.0",
+    version: "0.4.1",
   },
   { instructions: INSTRUCTIONS },
 );
@@ -367,7 +367,9 @@ server.registerTool(
       "read marker so the next call only returns what is new; `remaining` reports " +
       "how many are still unread. Set mentions_me=true to see only messages " +
       "directed at you; in that mode this is a PEEK that does NOT advance the " +
-      "marker (so broadcasts are not skipped).",
+      "marker (so broadcasts are not skipped). To page through more unread " +
+      "mentions than `limit`, call again with after_seq = the `next_after_seq` " +
+      "from the previous response until `remaining` is 0.",
     inputSchema: {
       limit: z
         .number()
@@ -380,9 +382,15 @@ server.registerTool(
         .boolean()
         .optional()
         .describe("Only messages whose `to` includes you (peek, no advance)"),
+      after_seq: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Cursor for mentions_me paging: pass the prior next_after_seq"),
     },
   },
-  async ({ limit, mentions_me }) => {
+  async ({ limit, mentions_me, after_seq }) => {
     try {
       touchSession();
       const { agentId, roomId } = requireActive();
@@ -391,6 +399,7 @@ server.registerTool(
         agentId,
         limit ?? 50,
         mentions_me ? agentId : undefined,
+        after_seq,
       );
       return ok(result);
     } catch (e) {
@@ -559,20 +568,30 @@ server.registerTool(
       "Delete old messages in the active room, keeping only the most recent " +
       "`keep_last`. Only the oldest are removed, so message numbers (seq) of " +
       "kept messages are unchanged and future numbers stay monotonic. " +
-      "Destructive and not reversible.",
+      "Destructive and not reversible. By default this REFUSES (returns " +
+      "refused:true with would_delete_unread/min_read_seq) if it would delete " +
+      "messages a still-present member has not read yet; pass force=true to " +
+      "prune anyway.",
     inputSchema: {
       keep_last: z
         .number()
         .int()
         .positive()
         .describe("How many of the newest messages to keep"),
+      force: z
+        .boolean()
+        .optional()
+        .describe("Delete even messages present members have not read yet"),
     },
   },
-  async ({ keep_last }) => {
+  async ({ keep_last, force }) => {
     try {
       touchSession();
       const { roomId } = requireActive();
-      return ok({ room_id: roomId, ...store.pruneMessages(roomId, keep_last) });
+      return ok({
+        room_id: roomId,
+        ...store.pruneMessages(roomId, keep_last, force ?? false),
+      });
     } catch (e) {
       return fail(asMessage(e));
     }
