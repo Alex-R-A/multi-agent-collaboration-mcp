@@ -79,7 +79,7 @@ function touchSession(): void {
 const server = new McpServer(
   {
     name: "agent-chat-mcp",
-    version: "0.4.1",
+    version: "0.4.2",
   },
   { instructions: INSTRUCTIONS },
 );

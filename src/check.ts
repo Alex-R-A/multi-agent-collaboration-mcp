@@ -23,18 +23,29 @@ function fail(msg: string): never {
 
 function parseArgs(argv: string[]): Args {
   const out: Args = { mentionsOnly: false };
+  // Read the value following a flag, failing if it is missing (e.g. a trailing
+  // `--db` would otherwise silently leave the value undefined).
+  const value = (i: number, flag: string): string => {
+    const v = argv[i + 1];
+    if (v === undefined) fail(`${flag} requires a value`);
+    return v;
+  };
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (a === "--mentions-only") {
       out.mentionsOnly = true;
     } else if (a === "--room") {
-      out.room = argv[++i];
+      out.room = value(i, a);
+      i++;
     } else if (a === "--agent") {
-      out.agent = argv[++i];
+      out.agent = value(i, a);
+      i++;
     } else if (a === "--since") {
-      out.since = Number(argv[++i]);
+      out.since = Number(value(i, a));
+      i++;
     } else if (a === "--db") {
-      out.db = argv[++i];
+      out.db = value(i, a);
+      i++;
     } else {
       fail(`unknown argument: ${a}`);
     }

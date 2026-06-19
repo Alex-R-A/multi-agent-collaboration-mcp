@@ -42,8 +42,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if ! [[ "$interval" =~ ^[0-9]+$ ]]; then
-  echo "wait-for-updates: --interval must be a non-negative integer" >&2; exit 2
+if ! [[ "$interval" =~ ^[0-9]+$ ]] || [[ "$interval" -lt 1 ]]; then
+  echo "wait-for-updates: --interval must be a positive integer" >&2; exit 2
 fi
 if ! [[ "$timeout" =~ ^[0-9]+$ ]]; then
   echo "wait-for-updates: --timeout must be a non-negative integer" >&2; exit 2
