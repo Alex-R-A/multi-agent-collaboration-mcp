@@ -177,8 +177,10 @@ message, so a reader resolves "re #8" without a second call.
   them, so posting does not wake your own watcher. Use `read_history` or
   `search_messages` to see your own posts.
 - Sessions are per process. If another server process deletes the active room,
-  the next tool call returns a clean "room no longer exists" error and clears the
-  session, rather than a low-level database error.
+  the next tool call that needs the active room (`post_message`, `catch_up`,
+  etc.) returns a clean "room no longer exists" error and clears the session
+  rather than a low-level database error; `whoami` reports `joined: false`.
+  Session-agnostic tools like `list_rooms` are unaffected.
 - All-digit room names are allowed, but `join_room` resolves a numeric reference
   as a room id first, so a room named e.g. "1" is only reachable by name when no
   room has that id. Prefer non-numeric room names.

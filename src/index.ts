@@ -79,7 +79,7 @@ function touchSession(): void {
 const server = new McpServer(
   {
     name: "agent-chat-mcp",
-    version: "0.4.3",
+    version: "0.4.4",
   },
   { instructions: INSTRUCTIONS },
 );
@@ -310,8 +310,9 @@ server.registerTool(
         .describe("Message body: a string, or a JSON object/array"),
       to: z
         .array(z.string().min(1))
+        .max(100)
         .optional()
-        .describe("agent_ids this message is directed at (mentions)"),
+        .describe("agent_ids this message is directed at (mentions); max 100"),
       reply_to_seq: z
         .number()
         .int()
@@ -335,6 +336,9 @@ server.registerTool(
         );
       }
       const mentions = to && to.length > 0 ? dedupe(to) : null;
+      // Compute unknown mentions BEFORE inserting, so a failure here cannot
+      // report an error for a message that was already stored.
+      const unknown = mentions ? store.unknownMentions(roomId, mentions) : [];
       const { seq } = store.postMessage(
         roomId,
         agentId,
@@ -348,7 +352,7 @@ server.registerTool(
         format: isText ? "text" : "json",
         to: mentions,
         reply_to_seq: reply_to_seq ?? null,
-        unknown_mentions: mentions ? store.unknownMentions(roomId, mentions) : [],
+        unknown_mentions: unknown,
       });
     } catch (e) {
       return fail(asMessage(e));
@@ -582,7 +586,9 @@ server.registerTool(
       force: z
         .boolean()
         .optional()
-        .describe("Delete even messages present members have not read yet"),
+        .describe(
+          "Delete even messages a member (present or left) has not read yet",
+        ),
     },
   },
   async ({ keep_last, force }) => {

@@ -297,11 +297,16 @@ export class ChatStore {
     return info.changes > 0;
   }
 
-  /** Bump liveness for an agent's active membership. */
+  /**
+   * Mark an active agent alive. Also clears left_at: an actively-acting session
+   * re-asserts presence, so a soft leave performed by another process using the
+   * same agent_id does not leave the live session showing as not-present. (A
+   * genuine leave_room clears the session, after which touch is never called.)
+   */
   touch(roomId: number, agentId: string): void {
     this.db
       .prepare(
-        "UPDATE memberships SET last_seen = datetime('now') WHERE room_id = ? AND agent_id = ?",
+        "UPDATE memberships SET last_seen = datetime('now'), left_at = NULL WHERE room_id = ? AND agent_id = ?",
       )
       .run(roomId, agentId);
   }
