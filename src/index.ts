@@ -56,6 +56,16 @@ function requireActive(): { agentId: string; roomId: number } {
   if (session.agentId === null || session.roomId === null) {
     throw new Error("join a room first with join_room");
   }
+  // The room may have been deleted by another server process; the local session
+  // would otherwise stay pointed at it and fail later with a low-level DB error.
+  if (!store.getRoom(session.roomId)) {
+    const stale = session.roomId;
+    session.agentId = null;
+    session.roomId = null;
+    throw new Error(
+      `active room ${stale} no longer exists (deleted); rejoin with join_room`,
+    );
+  }
   return { agentId: session.agentId, roomId: session.roomId };
 }
 
@@ -177,7 +187,7 @@ server.registerTool(
         description: target.description,
         pinned: target.pinned,
         last_read_seq: membership.last_read_seq,
-        unread: store.unreadCount(target.id, membership.last_read_seq),
+        unread: store.unreadCount(target.id, membership.last_read_seq, id),
         members: store.listAgents(target.id, 5).filter((a) => a.present).length,
       });
     } catch (e) {
@@ -231,7 +241,11 @@ server.registerTool(
         room_id: session.roomId,
         room_name: roomRow?.name ?? null,
         last_read_seq: membership?.last_read_seq ?? 0,
-        unread: store.unreadCount(session.roomId, membership?.last_read_seq ?? 0),
+        unread: store.unreadCount(
+          session.roomId,
+          membership?.last_read_seq ?? 0,
+          session.agentId,
+        ),
       });
     } catch (e) {
       return fail(asMessage(e));
@@ -341,11 +355,13 @@ server.registerTool(
   {
     title: "Catch up on new messages",
     description:
-      "Return messages posted since you last read (seq > your last_read marker), " +
-      "oldest first. By default ADVANCES your read marker so the next call only " +
-      "returns what is new; `remaining` reports how many are still unread. Set " +
-      "mentions_me=true to see only messages directed at you; in that mode this " +
-      "is a PEEK that does NOT advance the marker (so broadcasts are not skipped).",
+      "Return messages from OTHER agents posted since you last read (seq > your " +
+      "last_read marker), oldest first. Your own messages are never returned here " +
+      "(use read_history/search_messages to see them). By default ADVANCES your " +
+      "read marker so the next call only returns what is new; `remaining` reports " +
+      "how many are still unread. Set mentions_me=true to see only messages " +
+      "directed at you; in that mode this is a PEEK that does NOT advance the " +
+      "marker (so broadcasts are not skipped).",
     inputSchema: {
       limit: z
         .number()

@@ -16,6 +16,7 @@
     "build": "tsc",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
+    "pretest": "npm run build",
     "test": "node test/concurrent-catchup.mjs"
   },
   "engines": {

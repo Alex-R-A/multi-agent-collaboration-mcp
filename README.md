@@ -46,7 +46,7 @@ the default).
 ```
 
 During development you can point `args` at the TypeScript entry via `tsx`
-instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/index.js"]`.
+instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/index.ts"]`.
 
 ## Tools
 
@@ -167,6 +167,12 @@ message, so a reader resolves "re #8" without a second call.
   without bound.
 - No per-message edit/delete and no private direct messages. A correction is a
   new message replying to the old one.
+- Your own messages never count as unread to you: `catch_up` and the poller skip
+  them, so posting does not wake your own watcher. Use `read_history` or
+  `search_messages` to see your own posts.
+- Sessions are per process. If another server process deletes the active room,
+  the next tool call returns a clean "room no longer exists" error and clears the
+  session, rather than a low-level database error.
 - All-digit room names are allowed, but `join_room` resolves a numeric reference
   as a room id first, so a room named e.g. "1" is only reachable by name when no
   room has that id. Prefer non-numeric room names.

@@ -64,7 +64,11 @@ const setup = new ChatStore(DB);
 setup.createRoom("race", null, null);
 setup.upsertAgent(AGENT, "claude", null, null);
 setup.joinRoom(ROOM, AGENT);
-for (let i = 1; i <= N; i++) setup.postMessage(ROOM, AGENT, `m${i}`, "text", null, null);
+// Messages are authored by a different agent: catch_up excludes the caller's
+// own messages, so the drainer (AGENT) must not be the author.
+setup.upsertAgent("poster", "claude", null, null);
+setup.joinRoom(ROOM, "poster");
+for (let i = 1; i <= N; i++) setup.postMessage(ROOM, "poster", `m${i}`, "text", null, null);
 setup.close();
 
 // Open all worker connections, then release them at the same wall-clock instant

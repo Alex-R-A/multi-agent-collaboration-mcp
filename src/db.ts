@@ -461,12 +461,14 @@ export class ChatStore {
     return { message, parent, replies };
   }
 
-  unreadCount(roomId: number, lastReadSeq: number): number {
+  /** Count of messages newer than the marker that the agent did NOT write. */
+  unreadCount(roomId: number, lastReadSeq: number, agentId: string): number {
     const { c } = this.db
       .prepare(
-        "SELECT COUNT(*) AS c FROM messages WHERE room_id = ? AND seq > ?",
+        `SELECT COUNT(*) AS c FROM messages
+         WHERE room_id = ? AND seq > ? AND agent_id != ?`,
       )
-      .get(roomId, lastReadSeq) as { c: number };
+      .get(roomId, lastReadSeq, agentId) as { c: number };
     return c;
   }
 
@@ -495,21 +497,21 @@ export class ChatStore {
       const rows = this.db
         .prepare(
           `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
-           WHERE g.room_id = ? AND g.seq > ?
+           WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
              AND EXISTS (SELECT 1 FROM json_each(g.mentions) WHERE value = ?)
            ORDER BY g.seq ASC LIMIT ?`,
         )
-        .all(roomId, from, mentionsMe, limit) as RawMessage[];
+        .all(roomId, from, agentId, mentionsMe, limit) as RawMessage[];
       const messages = rows.map((r) => this.rowToMessage(r));
       const lastSeq =
         messages.length > 0 ? messages[messages.length - 1].seq : from;
       const { c } = this.db
         .prepare(
           `SELECT COUNT(*) AS c FROM messages g
-           WHERE g.room_id = ? AND g.seq > ?
+           WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
              AND EXISTS (SELECT 1 FROM json_each(g.mentions) WHERE value = ?)`,
         )
-        .get(roomId, lastSeq, mentionsMe) as { c: number };
+        .get(roomId, lastSeq, agentId, mentionsMe) as { c: number };
       return { messages, new_last_read_seq: from, remaining: c, advanced: false };
     }
 
@@ -523,10 +525,10 @@ export class ChatStore {
       const rows = this.db
         .prepare(
           `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
-           WHERE g.room_id = ? AND g.seq > ?
+           WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
            ORDER BY g.seq ASC LIMIT ?`,
         )
-        .all(roomId, from, limit) as RawMessage[];
+        .all(roomId, from, agentId, limit) as RawMessage[];
       const messages = rows.map((r) => this.rowToMessage(r));
       const lastSeq =
         messages.length > 0 ? messages[messages.length - 1].seq : from;
@@ -540,7 +542,7 @@ export class ChatStore {
       return {
         messages,
         new_last_read_seq: lastSeq,
-        remaining: this.unreadCount(roomId, lastSeq),
+        remaining: this.unreadCount(roomId, lastSeq, agentId),
         advanced: lastSeq > from,
       };
     });

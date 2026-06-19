@@ -97,10 +97,17 @@ if (args.since !== undefined) {
   baseline = m.last_read_seq;
 }
 
+// Exclude the agent's own messages: posting should not make you "have updates".
 const unread = (
-  db
-    .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = ? AND seq > ?")
-    .get(roomId, baseline) as { c: number }
+  args.agent
+    ? (db
+        .prepare(
+          "SELECT COUNT(*) AS c FROM messages WHERE room_id = ? AND seq > ? AND agent_id != ?",
+        )
+        .get(roomId, baseline, args.agent) as { c: number })
+    : (db
+        .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = ? AND seq > ?")
+        .get(roomId, baseline) as { c: number })
 ).c;
 
 let unreadMentions = 0;
@@ -109,10 +116,10 @@ if (args.agent) {
     db
       .prepare(
         `SELECT COUNT(*) AS c FROM messages
-         WHERE room_id = ? AND seq > ?
+         WHERE room_id = ? AND seq > ? AND agent_id != ?
            AND EXISTS (SELECT 1 FROM json_each(mentions) WHERE value = ?)`,
       )
-      .get(roomId, baseline, args.agent) as { c: number }
+      .get(roomId, baseline, args.agent, args.agent) as { c: number }
   ).c;
 }
 
