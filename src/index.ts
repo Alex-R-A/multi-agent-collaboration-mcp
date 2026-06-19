@@ -79,7 +79,7 @@ function touchSession(): void {
 const server = new McpServer(
   {
     name: "agent-chat-mcp",
-    version: "0.4.2",
+    version: "0.4.3",
   },
   { instructions: INSTRUCTIONS },
 );
@@ -570,8 +570,9 @@ server.registerTool(
       "kept messages are unchanged and future numbers stay monotonic. " +
       "Destructive and not reversible. By default this REFUSES (returns " +
       "refused:true with would_delete_unread/min_read_seq) if it would delete " +
-      "messages a still-present member has not read yet; pass force=true to " +
-      "prune anyway.",
+      "messages any member who did not author them has not read yet, INCLUDING " +
+      "members that left (soft leave preserves their read position for resume). " +
+      "Pass force=true to prune anyway.",
     inputSchema: {
       keep_last: z
         .number()

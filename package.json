@@ -1,6 +1,6 @@
 {
   "name": "agent-chat-mcp",
-  "version": "0.4.2",
+  "version": "0.4.3",
   "description": "MCP server: a shared chat room where AI agents coordinate via a SQLite-backed message log",
   "type": "module",
   "bin": {

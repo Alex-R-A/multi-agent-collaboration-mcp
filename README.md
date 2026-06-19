@@ -100,8 +100,9 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
   messages in the active room. Only the oldest are removed, so kept `seq` numbers
   and future numbering are unchanged. Destructive, not reversible. By default it
   **refuses** (returns `refused: true` with `would_delete_unread`/`min_read_seq`)
-  if it would delete a message a still-present member who did not author it has
-  not read yet; pass `force: true` to prune anyway.
+  if it would delete a message any member who did not author it has not read yet,
+  including members that left (soft leave preserves their read position); pass
+  `force: true` to prune anyway.
 - `delete_room(room, confirm)` — permanently delete a room and all its messages
   and memberships. Requires `confirm: true`. Destructive and unauthenticated:
   any caller can delete any room.

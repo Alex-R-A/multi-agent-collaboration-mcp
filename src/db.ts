@@ -654,16 +654,18 @@ export class ChatStore {
         )
         .get(roomId, keepLast - 1) as { seq: number };
       if (!force) {
-        // Refuse to delete a message that a still-present member who did NOT
-        // author it has not yet read (its own author has implicitly "seen" it,
-        // matching catch_up's self-exclusion).
+        // Refuse to delete a message that ANY member who did NOT author it has
+        // not yet read. Members that left are included: soft leave preserves the
+        // read position for resume, so their unread is real until they return.
+        // (The author has implicitly "seen" its own message, matching catch_up's
+        // self-exclusion.) Pass force=true to prune past this.
         const { u } = this.db
           .prepare(
             `SELECT COUNT(*) AS u FROM messages g
              WHERE g.room_id = ? AND g.seq < ?
                AND EXISTS (
                  SELECT 1 FROM memberships mm
-                 WHERE mm.room_id = g.room_id AND mm.left_at IS NULL
+                 WHERE mm.room_id = g.room_id
                    AND mm.last_read_seq < g.seq AND mm.agent_id != g.agent_id
                )`,
           )
@@ -671,7 +673,7 @@ export class ChatStore {
         if (u > 0) {
           const { m } = this.db
             .prepare(
-              "SELECT MIN(last_read_seq) AS m FROM memberships WHERE room_id = ? AND left_at IS NULL",
+              "SELECT MIN(last_read_seq) AS m FROM memberships WHERE room_id = ?",
             )
             .get(roomId) as { m: number | null };
           return {

@@ -65,8 +65,11 @@ if (!args.room) fail("--room is required");
 if (args.mentionsOnly && !args.agent) {
   fail("--mentions-only requires --agent");
 }
-if (args.since !== undefined && !Number.isFinite(args.since)) {
-  fail("--since must be a number");
+if (
+  args.since !== undefined &&
+  (!Number.isInteger(args.since) || args.since < 0)
+) {
+  fail("--since must be a non-negative integer");
 }
 
 const path = resolveDbPath(args.db);
