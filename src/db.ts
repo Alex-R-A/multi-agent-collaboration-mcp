@@ -43,6 +43,16 @@ export type AgentRow = {
   active: boolean;
 };
 
+export type RecipientStatus = {
+  id: string;
+  /** unknown = never joined, left = joined then left, idle = present but not
+   *  seen recently, active = present and seen within the liveness window. */
+  status: "active" | "idle" | "left" | "unknown";
+  present: boolean;
+  idle_seconds: number | null;
+  last_read_seq: number | null;
+};
+
 export type ReplyRef = {
   seq: number;
   from: string | null;
@@ -428,18 +438,56 @@ export class ChatStore {
     return r ? this.rowToMessage(r) : undefined;
   }
 
-  /** Returns agent_ids from `ids` that have never joined this room. */
-  unknownMentions(roomId: number, ids: string[]): string[] {
+  /**
+   * Per-recipient delivery status for tagged ids, preserving input order:
+   * whether each ever joined, is still present, how long since last seen, and
+   * how far it has read (compare to a message seq for a read receipt). Lets a
+   * poster judge whether a tag will be read or is posting into the void.
+   */
+  recipientStatus(
+    roomId: number,
+    ids: string[],
+    activeWithinMinutes: number,
+  ): RecipientStatus[] {
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => "?").join(",");
-    const known = this.db
+    const rows = this.db
       .prepare(
-        `SELECT agent_id FROM memberships
+        `SELECT agent_id, last_read_seq, left_at,
+                (strftime('%s','now') - strftime('%s', last_seen)) AS idle_seconds
+         FROM memberships
          WHERE room_id = ? AND agent_id IN (${placeholders})`,
       )
-      .all(roomId, ...ids) as { agent_id: string }[];
-    const knownSet = new Set(known.map((r) => r.agent_id));
-    return ids.filter((id) => !knownSet.has(id));
+      .all(roomId, ...ids) as {
+      agent_id: string;
+      last_read_seq: number;
+      left_at: string | null;
+      idle_seconds: number | null;
+    }[];
+    const byId = new Map(rows.map((r) => [r.agent_id, r]));
+    const threshold = activeWithinMinutes * 60;
+    return ids.map((id) => {
+      const r = byId.get(id);
+      if (!r) {
+        return {
+          id,
+          status: "unknown",
+          present: false,
+          idle_seconds: null,
+          last_read_seq: null,
+        };
+      }
+      const present = r.left_at === null;
+      const active =
+        present && r.idle_seconds !== null && r.idle_seconds <= threshold;
+      return {
+        id,
+        status: present ? (active ? "active" : "idle") : "left",
+        present,
+        idle_seconds: r.idle_seconds,
+        last_read_seq: r.last_read_seq,
+      };
+    });
   }
 
   /** A message plus its parent (if any) and direct replies. */

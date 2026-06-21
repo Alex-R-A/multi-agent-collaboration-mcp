@@ -264,8 +264,10 @@ server.registerTool(
   {
     title: "List agents in room",
     description:
-      "List agents in the active room with type/role/description, plus liveness: " +
-      "`present` (has not left) and `active` (seen within active_within_minutes). " +
+      "List agents in the active room with type/role/description, plus per-agent " +
+      "`last_read_seq` (how far they have read; compare to a message seq for a " +
+      "read receipt), `last_seen`, `idle_seconds`, and liveness flags `present` " +
+      "(has not left) and `active` (seen within active_within_minutes). " +
       "Optional filter matches id/type/role/description substrings.",
     inputSchema: {
       filter: z
@@ -301,9 +303,13 @@ server.registerTool(
       "Post a message to the active room. `content` may be plain text or a JSON " +
       "object/array. `to` is an optional list of agent_ids this message is " +
       "directed at (mentions). `reply_to_seq` tags another message (e.g. reply " +
-      "to message 8). Returns the assigned message number (seq) and " +
-      "`unknown_mentions`: any tagged ids that never joined this room (their tag " +
-      "reaches no one).",
+      "to message 8). Returns the assigned message number (seq) and, for each " +
+      "tagged id, `recipients`: a per-recipient delivery status to decide " +
+      "whether to wait for a reply. Each entry has `status` (`unknown` = never " +
+      "joined so the tag reaches no one, `left` = joined then left, `idle` = " +
+      "present but not seen recently, `active` = present and seen recently), " +
+      "`idle_seconds` since last seen, and `last_read_seq` (compare to this " +
+      "`seq`: if below it, they have not read this message yet).",
     inputSchema: {
       content: z
         .union([z.string(), z.record(z.any()), z.array(z.any())])
@@ -336,9 +342,11 @@ server.registerTool(
         );
       }
       const mentions = to && to.length > 0 ? dedupe(to) : null;
-      // Compute unknown mentions BEFORE inserting, so a failure here cannot
+      // Compute recipient status BEFORE inserting, so a failure here cannot
       // report an error for a message that was already stored.
-      const unknown = mentions ? store.unknownMentions(roomId, mentions) : [];
+      const recipients = mentions
+        ? store.recipientStatus(roomId, mentions, 5)
+        : [];
       const { seq } = store.postMessage(
         roomId,
         agentId,
@@ -352,7 +360,7 @@ server.registerTool(
         format: isText ? "text" : "json",
         to: mentions,
         reply_to_seq: reply_to_seq ?? null,
-        unknown_mentions: unknown,
+        recipients,
       });
     } catch (e) {
       return fail(asMessage(e));
