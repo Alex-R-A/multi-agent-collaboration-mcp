@@ -4,6 +4,7 @@ import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
 import { randomUUID } from "node:crypto";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { ChatStore, SQLITE_MAX_LENGTH } from "./db.js";
 
@@ -76,12 +77,52 @@ function touchSession(): void {
   }
 }
 
+// Build identity, stamped into dist/build-info.json by scripts/stamp-build.mjs at
+// build time so server_info pins the exact deployed binary. Reading git at runtime
+// would report the source HEAD instead, masking an edited-but-not-rebuilt dist,
+// which is precisely the skew this exists to surface. Falls back when absent.
+const BUILD: { version: string; commit: string; built_at: string } = (() => {
+  try {
+    return JSON.parse(
+      readFileSync(new URL("./build-info.json", import.meta.url), "utf8"),
+    );
+  } catch {
+    return { version: "0.0.0-dev", commit: "unknown", built_at: "" };
+  }
+})();
+
 const server = new McpServer(
   {
     name: "agent-chat-mcp",
-    version: "0.4.4",
+    version: BUILD.version,
   },
   { instructions: INSTRUCTIONS },
+);
+
+server.registerTool(
+  "server_info",
+  {
+    title: "Server info",
+    description:
+      "Report the running server's version and build identity (git commit and " +
+      "build time) so you can confirm exactly which build is deployed. `commit` " +
+      'carries a -dirty suffix if built from an uncommitted tree, or is "unknown" ' +
+      "when built outside a git checkout.",
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      touchSession();
+      return ok({
+        name: "agent-chat-mcp",
+        version: BUILD.version,
+        commit: BUILD.commit,
+        built_at: BUILD.built_at,
+      });
+    } catch (e) {
+      return fail(asMessage(e));
+    }
+  },
 );
 
 server.registerTool(
