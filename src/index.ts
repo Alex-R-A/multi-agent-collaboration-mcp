@@ -91,6 +91,36 @@ const BUILD: { version: string; commit: string; built_at: string } = (() => {
   }
 })();
 
+/**
+ * Re-read the on-disk build stamp and report whether a NEWER build has been
+ * deployed since this process started. If so, this server is stale: the client
+ * should reconnect the MCP to load the new code (a stdio server never
+ * hot-reloads). Compares built_at, which advances on every rebuild, including
+ * same-commit dirty rebuilds. No client UI surfaces serverInfo.version, so this
+ * in-band flag is the only way an agent learns it is running old code.
+ */
+function buildStatus(): {
+  stale: boolean;
+  latest_commit: string | null;
+  latest_built_at: string | null;
+} {
+  let latest: { commit: string; built_at: string } | null = null;
+  try {
+    latest = JSON.parse(
+      readFileSync(new URL("./build-info.json", import.meta.url), "utf8"),
+    );
+  } catch {
+    latest = null;
+  }
+  const stale =
+    latest !== null && latest.built_at !== "" && latest.built_at > BUILD.built_at;
+  return {
+    stale,
+    latest_commit: latest?.commit ?? null,
+    latest_built_at: latest?.built_at ?? null,
+  };
+}
+
 const server = new McpServer(
   {
     name: "agent-chat-mcp",
@@ -107,17 +137,24 @@ server.registerTool(
       "Report the running server's version and build identity (git commit and " +
       "build time) so you can confirm exactly which build is deployed. `commit` " +
       'carries a -dirty suffix if built from an uncommitted tree, or is "unknown" ' +
-      "when built outside a git checkout.",
+      "when built outside a git checkout. `stale` is true when a newer build has " +
+      "been deployed since this process started; reconnect the MCP to load it (a " +
+      "stdio server does not hot-reload). `latest_commit`/`latest_built_at` name " +
+      "that newer build when stale.",
     inputSchema: {},
   },
   async () => {
     try {
       touchSession();
+      const status = buildStatus();
       return ok({
         name: "agent-chat-mcp",
         version: BUILD.version,
         commit: BUILD.commit,
         built_at: BUILD.built_at,
+        stale: status.stale,
+        latest_commit: status.latest_commit,
+        latest_built_at: status.latest_built_at,
       });
     } catch (e) {
       return fail(asMessage(e));
@@ -184,7 +221,9 @@ server.registerTool(
       "UUID is generated and returned; reuse it later to resume the same " +
       "identity and read position. Supplying type/role/description lets other " +
       "agents understand who you are. Read the returned `pinned` intro first. " +
-      "Sets this room as active for the session.",
+      "Sets this room as active for the session. If the returned `server_stale` " +
+      "is true, this MCP server is running outdated code; tell the user to " +
+      "reconnect it (see server_info for details).",
     inputSchema: {
       room: z.string().min(1).describe("Room id or name to join"),
       agent_id: z
@@ -230,6 +269,10 @@ server.registerTool(
         last_read_seq: membership.last_read_seq,
         unread: store.unreadCount(target.id, membership.last_read_seq, id),
         members: store.listAgents(target.id, 5).filter((a) => a.present).length,
+        // Surface staleness at the session-start checkpoint, where it is seen
+        // once without per-call noise. True => this server is running old code;
+        // reconnect the MCP. See server_info for the latest commit.
+        server_stale: buildStatus().stale,
       });
     } catch (e) {
       return fail(asMessage(e));
