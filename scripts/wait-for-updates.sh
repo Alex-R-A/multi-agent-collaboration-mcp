@@ -10,7 +10,8 @@
 #   --room <id|name>     room to watch (required)
 #   --agent <agent_id>   your identity; baseline is its read marker, and your own
 #                        posts are skipped (required unless --since is given)
-#   --mentions-only      only fire when a message tags --agent
+#   --mentions-only      only fire when a message tags --agent or replies to one
+#                        of its messages
 #   --since <seq>        use this seq as the baseline instead of the read marker.
 #                        Without --agent this is a room-wide watcher: it has no
 #                        identity, so it wakes on ANY message, including yours.

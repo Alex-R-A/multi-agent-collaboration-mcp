@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 // One-shot, read-only probe: does a room have unread messages (or unread
-// mentions) for an agent, relative to its read marker (or an explicit --since)?
+// messages directed at an agent: its mentions or replies to its messages),
+// relative to its read marker (or an explicit --since)?
 // Exit 0 = updates exist, 1 = none yet, 2 = error. Prints a JSON status line.
 // Used by scripts/wait-for-updates.sh to poll without touching the read marker.
 import Database from "better-sqlite3";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { directedAt } from "./db.js";
 
 type Args = {
   room?: string;
@@ -137,9 +139,9 @@ try {
         .prepare(
           `SELECT COUNT(*) AS c FROM messages
            WHERE room_id = ? AND seq > ? AND agent_id != ?
-             AND EXISTS (SELECT 1 FROM json_each(mentions) WHERE value = ?)`,
+             AND ${directedAt("messages")}`,
         )
-        .get(roomId, baseline, args.agent, args.agent) as { c: number }
+        .get(roomId, baseline, args.agent, args.agent, args.agent) as { c: number }
     ).c;
   }
 

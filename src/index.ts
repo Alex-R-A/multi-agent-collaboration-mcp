@@ -28,7 +28,7 @@ Waiting for activity without busy-looping tool calls: run this bash poller as a 
 
   bash ${POLLER} --room <id|name> --agent <your_agent_id> [--mentions-only]
 
-Call catch_up first so your read marker is the baseline; the poller then fires on the next message from another agent (your own posts are skipped, so posting will not wake it), or, with --mentions-only, only when a message tags you. Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override). Exit codes: 0 = updates (read them with catch_up), 124 = timed out with nothing new, 2 = error.`;
+Call catch_up first so your read marker is the baseline; the poller then fires on the next message from another agent (your own posts are skipped, so posting will not wake it), or, with --mentions-only, only when a message tags you or replies to a message you wrote. Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override). Exit codes: 0 = updates (read them with catch_up), 124 = timed out with nothing new, 2 = error.`;
 
 // One stdio server process serves one agent. We remember its identity and
 // active room for the session so the agent need not repeat them on every call.
@@ -434,7 +434,10 @@ server.registerTool(
       mentions_me: z
         .boolean()
         .optional()
-        .describe("Only messages whose `to` includes you (peek, no advance)"),
+        .describe(
+          "Only messages directed at you: your `to` mentions or replies to a " +
+            "message you wrote (peek, no advance)",
+        ),
       after_seq: z
         .number()
         .int()
@@ -489,7 +492,10 @@ server.registerTool(
       mentions_me: z
         .boolean()
         .optional()
-        .describe("Only messages whose `to` includes you"),
+        .describe(
+          "Only messages directed at you: your `to` mentions or replies to a " +
+            "message you wrote",
+        ),
     },
   },
   async ({ limit, before_seq, mentions_me }) => {
@@ -504,6 +510,37 @@ server.registerTool(
           mentions_me ? agentId : undefined,
         ),
       );
+    } catch (e) {
+      return fail(asMessage(e));
+    }
+  },
+);
+
+server.registerTool(
+  "mark_read",
+  {
+    title: "Mark read",
+    description:
+      "Advance (or rewind) your read marker WITHOUT returning messages. Omit " +
+      "`seq` to jump to the latest message, skipping the backlog so catch_up " +
+      "only returns what arrives next; pass a `seq` to set the marker to a " +
+      "specific point (a lower value re-exposes those messages to catch_up for " +
+      "re-reading). Nothing is deleted; read_history still browses skipped " +
+      "messages. Returns previous/new marker and the room's latest seq.",
+    inputSchema: {
+      seq: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Marker target; omit to jump to the latest message"),
+    },
+  },
+  async ({ seq }) => {
+    try {
+      touchSession();
+      const { agentId, roomId } = requireActive();
+      return ok(store.markRead(roomId, agentId, seq));
     } catch (e) {
       return fail(asMessage(e));
     }

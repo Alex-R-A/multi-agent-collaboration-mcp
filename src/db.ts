@@ -94,6 +94,20 @@ const MESSAGE_FROM = `messages g
                       LEFT JOIN agents a ON a.id = g.agent_id
                       LEFT JOIN messages p ON p.room_id = g.room_id AND p.seq = g.reply_to_seq`;
 
+/**
+ * SQL predicate for "directed at me": an explicit mention, OR a reply to a
+ * message I authored. Binds the agent id to TWO `?` placeholders in order
+ * (mention value, then reply-parent author); push the id twice at each call.
+ * `alias` is the message row's table alias in the enclosing query ("g" or the
+ * bare table name "messages"); `mm` aliases the correlated parent lookup.
+ */
+export function directedAt(alias: string): string {
+  return `(EXISTS (SELECT 1 FROM json_each(${alias}.mentions) WHERE value = ?)
+           OR ${alias}.reply_to_seq IN (
+             SELECT seq FROM messages mm
+             WHERE mm.room_id = ${alias}.room_id AND mm.agent_id = ?))`;
+}
+
 export class ChatStore {
   readonly path: string;
   private db: Database.Database;
@@ -556,10 +570,10 @@ export class ChatStore {
         .prepare(
           `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
            WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
-             AND EXISTS (SELECT 1 FROM json_each(g.mentions) WHERE value = ?)
+             AND ${directedAt("g")}
            ORDER BY g.seq ASC LIMIT ?`,
         )
-        .all(roomId, lower, agentId, mentionsMe, limit) as RawMessage[];
+        .all(roomId, lower, agentId, mentionsMe, mentionsMe, limit) as RawMessage[];
       const messages = rows.map((r) => this.rowToMessage(r));
       const lastSeq =
         messages.length > 0 ? messages[messages.length - 1].seq : lower;
@@ -567,9 +581,9 @@ export class ChatStore {
         .prepare(
           `SELECT COUNT(*) AS c FROM messages g
            WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
-             AND EXISTS (SELECT 1 FROM json_each(g.mentions) WHERE value = ?)`,
+             AND ${directedAt("g")}`,
         )
-        .get(roomId, lastSeq, agentId, mentionsMe) as { c: number };
+        .get(roomId, lastSeq, agentId, mentionsMe, mentionsMe) as { c: number };
       return {
         messages,
         new_last_read_seq: from,
@@ -631,8 +645,8 @@ export class ChatStore {
       params.push(beforeSeq);
     }
     if (mentionsMe !== undefined) {
-      conds.push("EXISTS (SELECT 1 FROM json_each(g.mentions) WHERE value = ?)");
-      params.push(mentionsMe);
+      conds.push(directedAt("g"));
+      params.push(mentionsMe, mentionsMe);
     }
     const where = conds.join(" AND ");
     const rows = this.db
@@ -651,10 +665,8 @@ export class ChatStore {
       const moreConds = ["room_id = ?", "seq < ?"];
       const moreParams: (number | string)[] = [roomId, oldest];
       if (mentionsMe !== undefined) {
-        moreConds.push(
-          "EXISTS (SELECT 1 FROM json_each(mentions) WHERE value = ?)",
-        );
-        moreParams.push(mentionsMe);
+        moreConds.push(directedAt("messages"));
+        moreParams.push(mentionsMe, mentionsMe);
       }
       has_more = !!this.db
         .prepare(
@@ -663,6 +675,37 @@ export class ChatStore {
         .get(...moreParams);
     }
     return { messages, oldest_seq: oldest, has_more };
+  }
+
+  /**
+   * Set the read marker without returning messages. `seq` omitted jumps to the
+   * latest message (skip backlog); a value sets the marker to that point,
+   * clamped to [0, latest]. A lower value re-exposes those messages to catch_up.
+   * Returns the previous and new marker plus the room's latest seq.
+   */
+  markRead(
+    roomId: number,
+    agentId: string,
+    seq?: number,
+  ): { previous: number; new: number; latest: number } {
+    const tx = this.db.transaction(() => {
+      const membership = this.getMembership(roomId, agentId);
+      if (!membership) throw new Error("not a member of this room");
+      const { latest } = this.db
+        .prepare(
+          "SELECT COALESCE(MAX(seq), 0) AS latest FROM messages WHERE room_id = ?",
+        )
+        .get(roomId) as { latest: number };
+      const target =
+        seq === undefined ? latest : Math.max(0, Math.min(seq, latest));
+      this.db
+        .prepare(
+          "UPDATE memberships SET last_read_seq = ? WHERE room_id = ? AND agent_id = ?",
+        )
+        .run(target, roomId, agentId);
+      return { previous: membership.last_read_seq, new: target, latest };
+    });
+    return tx.immediate();
   }
 
   /** Full-text search of message bodies in a room, best matches first. */
