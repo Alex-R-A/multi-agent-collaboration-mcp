@@ -51,6 +51,12 @@ if ! [[ "$timeout" =~ ^[0-9]+$ ]]; then
   echo "wait-for-updates: --timeout must be a non-negative integer" >&2; exit 2
 fi
 
+# No passthrough flags means no --room (check.ts requires it). Guard explicitly:
+# expanding an empty array as "${probe_args[@]}" below trips `set -u` on bash 3.2.
+if [[ ${#probe_args[@]} -eq 0 ]]; then
+  echo "wait-for-updates: --room is required" >&2; exit 2
+fi
+
 if [[ ! -f "$CHECK" ]]; then
   echo "wait-for-updates: $CHECK not found; run 'npm run build' first" >&2
   exit 2
