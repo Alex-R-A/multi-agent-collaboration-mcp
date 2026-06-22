@@ -102,10 +102,17 @@ const MESSAGE_FROM = `messages g
  * bare table name "messages"); `mm` aliases the correlated parent lookup.
  */
 export function directedAt(alias: string): string {
+  // Both terms are EXISTS so the predicate is strictly two-valued. The reply
+  // term must NOT be `reply_to_seq IN (subquery)`: for a broadcast (reply_to_seq
+  // NULL) against a non-empty subquery, `NULL IN (...)` is NULL, so the predicate
+  // goes NULL and `NOT directedAt` silently drops the row. (seq is unique per
+  // room, so matching mm.seq = reply_to_seq AND author is equivalent.)
   return `(EXISTS (SELECT 1 FROM json_each(${alias}.mentions) WHERE value = ?)
-           OR ${alias}.reply_to_seq IN (
-             SELECT seq FROM messages mm
-             WHERE mm.room_id = ${alias}.room_id AND mm.agent_id = ?))`;
+           OR EXISTS (
+             SELECT 1 FROM messages mm
+             WHERE mm.room_id = ${alias}.room_id
+               AND mm.seq = ${alias}.reply_to_seq
+               AND mm.agent_id = ?))`;
 }
 
 export class ChatStore {

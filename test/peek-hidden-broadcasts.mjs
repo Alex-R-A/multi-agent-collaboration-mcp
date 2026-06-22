@@ -58,6 +58,25 @@ const check = (n, c, x) => {
   s.close();
 }
 
+{
+  // The production shape that exposed the directedAt NULL-IN bug: the reader
+  // AUTHORS a message first (so the reply-author subquery is non-empty), THEN an
+  // unread broadcast lands, THEN it peeks. hidden_by_filter must still count it.
+  const DB3 = join(dir, "peek3.db");
+  const s = new ChatStore(DB3);
+  s.createRoom("r", null, null);
+  s.upsertAgent("A", null, null, null); s.joinRoom(1, "A");
+  s.upsertAgent("B", null, null, null); s.joinRoom(1, "B");
+  s.postMessage(1, "A", "A's request", "text", null, null); // reader authored seq1
+  s.postMessage(1, "B", "broadcast", "text", null, null);    // unread broadcast seq2
+  s.postMessage(1, "B", "reply to A", "text", null, 1);      // directed reply seq3
+  const peek = s.catchUp(1, "A", 50, "A");
+  check("post-then-peek: reply is directed (msg=[3])", peek.messages.map((m) => m.seq).join(",") === "3", peek.messages.map((m) => m.seq));
+  check("post-then-peek: hidden_by_filter counts the broadcast (=1, not NULL-dropped to 0)", peek.hidden_by_filter === 1, peek.hidden_by_filter);
+  check("post-then-peek: unread_total = 2 (own seq1 excluded)", peek.unread_total === 2, peek.unread_total);
+  s.close();
+}
+
 rmSync(dir, { recursive: true, force: true });
 console.log(`\n${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"}`);
 process.exit(failures === 0 ? 0 : 1);
