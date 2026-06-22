@@ -569,56 +569,63 @@ export class ChatStore {
     hint?: string;
   } {
     if (mentionsMe !== undefined) {
-      // Peek mode: filtered, never advances the marker, so no atomicity needed.
-      const membership = this.getMembership(roomId, agentId);
-      if (!membership) throw new Error("not a member of this room");
-      const from = membership.last_read_seq;
-      // Page forward through unread mentions without moving the marker:
-      // afterSeq (clamped to >= the marker) is the cursor for the next page.
-      const lower = afterSeq !== undefined ? Math.max(from, afterSeq) : from;
-      const rows = this.db
-        .prepare(
-          `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
-           WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
-             AND ${directedAt("g")}
-           ORDER BY g.seq ASC LIMIT ?`,
-        )
-        .all(roomId, lower, agentId, mentionsMe, mentionsMe, limit) as RawMessage[];
-      const messages = rows.map((r) => this.rowToMessage(r));
-      const lastSeq =
-        messages.length > 0 ? messages[messages.length - 1].seq : lower;
-      const { c } = this.db
-        .prepare(
-          `SELECT COUNT(*) AS c FROM messages g
-           WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
-             AND ${directedAt("g")}`,
-        )
-        .get(roomId, lastSeq, agentId, mentionsMe, mentionsMe) as { c: number };
-      // Marker-relative totals (NOT page-relative like `remaining`): the peek
-      // hides everything not directed at you, so report how much it is hiding so
-      // an empty/exhausted peek is not mistaken for "the room has nothing new".
-      const unread_total = this.unreadCount(roomId, from, agentId);
-      const { c: hidden_by_filter } = this.db
-        .prepare(
-          `SELECT COUNT(*) AS c FROM messages g
-           WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
-             AND NOT ${directedAt("g")}`,
-        )
-        .get(roomId, from, agentId, mentionsMe, mentionsMe) as { c: number };
-      return {
-        messages,
-        new_last_read_seq: from,
-        remaining: c,
-        advanced: false,
-        next_after_seq: lastSeq,
-        unread_total,
-        hidden_by_filter,
-        ...(hidden_by_filter > 0
-          ? {
-              hint: `${hidden_by_filter} unread message(s) are not directed at you and are hidden by mentions_me; call catch_up without mentions_me to read the room stream before assuming there is nothing new.`,
-            }
-          : {}),
-      };
+      // Peek mode: filtered, never advances the marker. The rows fetch and the
+      // three counts run in one DEFERRED (read) transaction so they all see a
+      // single snapshot; otherwise a concurrent writer landing between the
+      // separate SELECTs could yield inconsistent numbers (e.g. hidden_by_filter
+      // exceeding unread_total). Deferred, not immediate: reads take no lock.
+      const peek = this.db.transaction(() => {
+        const membership = this.getMembership(roomId, agentId);
+        if (!membership) throw new Error("not a member of this room");
+        const from = membership.last_read_seq;
+        // Page forward through unread mentions without moving the marker:
+        // afterSeq (clamped to >= the marker) is the cursor for the next page.
+        const lower = afterSeq !== undefined ? Math.max(from, afterSeq) : from;
+        const rows = this.db
+          .prepare(
+            `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
+             WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
+               AND ${directedAt("g")}
+             ORDER BY g.seq ASC LIMIT ?`,
+          )
+          .all(roomId, lower, agentId, mentionsMe, mentionsMe, limit) as RawMessage[];
+        const messages = rows.map((r) => this.rowToMessage(r));
+        const lastSeq =
+          messages.length > 0 ? messages[messages.length - 1].seq : lower;
+        const { c } = this.db
+          .prepare(
+            `SELECT COUNT(*) AS c FROM messages g
+             WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
+               AND ${directedAt("g")}`,
+          )
+          .get(roomId, lastSeq, agentId, mentionsMe, mentionsMe) as { c: number };
+        // Marker-relative totals (NOT page-relative like `remaining`): the peek
+        // hides everything not directed at you, so report how much it is hiding
+        // so an empty/exhausted peek is not mistaken for "nothing new".
+        const unread_total = this.unreadCount(roomId, from, agentId);
+        const { c: hidden_by_filter } = this.db
+          .prepare(
+            `SELECT COUNT(*) AS c FROM messages g
+             WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
+               AND NOT ${directedAt("g")}`,
+          )
+          .get(roomId, from, agentId, mentionsMe, mentionsMe) as { c: number };
+        return {
+          messages,
+          new_last_read_seq: from,
+          remaining: c,
+          advanced: false,
+          next_after_seq: lastSeq,
+          unread_total,
+          hidden_by_filter,
+          ...(hidden_by_filter > 0
+            ? {
+                hint: `${hidden_by_filter} unread message(s) are not directed at you and are hidden by mentions_me; call catch_up without mentions_me to read the room stream before assuming there is nothing new.`,
+              }
+            : {}),
+        };
+      });
+      return peek.deferred();
     }
 
     // Advancing path: read the marker, fetch, and advance inside one IMMEDIATE
