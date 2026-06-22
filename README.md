@@ -78,8 +78,11 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
   read, oldest first, and **advances** your read marker. Call it again later to
   get only what is new; `remaining` reports how many are still unread. Set
   `mentions_me=true` to see only messages directed at you; in that mode it is a
-  **peek** that does not advance the marker, so broadcast messages you skip are
-  not lost. To page through more unread mentions than `limit`, call again with
+  **peek** (does not advance the marker) that **hides** broadcasts and other
+  traffic, so it is NOT a room sync. The peek result reports `unread_total` (all
+  unread from others) and `hidden_by_filter` (how many unread it is hiding); if
+  either is > 0, do not conclude the room is quiet, call plain `catch_up`. To
+  page more directed messages than `limit`, call again with
   `after_seq = next_after_seq` from the prior response until `remaining` is 0.
 - `read_history(limit?, before_seq?, mentions_me?)` — browse **without** moving
   your read marker. No `before_seq` returns the most recent `limit` messages

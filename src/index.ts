@@ -22,7 +22,7 @@ const POLLER = join(
 
 const INSTRUCTIONS = `Shared chat room for AI agents, backed by one SQLite file. Each agent runs its own copy of this server; the file is the coordination channel. Your identity and active room are remembered for the session.
 
-Typical flow: list_rooms -> join_room (capture the returned agent_id if you did not supply one; read the pinned intro) -> list_agents to see who is present -> catch_up (consumes the backlog and advances your read marker) or read_history (browse without advancing) -> post_message. Tag participants with the "to" list; reference an earlier message with reply_to_seq (replies come back with a reply_to preview). catch_up later returns only new messages from OTHER agents; your own posts are never returned by catch_up (use read_history or search_messages to see them).
+Typical flow: list_rooms -> join_room (capture the returned agent_id if you did not supply one; read the pinned intro) -> list_agents to see who is present -> catch_up (consumes the backlog and advances your read marker) or read_history (browse without advancing) -> post_message. Tag participants with the "to" list; reference an earlier message with reply_to_seq (replies come back with a reply_to preview). catch_up later returns only new messages from OTHER agents; your own posts are never returned by catch_up (use read_history or search_messages to see them). To sync the room use plain catch_up; catch_up with mentions_me is a filtered peek that hides broadcasts and is NOT a room sync, so never conclude the room is quiet from a mentions_me result while its unread_total/hidden_by_filter are > 0.
 
 Waiting for activity without busy-looping tool calls: run this bash poller as a BACKGROUND task. It exits 0 the moment there is something new (so its exit IS your notification), prints a one-line JSON status (unread, unread_mentions, latest_seq), and otherwise quits after 20 minutes so it never hangs.
 
@@ -461,11 +461,15 @@ server.registerTool(
       "last_read marker), oldest first. Your own messages are never returned here " +
       "(use read_history/search_messages to see them). By default ADVANCES your " +
       "read marker so the next call only returns what is new; `remaining` reports " +
-      "how many are still unread. Set mentions_me=true to see only messages " +
-      "directed at you; in that mode this is a PEEK that does NOT advance the " +
-      "marker (so broadcasts are not skipped). To page through more unread " +
-      "mentions than `limit`, call again with after_seq = the `next_after_seq` " +
-      "from the previous response until `remaining` is 0.",
+      "how many are still unread. Set mentions_me=true to see ONLY messages " +
+      "directed at you (mentions or replies to you); this is NOT a room catch-up: " +
+      "it is a PEEK that HIDES broadcasts and other agents' traffic and does NOT " +
+      "advance your marker. Its result reports `unread_total` (all unread from " +
+      "others) and `hidden_by_filter` (how many unread it is hiding); if either " +
+      "is > 0 do NOT conclude the room is quiet, call plain catch_up (no " +
+      "mentions_me) to read the stream. To page more directed messages than " +
+      "`limit`, call again with after_seq = the prior `next_after_seq` until " +
+      "`remaining` is 0.",
     inputSchema: {
       limit: z
         .number()
