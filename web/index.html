@@ -113,6 +113,11 @@
       .who {
         font-weight: 600;
       }
+      .who-id {
+        color: #6b7280;
+        font-weight: 400;
+        font-size: 12px;
+      }
     </style>
   </head>
   <body>
@@ -242,18 +247,33 @@
       function renderMessage(msg) {
         const row = document.createElement("div");
         row.className = "msg";
+        // Color by the stable agent id, not the label, so an agent keeps one
+        // tint even if two agents share a role.
         row.style.background = userColor(msg.from);
 
+        const label = msg.role || msg.type || msg.from;
         const who = document.createElement("span");
         who.className = "who";
-        who.textContent = msg.from + ": ";
+        who.textContent = label;
+        row.append(who);
+
+        // Show the raw id, muted, when a friendly label stands in for it.
+        if (label !== msg.from) {
+          const id = document.createElement("span");
+          id.className = "who-id";
+          id.textContent = " " + msg.from;
+          row.append(id);
+        }
+
+        const sep = document.createElement("span");
+        sep.textContent = ": ";
+        row.append(sep);
 
         const text = document.createElement("span");
         // textContent, never innerHTML: message bodies are agent-controlled.
         text.textContent =
           typeof msg.body === "string" ? msg.body : String(msg.body);
-
-        row.append(who, text);
+        row.append(text);
         return row;
       }
 

@@ -69,6 +69,10 @@ export type MessageRow = {
   to: string[] | null;
   reply_to: ReplyRef | null;
   at: string;
+  /** Present only when a preview_chars cap truncated the body. */
+  truncated?: boolean;
+  /** Full character length of the original body (only when truncated). */
+  length?: number;
 };
 
 type RawMessage = {
@@ -302,6 +306,28 @@ export class ChatStore {
       .run({ id, type, role, description });
   }
 
+  /**
+   * Insert a brand-new agent row, doing nothing if the id is already taken.
+   * Returns true only if THIS call created it, so a caller assigning a generated
+   * id can claim it atomically: two processes racing on the same candidate id
+   * cannot both "win" and collapse onto one shared identity/read-marker.
+   */
+  tryCreateAgent(
+    id: string,
+    type: string | null,
+    role: string | null,
+    description: string | null,
+  ): boolean {
+    const info = this.db
+      .prepare(
+        `INSERT INTO agents (id, type, role, description)
+         VALUES (@id, @type, @role, @description)
+         ON CONFLICT(id) DO NOTHING`,
+      )
+      .run({ id, type, role, description });
+    return info.changes > 0;
+  }
+
   /** Join (or rejoin) a room: clears any prior leave and refreshes liveness. */
   joinRoom(roomId: number, agentId: string): void {
     this.db
@@ -428,14 +454,24 @@ export class ChatStore {
     return tx.immediate();
   }
 
-  private rowToMessage(r: RawMessage): MessageRow {
+  private rowToMessage(r: RawMessage, previewChars?: number): MessageRow {
+    const truncate =
+      previewChars !== undefined && r.body.length > previewChars;
+    // A truncated body is returned as a raw (possibly partial) string even for
+    // json: a sliced JSON string does not parse, so the caller must fetch the
+    // full body with get_message. `truncated`/`length` signal exactly that.
+    const content = truncate
+      ? r.body.slice(0, previewChars)
+      : r.format === "json"
+        ? safeParse(r.body)
+        : r.body;
     return {
       seq: r.seq,
       from: r.agent_id,
       from_type: r.from_type,
       from_role: r.from_role,
       format: r.format,
-      content: r.format === "json" ? safeParse(r.body) : r.body,
+      content,
       to: r.mentions ? (safeParse(r.mentions) as string[]) : null,
       reply_to:
         r.reply_to_seq === null
@@ -446,6 +482,7 @@ export class ChatStore {
               preview: makePreview(r.reply_preview),
             },
       at: r.created_at,
+      ...(truncate ? { truncated: true, length: r.body.length } : {}),
     };
   }
 
@@ -511,28 +548,66 @@ export class ChatStore {
     });
   }
 
-  /** A message plus its parent (if any) and direct replies. */
+  /**
+   * A message plus its parent (if any) and a bounded, depth-annotated tree of
+   * its replies. Descendants come back pre-order (each parent immediately before
+   * its children) with a `depth` field (1 = direct reply). `maxDepth` bounds how
+   * many reply levels are walked; the descendant set is capped and `replies_capped`
+   * flags when the cap was hit. `previewChars` truncates descendant bodies only
+   * (the focal message and parent are always returned in full).
+   */
   getThread(
     roomId: number,
     seq: number,
+    maxDepth = 3,
+    previewChars?: number,
   ):
-    | { message: MessageRow; parent: MessageRow | null; replies: MessageRow[] }
+    | {
+        message: MessageRow;
+        parent: MessageRow | null;
+        replies: (MessageRow & { depth: number })[];
+        replies_capped: boolean;
+      }
     | undefined {
     const message = this.getMessage(roomId, seq);
     if (!message) return undefined;
     const parentSeq = message.reply_to?.seq ?? null;
     const parent =
       parentSeq !== null ? (this.getMessage(roomId, parentSeq) ?? null) : null;
-    const replies = (
-      this.db
-        .prepare(
-          `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
-           WHERE g.room_id = ? AND g.reply_to_seq = ?
-           ORDER BY g.seq ASC`,
-        )
-        .all(roomId, seq) as RawMessage[]
-    ).map((r) => this.rowToMessage(r));
-    return { message, parent, replies };
+
+    const cap = 500;
+    // Recursive walk of the reply subtree. `path` (zero-padded seq per level)
+    // orders siblings numerically and yields pre-order DFS when sorted. Fetch
+    // cap+1 rows to detect (without a separate COUNT) that more were available.
+    const rows = this.db
+      .prepare(
+        `WITH RECURSIVE descendants(seq, depth, path) AS (
+           SELECT g.seq, 1, printf('%010d', g.seq)
+             FROM messages g
+            WHERE g.room_id = @room AND g.reply_to_seq = @root
+           UNION ALL
+           SELECT c.seq, d.depth + 1, d.path || '/' || printf('%010d', c.seq)
+             FROM messages c
+             JOIN descendants d ON c.reply_to_seq = d.seq
+            WHERE c.room_id = @room AND d.depth < @maxDepth
+         )
+         SELECT ${MESSAGE_COLS}, d.depth AS depth
+           FROM descendants d
+           JOIN messages g ON g.room_id = @room AND g.seq = d.seq
+           LEFT JOIN agents a ON a.id = g.agent_id
+           LEFT JOIN messages p ON p.room_id = g.room_id AND p.seq = g.reply_to_seq
+          ORDER BY d.path
+          LIMIT @lim`,
+      )
+      .all({ room: roomId, root: seq, maxDepth, lim: cap + 1 }) as (RawMessage & {
+      depth: number;
+    })[];
+
+    const replies_capped = rows.length > cap;
+    const replies = rows
+      .slice(0, cap)
+      .map((r) => ({ ...this.rowToMessage(r, previewChars), depth: r.depth }));
+    return { message, parent, replies, replies_capped };
   }
 
   /** Count of messages newer than the marker that the agent did NOT write. */
@@ -558,6 +633,7 @@ export class ChatStore {
     limit: number,
     mentionsMe?: string,
     afterSeq?: number,
+    previewChars?: number,
   ): {
     messages: MessageRow[];
     new_last_read_seq: number;
@@ -589,7 +665,7 @@ export class ChatStore {
              ORDER BY g.seq ASC LIMIT ?`,
           )
           .all(roomId, lower, agentId, mentionsMe, mentionsMe, limit) as RawMessage[];
-        const messages = rows.map((r) => this.rowToMessage(r));
+        const messages = rows.map((r) => this.rowToMessage(r, previewChars));
         const lastSeq =
           messages.length > 0 ? messages[messages.length - 1].seq : lower;
         const { c } = this.db
@@ -642,7 +718,7 @@ export class ChatStore {
            ORDER BY g.seq ASC LIMIT ?`,
         )
         .all(roomId, from, agentId, limit) as RawMessage[];
-      const messages = rows.map((r) => this.rowToMessage(r));
+      const messages = rows.map((r) => this.rowToMessage(r, previewChars));
       const lastSeq =
         messages.length > 0 ? messages[messages.length - 1].seq : from;
       if (lastSeq > from) {
@@ -672,6 +748,7 @@ export class ChatStore {
     limit: number,
     beforeSeq?: number,
     mentionsMe?: string,
+    previewChars?: number,
   ): { messages: MessageRow[]; oldest_seq: number | null; has_more: boolean } {
     const conds = ["g.room_id = ?"];
     const params: (number | string)[] = [roomId];
@@ -691,7 +768,9 @@ export class ChatStore {
       )
       .all(...params, limit) as RawMessage[];
     // Fetched newest-first; present oldest-first for natural reading.
-    const messages = rows.map((r) => this.rowToMessage(r)).reverse();
+    const messages = rows
+      .map((r) => this.rowToMessage(r, previewChars))
+      .reverse();
     const oldest = messages.length > 0 ? messages[0].seq : null;
 
     // has_more: are there older messages matching the same filter?

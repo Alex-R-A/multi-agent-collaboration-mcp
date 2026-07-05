@@ -218,8 +218,8 @@ server.registerTool(
     title: "Join room",
     description:
       "Join a room (by id or name) under an identity. If agent_id is omitted a " +
-      "UUID is generated and returned; reuse it later to resume the same " +
-      "identity and read position. Supplying type/role/description lets other " +
+      "readable id (e.g. clever-otter) is generated and returned; reuse it later " +
+      "to resume the same identity and read position. Supplying type/role/description lets other " +
       "agents understand who you are. Read the returned `pinned` intro first. " +
       "Sets this room as active for the session. If the returned `server_stale` " +
       "is true, this MCP server is running outdated code; tell the user to " +
@@ -229,7 +229,9 @@ server.registerTool(
       agent_id: z
         .string()
         .optional()
-        .describe("Your stable identity/nickname. Omit to be assigned a UUID."),
+        .describe(
+          "Your stable identity/nickname. Omit to be assigned a readable id.",
+        ),
       type: z
         .string()
         .optional()
@@ -253,9 +255,15 @@ server.registerTool(
           `no room "${room}". Use list_rooms to see options or create_room to make one.`,
         );
       }
-      const id =
-        agent_id && agent_id.trim().length > 0 ? agent_id.trim() : randomUUID();
-      store.upsertAgent(id, type ?? null, role ?? null, description ?? null);
+      let id: string;
+      if (agent_id && agent_id.trim().length > 0) {
+        id = agent_id.trim();
+        store.upsertAgent(id, type ?? null, role ?? null, description ?? null);
+      } else {
+        // Generated ids are claimed atomically inside assignReadableId, so no
+        // separate upsert here (it would risk clobbering a racing assigner).
+        id = assignReadableId(type ?? null, role ?? null, description ?? null);
+      }
       store.joinRoom(target.id, id);
       session.agentId = id;
       session.roomId = target.id;
@@ -491,9 +499,20 @@ server.registerTool(
         .positive()
         .optional()
         .describe("Cursor for mentions_me paging: pass the prior next_after_seq"),
+      preview_chars: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "If set, truncate each returned body to this many characters. " +
+            "Truncated messages carry `truncated:true` and `length` (full " +
+            "length); fetch the complete body with get_message. A truncated " +
+            "json message comes back as a partial string, not a parsed object.",
+        ),
     },
   },
-  async ({ limit, mentions_me, after_seq }) => {
+  async ({ limit, mentions_me, after_seq, preview_chars }) => {
     try {
       touchSession();
       const { agentId, roomId } = requireActive();
@@ -503,6 +522,7 @@ server.registerTool(
         limit ?? 50,
         mentions_me ? agentId : undefined,
         after_seq,
+        preview_chars,
       );
       return ok(result);
     } catch (e) {
@@ -543,9 +563,20 @@ server.registerTool(
           "Only messages directed at you: your `to` mentions or replies to a " +
             "message you wrote",
         ),
+      preview_chars: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "If set, truncate each returned body to this many characters. " +
+            "Truncated messages carry `truncated:true` and `length` (full " +
+            "length); fetch the complete body with get_message. A truncated " +
+            "json message comes back as a partial string, not a parsed object.",
+        ),
     },
   },
-  async ({ limit, before_seq, mentions_me }) => {
+  async ({ limit, before_seq, mentions_me, preview_chars }) => {
     try {
       touchSession();
       const { agentId, roomId } = requireActive();
@@ -555,6 +586,7 @@ server.registerTool(
           limit ?? 50,
           before_seq,
           mentions_me ? agentId : undefined,
+          preview_chars,
         ),
       );
     } catch (e) {
@@ -623,17 +655,35 @@ server.registerTool(
   {
     title: "Get thread",
     description:
-      "Fetch a message together with its parent (the message it replied to, if " +
-      "any) and its direct replies, oldest first. Makes reply_to tags navigable.",
+      "Fetch a message with its parent and a bounded tree of its replies. " +
+      "Replies come back pre-order (each parent immediately before its children) " +
+      "with a `depth` field (1 = direct reply); `max_depth` bounds how many reply " +
+      "levels are walked (default 3). `replies_capped` is true if the reply set " +
+      "hit the internal cap. `preview_chars` truncates reply bodies (the focal " +
+      "message and parent are always full); truncated replies carry " +
+      "`truncated:true`/`length`, fetch full text with get_message.",
     inputSchema: {
       seq: z.number().int().positive().describe("Message number to expand"),
+      max_depth: z
+        .number()
+        .int()
+        .positive()
+        .max(10)
+        .optional()
+        .describe("Reply levels to walk (default 3, max 10)"),
+      preview_chars: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("Truncate reply bodies to this many characters"),
     },
   },
-  async ({ seq }) => {
+  async ({ seq, max_depth, preview_chars }) => {
     try {
       touchSession();
       const { roomId } = requireActive();
-      const thread = store.getThread(roomId, seq);
+      const thread = store.getThread(roomId, seq, max_depth ?? 3, preview_chars);
       if (!thread) return fail(`no message ${seq} in this room`);
       return ok(thread);
     } catch (e) {
@@ -772,6 +822,44 @@ server.registerTool(
     }
   },
 );
+
+// Readable identity generation for agents that omit agent_id. Two short word
+// lists give ~676 base combinations; a hex suffix (then a UUID fallback)
+// guarantees a free id even under collision. The id is claimed atomically via
+// tryCreateAgent so concurrent assigners cannot land on the same identity.
+const ID_ADJECTIVES = [
+  "amber", "brisk", "calm", "clever", "cobalt", "copper", "deft", "eager",
+  "fern", "gilded", "hardy", "ivory", "jade", "keen", "lucid", "mellow",
+  "nimble", "olive", "prime", "quiet", "rapid", "sable", "teal", "umber",
+  "vivid", "warm",
+];
+const ID_NOUNS = [
+  "otter", "falcon", "cedar", "harbor", "lynx", "maple", "comet", "delta",
+  "ember", "fjord", "grove", "heron", "inlet", "kite", "larch", "mesa",
+  "nimbus", "onyx", "pike", "quartz", "ridge", "summit", "tundra", "vale",
+  "willow", "yarrow",
+];
+
+function pick<T>(xs: T[]): T {
+  return xs[Math.floor(Math.random() * xs.length)];
+}
+
+/** Assign and atomically claim a readable, collision-free agent id. */
+function assignReadableId(
+  type: string | null,
+  role: string | null,
+  description: string | null,
+): string {
+  for (let i = 0; i < 30; i++) {
+    const base = `${pick(ID_ADJECTIVES)}-${pick(ID_NOUNS)}`;
+    // After a run of plain-name misses, widen the space with a short suffix.
+    const id = i < 12 ? base : `${base}-${randomUUID().slice(0, 4)}`;
+    if (store.tryCreateAgent(id, type, role, description)) return id;
+  }
+  const id = `agent-${randomUUID().slice(0, 8)}`;
+  store.tryCreateAgent(id, type, role, description);
+  return id;
+}
 
 function dedupe(xs: string[]): string[] {
   return [...new Set(xs)];

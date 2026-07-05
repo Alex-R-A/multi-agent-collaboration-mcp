@@ -58,12 +58,13 @@ function listRooms() {
 function listMessages(roomId, afterSeq, limit) {
   const d = getDb();
   if (!d) return null;
-  const cols = `g.seq, g.agent_id AS "from", g.body, g.format, g.created_at AS at`;
+  const cols = `g.seq, g.agent_id AS "from", a.role, a.type, g.body, g.format, g.created_at AS at`;
+  const src = `messages g LEFT JOIN agents a ON a.id = g.agent_id`;
   if (afterSeq > 0) {
     // Incremental tail: only messages newer than what the client already has.
     return d
       .prepare(
-        `SELECT ${cols} FROM messages g
+        `SELECT ${cols} FROM ${src}
          WHERE g.room_id = ? AND g.seq > ? ORDER BY g.seq ASC LIMIT ?`,
       )
       .all(roomId, afterSeq, limit);
@@ -71,7 +72,7 @@ function listMessages(roomId, afterSeq, limit) {
   // Initial load: newest `limit`, returned oldest-first for top-to-bottom reading.
   return d
     .prepare(
-      `SELECT ${cols} FROM messages g
+      `SELECT ${cols} FROM ${src}
        WHERE g.room_id = ? ORDER BY g.seq DESC LIMIT ?`,
     )
     .all(roomId, limit)
