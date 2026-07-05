@@ -273,7 +273,15 @@ export class ChatStore {
       .prepare(`PRAGMA table_info(${table})`)
       .all() as { name: string }[];
     if (!cols.some((c) => c.name === column)) {
-      this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+      try {
+        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
+      } catch (e) {
+        // Two fresh processes migrating the same legacy file can both pass
+        // the PRAGMA check; the loser's ALTER must be a no-op, not a startup
+        // crash.
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!/duplicate column name/i.test(msg)) throw e;
+      }
     }
   }
 
@@ -397,13 +405,20 @@ export class ChatStore {
       )
       .run(roomId, agentId);
     if (sessionId !== null) {
+      // Refresh updated_at on rejoin (keeping the cursor position): the GC
+      // below must never reap the very session this join is resuming, which
+      // an INSERT OR IGNORE (no liveness refresh) allowed.
       this.db
         .prepare(
-          `INSERT OR IGNORE INTO session_markers (room_id, agent_id, session_id, last_read_seq)
-           VALUES (?, ?, ?, (SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?))`,
+          `INSERT INTO session_markers (room_id, agent_id, session_id, last_read_seq)
+           VALUES (?, ?, ?, (SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?))
+           ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
+             updated_at = datetime('now')`,
         )
         .run(roomId, agentId, sessionId, roomId, agentId);
-      // GC: session cursors are per-process and abandoned when processes die.
+      // GC dead session cursors. Live sessions stay off this radar: the
+      // upsert above refreshes on join and touch() refreshes on every tool
+      // call, so only sessions silent for 7+ days qualify.
       this.db
         .prepare(
           "DELETE FROM session_markers WHERE room_id = ? AND updated_at < datetime('now', '-7 days')",
@@ -438,12 +453,21 @@ export class ChatStore {
    * same agent_id does not leave the live session showing as not-present. (A
    * genuine leave_room clears the session, after which touch is never called.)
    */
-  touch(roomId: number, agentId: string): void {
+  touch(roomId: number, agentId: string, sessionId: string | null = null): void {
     this.db
       .prepare(
         "UPDATE memberships SET last_seen = datetime('now'), left_at = NULL WHERE room_id = ? AND agent_id = ?",
       )
       .run(roomId, agentId);
+    if (sessionId !== null) {
+      // Keep a live-but-idle private session's cursor row out of the 7-day
+      // GC: a quiet room advances no cursor, but the process is still alive.
+      this.db
+        .prepare(
+          "UPDATE session_markers SET updated_at = datetime('now') WHERE room_id = ? AND agent_id = ? AND session_id = ?",
+        )
+        .run(roomId, agentId, sessionId);
+    }
   }
 
   getMembership(
@@ -713,13 +737,28 @@ export class ChatStore {
       const size = JSON.stringify(m).length;
       if (out.length === 0 && size > maxBytes) {
         // Head message alone busts the budget: shrink its body to fit,
-        // leaving room for the JSON envelope around it.
-        const envelope = size - r.body.length;
-        const keep = Math.max(
-          200,
-          Math.floor((maxBytes - envelope) * 0.9),
-        );
-        out.push(map(r, Math.min(keep, previewChars ?? Infinity)));
+        // leaving room for the JSON envelope around it. The envelope must be
+        // measured against the content actually present in m: previewChars
+        // may already have truncated it, and subtracting the raw body length
+        // instead drives the envelope negative, inflating `keep` past the
+        // budget and re-emitting the oversized preview.
+        const measured =
+          typeof m.content === "string" ? m.content.length : r.body.length;
+        const envelope = Math.max(0, size - measured);
+        let keep = Math.max(200, Math.floor((maxBytes - envelope) * 0.9));
+        let head = map(r, Math.min(keep, previewChars ?? Infinity));
+        // Serialized size is ~linear in kept chars but escaping can inflate
+        // it (control chars serialize 6x), so verify and correct once
+        // proportionally rather than trusting the estimate.
+        const headSize = JSON.stringify(head).length;
+        if (headSize > maxBytes) {
+          keep = Math.max(
+            200,
+            Math.floor((keep * maxBytes * 0.9) / headSize),
+          );
+          head = map(r, Math.min(keep, previewChars ?? Infinity));
+        }
+        out.push(head);
         return { messages: out, byteLimited: true };
       }
       if (used + size > maxBytes && out.length > 0) {
@@ -758,7 +797,10 @@ export class ChatStore {
     return {
       ...base,
       content: r.body.slice(offset, end),
-      truncated: true,
+      // truncated means "there is more BEYOND this slice", so the final page
+      // of an offset walk reports false and pagers terminate on it instead of
+      // spinning on empty tail pages.
+      truncated: end < r.body.length,
       length: r.body.length,
       offset,
     };
@@ -821,8 +863,12 @@ export class ChatStore {
    * its replies. Descendants come back pre-order (each parent immediately before
    * its children) with a `depth` field (1 = direct reply). `maxDepth` bounds how
    * many reply levels are walked; the descendant set is capped and `replies_capped`
-   * flags when the cap was hit. `previewChars` truncates descendant bodies only
-   * (the focal message and parent are always returned in full).
+   * flags when the cap was hit. `previewChars` truncates descendant bodies.
+   * The whole response shares ONE byte budget: the focal message is fetched
+   * first, the parent and replies are charged against what remains (with a
+   * small floor each), so root + parent + replies cannot stack three separate
+   * caps into an oversized response. Oversized bodies arrive truncated with
+   * markers; page them via get_message.
    */
   getThread(
     roomId: number,
@@ -840,9 +886,18 @@ export class ChatStore {
     | undefined {
     const message = this.getMessage(roomId, seq);
     if (!message) return undefined;
+    // One budget for the whole thread response. The focal message spends
+    // first; parent and replies get what remains, floored so they are never
+    // starved to nothing.
+    const FLOOR = 2_000;
+    let remaining = DEFAULT_MAX_BYTES - JSON.stringify(message).length;
     const parentSeq = message.reply_to?.seq ?? null;
     const parent =
-      parentSeq !== null ? (this.getMessage(roomId, parentSeq) ?? null) : null;
+      parentSeq !== null
+        ? (this.getMessage(roomId, parentSeq, 0, Math.max(FLOOR, remaining)) ??
+          null)
+        : null;
+    if (parent) remaining -= JSON.stringify(parent).length;
 
     const cap = 500;
     // Recursive walk of the reply subtree. `path` (zero-padded seq per level)
@@ -876,7 +931,7 @@ export class ChatStore {
     const { messages: replies, byteLimited } = this.boundByBytes(
       rows.slice(0, cap),
       previewChars,
-      DEFAULT_MAX_BYTES,
+      Math.max(FLOOR, remaining),
       (r, pc) => ({
         ...this.rowToMessage(r, pc),
         depth: (r as RawMessage & { depth: number }).depth,
@@ -1189,25 +1244,36 @@ export class ChatStore {
         // Refuse to delete a message that ANY member who did NOT author it has
         // not yet read. Members that left are included: soft leave preserves the
         // read position for resume, so their unread is real until they return.
-        // (The author has implicitly "seen" its own message, matching catch_up's
-        // self-exclusion.) Pass force=true to prune past this.
+        // Private session cursors count too: the identity marker is the MAX
+        // across sessions, so a lagging twin's unread is invisible to it and
+        // only the session_markers row knows. (The author has implicitly
+        // "seen" its own message, matching catch_up's self-exclusion.) Pass
+        // force=true to prune past this.
         const { u } = this.db
           .prepare(
             `SELECT COUNT(*) AS u FROM messages g
              WHERE g.room_id = ? AND g.seq < ?
-               AND EXISTS (
+               AND (EXISTS (
                  SELECT 1 FROM memberships mm
                  WHERE mm.room_id = g.room_id
                    AND mm.last_read_seq < g.seq AND mm.agent_id != g.agent_id
-               )`,
+               ) OR EXISTS (
+                 SELECT 1 FROM session_markers sm
+                 WHERE sm.room_id = g.room_id
+                   AND sm.last_read_seq < g.seq AND sm.agent_id != g.agent_id
+               ))`,
           )
           .get(roomId, cutoff.seq) as { u: number };
         if (u > 0) {
           const { m } = this.db
             .prepare(
-              "SELECT MIN(last_read_seq) AS m FROM memberships WHERE room_id = ?",
+              `SELECT MIN(m) AS m FROM (
+                 SELECT MIN(last_read_seq) AS m FROM memberships WHERE room_id = ?
+                 UNION ALL
+                 SELECT MIN(last_read_seq) FROM session_markers WHERE room_id = ?
+               )`,
             )
-            .get(roomId) as { m: number | null };
+            .get(roomId, roomId) as { m: number | null };
           return {
             deleted: 0,
             kept: total,

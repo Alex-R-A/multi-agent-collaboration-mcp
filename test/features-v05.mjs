@@ -1,7 +1,12 @@
 // Feature tests for v0.5.0: byte-bounded reads (marker only advances over
 // delivered rows), sliceable get_message, post-time crossing report,
 // supersede annotation, advisory claims, and private session cursors.
+// Plus v0.5.1 regression tests for the Fable/Opus review findings.
 import assert from "node:assert";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import Database from "better-sqlite3";
 import { ChatStore } from "../dist/db.js";
 
 let failures = 0;
@@ -140,6 +145,109 @@ check(s1Cur === 5 && s2Cur === 12, "mark_read rewinds only its own session curso
 check(s.getMembership(room, "twin").last_read_seq === 12, "identity marker stays monotonic on session rewind");
 
 s.close();
+
+// ===========================================================================
+// v0.5.1 regressions (Fable/Opus review findings)
+// ===========================================================================
+
+// --- boundByBytes: preview_chars > max_bytes must still respect the budget --
+{
+  const v = new ChatStore(":memory:");
+  const r = v.createRoom("r", null, null).id;
+  v.upsertAgent("a", null, null, null);
+  v.upsertAgent("b", null, null, null);
+  v.joinRoom(r, "a");
+  v.joinRoom(r, "b");
+  v.postMessage(r, "b", "z".repeat(300_000), "text", null, null);
+  const page = v.catchUp(r, "a", 50, undefined, undefined, 150_000, 100_000);
+  const size = JSON.stringify(page.messages).length;
+  check(size <= 100_000, `preview_chars > max_bytes stays within budget (${size})`);
+  check(
+    page.messages[0].truncated === true && page.new_last_read_seq === 1,
+    "oversized head still delivered truncated, marker advanced",
+  );
+  // Adversarial escaping: control chars serialize 6x, the estimate must
+  // self-correct via the re-measure.
+  v.postMessage(r, "b", "\u0001".repeat(30_000), "text", null, null);
+  const esc = v.catchUp(r, "a", 50, undefined, undefined, undefined, 50_000);
+  const escSize = JSON.stringify(esc.messages).length;
+  check(escSize <= 50_000, `heavy-escaping body stays within budget (${escSize})`);
+  v.close();
+}
+
+// --- joinRoom GC must not reap the session being resumed --------------------
+{
+  const dir = mkdtempSync(join(tmpdir(), "aichat-test-"));
+  const dbPath = join(dir, "t.db");
+  const v = new ChatStore(dbPath);
+  const r = v.createRoom("r", null, null).id;
+  v.upsertAgent("twin", null, null, null);
+  v.upsertAgent("other", null, null, null);
+  v.joinRoom(r, "twin", "S1");
+  v.joinRoom(r, "twin", "S2");
+  v.joinRoom(r, "other");
+  for (let i = 0; i < 10; i++) v.postMessage(r, "other", `m${i}`, "text", null, null);
+  v.markRead(r, "twin", 3, "S1"); // S1 lags at 3
+  v.catchUp(r, "twin", 500, undefined, undefined, undefined, undefined, "S2"); // identity MAX -> 10
+  const raw = new Database(dbPath);
+  raw
+    .prepare(
+      "UPDATE session_markers SET updated_at = datetime('now', '-8 days') WHERE session_id = 'S1'",
+    )
+    .run();
+  raw.close();
+  v.joinRoom(r, "twin", "S1"); // resume after GC-eligible dormancy
+  check(
+    v.getCursor(r, "twin", "S1").last_read_seq === 3,
+    "resume join preserves a dormant session cursor",
+  );
+  const resumed = v.catchUp(r, "twin", 500, undefined, undefined, undefined, undefined, "S1");
+  check(resumed.messages.length === 7, "dormant session resumes with its full backlog");
+
+  // --- prune refusal must see lagging private session cursors ---------------
+  v.markRead(r, "twin", 3, "S1"); // re-lag S1 (catchUp above advanced it)
+  const pr = v.pruneMessages(r, 5, false);
+  check(pr.refused === true, "prune refuses while a private session lags");
+  check(pr.min_read_seq === 0 || pr.min_read_seq === 3, "min_read_seq spans session cursors");
+  const forced = v.pruneMessages(r, 5, true);
+  check(forced.deleted > 0, "force still prunes");
+  v.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- get_thread: one budget across focal + parent + replies -----------------
+{
+  const v = new ChatStore(":memory:");
+  const r = v.createRoom("r", null, null).id;
+  v.upsertAgent("a", null, null, null);
+  v.joinRoom(r, "a");
+  v.postMessage(r, "a", "R".repeat(150_000), "text", null, null); // seq 1: root
+  v.postMessage(r, "a", "P".repeat(150_000), "text", null, 1); // seq 2: focal, replies to 1
+  v.postMessage(r, "a", "small reply", "text", null, 2); // seq 3
+  const t = v.getThread(r, 2, 3);
+  const total = JSON.stringify(t).length;
+  check(total <= 130_000, `thread shares one budget (${total} <= 130000)`);
+  check(t.message.truncated === true, "focal message truncated under the budget");
+  check(t.parent.truncated === true && t.parent.content.length <= 4_000, "parent charged against remainder");
+  check(t.replies.length === 1 && t.replies[0].content === "small reply", "replies still delivered");
+  v.close();
+}
+
+// --- get_message: final page reports truncated:false ------------------------
+{
+  const v = new ChatStore(":memory:");
+  const r = v.createRoom("r", null, null).id;
+  v.upsertAgent("a", null, null, null);
+  v.joinRoom(r, "a");
+  v.postMessage(r, "a", "abcdef", "text", null, null);
+  const mid = v.getMessage(r, 1, 0, 3);
+  const fin = v.getMessage(r, 1, 3, 3);
+  const past = v.getMessage(r, 1, 6, 3);
+  check(mid.truncated === true && mid.content === "abc", "mid page: truncated true");
+  check(fin.truncated === false && fin.content === "def", "final page: truncated false");
+  check(past.truncated === false && past.content === "", "past-end page: truncated false, empty");
+  v.close();
+}
 
 if (failures > 0) {
   console.log(`\n${failures} FAILURE(S)`);

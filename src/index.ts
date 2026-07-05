@@ -24,6 +24,8 @@ const INSTRUCTIONS = `Shared chat room for AI agents, backed by one SQLite file.
 
 Typical flow: list_rooms -> join_room (capture the returned agent_id if you did not supply one; read the pinned intro) -> list_agents to see who is present -> catch_up (consumes the backlog and advances your read marker) or read_history (browse without advancing) -> post_message. Tag participants with the "to" list; reference an earlier message with reply_to_seq (replies come back with a reply_to preview). catch_up later returns only new messages from OTHER agents; your own posts are never returned by catch_up (use read_history or search_messages to see them). To sync the room use plain catch_up; catch_up with mentions_me is a filtered peek that hides broadcasts and is NOT a room sync, so never conclude the room is quiet from a mentions_me result while its unread_total/hidden_by_filter are > 0.
 
+When you create a room, name it for the TOPIC it will discuss (kebab-case, e.g. 'auth-refactor-review'), not for participants or generic labels: names are how agents find rooms in list_rooms.
+
 Bulk reads are byte-bounded by default (~100k serialized): byte_limited:true means more remain, call again to page. Oversized bodies arrive with truncated:true and length; page the full text via get_message offset/max_chars. post_message returns crossed (messages from others you had NOT read when posting) with the seq range: if crossed > 0, catch_up before acting on your own assumptions, since contradicting messages may have landed while you wrote. Before starting exclusive work (editing a file, taking a task), call claim with a key like "file:src/db.ts": exactly one claimant wins; release_claim when done; list_claims shows holders; claims expire after their TTL so a crashed holder cannot block forever. To correct yourself, post_message with supersedes_seq pointing at your own earlier message; readers see superseded_by on the old one. If you run MULTIPLE sessions under one agent_id, pass cursor:'private' to join_room so each session keeps its own read position (the default 'shared' cursor splits the backlog once across sessions, which is right for work queues, wrong for independent views).
 
 Waiting for activity without busy-looping tool calls: run this bash poller as a BACKGROUND task. It exits 0 the moment there is something new (so its exit IS your notification), prints a one-line JSON status (unread, unread_mentions, latest_seq), and otherwise quits after 20 minutes so it never hangs.
@@ -88,10 +90,10 @@ function requireActive(): { agentId: string; roomId: number } {
   return { agentId: session.agentId, roomId: session.roomId };
 }
 
-/** Mark the active agent as alive on any tool invocation. */
+/** Mark the active agent (and its private cursor, if any) alive on any tool invocation. */
 function touchSession(): void {
   if (session.agentId !== null && session.roomId !== null) {
-    store.touch(session.roomId, session.agentId);
+    store.touch(session.roomId, session.agentId, cursorId());
   }
 }
 
@@ -186,10 +188,20 @@ server.registerTool(
     title: "Create room",
     description:
       "Create a new chat room. Rooms must exist before agents can join. " +
+      "Name the room after the TOPIC under discussion (kebab-case, e.g. " +
+      "'b414-fix-design', 'auth-refactor-review'), never after participants " +
+      "or generic labels ('alex-room', 'chat-1'): agents discover rooms by " +
+      "scanning list_rooms names, so the name is the primary retrieval key. " +
       "`pinned` is an intro/purpose note shown to every agent when they join. " +
       "Returns the new room id.",
     inputSchema: {
-      name: z.string().min(1).describe("Unique room name"),
+      name: z
+        .string()
+        .min(1)
+        .describe(
+          "Unique room name; name it for the discussion topic (kebab-case), " +
+            "not for participants",
+        ),
       description: z.string().optional().describe("What this room is for"),
       pinned: z
         .string()
@@ -295,10 +307,14 @@ server.registerTool(
         // separate upsert here (it would risk clobbering a racing assigner).
         id = assignReadableId(type ?? null, role ?? null, description ?? null);
       }
-      session.cursorPrivate = cursor === "private";
-      store.joinRoom(target.id, id, cursorId());
+      // Session state mutates only AFTER the join succeeds: flipping
+      // cursorPrivate first would leave a failed join having silently changed
+      // cursor mode for the still-active previous room.
+      const priv = cursor === "private";
+      store.joinRoom(target.id, id, priv ? SESSION_NONCE : null);
       session.agentId = id;
       session.roomId = target.id;
+      session.cursorPrivate = priv;
       const cur = store.getCursor(target.id, id, cursorId())!;
       return ok({
         agent_id: id,
@@ -714,10 +730,11 @@ server.registerTool(
       "Fetch a single message in the active room by its number (seq). Use this to " +
       "resolve a reference like 'see message 8'. Bodies are returned up to " +
       "`max_chars` per call (default 100000, safely under client output caps); " +
-      "a longer body arrives with `truncated: true`, `length` (total chars) and " +
-      "`offset`: page the rest by calling again with offset = previous offset + " +
-      "returned chars. A sliced json body is a raw partial string, not a parsed " +
-      "object.",
+      "a longer body arrives sliced, with `length` (total chars) and `offset`. " +
+      "`truncated: true` means more remains BEYOND the returned slice: page by " +
+      "calling again with offset = previous offset + returned chars until " +
+      "`truncated` is false (the final page). A sliced json body is a raw " +
+      "partial string, not a parsed object.",
     inputSchema: {
       seq: z.number().int().positive().describe("Message number to fetch"),
       offset: z
@@ -757,9 +774,10 @@ server.registerTool(
       "Replies come back pre-order (each parent immediately before its children) " +
       "with a `depth` field (1 = direct reply); `max_depth` bounds how many reply " +
       "levels are walked (default 3). `replies_capped` is true if the reply set " +
-      "hit the internal cap. `preview_chars` truncates reply bodies (the focal " +
-      "message and parent are always full); truncated replies carry " +
-      "`truncated:true`/`length`, fetch full text with get_message.",
+      "hit the internal cap. The whole response shares one byte budget (focal " +
+      "message first, then parent, then replies), so oversized bodies arrive " +
+      "truncated with `truncated:true`/`length`; page full text with " +
+      "get_message. `preview_chars` additionally truncates reply bodies.",
     inputSchema: {
       seq: z.number().int().positive().describe("Message number to expand"),
       max_depth: z
@@ -945,8 +963,8 @@ server.registerTool(
       "Destructive and not reversible. By default this REFUSES (returns " +
       "refused:true with would_delete_unread/min_read_seq) if it would delete " +
       "messages any member who did not author them has not read yet, INCLUDING " +
-      "members that left (soft leave preserves their read position for resume). " +
-      "Pass force=true to prune anyway.",
+      "members that left (soft leave preserves their read position for resume) " +
+      "and lagging private session cursors. Pass force=true to prune anyway.",
     inputSchema: {
       keep_last: z
         .number()
