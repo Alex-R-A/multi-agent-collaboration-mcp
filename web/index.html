@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>agent-chat viewer</title>
+    <style>
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        height: 100vh;
+        display: flex;
+        flex-direction: column;
+        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        color: #1a1a1a;
+        background: #f4f4f5;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 16px;
+        background: #fff;
+        border-bottom: 1px solid #ddd;
+      }
+      header h1 {
+        margin: 0;
+        font-size: 14px;
+        font-weight: 600;
+        color: #6b7280;
+        letter-spacing: 0.02em;
+      }
+      #room-title {
+        font-weight: 600;
+      }
+      button {
+        font: inherit;
+        cursor: pointer;
+      }
+      #back {
+        border: 1px solid #ccc;
+        background: #fff;
+        border-radius: 6px;
+        padding: 4px 10px;
+      }
+      #back:hover {
+        border-color: #999;
+      }
+      main {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+      }
+      #rooms {
+        flex: 1;
+        overflow: auto;
+        padding: 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 8px;
+      }
+      .room {
+        text-align: left;
+        border: 1px solid #ddd;
+        background: #fff;
+        border-radius: 8px;
+        padding: 12px 14px;
+        display: flex;
+        flex-direction: column;
+        gap: 3px;
+      }
+      .room:hover {
+        border-color: #888;
+      }
+      .room-name {
+        font-weight: 600;
+      }
+      .room-meta {
+        font-size: 12px;
+        color: #6b7280;
+      }
+      .room-desc {
+        font-size: 13px;
+        color: #4b5563;
+        margin-top: 2px;
+      }
+      .placeholder {
+        padding: 24px;
+        color: #6b7280;
+      }
+      #chat {
+        flex: 1;
+        min-height: 0;
+        display: flex;
+      }
+      #messages {
+        flex: 1;
+        overflow: auto;
+        padding: 12px 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+      }
+      .msg {
+        padding: 4px 9px;
+        border-radius: 4px;
+        line-height: 1.45;
+        white-space: pre-wrap;
+        word-break: break-word;
+      }
+      .who {
+        font-weight: 600;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>agent-chat</h1>
+      <button id="back" hidden>&larr; Rooms</button>
+      <span id="room-title"></span>
+    </header>
+    <main>
+      <section id="rooms"></section>
+      <section id="chat" hidden><div id="messages"></div></section>
+    </main>
+
+    <script>
+      const STORAGE_KEY = "agent-chat.room";
+      const POLL_MS = 1500;
+
+      const el = {
+        rooms: document.getElementById("rooms"),
+        chat: document.getElementById("chat"),
+        messages: document.getElementById("messages"),
+        back: document.getElementById("back"),
+        title: document.getElementById("room-title"),
+      };
+
+      let currentRoom = null; // { id, name }
+      let lastSeq = 0;
+      let pollTimer = null;
+
+      el.back.addEventListener("click", showRooms);
+
+      // Stable, subtle per-username background so each agent's lines share a tint.
+      function userColor(name) {
+        let h = 0;
+        for (let i = 0; i < name.length; i++)
+          h = (h * 31 + name.charCodeAt(i)) % 360;
+        return `hsl(${h}, 60%, 92%)`;
+      }
+
+      async function fetchJson(url) {
+        const r = await fetch(url);
+        return r.json();
+      }
+
+      async function showRooms() {
+        stopPolling();
+        currentRoom = null;
+        el.chat.hidden = true;
+        el.back.hidden = true;
+        el.title.textContent = "";
+        el.rooms.hidden = false;
+        el.rooms.innerHTML = '<div class="placeholder">Loading...</div>';
+
+        const data = await fetchJson("/api/rooms");
+        el.rooms.textContent = "";
+        if (data.error) return placeholder(el.rooms, data.error);
+        if (!data.rooms.length)
+          return placeholder(el.rooms, "No chat rooms yet.");
+
+        for (const room of data.rooms) {
+          const card = document.createElement("button");
+          card.className = "room";
+
+          const name = document.createElement("div");
+          name.className = "room-name";
+          name.textContent = room.name;
+          card.append(name);
+
+          const meta = document.createElement("div");
+          meta.className = "room-meta";
+          meta.textContent =
+            `${room.messages} messages · ${room.members} present` +
+            (room.last_activity ? ` · last ${room.last_activity} UTC` : "");
+          card.append(meta);
+
+          if (room.description) {
+            const desc = document.createElement("div");
+            desc.className = "room-desc";
+            desc.textContent = room.description;
+            card.append(desc);
+          }
+
+          card.addEventListener("click", () => openRoom(room.id, room.name));
+          el.rooms.append(card);
+        }
+      }
+
+      function placeholder(container, text) {
+        const p = document.createElement("div");
+        p.className = "placeholder";
+        p.textContent = text;
+        container.append(p);
+      }
+
+      function openRoom(id, name) {
+        currentRoom = { id, name };
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(currentRoom));
+        lastSeq = 0;
+        el.messages.textContent = "";
+        el.rooms.hidden = true;
+        el.chat.hidden = false;
+        el.back.hidden = false;
+        el.title.textContent = name;
+        loadNew(true).then(startPolling);
+      }
+
+      function nearBottom() {
+        const m = el.messages;
+        return m.scrollHeight - m.scrollTop - m.clientHeight < 80;
+      }
+
+      async function loadNew(initial) {
+        if (!currentRoom) return;
+        const stick = initial || nearBottom();
+        const data = await fetchJson(
+          `/api/messages?room=${currentRoom.id}&after=${lastSeq}&limit=500`,
+        );
+        if (!currentRoom || data.error || !data.messages) return;
+        for (const msg of data.messages) {
+          el.messages.append(renderMessage(msg));
+          if (msg.seq > lastSeq) lastSeq = msg.seq;
+        }
+        if (stick && data.messages.length)
+          el.messages.scrollTop = el.messages.scrollHeight;
+      }
+
+      function renderMessage(msg) {
+        const row = document.createElement("div");
+        row.className = "msg";
+        row.style.background = userColor(msg.from);
+
+        const who = document.createElement("span");
+        who.className = "who";
+        who.textContent = msg.from + ": ";
+
+        const text = document.createElement("span");
+        // textContent, never innerHTML: message bodies are agent-controlled.
+        text.textContent =
+          typeof msg.body === "string" ? msg.body : String(msg.body);
+
+        row.append(who, text);
+        return row;
+      }
+
+      function startPolling() {
+        stopPolling();
+        pollTimer = setInterval(() => loadNew(false), POLL_MS);
+      }
+      function stopPolling() {
+        if (pollTimer) clearInterval(pollTimer);
+        pollTimer = null;
+      }
+
+      // Reopen the remembered room on load, else show the room list.
+      (function init() {
+        const saved = localStorage.getItem(STORAGE_KEY);
+        if (saved) {
+          try {
+            const r = JSON.parse(saved);
+            if (r && r.id) return openRoom(r.id, r.name);
+          } catch {}
+        }
+        showRooms();
+      })();
+    </script>
+  </body>
+</html>
