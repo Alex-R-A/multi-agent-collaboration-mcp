@@ -24,6 +24,8 @@ const INSTRUCTIONS = `Shared chat room for AI agents, backed by one SQLite file.
 
 Typical flow: list_rooms -> join_room (capture the returned agent_id if you did not supply one; read the pinned intro) -> list_agents to see who is present -> catch_up (consumes the backlog and advances your read marker) or read_history (browse without advancing) -> post_message. Tag participants with the "to" list; reference an earlier message with reply_to_seq (replies come back with a reply_to preview). catch_up later returns only new messages from OTHER agents; your own posts are never returned by catch_up (use read_history or search_messages to see them). To sync the room use plain catch_up; catch_up with mentions_me is a filtered peek that hides broadcasts and is NOT a room sync, so never conclude the room is quiet from a mentions_me result while its unread_total/hidden_by_filter are > 0.
 
+Bulk reads are byte-bounded by default (~100k serialized): byte_limited:true means more remain, call again to page. Oversized bodies arrive with truncated:true and length; page the full text via get_message offset/max_chars. post_message returns crossed (messages from others you had NOT read when posting) with the seq range: if crossed > 0, catch_up before acting on your own assumptions, since contradicting messages may have landed while you wrote. Before starting exclusive work (editing a file, taking a task), call claim with a key like "file:src/db.ts": exactly one claimant wins; release_claim when done; list_claims shows holders; claims expire after their TTL so a crashed holder cannot block forever. To correct yourself, post_message with supersedes_seq pointing at your own earlier message; readers see superseded_by on the old one. If you run MULTIPLE sessions under one agent_id, pass cursor:'private' to join_room so each session keeps its own read position (the default 'shared' cursor splits the backlog once across sessions, which is right for work queues, wrong for independent views).
+
 Waiting for activity without busy-looping tool calls: run this bash poller as a BACKGROUND task. It exits 0 the moment there is something new (so its exit IS your notification), prints a one-line JSON status (unread, unread_mentions, latest_seq), and otherwise quits after 20 minutes so it never hangs.
 
   bash ${POLLER} --room <id|name> --agent <your_agent_id> [--mentions-only]
@@ -32,18 +34,34 @@ Call catch_up first so your read marker is the baseline; the poller then fires o
 
 // One stdio server process serves one agent. We remember its identity and
 // active room for the session so the agent need not repeat them on every call.
-const session: { agentId: string | null; roomId: number | null } = {
+const session: {
+  agentId: string | null;
+  roomId: number | null;
+  cursorPrivate: boolean;
+} = {
   agentId: null,
   roomId: null,
+  cursorPrivate: false,
 };
+
+// Distinguishes this process's private read cursor (join_room cursor:'private')
+// from other sessions running under the same agent_id.
+const SESSION_NONCE = randomUUID();
+
+/** The session-cursor key for store calls: a nonce in private mode, else null. */
+function cursorId(): string | null {
+  return session.cursorPrivate ? SESSION_NONCE : null;
+}
 
 type ToolResult = {
   content: { type: "text"; text: string }[];
   isError?: boolean;
 };
 
+// Compact (not pretty-printed) JSON: bulk reads run against a hard client
+// output cap, and indentation wastes budget that could carry messages.
 function ok(data: unknown): ToolResult {
-  return { content: [{ type: "text", text: JSON.stringify(data, null, 2) }] };
+  return { content: [{ type: "text", text: JSON.stringify(data) }] };
 }
 
 function fail(message: string): ToolResult {
@@ -223,7 +241,12 @@ server.registerTool(
       "agents understand who you are. Read the returned `pinned` intro first. " +
       "Sets this room as active for the session. If the returned `server_stale` " +
       "is true, this MCP server is running outdated code; tell the user to " +
-      "reconnect it (see server_info for details).",
+      "reconnect it (see server_info for details). `cursor` controls the read " +
+      "position when several sessions share one agent_id: 'shared' (default) is " +
+      "one marker for the identity, so concurrent sessions SPLIT the backlog " +
+      "(each message delivered once, work-queue style); 'private' gives THIS " +
+      "session its own cursor (initialized from the shared marker), so it sees " +
+      "the full stream independently of its twins.",
     inputSchema: {
       room: z.string().min(1).describe("Room id or name to join"),
       agent_id: z
@@ -244,9 +267,17 @@ server.registerTool(
         .string()
         .optional()
         .describe("Short description of who you are / what you do"),
+      cursor: z
+        .enum(["shared", "private"])
+        .optional()
+        .describe(
+          "'shared' (default): one read marker per identity, concurrent " +
+            "sessions split the backlog. 'private': this session keeps its own " +
+            "read position.",
+        ),
     },
   },
-  async ({ room, agent_id, type, role, description }) => {
+  async ({ room, agent_id, type, role, description, cursor }) => {
     try {
       touchSession();
       const target = store.resolveRoom(room);
@@ -264,18 +295,20 @@ server.registerTool(
         // separate upsert here (it would risk clobbering a racing assigner).
         id = assignReadableId(type ?? null, role ?? null, description ?? null);
       }
-      store.joinRoom(target.id, id);
+      session.cursorPrivate = cursor === "private";
+      store.joinRoom(target.id, id, cursorId());
       session.agentId = id;
       session.roomId = target.id;
-      const membership = store.getMembership(target.id, id)!;
+      const cur = store.getCursor(target.id, id, cursorId())!;
       return ok({
         agent_id: id,
         room_id: target.id,
         room_name: target.name,
         description: target.description,
         pinned: target.pinned,
-        last_read_seq: membership.last_read_seq,
-        unread: store.unreadCount(target.id, membership.last_read_seq, id),
+        cursor: session.cursorPrivate ? "private" : "shared",
+        last_read_seq: cur.last_read_seq,
+        unread: store.unreadCount(target.id, cur.last_read_seq, id),
         members: store.listAgents(target.id, 5).filter((a) => a.present).length,
         // Surface staleness at the session-start checkpoint, where it is seen
         // once without per-call noise. True => this server is running old code;
@@ -302,9 +335,10 @@ server.registerTool(
     try {
       touchSession();
       const { agentId, roomId } = requireActive();
-      const left = store.leaveRoom(roomId, agentId);
+      const left = store.leaveRoom(roomId, agentId, cursorId());
       session.agentId = null;
       session.roomId = null;
+      session.cursorPrivate = false;
       return ok({ left, room_id: roomId });
     } catch (e) {
       return fail(asMessage(e));
@@ -332,16 +366,17 @@ server.registerTool(
         session.roomId = null;
         return ok({ joined: false, note: "active room was deleted; rejoin" });
       }
-      const membership = store.getMembership(session.roomId, session.agentId);
+      const cur = store.getCursor(session.roomId, session.agentId, cursorId());
       return ok({
         joined: true,
         agent_id: session.agentId,
         room_id: session.roomId,
         room_name: roomRow?.name ?? null,
-        last_read_seq: membership?.last_read_seq ?? 0,
+        cursor: session.cursorPrivate ? "private" : "shared",
+        last_read_seq: cur?.last_read_seq ?? 0,
         unread: store.unreadCount(
           session.roomId,
-          membership?.last_read_seq ?? 0,
+          cur?.last_read_seq ?? 0,
           session.agentId,
         ),
       });
@@ -401,7 +436,13 @@ server.registerTool(
       "joined so the tag reaches no one, `left` = joined then left, `idle` = " +
       "present but not seen recently, `active` = present and seen recently), " +
       "`idle_seconds` since last seen, and `last_read_seq` (compare to this " +
-      "`seq`: if below it, they have not read this message yet).",
+      "`seq`: if below it, they have not read this message yet). The response's " +
+      "`crossed` counts messages from others YOU had not read when you posted " +
+      "(with `crossed_range`): if > 0, catch_up, since contradicting messages " +
+      "may have landed while you wrote. `supersedes_seq` marks YOUR OWN earlier " +
+      "message as superseded by this one (readers see `superseded_by` on it); " +
+      "use it for corrections/retractions instead of leaving both versions " +
+      "standing with equal weight.",
     inputSchema: {
       content: z
         .union([z.string(), z.record(z.any()), z.array(z.any())])
@@ -417,9 +458,18 @@ server.registerTool(
         .positive()
         .optional()
         .describe("seq of a message in this room you are replying to"),
+      supersedes_seq: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "seq of YOUR OWN earlier message that this message supersedes " +
+            "(correction/retraction)",
+        ),
     },
   },
-  async ({ content, to, reply_to_seq }) => {
+  async ({ content, to, reply_to_seq, supersedes_seq }) => {
     try {
       touchSession();
       const { agentId, roomId } = requireActive();
@@ -439,19 +489,24 @@ server.registerTool(
       const recipients = mentions
         ? store.recipientStatus(roomId, mentions, 5)
         : [];
-      const { seq } = store.postMessage(
+      const { seq, crossed, crossed_range } = store.postMessage(
         roomId,
         agentId,
         body,
         isText ? "text" : "json",
         mentions,
         reply_to_seq ?? null,
+        supersedes_seq ?? null,
+        cursorId(),
       );
       return ok({
         seq,
         format: isText ? "text" : "json",
         to: mentions,
         reply_to_seq: reply_to_seq ?? null,
+        supersedes_seq: supersedes_seq ?? null,
+        crossed,
+        crossed_range,
         recipients,
       });
     } catch (e) {
@@ -510,9 +565,20 @@ server.registerTool(
             "length); fetch the complete body with get_message. A truncated " +
             "json message comes back as a partial string, not a parsed object.",
         ),
+      max_bytes: z
+        .number()
+        .int()
+        .min(1000)
+        .max(400_000)
+        .optional()
+        .describe(
+          "Serialized-size budget for this page (default 100000). The marker " +
+            "only advances over returned messages, so nothing is skipped: " +
+            "`byte_limited: true` means more remain, call again.",
+        ),
     },
   },
-  async ({ limit, mentions_me, after_seq, preview_chars }) => {
+  async ({ limit, mentions_me, after_seq, preview_chars, max_bytes }) => {
     try {
       touchSession();
       const { agentId, roomId } = requireActive();
@@ -523,6 +589,8 @@ server.registerTool(
         mentions_me ? agentId : undefined,
         after_seq,
         preview_chars,
+        max_bytes,
+        cursorId(),
       );
       return ok(result);
     } catch (e) {
@@ -574,9 +642,20 @@ server.registerTool(
             "length); fetch the complete body with get_message. A truncated " +
             "json message comes back as a partial string, not a parsed object.",
         ),
+      max_bytes: z
+        .number()
+        .int()
+        .min(1000)
+        .max(400_000)
+        .optional()
+        .describe(
+          "Serialized-size budget for this page (default 100000); " +
+            "`byte_limited: true` means the page was trimmed, page on with " +
+            "before_seq.",
+        ),
     },
   },
-  async ({ limit, before_seq, mentions_me, preview_chars }) => {
+  async ({ limit, before_seq, mentions_me, preview_chars, max_bytes }) => {
     try {
       touchSession();
       const { agentId, roomId } = requireActive();
@@ -587,6 +666,7 @@ server.registerTool(
           before_seq,
           mentions_me ? agentId : undefined,
           preview_chars,
+          max_bytes,
         ),
       );
     } catch (e) {
@@ -619,7 +699,7 @@ server.registerTool(
     try {
       touchSession();
       const { agentId, roomId } = requireActive();
-      return ok(store.markRead(roomId, agentId, seq));
+      return ok(store.markRead(roomId, agentId, seq, cursorId()));
     } catch (e) {
       return fail(asMessage(e));
     }
@@ -632,16 +712,34 @@ server.registerTool(
     title: "Get one message",
     description:
       "Fetch a single message in the active room by its number (seq). Use this to " +
-      "resolve a reference like 'see message 8'.",
+      "resolve a reference like 'see message 8'. Bodies are returned up to " +
+      "`max_chars` per call (default 100000, safely under client output caps); " +
+      "a longer body arrives with `truncated: true`, `length` (total chars) and " +
+      "`offset`: page the rest by calling again with offset = previous offset + " +
+      "returned chars. A sliced json body is a raw partial string, not a parsed " +
+      "object.",
     inputSchema: {
       seq: z.number().int().positive().describe("Message number to fetch"),
+      offset: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Character offset to start the body slice at (default 0)"),
+      max_chars: z
+        .number()
+        .int()
+        .min(100)
+        .max(400_000)
+        .optional()
+        .describe("Max body characters to return (default 100000)"),
     },
   },
-  async ({ seq }) => {
+  async ({ seq, offset, max_chars }) => {
     try {
       touchSession();
       const { roomId } = requireActive();
-      const msg = store.getMessage(roomId, seq);
+      const msg = store.getMessage(roomId, seq, offset ?? 0, max_chars);
       if (!msg) return fail(`no message ${seq} in this room`);
       return ok(msg);
     } catch (e) {
@@ -740,7 +838,96 @@ server.registerTool(
     try {
       touchSession();
       const { roomId } = requireActive();
-      return ok({ matches: store.searchMessages(roomId, query, limit ?? 20) });
+      return ok(store.searchMessages(roomId, query, limit ?? 20));
+    } catch (e) {
+      return fail(asMessage(e));
+    }
+  },
+);
+
+server.registerTool(
+  "claim",
+  {
+    title: "Claim a resource",
+    description:
+      "Claim exclusive (advisory) ownership of a named resource in the active " +
+      "room BEFORE starting work on it, e.g. key 'file:src/db.ts' or " +
+      "'task:B-414'. Atomic single-winner: exactly one of two simultaneous " +
+      "claimants is granted, unlike social 'I claim X' posts, which can cross. " +
+      "Returns granted:true with expires_at, or granted:false with the current " +
+      "holder. Claims expire after ttl_seconds (default 900), so a crashed " +
+      "holder cannot block forever; re-claim your own key to renew. Advisory " +
+      "only: it does not physically lock anything, cooperating agents must " +
+      "check it. Ownership is per agent_id.",
+    inputSchema: {
+      key: z
+        .string()
+        .min(1)
+        .max(500)
+        .describe("Resource name, e.g. 'file:src/db.ts' or 'task:refactor-x'"),
+      ttl_seconds: z
+        .number()
+        .int()
+        .positive()
+        .max(86_400)
+        .optional()
+        .describe("Claim lifetime in seconds (default 900 = 15 minutes)"),
+      note: z
+        .string()
+        .optional()
+        .describe("What you are doing with it (shown to other agents)"),
+    },
+  },
+  async ({ key, ttl_seconds, note }) => {
+    try {
+      touchSession();
+      const { agentId, roomId } = requireActive();
+      return ok(
+        store.claimResource(roomId, key, agentId, ttl_seconds ?? 900, note ?? null),
+      );
+    } catch (e) {
+      return fail(asMessage(e));
+    }
+  },
+);
+
+server.registerTool(
+  "release_claim",
+  {
+    title: "Release a claim",
+    description:
+      "Release a claim you hold so others can take it. Expired claims can be " +
+      "released by anyone; an active claim only by its holder.",
+    inputSchema: {
+      key: z.string().min(1).max(500).describe("Resource name to release"),
+    },
+  },
+  async ({ key }) => {
+    try {
+      touchSession();
+      const { agentId, roomId } = requireActive();
+      return ok(store.releaseClaim(roomId, key, agentId));
+    } catch (e) {
+      return fail(asMessage(e));
+    }
+  },
+);
+
+server.registerTool(
+  "list_claims",
+  {
+    title: "List claims",
+    description:
+      "List active (unexpired) claims in the active room: key, holder, note, " +
+      "and seconds until expiry. Check before starting work that overlaps " +
+      "someone's claim.",
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      touchSession();
+      const { roomId } = requireActive();
+      return ok({ claims: store.listClaims(roomId) });
     } catch (e) {
       return fail(asMessage(e));
     }

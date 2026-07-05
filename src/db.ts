@@ -16,6 +16,15 @@ function resolveDbPath(): string {
 /** SQLite's default maximum string/blob byte length (SQLITE_MAX_LENGTH). */
 export const SQLITE_MAX_LENGTH = 1_000_000_000;
 
+/**
+ * Default serialized-size budget for bulk message reads (catch_up,
+ * read_history, get_thread replies, search_messages). Chosen conservatively
+ * below observed MCP client output caps (~200k chars): an oversized response
+ * fails AFTER the read marker committed, silently skipping messages, so the
+ * budget must make responses that always fit.
+ */
+export const DEFAULT_MAX_BYTES = 100_000;
+
 export type RoomRow = {
   id: number;
   name: string;
@@ -69,10 +78,16 @@ export type MessageRow = {
   to: string[] | null;
   reply_to: ReplyRef | null;
   at: string;
-  /** Present only when a preview_chars cap truncated the body. */
+  /** Present only when a preview/byte/slice cap truncated the body. */
   truncated?: boolean;
   /** Full character length of the original body (only when truncated). */
   length?: number;
+  /** Character offset of a get_message slice (only when slicing). */
+  offset?: number;
+  /** seq of this author's earlier message that this one supersedes. */
+  supersedes?: number;
+  /** seq of the latest message that supersedes this one. */
+  superseded_by?: number;
 };
 
 type RawMessage = {
@@ -87,11 +102,19 @@ type RawMessage = {
   reply_from: string | null;
   reply_preview: string | null;
   created_at: string;
+  supersedes_seq: number | null;
+  superseded_by: number | null;
 };
 
 // A message row joined to its author and (for reply previews) its parent.
+// superseded_by resolves ONE hop (the latest direct superseder); readers follow
+// chains by looking at that message's own superseded_by.
 const MESSAGE_COLS = `g.seq, g.agent_id, a.type AS from_type, a.role AS from_role,
                       g.format, g.body, g.mentions, g.reply_to_seq, g.created_at,
+                      g.supersedes_seq,
+                      (SELECT s.seq FROM messages s
+                        WHERE s.room_id = g.room_id AND s.supersedes_seq = g.seq
+                        ORDER BY s.seq DESC LIMIT 1) AS superseded_by,
                       p.agent_id AS reply_from, substr(p.body, 1, 101) AS reply_preview`;
 
 const MESSAGE_FROM = `messages g
@@ -184,10 +207,37 @@ export class ChatStore {
     this.ensureColumn("messages", "format", "TEXT NOT NULL DEFAULT 'text'");
     this.ensureColumn("messages", "reply_to_seq", "INTEGER");
     this.ensureColumn("messages", "mentions", "TEXT");
+    this.ensureColumn("messages", "supersedes_seq", "INTEGER");
 
     this.db.exec(`
       CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages(room_id, seq);
       CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(room_id, reply_to_seq);
+      CREATE INDEX IF NOT EXISTS idx_messages_supersedes ON messages(room_id, supersedes_seq);
+
+      -- Per-session read cursors for identities running multiple concurrent
+      -- sessions (join_room cursor:'private'). The memberships marker stays the
+      -- identity-level read receipt (advanced to the MAX across sessions).
+      CREATE TABLE IF NOT EXISTS session_markers (
+        room_id       INTEGER NOT NULL REFERENCES rooms(id),
+        agent_id      TEXT NOT NULL REFERENCES agents(id),
+        session_id    TEXT NOT NULL,
+        last_read_seq INTEGER NOT NULL DEFAULT 0,
+        updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (room_id, agent_id, session_id)
+      );
+
+      -- Advisory single-winner work claims with TTL. Purely advisory: nothing
+      -- fences the claimed resource itself; expiry frees claims from crashed
+      -- holders.
+      CREATE TABLE IF NOT EXISTS claims (
+        room_id    INTEGER NOT NULL REFERENCES rooms(id),
+        key        TEXT NOT NULL,
+        agent_id   TEXT NOT NULL,
+        note       TEXT,
+        expires_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        PRIMARY KEY (room_id, key)
+      );
     `);
 
     // Full-text search over message bodies. External-content FTS5 mirrors
@@ -328,8 +378,13 @@ export class ChatStore {
     return info.changes > 0;
   }
 
-  /** Join (or rejoin) a room: clears any prior leave and refreshes liveness. */
-  joinRoom(roomId: number, agentId: string): void {
+  /**
+   * Join (or rejoin) a room: clears any prior leave and refreshes liveness.
+   * With sessionId (a private cursor), also ensure a per-session read cursor,
+   * initialized from the identity marker so a new session starts where the
+   * identity left off; an existing session row keeps its position.
+   */
+  joinRoom(roomId: number, agentId: string, sessionId: string | null = null): void {
     this.db
       .prepare(
         "INSERT OR IGNORE INTO memberships (room_id, agent_id) VALUES (?, ?)",
@@ -341,10 +396,33 @@ export class ChatStore {
          WHERE room_id = ? AND agent_id = ?`,
       )
       .run(roomId, agentId);
+    if (sessionId !== null) {
+      this.db
+        .prepare(
+          `INSERT OR IGNORE INTO session_markers (room_id, agent_id, session_id, last_read_seq)
+           VALUES (?, ?, ?, (SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?))`,
+        )
+        .run(roomId, agentId, sessionId, roomId, agentId);
+      // GC: session cursors are per-process and abandoned when processes die.
+      this.db
+        .prepare(
+          "DELETE FROM session_markers WHERE room_id = ? AND updated_at < datetime('now', '-7 days')",
+        )
+        .run(roomId);
+    }
   }
 
   /** Soft leave: keep the row (and read position) but mark not present. */
-  leaveRoom(roomId: number, agentId: string): boolean {
+  leaveRoom(roomId: number, agentId: string, sessionId: string | null = null): boolean {
+    if (sessionId !== null) {
+      // The session cursor's reads are already folded into the identity marker
+      // (MAX on advance), so dropping the row loses nothing on resume.
+      this.db
+        .prepare(
+          "DELETE FROM session_markers WHERE room_id = ? AND agent_id = ? AND session_id = ?",
+        )
+        .run(roomId, agentId, sessionId);
+    }
     const info = this.db
       .prepare(
         `UPDATE memberships SET left_at = datetime('now'), last_seen = datetime('now')
@@ -379,6 +457,65 @@ export class ChatStore {
       .get(roomId, agentId) as
       | { last_read_seq: number; left_at: string | null }
       | undefined;
+  }
+
+  /**
+   * Read the effective cursor: the per-session position when sessionId is set
+   * (falling back to the identity marker if the session row does not exist
+   * yet), else the identity marker. Read-only, so it is safe inside a deferred
+   * (read) transaction.
+   */
+  getCursor(
+    roomId: number,
+    agentId: string,
+    sessionId: string | null,
+  ): { last_read_seq: number; left_at: string | null } | undefined {
+    const membership = this.getMembership(roomId, agentId);
+    if (!membership || sessionId === null) return membership;
+    const s = this.db
+      .prepare(
+        "SELECT last_read_seq FROM session_markers WHERE room_id = ? AND agent_id = ? AND session_id = ?",
+      )
+      .get(roomId, agentId, sessionId) as { last_read_seq: number } | undefined;
+    return s
+      ? { last_read_seq: s.last_read_seq, left_at: membership.left_at }
+      : membership;
+  }
+
+  /**
+   * Move the cursor to seq. Shared mode sets the identity marker exactly
+   * (rewind allowed, preserving mark_read semantics). Session mode upserts the
+   * session cursor exactly and raises the identity marker monotonically to the
+   * MAX across sessions, keeping it meaningful as "some session of this
+   * identity has read this far" for read receipts.
+   */
+  private setCursor(
+    roomId: number,
+    agentId: string,
+    sessionId: string | null,
+    seq: number,
+  ): void {
+    if (sessionId === null) {
+      this.db
+        .prepare(
+          "UPDATE memberships SET last_read_seq = ? WHERE room_id = ? AND agent_id = ?",
+        )
+        .run(seq, roomId, agentId);
+      return;
+    }
+    this.db
+      .prepare(
+        `INSERT INTO session_markers (room_id, agent_id, session_id, last_read_seq)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
+           last_read_seq = excluded.last_read_seq, updated_at = datetime('now')`,
+      )
+      .run(roomId, agentId, sessionId, seq);
+    this.db
+      .prepare(
+        "UPDATE memberships SET last_read_seq = max(last_read_seq, ?) WHERE room_id = ? AND agent_id = ?",
+      )
+      .run(seq, roomId, agentId);
   }
 
   listAgents(
@@ -424,7 +561,14 @@ export class ChatStore {
 
   // --- messages ----------------------------------------------------------
 
-  /** Insert a message, allocating the next per-room seq atomically. */
+  /**
+   * Insert a message, allocating the next per-room seq atomically. Also
+   * reports the poster's blind spot: `crossed` counts messages from OTHERS the
+   * poster had not read at post time (cursor-relative), with the seq range, so
+   * a poster learns in the same call that it may have posted over unseen
+   * traffic. supersedesSeq marks the poster's OWN earlier message as
+   * superseded by this one (validated in-transaction).
+   */
   postMessage(
     roomId: number,
     agentId: string,
@@ -432,10 +576,48 @@ export class ChatStore {
     format: "text" | "json",
     mentions: string[] | null,
     replyToSeq: number | null,
-  ): { id: number; seq: number } {
+    supersedesSeq: number | null = null,
+    sessionId: string | null = null,
+  ): {
+    id: number;
+    seq: number;
+    crossed: number;
+    crossed_range: { from_seq: number; to_seq: number } | null;
+  } {
     const mentionsJson =
       mentions && mentions.length > 0 ? JSON.stringify(mentions) : null;
     const tx = this.db.transaction(() => {
+      if (supersedesSeq !== null) {
+        const target = this.db
+          .prepare(
+            "SELECT agent_id FROM messages WHERE room_id = ? AND seq = ?",
+          )
+          .get(roomId, supersedesSeq) as { agent_id: string } | undefined;
+        if (!target) {
+          throw new Error(
+            `supersedes_seq ${supersedesSeq} does not exist in this room`,
+          );
+        }
+        if (target.agent_id !== agentId) {
+          throw new Error(
+            `supersedes_seq ${supersedesSeq} was written by ${target.agent_id}; you can only supersede your own messages`,
+          );
+        }
+      }
+      // Crossing report: computed before the insert so "unread" excludes the
+      // message being posted.
+      const cursor = this.getCursor(roomId, agentId, sessionId);
+      const from = cursor?.last_read_seq ?? 0;
+      const crossing = this.db
+        .prepare(
+          `SELECT COUNT(*) AS c, MIN(seq) AS mn, MAX(seq) AS mx FROM messages
+           WHERE room_id = ? AND seq > ? AND agent_id != ?`,
+        )
+        .get(roomId, from, agentId) as {
+        c: number;
+        mn: number | null;
+        mx: number | null;
+      };
       const { next } = this.db
         .prepare(
           "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM messages WHERE room_id = ?",
@@ -443,11 +625,28 @@ export class ChatStore {
         .get(roomId) as { next: number };
       const info = this.db
         .prepare(
-          `INSERT INTO messages (room_id, seq, agent_id, format, body, mentions, reply_to_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO messages (room_id, seq, agent_id, format, body, mentions, reply_to_seq, supersedes_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
         )
-        .run(roomId, next, agentId, format, body, mentionsJson, replyToSeq);
-      return { id: Number(info.lastInsertRowid), seq: next };
+        .run(
+          roomId,
+          next,
+          agentId,
+          format,
+          body,
+          mentionsJson,
+          replyToSeq,
+          supersedesSeq,
+        );
+      return {
+        id: Number(info.lastInsertRowid),
+        seq: next,
+        crossed: crossing.c,
+        crossed_range:
+          crossing.c > 0
+            ? { from_seq: crossing.mn!, to_seq: crossing.mx! }
+            : null,
+      };
     });
     // IMMEDIATE acquires the write lock before reading MAX(seq), so concurrent
     // writer processes cannot allocate the same seq.
@@ -483,17 +682,86 @@ export class ChatStore {
             },
       at: r.created_at,
       ...(truncate ? { truncated: true, length: r.body.length } : {}),
+      ...(r.supersedes_seq !== null && r.supersedes_seq !== undefined
+        ? { supersedes: r.supersedes_seq }
+        : {}),
+      ...(r.superseded_by !== null && r.superseded_by !== undefined
+        ? { superseded_by: r.superseded_by }
+        : {}),
     };
   }
 
-  getMessage(roomId: number, seq: number): MessageRow | undefined {
+  /**
+   * Bound a bulk read by serialized size: accumulate whole messages (in row
+   * order) until adding the next would exceed maxBytes. If the FIRST message
+   * alone exceeds the budget it is delivered truncated (never an empty page,
+   * which would deadlock paging); its `truncated`/`length` markers point the
+   * reader at get_message offset paging for the rest. `map` lets callers
+   * decorate rows (e.g. thread depth) while sizes are measured on the real
+   * output shape.
+   */
+  private boundByBytes<T extends MessageRow>(
+    rows: RawMessage[],
+    previewChars: number | undefined,
+    maxBytes: number,
+    map: (r: RawMessage, previewChars?: number) => T,
+  ): { messages: T[]; byteLimited: boolean } {
+    const out: T[] = [];
+    let used = 0;
+    for (const r of rows) {
+      const m = map(r, previewChars);
+      const size = JSON.stringify(m).length;
+      if (out.length === 0 && size > maxBytes) {
+        // Head message alone busts the budget: shrink its body to fit,
+        // leaving room for the JSON envelope around it.
+        const envelope = size - r.body.length;
+        const keep = Math.max(
+          200,
+          Math.floor((maxBytes - envelope) * 0.9),
+        );
+        out.push(map(r, Math.min(keep, previewChars ?? Infinity)));
+        return { messages: out, byteLimited: true };
+      }
+      if (used + size > maxBytes && out.length > 0) {
+        return { messages: out, byteLimited: true };
+      }
+      out.push(m);
+      used += size;
+    }
+    return { messages: out, byteLimited: false };
+  }
+
+  /**
+   * Fetch one message. Bodies are capped at maxChars per call (default 100k,
+   * safely under client output limits); page a longer body with `offset`. A
+   * partial view carries truncated/length/offset markers, and a sliced json
+   * body is returned as a raw partial string, not a parsed object.
+   */
+  getMessage(
+    roomId: number,
+    seq: number,
+    offset = 0,
+    maxChars = DEFAULT_MAX_BYTES,
+  ): MessageRow | undefined {
     const r = this.db
       .prepare(
         `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
          WHERE g.room_id = ? AND g.seq = ?`,
       )
       .get(roomId, seq) as RawMessage | undefined;
-    return r ? this.rowToMessage(r) : undefined;
+    if (!r) return undefined;
+    const end = Math.min(offset + maxChars, r.body.length);
+    const partial = offset > 0 || end < r.body.length;
+    if (!partial) return this.rowToMessage(r);
+    // Build the envelope without parsing the (possibly huge) body.
+    const base = this.rowToMessage({ ...r, body: "" });
+    return {
+      ...base,
+      content: r.body.slice(offset, end),
+      truncated: true,
+      length: r.body.length,
+      offset,
+    };
   }
 
   /**
@@ -567,6 +835,7 @@ export class ChatStore {
         parent: MessageRow | null;
         replies: (MessageRow & { depth: number })[];
         replies_capped: boolean;
+        byte_limited?: boolean;
       }
     | undefined {
     const message = this.getMessage(roomId, seq);
@@ -604,10 +873,22 @@ export class ChatStore {
     })[];
 
     const replies_capped = rows.length > cap;
-    const replies = rows
-      .slice(0, cap)
-      .map((r) => ({ ...this.rowToMessage(r, previewChars), depth: r.depth }));
-    return { message, parent, replies, replies_capped };
+    const { messages: replies, byteLimited } = this.boundByBytes(
+      rows.slice(0, cap),
+      previewChars,
+      DEFAULT_MAX_BYTES,
+      (r, pc) => ({
+        ...this.rowToMessage(r, pc),
+        depth: (r as RawMessage & { depth: number }).depth,
+      }),
+    );
+    return {
+      message,
+      parent,
+      replies,
+      replies_capped,
+      ...(byteLimited ? { byte_limited: true } : {}),
+    };
   }
 
   /** Count of messages newer than the marker that the agent did NOT write. */
@@ -634,11 +915,14 @@ export class ChatStore {
     mentionsMe?: string,
     afterSeq?: number,
     previewChars?: number,
+    maxBytes: number = DEFAULT_MAX_BYTES,
+    sessionId: string | null = null,
   ): {
     messages: MessageRow[];
     new_last_read_seq: number;
     remaining: number;
     advanced: boolean;
+    byte_limited?: boolean;
     next_after_seq?: number;
     unread_total?: number;
     hidden_by_filter?: number;
@@ -651,9 +935,9 @@ export class ChatStore {
       // separate SELECTs could yield inconsistent numbers (e.g. hidden_by_filter
       // exceeding unread_total). Deferred, not immediate: reads take no lock.
       const peek = this.db.transaction(() => {
-        const membership = this.getMembership(roomId, agentId);
-        if (!membership) throw new Error("not a member of this room");
-        const from = membership.last_read_seq;
+        const cursor = this.getCursor(roomId, agentId, sessionId);
+        if (!cursor) throw new Error("not a member of this room");
+        const from = cursor.last_read_seq;
         // Page forward through unread mentions without moving the marker:
         // afterSeq (clamped to >= the marker) is the cursor for the next page.
         const lower = afterSeq !== undefined ? Math.max(from, afterSeq) : from;
@@ -665,7 +949,12 @@ export class ChatStore {
              ORDER BY g.seq ASC LIMIT ?`,
           )
           .all(roomId, lower, agentId, mentionsMe, mentionsMe, limit) as RawMessage[];
-        const messages = rows.map((r) => this.rowToMessage(r, previewChars));
+        const { messages, byteLimited } = this.boundByBytes(
+          rows,
+          previewChars,
+          maxBytes,
+          (r, pc) => this.rowToMessage(r, pc),
+        );
         const lastSeq =
           messages.length > 0 ? messages[messages.length - 1].seq : lower;
         const { c } = this.db
@@ -691,6 +980,7 @@ export class ChatStore {
           new_last_read_seq: from,
           remaining: c,
           advanced: false,
+          ...(byteLimited ? { byte_limited: true } : {}),
           next_after_seq: lastSeq,
           unread_total,
           hidden_by_filter,
@@ -704,13 +994,16 @@ export class ChatStore {
       return peek.deferred();
     }
 
-    // Advancing path: read the marker, fetch, and advance inside one IMMEDIATE
+    // Advancing path: read the cursor, fetch, and advance inside one IMMEDIATE
     // transaction so a concurrent same-identity call serializes behind it and
-    // reads the updated marker instead of returning overlapping messages.
+    // reads the updated cursor instead of returning overlapping messages.
+    // The byte bound trims BEFORE the advance, so the cursor only ever covers
+    // rows actually included in the response: a response the client rejects as
+    // oversized can no longer strand messages behind an advanced marker.
     const tx = this.db.transaction(() => {
-      const membership = this.getMembership(roomId, agentId);
-      if (!membership) throw new Error("not a member of this room");
-      const from = membership.last_read_seq;
+      const cursor = this.getCursor(roomId, agentId, sessionId);
+      if (!cursor) throw new Error("not a member of this room");
+      const from = cursor.last_read_seq;
       const rows = this.db
         .prepare(
           `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
@@ -718,21 +1011,23 @@ export class ChatStore {
            ORDER BY g.seq ASC LIMIT ?`,
         )
         .all(roomId, from, agentId, limit) as RawMessage[];
-      const messages = rows.map((r) => this.rowToMessage(r, previewChars));
+      const { messages, byteLimited } = this.boundByBytes(
+        rows,
+        previewChars,
+        maxBytes,
+        (r, pc) => this.rowToMessage(r, pc),
+      );
       const lastSeq =
         messages.length > 0 ? messages[messages.length - 1].seq : from;
       if (lastSeq > from) {
-        this.db
-          .prepare(
-            "UPDATE memberships SET last_read_seq = ? WHERE room_id = ? AND agent_id = ?",
-          )
-          .run(lastSeq, roomId, agentId);
+        this.setCursor(roomId, agentId, sessionId, lastSeq);
       }
       return {
         messages,
         new_last_read_seq: lastSeq,
         remaining: this.unreadCount(roomId, lastSeq, agentId),
         advanced: lastSeq > from,
+        ...(byteLimited ? { byte_limited: true } : {}),
       };
     });
     return tx.immediate();
@@ -749,7 +1044,13 @@ export class ChatStore {
     beforeSeq?: number,
     mentionsMe?: string,
     previewChars?: number,
-  ): { messages: MessageRow[]; oldest_seq: number | null; has_more: boolean } {
+    maxBytes: number = DEFAULT_MAX_BYTES,
+  ): {
+    messages: MessageRow[];
+    oldest_seq: number | null;
+    has_more: boolean;
+    byte_limited?: boolean;
+  } {
     const conds = ["g.room_id = ?"];
     const params: (number | string)[] = [roomId];
     if (beforeSeq !== undefined) {
@@ -767,10 +1068,15 @@ export class ChatStore {
          WHERE ${where} ORDER BY g.seq DESC LIMIT ?`,
       )
       .all(...params, limit) as RawMessage[];
-    // Fetched newest-first; present oldest-first for natural reading.
-    const messages = rows
-      .map((r) => this.rowToMessage(r, previewChars))
-      .reverse();
+    // Fetched newest-first; byte-bound in that order (keeping the page nearest
+    // the requested position), then present oldest-first for natural reading.
+    const { messages: bounded, byteLimited } = this.boundByBytes(
+      rows,
+      previewChars,
+      maxBytes,
+      (r, pc) => this.rowToMessage(r, pc),
+    );
+    const messages = bounded.reverse();
     const oldest = messages.length > 0 ? messages[0].seq : null;
 
     // has_more: are there older messages matching the same filter?
@@ -788,7 +1094,12 @@ export class ChatStore {
         )
         .get(...moreParams);
     }
-    return { messages, oldest_seq: oldest, has_more };
+    return {
+      messages,
+      oldest_seq: oldest,
+      has_more,
+      ...(byteLimited ? { byte_limited: true } : {}),
+    };
   }
 
   /**
@@ -801,10 +1112,11 @@ export class ChatStore {
     roomId: number,
     agentId: string,
     seq?: number,
+    sessionId: string | null = null,
   ): { previous: number; new: number; latest: number } {
     const tx = this.db.transaction(() => {
-      const membership = this.getMembership(roomId, agentId);
-      if (!membership) throw new Error("not a member of this room");
+      const cursor = this.getCursor(roomId, agentId, sessionId);
+      if (!cursor) throw new Error("not a member of this room");
       const { latest } = this.db
         .prepare(
           "SELECT COALESCE(MAX(seq), 0) AS latest FROM messages WHERE room_id = ?",
@@ -812,18 +1124,22 @@ export class ChatStore {
         .get(roomId) as { latest: number };
       const target =
         seq === undefined ? latest : Math.max(0, Math.min(seq, latest));
-      this.db
-        .prepare(
-          "UPDATE memberships SET last_read_seq = ? WHERE room_id = ? AND agent_id = ?",
-        )
-        .run(target, roomId, agentId);
-      return { previous: membership.last_read_seq, new: target, latest };
+      this.setCursor(roomId, agentId, sessionId, target);
+      return { previous: cursor.last_read_seq, new: target, latest };
     });
     return tx.immediate();
   }
 
-  /** Full-text search of message bodies in a room, best matches first. */
-  searchMessages(roomId: number, query: string, limit: number): MessageRow[] {
+  /**
+   * Full-text search of message bodies in a room, best matches first.
+   * Byte-bounded like the other bulk reads; trimming drops the WORST matches
+   * (rank order), and byte_limited reports that it happened.
+   */
+  searchMessages(
+    roomId: number,
+    query: string,
+    limit: number,
+  ): { matches: MessageRow[]; byte_limited?: boolean } {
     const rows = this.db
       .prepare(
         `SELECT ${MESSAGE_COLS}
@@ -835,7 +1151,13 @@ export class ChatStore {
          ORDER BY rank LIMIT ?`,
       )
       .all(query, roomId, limit) as RawMessage[];
-    return rows.map((r) => this.rowToMessage(r));
+    const { messages, byteLimited } = this.boundByBytes(
+      rows,
+      undefined,
+      DEFAULT_MAX_BYTES,
+      (r, pc) => this.rowToMessage(r, pc),
+    );
+    return { matches: messages, ...(byteLimited ? { byte_limited: true } : {}) };
   }
 
   /**
@@ -919,10 +1241,150 @@ export class ChatStore {
       // and so foreign keys to rooms(id) are satisfied.
       this.db.prepare("DELETE FROM messages WHERE room_id = ?").run(roomId);
       this.db.prepare("DELETE FROM memberships WHERE room_id = ?").run(roomId);
+      this.db.prepare("DELETE FROM session_markers WHERE room_id = ?").run(roomId);
+      this.db.prepare("DELETE FROM claims WHERE room_id = ?").run(roomId);
       this.db.prepare("DELETE FROM rooms WHERE id = ?").run(roomId);
       return { messages, members };
     });
     // IMMEDIATE for the same read-then-write snapshot reason as pruneMessages.
+    return tx.immediate();
+  }
+
+  // --- advisory claims ----------------------------------------------------
+
+  /**
+   * Claim exclusive (advisory) ownership of a named resource. Atomic single
+   * winner: the read-check and upsert run in one IMMEDIATE transaction, so two
+   * simultaneous claimants cannot both be granted (unlike two "I claim X" chat
+   * posts, which can cross). Re-claiming your own key renews the TTL; an
+   * expired claim is grantable to anyone. Ownership is per agent_id: two
+   * sessions sharing an identity share its claims.
+   */
+  claimResource(
+    roomId: number,
+    key: string,
+    agentId: string,
+    ttlSeconds: number,
+    note: string | null,
+  ):
+    | { granted: true; key: string; expires_at: string; renewed: boolean }
+    | {
+        granted: false;
+        key: string;
+        holder: string;
+        note: string | null;
+        expires_at: string;
+        expires_in_seconds: number;
+      } {
+    const tx = this.db.transaction(() => {
+      const row = this.db
+        .prepare(
+          `SELECT agent_id, note, expires_at,
+                  (strftime('%s', expires_at) - strftime('%s', 'now')) AS remaining
+           FROM claims WHERE room_id = ? AND key = ?`,
+        )
+        .get(roomId, key) as
+        | {
+            agent_id: string;
+            note: string | null;
+            expires_at: string;
+            remaining: number;
+          }
+        | undefined;
+      if (row && row.remaining > 0 && row.agent_id !== agentId) {
+        return {
+          granted: false as const,
+          key,
+          holder: row.agent_id,
+          note: row.note,
+          expires_at: row.expires_at,
+          expires_in_seconds: row.remaining,
+        };
+      }
+      this.db
+        .prepare(
+          `INSERT INTO claims (room_id, key, agent_id, note, expires_at)
+           VALUES (?, ?, ?, ?, datetime('now', '+' || ? || ' seconds'))
+           ON CONFLICT(room_id, key) DO UPDATE SET
+             agent_id = excluded.agent_id, note = excluded.note,
+             expires_at = excluded.expires_at, updated_at = datetime('now')`,
+        )
+        .run(roomId, key, agentId, note, ttlSeconds);
+      const { expires_at } = this.db
+        .prepare("SELECT expires_at FROM claims WHERE room_id = ? AND key = ?")
+        .get(roomId, key) as { expires_at: string };
+      return {
+        granted: true as const,
+        key,
+        expires_at,
+        renewed: row !== undefined && row.agent_id === agentId,
+      };
+    });
+    return tx.immediate();
+  }
+
+  /** Release your own claim. Expired claims can be released by anyone. */
+  releaseClaim(
+    roomId: number,
+    key: string,
+    agentId: string,
+  ):
+    | { released: true; key: string }
+    | { released: false; key: string; reason: string } {
+    const tx = this.db.transaction(() => {
+      const row = this.db
+        .prepare(
+          `SELECT agent_id,
+                  (strftime('%s', expires_at) - strftime('%s', 'now')) AS remaining
+           FROM claims WHERE room_id = ? AND key = ?`,
+        )
+        .get(roomId, key) as
+        | { agent_id: string; remaining: number }
+        | undefined;
+      if (!row) return { released: false as const, key, reason: "no such claim" };
+      if (row.agent_id !== agentId && row.remaining > 0) {
+        return {
+          released: false as const,
+          key,
+          reason: `held by ${row.agent_id} for another ${row.remaining}s; expiry frees it`,
+        };
+      }
+      this.db
+        .prepare("DELETE FROM claims WHERE room_id = ? AND key = ?")
+        .run(roomId, key);
+      return { released: true as const, key };
+    });
+    return tx.immediate();
+  }
+
+  /** Active (unexpired) claims in a room; expired rows are pruned in passing. */
+  listClaims(roomId: number): {
+    key: string;
+    holder: string;
+    note: string | null;
+    expires_at: string;
+    expires_in_seconds: number;
+  }[] {
+    const tx = this.db.transaction(() => {
+      this.db
+        .prepare(
+          "DELETE FROM claims WHERE room_id = ? AND expires_at <= datetime('now')",
+        )
+        .run(roomId);
+      return this.db
+        .prepare(
+          `SELECT key, agent_id AS holder, note, expires_at,
+                  (strftime('%s', expires_at) - strftime('%s', 'now')) AS expires_in_seconds
+           FROM claims WHERE room_id = ? ORDER BY key`,
+        )
+        .all(roomId) as {
+        key: string;
+        holder: string;
+        note: string | null;
+        expires_at: string;
+        expires_in_seconds: number;
+      }[];
+    });
     return tx.immediate();
   }
 
