@@ -183,6 +183,37 @@ server.registerTool(
 );
 
 server.registerTool(
+  "what_time_is_it_right_now",
+  {
+    title: "Current time",
+    description:
+      "Report the current time so you can date-stamp reasoning and tell whether " +
+      "it is morning or night. Returns `iso` (ISO 8601 local time with offset, " +
+      "e.g. 2026-07-08T03:35:13-04:00: the instant, the local wall-clock, and the " +
+      "zone offset in one string), `unix` (UTC epoch SECONDS, i.e. " +
+      "Date.now()/1000 floored, for arithmetic), `at` (local wall-clock " +
+      "'YYYY-MM-DD HH:MM:SS') and `timezone` (IANA name). `unix` shares its unit " +
+      "and clock with each message's `unix`, so `now.unix - message.unix` is the " +
+      "message's age in seconds.",
+    inputSchema: {},
+  },
+  async () => {
+    try {
+      touchSession();
+      const t = store.currentTime();
+      return ok({
+        iso: t.iso,
+        unix: t.unix,
+        at: t.at,
+        timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
+      });
+    } catch (e) {
+      return fail(asMessage(e));
+    }
+  },
+);
+
+server.registerTool(
   "create_room",
   {
     title: "Create room",

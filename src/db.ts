@@ -77,7 +77,11 @@ export type MessageRow = {
   content: unknown;
   to: string[] | null;
   reply_to: ReplyRef | null;
+  /** Local wall-clock "YYYY-MM-DD HH:MM:SS" in the server host's timezone. */
   at: string;
+  /** UTC epoch seconds (== Date.now()/1000 at creation); timezone-independent,
+   *  directly comparable to what_time_is_it_right_now's `unix`. */
+  unix: number;
   /** Present only when a preview/byte/slice cap truncated the body. */
   truncated?: boolean;
   /** Full character length of the original body (only when truncated). */
@@ -101,7 +105,8 @@ type RawMessage = {
   reply_to_seq: number | null;
   reply_from: string | null;
   reply_preview: string | null;
-  created_at: string;
+  created_local: string;
+  created_unix: number;
   supersedes_seq: number | null;
   superseded_by: number | null;
 };
@@ -110,7 +115,9 @@ type RawMessage = {
 // superseded_by resolves ONE hop (the latest direct superseder); readers follow
 // chains by looking at that message's own superseded_by.
 const MESSAGE_COLS = `g.seq, g.agent_id, a.type AS from_type, a.role AS from_role,
-                      g.format, g.body, g.mentions, g.reply_to_seq, g.created_at,
+                      g.format, g.body, g.mentions, g.reply_to_seq,
+                      datetime(g.created_at, 'localtime') AS created_local,
+                      CAST(strftime('%s', g.created_at) AS INTEGER) AS created_unix,
                       g.supersedes_seq,
                       (SELECT s.seq FROM messages s
                         WHERE s.room_id = g.room_id AND s.supersedes_seq = g.seq
@@ -317,6 +324,33 @@ export class ChatStore {
     return this.db.prepare("SELECT * FROM rooms WHERE name = ?").get(name) as
       | RoomRow
       | undefined;
+  }
+
+  /**
+   * Current time from the shared DB clock: UTC epoch seconds plus the local
+   * wall-clock string, in the same unit and format as message timestamps so an
+   * agent can subtract `unix` values directly to get elapsed seconds.
+   */
+  currentTime(): { unix: number; at: string; iso: string } {
+    const r = this.db
+      .prepare(
+        `SELECT CAST(strftime('%s','now') AS INTEGER) AS unix,
+                datetime('now','localtime') AS at,
+                CAST(strftime('%s', datetime('now','localtime')) AS INTEGER)
+                  - CAST(strftime('%s','now') AS INTEGER) AS offset_seconds`,
+      )
+      .get() as { unix: number; at: string; offset_seconds: number };
+    // ISO 8601 local time with explicit offset, e.g. 2026-07-08T03:35:13-04:00.
+    // offset_seconds is the local wall-clock read as UTC minus true UTC, i.e.
+    // the zone offset for THIS instant (so it tracks DST). All SQLite-sourced;
+    // no JS Date, keeping the value identical in clock and format to `at`.
+    const off = r.offset_seconds;
+    const sign = off >= 0 ? "+" : "-";
+    const abs = Math.abs(off);
+    const hh = String(Math.floor(abs / 3600)).padStart(2, "0");
+    const mm = String(Math.floor((abs % 3600) / 60)).padStart(2, "0");
+    const iso = `${r.at.replace(" ", "T")}${sign}${hh}:${mm}`;
+    return { unix: r.unix, at: r.at, iso };
   }
 
   listRooms(): RoomSummary[] {
@@ -704,7 +738,8 @@ export class ChatStore {
               from: r.reply_from,
               preview: makePreview(r.reply_preview),
             },
-      at: r.created_at,
+      at: r.created_local,
+      unix: r.created_unix,
       ...(truncate ? { truncated: true, length: r.body.length } : {}),
       ...(r.supersedes_seq !== null && r.supersedes_seq !== undefined
         ? { supersedes: r.supersedes_seq }
