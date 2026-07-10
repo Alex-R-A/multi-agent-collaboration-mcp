@@ -6,27 +6,34 @@
     <title>agent-chat</title>
     <link
       rel="icon"
-      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2314110c'/%3E%3Ccircle cx='16' cy='16' r='6' fill='%23e0a34a'/%3E%3C/svg%3E"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23121316'/%3E%3Ccircle cx='16' cy='16' r='6' fill='%23d7dade'/%3E%3C/svg%3E"
     />
     <style>
-      @import url("https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Red+Hat+Mono:ital,wght@0,300..700;1,300..700&display=swap");
+      @import url("https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=IBM+Plex+Mono:wght@400;500;600&display=swap");
 
       :root {
-        --bg: #14110c;
-        --surface: #1b1712;
-        --surface-2: #221d16;
-        --surface-3: #2a241b;
-        --line: #2e2820;
-        --line-soft: #262019;
-        --text: #ece4d4;
-        --text-dim: #a89c85;
-        --text-faint: #6f6553;
-        --accent: #e0a34a;
-        --accent-soft: rgba(224, 163, 74, 0.13);
-        --accent-line: rgba(224, 163, 74, 0.35);
-        --danger: #d96b57;
-        --font-display: "Instrument Serif", "Iowan Old Style", Georgia, serif;
-        --font-mono: "Red Hat Mono", ui-monospace, "SF Mono", Menlo, Consolas,
+        /* Neutral grayscale ramp, near-black to near-white (never pure). */
+        --bg: #121316;
+        --surface: #17181c;
+        --surface-2: #1e2024;
+        --surface-3: #26282d;
+        --line: #2e3136;
+        --line-soft: #24262b;
+        --text: #e8eaed;
+        --text-dim: #9aa0a8;
+        --text-faint: #83898f;
+        /* The "accent" is near-white: emphasis through contrast, not hue. */
+        --accent: #f2f4f6;
+        --accent-soft: rgba(255, 255, 255, 0.08);
+        --accent-line: rgba(255, 255, 255, 0.3);
+        --on-accent: #101114;
+        /* Deliberately the one non-gray: destructive/error semantics only. */
+        --danger: #cf6b6b;
+        --font-display: "IBM Plex Sans", -apple-system, "Segoe UI", Roboto,
+          sans-serif;
+        --font-ui: "IBM Plex Sans", -apple-system, "Segoe UI", Roboto,
+          sans-serif;
+        --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", Menlo, Consolas,
           monospace;
       }
 
@@ -47,19 +54,34 @@
 
       body {
         margin: 0;
-        font-family: var(--font-mono);
+        font-family: var(--font-ui);
         font-size: 13px;
         line-height: 1.55;
         color: var(--text);
+        /* Depth from gray gradients only: a soft top-right sheen and a
+           bottom-left lift over the near-black base. */
         background:
-          radial-gradient(1100px 700px at 88% -12%, rgba(224, 163, 74, 0.06), transparent 60%),
-          radial-gradient(900px 900px at -10% 110%, rgba(224, 163, 74, 0.03), transparent 55%),
+          radial-gradient(1100px 700px at 88% -12%, rgba(255, 255, 255, 0.05), transparent 60%),
+          radial-gradient(900px 900px at -10% 110%, rgba(255, 255, 255, 0.03), transparent 55%),
+          linear-gradient(180deg, #15161a 0%, var(--bg) 40%),
           var(--bg);
+      }
+
+      /* Data surfaces stay monospace; UI chrome is the sans. */
+      .msg .body,
+      pre.json,
+      #pinned-body,
+      .msg-meta,
+      #compose-text,
+      #join-name,
+      #filter,
+      #search {
+        font-family: var(--font-mono);
       }
 
       ::selection {
         background: var(--accent);
-        color: #1a1206;
+        color: var(--on-accent);
       }
 
       button {
@@ -111,7 +133,7 @@
         flex-direction: column;
         min-height: 0;
         border-right: 1px solid var(--line-soft);
-        background: linear-gradient(180deg, var(--surface) 0%, #181410 100%);
+        background: linear-gradient(180deg, var(--surface) 0%, #131417 100%);
       }
 
       .masthead {
@@ -120,10 +142,10 @@
       }
 
       .wordmark {
-        font-family: var(--font-display);
-        font-style: italic;
-        font-size: 24px;
-        letter-spacing: 0.01em;
+        font-family: var(--font-ui);
+        font-weight: 600;
+        font-size: 17px;
+        letter-spacing: 0.02em;
         color: var(--text);
         display: flex;
         align-items: baseline;
@@ -131,8 +153,8 @@
       }
 
       .wordmark em {
-        color: var(--accent);
-        font-style: italic;
+        color: var(--text-faint);
+        font-style: normal;
       }
 
       .dot {
@@ -155,13 +177,13 @@
 
       @keyframes pulse {
         0% {
-          box-shadow: 0 0 0 0 rgba(224, 163, 74, 0.45);
+          box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.35);
         }
         70% {
-          box-shadow: 0 0 0 9px rgba(224, 163, 74, 0);
+          box-shadow: 0 0 0 9px rgba(255, 255, 255, 0);
         }
         100% {
-          box-shadow: 0 0 0 0 rgba(224, 163, 74, 0);
+          box-shadow: 0 0 0 0 rgba(255, 255, 255, 0);
         }
       }
 
@@ -234,6 +256,7 @@
       .room-card .meta {
         margin-top: 2px;
         font-size: 10.5px;
+        font-weight: 500;
         color: var(--text-faint);
       }
 
@@ -284,7 +307,7 @@
         inset: 0;
         background-image: radial-gradient(
           circle,
-          rgba(236, 228, 212, 0.03) 1px,
+          rgba(255, 255, 255, 0.03) 1px,
           transparent 1px
         );
         background-size: 26px 26px;
@@ -309,9 +332,9 @@
         padding: 5px 10px;
       }
       #mobile-title {
-        font-family: var(--font-display);
-        font-style: italic;
-        font-size: 17px;
+        font-family: var(--font-ui);
+        font-weight: 600;
+        font-size: 14px;
         overflow: hidden;
         text-overflow: ellipsis;
         white-space: nowrap;
@@ -322,20 +345,20 @@
         align-items: flex-end;
         justify-content: space-between;
         gap: 18px;
-        padding: 18px 26px 14px;
+        padding: 16px 26px 13px;
         border-bottom: 1px solid var(--line-soft);
-        background: rgba(20, 17, 12, 0.75);
+        background: rgba(18, 19, 22, 0.75);
         backdrop-filter: blur(6px);
         z-index: 2;
       }
 
       #room-name {
         margin: 0;
-        font-family: var(--font-display);
-        font-weight: 400;
-        font-size: 27px;
-        line-height: 1.15;
-        letter-spacing: 0.005em;
+        font-family: var(--font-ui);
+        font-weight: 600;
+        font-size: 20px;
+        line-height: 1.2;
+        letter-spacing: -0.01em;
       }
 
       #room-desc {
@@ -480,7 +503,7 @@
         margin-left: auto;
         flex: none;
         background: var(--danger);
-        color: #1a0f0c;
+        color: var(--on-accent);
         font-weight: 600;
         font-size: 11px;
         letter-spacing: 0.04em;
@@ -763,7 +786,7 @@
         border-left-color: var(--accent);
         background: linear-gradient(
           90deg,
-          rgba(224, 163, 74, 0.07),
+          rgba(255, 255, 255, 0.06),
           var(--hue-bg, transparent) 55%
         );
       }
@@ -862,11 +885,11 @@
         bottom: 20px;
         transform: translateX(-50%);
         background: var(--accent);
-        color: #1a1206;
+        color: var(--on-accent);
         font-weight: 600;
         font-size: 11.5px;
-        letter-spacing: 0.04em;
-        border-radius: 999px;
+        letter-spacing: 0.02em;
+        border-radius: 6px;
         padding: 8px 16px;
         box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
         animation: rise 0.25s ease-out;
@@ -926,11 +949,11 @@
 
       .btn-accent {
         background: var(--accent);
-        color: #1a1206;
+        color: var(--on-accent);
         font-weight: 600;
         font-size: 12px;
-        letter-spacing: 0.04em;
-        border-radius: 8px;
+        letter-spacing: 0.02em;
+        border-radius: 6px;
         padding: 9px 16px;
         flex: none;
       }
@@ -1042,9 +1065,9 @@
         z-index: 1;
       }
       .placeholder .big {
-        font-family: var(--font-display);
-        font-style: italic;
-        font-size: 26px;
+        font-family: var(--font-ui);
+        font-weight: 600;
+        font-size: 20px;
         color: var(--text-dim);
       }
       .placeholder .hint {
@@ -1311,8 +1334,9 @@
         } catch {}
       }
 
-      // Stable hue per agent id (FNV-1a), rendered at fixed OKLCH lightness so
-      // every identity is distinguishable but none shouts.
+      // Stable per-agent identity in GRAYSCALE: the FNV-1a hash picks a
+      // lightness step (never a hue), so each agent keeps a distinct gray bar
+      // and name weight while the palette stays strictly monochrome.
       function hue(id) {
         let h = 0x811c9dc5;
         for (let i = 0; i < id.length; i++) {
@@ -1324,9 +1348,11 @@
 
       function applyHue(node, id) {
         const h = hue(id);
-        node.style.setProperty("--hue-name", `oklch(78% 0.11 ${h})`);
-        node.style.setProperty("--hue-bar", `oklch(62% 0.12 ${h} / 0.75)`);
-        node.style.setProperty("--hue-bg", `oklch(72% 0.1 ${h} / 0.045)`);
+        const barL = 42 + (h % 46); // 42..87% gray bar
+        const nameL = 74 + (h % 19); // 74..92% keeps names >= 4.5:1 on the bg
+        node.style.setProperty("--hue-name", `oklch(${nameL}% 0 0)`);
+        node.style.setProperty("--hue-bar", `oklch(${barL}% 0 0 / 0.8)`);
+        node.style.setProperty("--hue-bg", `oklch(90% 0 0 / 0.03)`);
       }
 
       // `at` is SQLite UTC "YYYY-MM-DD HH:MM:SS".
