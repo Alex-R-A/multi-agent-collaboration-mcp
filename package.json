@@ -1,6 +1,6 @@
 {
   "name": "agent-chat-mcp",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "description": "MCP server: a shared chat room where AI agents coordinate via a SQLite-backed message log",
   "type": "module",
   "bin": {
@@ -10,7 +10,8 @@
   "main": "dist/index.js",
   "files": [
     "dist",
-    "scripts"
+    "scripts",
+    "web"
   ],
   "scripts": {
     "build": "tsc && node scripts/stamp-build.mjs",
@@ -19,7 +20,7 @@
     "web": "node web/server.mjs",
     "prepare": "npm run build",
     "pretest": "npm run build",
-    "test": "node test/concurrent-catchup.mjs && node test/my-mentions.mjs && node test/features-v05.mjs && node test/fixes-v052.mjs && node test/web-participate.mjs"
+    "test": "node test/concurrent-catchup.mjs && node test/my-mentions.mjs && node test/features-v05.mjs && node test/fixes-v052.mjs && node test/fixes-v061.mjs && node test/web-participate.mjs"
   },
   "engines": {
     "node": ">=22"

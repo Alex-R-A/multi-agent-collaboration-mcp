@@ -102,31 +102,45 @@ try {
 
   if (!args.room) {
     // All-rooms watch: unread relative to each present membership's marker.
+    // All three reads run in one DEFERRED transaction so they see a single
+    // snapshot; separate autocommit reads can disagree under concurrent
+    // marker updates (e.g. unread=0 alongside nonzero unread_mentions).
     const agent = args.agent;
     if (!agent) fail("--agent is required when watching all rooms");
-    const { n: rooms } = db
-      .prepare(
-        "SELECT COUNT(*) AS n FROM memberships WHERE agent_id = ? AND left_at IS NULL",
-      )
-      .get(agent) as { n: number };
-    if (rooms === 0) fail(`agent "${agent}" is not a member of any room`);
-    const { c: unread } = db
-      .prepare(
-        `SELECT COUNT(*) AS c FROM messages g
-         JOIN memberships mb ON mb.room_id = g.room_id
-              AND mb.agent_id = ? AND mb.left_at IS NULL
-         WHERE g.seq > mb.last_read_seq AND g.agent_id != ?`,
-      )
-      .get(agent, agent) as { c: number };
-    const { c: unreadMentions } = db
-      .prepare(
-        `SELECT COUNT(*) AS c FROM messages g
-         JOIN memberships mb ON mb.room_id = g.room_id
-              AND mb.agent_id = ? AND mb.left_at IS NULL
-         WHERE g.seq > mb.last_read_seq AND g.agent_id != ?
-           AND ${directedAt("g")}`,
-      )
-      .get(agent, agent, agent, agent) as { c: number };
+    const counts = db
+      .transaction(() => {
+        const { n: rooms } = db
+          .prepare(
+            "SELECT COUNT(*) AS n FROM memberships WHERE agent_id = ? AND left_at IS NULL",
+          )
+          .get(agent) as { n: number };
+        if (rooms === 0) return null;
+        const { c: unread } = db
+          .prepare(
+            `SELECT COUNT(*) AS c FROM messages g
+             JOIN memberships mb ON mb.room_id = g.room_id
+                  AND mb.agent_id = ? AND mb.left_at IS NULL
+             WHERE g.seq > mb.last_read_seq AND g.agent_id != ?`,
+          )
+          .get(agent, agent) as { c: number };
+        const { c: unreadMentions } = db
+          .prepare(
+            `SELECT COUNT(*) AS c FROM messages g
+             JOIN memberships mb ON mb.room_id = g.room_id
+                  AND mb.agent_id = ? AND mb.left_at IS NULL
+             WHERE g.seq > mb.last_read_seq AND g.agent_id != ?
+               AND ${directedAt("g")}`,
+          )
+          .get(agent, agent, agent, agent) as { c: number };
+        return { rooms, unread, unreadMentions };
+      })
+      .deferred();
+    if (counts === null) fail(`agent "${agent}" is not a member of any room`);
+    const { rooms, unread, unreadMentions } = counts as {
+      rooms: number;
+      unread: number;
+      unreadMentions: number;
+    };
     db.close();
     const hasUpdates = args.mentionsOnly ? unreadMentions > 0 : unread > 0;
     process.stdout.write(
@@ -155,59 +169,74 @@ try {
   if (!room) fail(`no room "${args.room}"`);
   const roomId = room.id;
 
-  let baseline: number;
-  if (args.since !== undefined) {
-    baseline = args.since;
-  } else {
-    if (!args.agent) fail("--agent is required unless --since is given");
-    const m = db
-      .prepare(
-        "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
-      )
-      .get(roomId, args.agent) as { last_read_seq: number } | undefined;
-    if (!m) {
-      fail(
-        `agent "${args.agent}" is not a member of room ${roomId}; join first or pass --since`,
-      );
-    }
-    baseline = m.last_read_seq;
+  if (args.since === undefined && !args.agent) {
+    fail("--agent is required unless --since is given");
   }
-
-  // Exclude the agent's own messages: posting should not make you "have updates".
-  const unread = (
-    args.agent
-      ? (db
+  // One DEFERRED transaction = one snapshot for baseline + counts + latest.
+  const snap = db
+    .transaction(() => {
+      let baseline: number;
+      if (args.since !== undefined) {
+        baseline = args.since;
+      } else {
+        const m = db
           .prepare(
-            "SELECT COUNT(*) AS c FROM messages WHERE room_id = ? AND seq > ? AND agent_id != ?",
+            "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
           )
-          .get(roomId, baseline, args.agent) as { c: number })
-      : (db
-          .prepare(
-            "SELECT COUNT(*) AS c FROM messages WHERE room_id = ? AND seq > ?",
-          )
-          .get(roomId, baseline) as { c: number })
-  ).c;
+          .get(roomId, args.agent) as { last_read_seq: number } | undefined;
+        if (!m) return null;
+        baseline = m.last_read_seq;
+      }
 
-  let unreadMentions = 0;
-  if (args.agent) {
-    unreadMentions = (
-      db
-        .prepare(
-          `SELECT COUNT(*) AS c FROM messages
-           WHERE room_id = ? AND seq > ? AND agent_id != ?
-             AND ${directedAt("messages")}`,
-        )
-        .get(roomId, baseline, args.agent, args.agent, args.agent) as { c: number }
-    ).c;
+      // Exclude the agent's own messages: posting should not make you "have updates".
+      const unread = (
+        args.agent
+          ? (db
+              .prepare(
+                "SELECT COUNT(*) AS c FROM messages WHERE room_id = ? AND seq > ? AND agent_id != ?",
+              )
+              .get(roomId, baseline, args.agent) as { c: number })
+          : (db
+              .prepare(
+                "SELECT COUNT(*) AS c FROM messages WHERE room_id = ? AND seq > ?",
+              )
+              .get(roomId, baseline) as { c: number })
+      ).c;
+
+      let unreadMentions = 0;
+      if (args.agent) {
+        unreadMentions = (
+          db
+            .prepare(
+              `SELECT COUNT(*) AS c FROM messages
+               WHERE room_id = ? AND seq > ? AND agent_id != ?
+                 AND ${directedAt("messages")}`,
+            )
+            .get(roomId, baseline, args.agent, args.agent, args.agent) as { c: number }
+        ).c;
+      }
+
+      const latest = (
+        db
+          .prepare(
+            "SELECT COALESCE(MAX(seq), 0) AS s FROM messages WHERE room_id = ?",
+          )
+          .get(roomId) as { s: number }
+      ).s;
+      return { baseline, unread, unreadMentions, latest };
+    })
+    .deferred();
+  if (snap === null) {
+    fail(
+      `agent "${args.agent}" is not a member of room ${roomId}; join first or pass --since`,
+    );
   }
-
-  const latest = (
-    db
-      .prepare(
-        "SELECT COALESCE(MAX(seq), 0) AS s FROM messages WHERE room_id = ?",
-      )
-      .get(roomId) as { s: number }
-  ).s;
+  const { baseline, unread, unreadMentions, latest } = snap as {
+    baseline: number;
+    unread: number;
+    unreadMentions: number;
+    latest: number;
+  };
   db.close();
 
   const hasUpdates = args.mentionsOnly ? unreadMentions > 0 : unread > 0;

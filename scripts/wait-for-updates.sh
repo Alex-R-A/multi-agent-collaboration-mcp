@@ -90,10 +90,15 @@ while true; do
 
   if [[ "$timeout" -gt 0 ]]; then
     now=$(date +%s)
-    if (( now - start >= timeout )); then
+    elapsed=$(( now - start ))
+    if (( elapsed >= timeout )); then
       echo '{"timed_out":true}' >&2
       exit 124
     fi
+    # Never sleep past the deadline: clamp the nap to the time remaining.
+    remaining=$(( timeout - elapsed ))
+    sleep "$(( interval < remaining ? interval : remaining ))"
+  else
+    sleep "$interval"
   fi
-  sleep "$interval"
 done

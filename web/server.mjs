@@ -63,7 +63,10 @@ function listMessages(roomId, afterSeq, beforeSeq, limit) {
   const d = getDb();
   if (!d) return null;
   const cols = `g.seq, g.agent_id AS "from", a.role, a.type, g.body, g.format,
-                g.mentions, g.reply_to_seq, g.created_at AS at`;
+                g.mentions, g.reply_to_seq, g.supersedes_seq, g.created_at AS at,
+                (SELECT s.seq FROM messages s
+                  WHERE s.room_id = g.room_id AND s.supersedes_seq = g.seq
+                  ORDER BY s.seq DESC LIMIT 1) AS superseded_by`;
   const src = `messages g LEFT JOIN agents a ON a.id = g.agent_id`;
   let rows;
   if (afterSeq > 0) {
@@ -108,11 +111,19 @@ function listMessages(roomId, afterSeq, beforeSeq, limit) {
 // Writable handle for participation endpoints only. Kept separate from the
 // query_only read handle so a bug in a read path can never write.
 let wdb = null;
+let wdbHasReplyAgent = false;
 function getWriteDb() {
   if (wdb) return wdb;
   if (!existsSync(DB_PATH)) return null;
   wdb = new Database(DB_PATH, { fileMustExist: true });
   wdb.pragma("busy_timeout = 5000");
+  // The viewer never migrates the shared file; only stamp the denormalized
+  // reply author when a current MCP server has already added the column.
+  wdbHasReplyAgent = !!wdb
+    .prepare(
+      "SELECT 1 FROM pragma_table_info('messages') WHERE name = 'reply_to_agent'",
+    )
+    .get();
   return wdb;
 }
 
@@ -160,7 +171,17 @@ function joinRoom(d, roomId, name) {
   d.prepare(
     "UPDATE memberships SET left_at = NULL, last_seen = datetime('now') WHERE room_id = ? AND agent_id = ?",
   ).run(roomId, name);
-  return { joined: true, agent_id: name, room_id: roomId };
+  const m = d
+    .prepare(
+      "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
+    )
+    .get(roomId, name);
+  return {
+    joined: true,
+    agent_id: name,
+    room_id: roomId,
+    last_read_seq: m.last_read_seq,
+  };
 }
 
 function postMessage(d, roomId, name, body, replyToSeq, mentions) {
@@ -175,23 +196,32 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
   // concurrent agent writer cannot take the same seq and the reply reference
   // cannot dangle against a racing prune.
   const tx = d.transaction(() => {
+    let replyToAgent = null;
     if (replyToSeq !== null) {
       const parent = d
-        .prepare("SELECT 1 FROM messages WHERE room_id = ? AND seq = ?")
+        .prepare("SELECT agent_id FROM messages WHERE room_id = ? AND seq = ?")
         .get(roomId, replyToSeq);
       if (!parent) {
         throw new Error(`reply_to_seq ${replyToSeq} does not exist in this room`);
       }
+      replyToAgent = parent.agent_id;
     }
     const { next } = d
       .prepare(
         "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM messages WHERE room_id = ?",
       )
       .get(roomId);
-    d.prepare(
-      `INSERT INTO messages (room_id, seq, agent_id, format, body, mentions, reply_to_seq)
-       VALUES (?, ?, ?, 'text', ?, ?, ?)`,
-    ).run(roomId, next, name, body, mentionsJson, replyToSeq);
+    if (wdbHasReplyAgent) {
+      d.prepare(
+        `INSERT INTO messages (room_id, seq, agent_id, format, body, mentions, reply_to_seq, reply_to_agent)
+         VALUES (?, ?, ?, 'text', ?, ?, ?, ?)`,
+      ).run(roomId, next, name, body, mentionsJson, replyToSeq, replyToAgent);
+    } else {
+      d.prepare(
+        `INSERT INTO messages (room_id, seq, agent_id, format, body, mentions, reply_to_seq)
+         VALUES (?, ?, ?, 'text', ?, ?, ?)`,
+      ).run(roomId, next, name, body, mentionsJson, replyToSeq);
+    }
     d.prepare(
       "UPDATE memberships SET last_seen = datetime('now') WHERE room_id = ? AND agent_id = ?",
     ).run(roomId, name);
@@ -420,6 +450,25 @@ const server = createServer(async (req, res) => {
           error: `No database at ${DB_PATH}.`,
         });
       return sendJson(res, 200, { messages });
+    }
+    if (url.pathname === "/api/me") {
+      // Membership state for a (room, name): lets the client learn its read
+      // marker after a reload so gap-aware read marking works.
+      const roomId = Number(url.searchParams.get("room"));
+      const name = (url.searchParams.get("name") || "").trim();
+      if (!Number.isInteger(roomId) || roomId <= 0 || !name)
+        return sendJson(res, 400, { error: "room (id) and name are required" });
+      const d = getDb();
+      if (!d) return sendJson(res, 200, { joined: false });
+      const m = d
+        .prepare(
+          "SELECT last_read_seq, left_at FROM memberships WHERE room_id = ? AND agent_id = ?",
+        )
+        .get(roomId, name);
+      return sendJson(res, 200, {
+        joined: !!m && m.left_at === null,
+        last_read_seq: m ? m.last_read_seq : 0,
+      });
     }
     if (url.pathname === "/api/search") {
       const roomId = Number(url.searchParams.get("room"));

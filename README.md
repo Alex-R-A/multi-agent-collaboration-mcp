@@ -90,15 +90,20 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
   message arrives truncated (with `truncated`/`length`); page its full body
   via `get_message`. Call again later to get only what is new; `remaining`
   reports how many are still unread.
-- `my_mentions(limit?, preview_chars?, max_bytes?)` — the cross-room **inbox**:
-  unread messages directed at you (your `to` mentions, or replies to messages
-  you wrote) across **every room you are present in**, oldest first, each entry
-  tagged `room_id`/`room_name`. Rooms you left are muted. Strictly a peek: no
-  read marker moves; an entry clears once you actually read its room
-  (`catch_up` or `mark_read` there). Needs an identity but no active room.
-  `by_room` lists every room with any unread from others, reporting both
-  `directed` and total `unread` (broadcasts included), so an empty inbox with
-  nonzero `unread` means rooms still have traffic to sync, not silence.
+- `my_mentions(limit?, preview_chars?, max_bytes?, after_id?)` — the cross-room
+  **inbox**: unread messages directed at you (your `to` mentions, or replies to
+  messages you wrote) across **every room you are present in**, oldest first,
+  each entry tagged `room_id`/`room_name`. Rooms you left are muted. Strictly a
+  peek: no read marker moves; an entry clears once you actually read its room
+  (`catch_up` or `mark_read` there). To see past `limit` or a byte cut without
+  reading rooms first, pass `after_id = next_after_id` from the prior response
+  (paging state only). Sessions joined with `cursor: 'private'` see the inbox
+  relative to their own session cursor, matching what their `catch_up` would
+  deliver. Needs an identity but no active room. `by_room` lists every room
+  with any unread from others (most directed first, truncated to the byte
+  budget with `by_room_truncated: true`), reporting both `directed` and total
+  `unread` (broadcasts included), so an empty inbox with nonzero `unread`
+  means rooms still have traffic to sync, not silence.
 - `read_history(limit?, before_seq?, preview_chars?, max_bytes?)`
   — browse **without** moving your read marker. No `before_seq` returns the
   most recent `limit` messages (e.g. the last 5); page backward by passing
@@ -156,10 +161,14 @@ notification. It reads the SQLite file directly (a one-shot Node probe,
 `dist/check.js`) and never advances your read marker.
 
 ```
-bash scripts/wait-for-updates.sh --agent <your_agent_id> [--mentions-only]
+bash scripts/wait-for-updates.sh --agent <your_agent_id> --db <path> [--mentions-only]
 ```
 
-Run it as a background task. Without `--room` it watches **all rooms you are
+Run it as a background task. Pass `--db` whenever your MCP config sets
+`AGENT_CHAT_DB`: that variable reaches only the MCP server process, not a
+separately launched shell, which would otherwise silently watch the default
+database (the server's MCP instructions print the exact command with the
+resolved path). Without `--room` it watches **all rooms you are
 present in** at once; add `--room <id|name>` to scope it to one room.
 `catch_up` first so your read markers are the baseline; the poller then fires
 on the next message (or, with `--mentions-only`, only when a message tags you

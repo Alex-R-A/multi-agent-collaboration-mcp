@@ -142,17 +142,13 @@ const MESSAGE_FROM = `messages g
  * bare table name "messages"); `mm` aliases the correlated parent lookup.
  */
 export function directedAt(alias: string): string {
-  // Both terms are EXISTS so the predicate is strictly two-valued. The reply
-  // term must NOT be `reply_to_seq IN (subquery)`: for a broadcast (reply_to_seq
-  // NULL) against a non-empty subquery, `NULL IN (...)` is NULL, so the predicate
-  // goes NULL and `NOT directedAt` silently drops the row. (seq is unique per
-  // room, so matching mm.seq = reply_to_seq AND author is equivalent.)
+  // Strictly two-valued (never NULL): EXISTS for the mention term, IFNULL for
+  // the reply term, so `NOT directedAt` can never silently drop rows. The
+  // reply term reads the DENORMALIZED reply_to_agent column stamped at insert
+  // time: a live parent lookup would cost a correlated subquery per row AND
+  // silently un-direct replies whose parent was pruned.
   return `(EXISTS (SELECT 1 FROM json_each(${alias}.mentions) WHERE value = ?)
-           OR EXISTS (
-             SELECT 1 FROM messages mm
-             WHERE mm.room_id = ${alias}.room_id
-               AND mm.seq = ${alias}.reply_to_seq
-               AND mm.agent_id = ?))`;
+           OR IFNULL(${alias}.reply_to_agent = ?, 0))`;
 }
 
 export class ChatStore {
@@ -221,6 +217,16 @@ export class ChatStore {
     this.ensureColumn("messages", "reply_to_seq", "INTEGER");
     this.ensureColumn("messages", "mentions", "TEXT");
     this.ensureColumn("messages", "supersedes_seq", "INTEGER");
+    this.ensureColumn("messages", "reply_to_agent", "TEXT");
+    // Backfill the denormalized reply author for rows written by older builds
+    // whose parent still exists. Rows whose parent was already pruned stay
+    // NULL (their direction is unrecoverable) and are re-examined harmlessly.
+    this.db.exec(`
+      UPDATE messages SET reply_to_agent =
+        (SELECT p.agent_id FROM messages p
+          WHERE p.room_id = messages.room_id AND p.seq = messages.reply_to_seq)
+      WHERE reply_to_seq IS NOT NULL AND reply_to_agent IS NULL
+    `);
 
     this.db.exec(`
       -- UNIQUE(room_id, seq) already provides an implicit (room_id, seq) index
@@ -654,16 +660,20 @@ export class ChatStore {
     const mentionsJson =
       mentions && mentions.length > 0 ? JSON.stringify(mentions) : null;
     const tx = this.db.transaction(() => {
+      let replyToAgent: string | null = null;
       if (replyToSeq !== null) {
-        // Existence only -- never fetch the body, which can be huge.
+        // Author only -- never fetch the body, which can be huge. The author
+        // is denormalized onto the reply so its directedness survives pruning
+        // of the parent.
         const parent = this.db
-          .prepare("SELECT 1 FROM messages WHERE room_id = ? AND seq = ?")
-          .get(roomId, replyToSeq);
+          .prepare("SELECT agent_id FROM messages WHERE room_id = ? AND seq = ?")
+          .get(roomId, replyToSeq) as { agent_id: string } | undefined;
         if (!parent) {
           throw new Error(
             `reply_to_seq ${replyToSeq} does not exist in this room`,
           );
         }
+        replyToAgent = parent.agent_id;
       }
       if (supersedesSeq !== null) {
         const target = this.db
@@ -703,8 +713,8 @@ export class ChatStore {
         .get(roomId) as { next: number };
       const info = this.db
         .prepare(
-          `INSERT INTO messages (room_id, seq, agent_id, format, body, mentions, reply_to_seq, supersedes_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO messages (room_id, seq, agent_id, format, body, mentions, reply_to_seq, reply_to_agent, supersedes_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           roomId,
@@ -714,6 +724,7 @@ export class ChatStore {
           body,
           mentionsJson,
           replyToSeq,
+          replyToAgent,
           supersedesSeq,
         );
       return {
@@ -1112,47 +1123,109 @@ export class ChatStore {
    * global total order across rooms), each row tagged room_id/room_name.
    *
    * Strictly a PEEK: no read marker moves. An entry clears when its room is
-   * actually read (catch_up / mark_read there), so the normal workflow drains
-   * the inbox without a second cursor system. Baselines are identity-level
-   * markers, so a lagging private-cursor session may see fewer entries than
-   * its own cursor would imply (same caveat as the poller).
+   * actually read (catch_up / mark_read there). Baselines follow the CALLER's
+   * cursor: with a sessionId, each room's private session cursor when one
+   * exists (falling back to the identity marker), so the inbox never hides a
+   * message the same session's catch_up would still deliver; identity-level
+   * otherwise. The poller remains identity-level (it cannot know the nonce).
    *
-   * by_room lists EVERY present room with any unread from others, reporting
-   * both `directed` and total `unread` (broadcasts included): an empty inbox
-   * with nonzero unread means rooms have traffic to sync, not silence. Rows
-   * and counts read one DEFERRED snapshot so they cannot disagree.
+   * Paging: rows come back oldest-first by messages.id (a global total order
+   * across rooms); pass next_after_id back as afterId to page past `limit` or
+   * a byte cut without waiting for rooms to be read. afterId is paging state
+   * only; by_room counts stay marker-relative.
+   *
+   * by_room lists EVERY present room with any unread from others (most
+   * directed first), reporting both `directed` and total `unread` (broadcasts
+   * included): an empty inbox with nonzero unread means rooms have traffic to
+   * sync, not silence. by_room shares the byte budget (capped to half, worst
+   * rooms dropped with by_room_truncated:true) so many chatty rooms cannot
+   * bury the entries themselves. Rows and counts read one DEFERRED snapshot.
    */
   myMentions(
     agentId: string,
     limit: number,
     previewChars?: number,
     maxBytes: number = DEFAULT_MAX_BYTES,
+    sessionId: string | null = null,
+    afterId = 0,
   ): {
     messages: MentionRow[];
     total_directed: number;
+    next_after_id: number;
     by_room: { room_id: number; name: string; unread: number; directed: number }[];
+    by_room_truncated?: boolean;
     byte_limited?: boolean;
   } {
+    // '' never collides with a real session id, so one query shape serves
+    // both shared and private cursors.
+    const sessionKey = sessionId ?? "";
     const tx = this.db.transaction(() => {
       const rows = this.db
         .prepare(
-          `SELECT ${MESSAGE_COLS}, g.room_id AS room_id, r.name AS room_name
+          `SELECT ${MESSAGE_COLS}, g.id AS gid, g.room_id AS room_id, r.name AS room_name
            FROM ${MESSAGE_FROM}
            JOIN memberships mb ON mb.room_id = g.room_id
                 AND mb.agent_id = ? AND mb.left_at IS NULL
+           LEFT JOIN session_markers sm ON sm.room_id = g.room_id
+                AND sm.agent_id = mb.agent_id AND sm.session_id = ?
            JOIN rooms r ON r.id = g.room_id
-           WHERE g.seq > mb.last_read_seq AND g.agent_id != ?
+           WHERE g.seq > COALESCE(sm.last_read_seq, mb.last_read_seq)
+             AND g.id > ? AND g.agent_id != ?
              AND ${directedAt("g")}
            ORDER BY g.id ASC LIMIT ?`,
         )
-        .all(agentId, agentId, agentId, agentId, limit) as (RawMessage & {
+        .all(agentId, sessionKey, afterId, agentId, agentId, agentId, limit) as (RawMessage & {
+        gid: number;
         room_id: number;
         room_name: string;
       })[];
+
+      // Placeholder text order: the SUM(CASE directedAt) pair, the membership
+      // join, the session-marker join key, then the author exclusion.
+      const allRooms = this.db
+        .prepare(
+          `SELECT g.room_id AS room_id, r.name AS name, COUNT(*) AS unread,
+                  SUM(CASE WHEN ${directedAt("g")} THEN 1 ELSE 0 END) AS directed
+           FROM messages g
+           JOIN memberships mb ON mb.room_id = g.room_id
+                AND mb.agent_id = ? AND mb.left_at IS NULL
+           LEFT JOIN session_markers sm ON sm.room_id = g.room_id
+                AND sm.agent_id = mb.agent_id AND sm.session_id = ?
+           JOIN rooms r ON r.id = g.room_id
+           WHERE g.seq > COALESCE(sm.last_read_seq, mb.last_read_seq)
+             AND g.agent_id != ?
+           GROUP BY g.room_id, r.name
+           ORDER BY g.room_id`,
+        )
+        .all(agentId, agentId, agentId, sessionKey, agentId) as {
+        room_id: number;
+        name: string;
+        unread: number;
+        directed: number;
+      }[];
+      const total_directed = allRooms.reduce((a, r) => a + r.directed, 0);
+
+      // Cap by_room to half the budget, most directed rooms first, so the
+      // response as a whole honors maxBytes.
+      const byRoom = [...allRooms].sort(
+        (a, b) =>
+          b.directed - a.directed || b.unread - a.unread || a.room_id - b.room_id,
+      );
+      let by_room_truncated = false;
+      const roomBudget = Math.floor(maxBytes / 2);
+      while (byRoom.length > 1 && JSON.stringify(byRoom).length > roomBudget) {
+        byRoom.pop();
+        by_room_truncated = true;
+      }
+
+      const msgBudget = Math.max(
+        2_000,
+        maxBytes - JSON.stringify(byRoom).length,
+      );
       const { messages, byteLimited } = this.boundByBytes(
         rows,
         previewChars,
-        maxBytes,
+        msgBudget,
         (r, pc) => {
           const extra = r as RawMessage & { room_id: number; room_name: string };
           return {
@@ -1162,32 +1235,14 @@ export class ChatStore {
           };
         },
       );
-      // All four placeholders bind the same agent id; textual order is the
-      // SUM(CASE directedAt) pair, then the membership join, then the author
-      // exclusion.
-      const byRoom = this.db
-        .prepare(
-          `SELECT g.room_id AS room_id, r.name AS name, COUNT(*) AS unread,
-                  SUM(CASE WHEN ${directedAt("g")} THEN 1 ELSE 0 END) AS directed
-           FROM messages g
-           JOIN memberships mb ON mb.room_id = g.room_id
-                AND mb.agent_id = ? AND mb.left_at IS NULL
-           JOIN rooms r ON r.id = g.room_id
-           WHERE g.seq > mb.last_read_seq AND g.agent_id != ?
-           GROUP BY g.room_id, r.name
-           ORDER BY g.room_id`,
-        )
-        .all(agentId, agentId, agentId, agentId) as {
-        room_id: number;
-        name: string;
-        unread: number;
-        directed: number;
-      }[];
-      const total_directed = byRoom.reduce((a, r) => a + r.directed, 0);
+      const next_after_id =
+        messages.length > 0 ? rows[messages.length - 1].gid : afterId;
       return {
         messages,
         total_directed,
+        next_after_id,
         by_room: byRoom,
+        ...(by_room_truncated ? { by_room_truncated: true } : {}),
         ...(byteLimited ? { byte_limited: true } : {}),
       };
     });

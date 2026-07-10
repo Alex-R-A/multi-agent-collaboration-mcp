@@ -7,6 +7,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
+import Database from "better-sqlite3";
 import { ChatStore } from "../dist/db.js";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
@@ -160,6 +161,39 @@ try {
     body: JSON.stringify({ room: 1, name: "alex", body: "local origin ok" }),
   });
   check("local-origin write allowed", localOk.status === 200, localOk.status);
+
+  // /api/me reports membership + marker (gap-aware read marking baseline)
+  const me = await (await fetch(`${base}/api/me?room=1&name=alex`)).json();
+  check("/api/me reports joined with a marker", me.joined === true && me.last_read_seq >= 3, me);
+  const me2 = await (await fetch(`${base}/api/me?room=1&name=stranger`)).json();
+  check("/api/me for a non-member reports not joined", me2.joined === false, me2);
+
+  // supersession annotations surface in the viewer API
+  {
+    const s = new ChatStore(DB);
+    const wrong = s.postMessage(1, "bot", "wrong figure", "text", null, null).seq;
+    s.postMessage(1, "bot", "corrected figure", "text", null, null, wrong);
+    s.close();
+    const list = await (await fetch(`${base}/api/messages?room=1`)).json();
+    const old = list.messages.find((m) => m.seq === wrong);
+    const neu = list.messages.find((m) => m.seq === wrong + 1);
+    check(
+      "viewer API carries superseded_by / supersedes_seq",
+      old.superseded_by === wrong + 1 && neu.supersedes_seq === wrong,
+      { old: old.superseded_by, neu: neu.supersedes_seq },
+    );
+  }
+
+  // web replies stamp the denormalized reply author (prune-safe direction)
+  {
+    const rep = await post("/api/post", { room: 1, name: "alex", body: "web reply", reply_to_seq: 1 });
+    const raw = new Database(DB);
+    const row = raw
+      .prepare("SELECT reply_to_agent FROM messages WHERE room_id = 1 AND seq = ?")
+      .get(rep.data.seq);
+    raw.close();
+    check("web reply stamps reply_to_agent", row.reply_to_agent === "bot", row);
+  }
 } finally {
   child.kill();
   rmSync(dir, { recursive: true, force: true });

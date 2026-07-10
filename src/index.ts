@@ -30,9 +30,9 @@ Bulk reads are byte-bounded by default (~100k serialized): byte_limited:true mea
 
 Waiting for activity without busy-looping tool calls: run this bash poller as a BACKGROUND task. It exits 0 the moment there is something new (so its exit IS your notification), prints a one-line JSON status (unread, unread_mentions, latest_seq), and otherwise quits after 20 minutes so it never hangs.
 
-  bash ${POLLER} --agent <your_agent_id> [--mentions-only]
+  bash ${POLLER} --agent <your_agent_id> --db ${store.path} [--mentions-only]
 
-Without --room it watches ALL rooms you are present in at once; add --room <id|name> to scope it to one room. Call catch_up (per room) first so your read markers are the baseline; the poller then fires on the next message from another agent (your own posts are skipped, so posting will not wake it), or, with --mentions-only, only when a message tags you or replies to a message you wrote (my_mentions then shows exactly those). Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override; requires --room since seqs are per-room). Exit codes: 0 = updates (read them with catch_up / my_mentions), 124 = timed out with nothing new, 2 = error. NOTE for cursor:'private' sessions: baselines are IDENTITY-level markers (the MAX across your twin sessions), so a lagging private session should use --room with --since = its own last_read_seq from whoami.`;
+ALWAYS pass --db as shown: AGENT_CHAT_DB in your MCP config reaches only the MCP server process, not a background shell, which would otherwise silently watch the default database. Without --room it watches ALL rooms you are present in at once; add --room <id|name> to scope it to one room. Call catch_up (per room) first so your read markers are the baseline; the poller then fires on the next message from another agent (your own posts are skipped, so posting will not wake it), or, with --mentions-only, only when a message tags you or replies to a message you wrote (my_mentions then shows exactly those). Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override; requires --room since seqs are per-room). Exit codes: 0 = updates (read them with catch_up / my_mentions), 124 = timed out with nothing new, 2 = error. NOTE for cursor:'private' sessions: baselines are IDENTITY-level markers (the MAX across your twin sessions), so a lagging private session should use --room with --since = its own last_read_seq from whoami.`;
 
 // One stdio server process serves one agent. We remember its identity and
 // active room for the session so the agent need not repeat them on every call.
@@ -79,9 +79,9 @@ function requireActive(): { agentId: string; roomId: number } {
   }
   // The room may have been deleted by another server process; the local session
   // would otherwise stay pointed at it and fail later with a low-level DB error.
+  // The identity survives: only the active room is gone.
   if (!store.getRoom(session.roomId)) {
     const stale = session.roomId;
-    session.agentId = null;
     session.roomId = null;
     throw new Error(
       `active room ${stale} no longer exists (deleted); rejoin with join_room`,
@@ -419,10 +419,11 @@ server.registerTool(
       touchSession();
       const { agentId, roomId } = requireActive();
       const left = store.leaveRoom(roomId, agentId);
-      session.agentId = null;
+      // Keep the identity: the session is still this agent, and my_mentions
+      // (memberships elsewhere) must keep working after leaving one room.
       session.roomId = null;
       session.cursorPrivate = false;
-      return ok({ left, room_id: roomId });
+      return ok({ left, room_id: roomId, agent_id: agentId });
     } catch (e) {
       return fail(asMessage(e));
     }
@@ -440,14 +441,21 @@ server.registerTool(
     try {
       touchSession();
       if (session.agentId === null || session.roomId === null) {
-        return ok({ joined: false });
+        return ok({
+          joined: false,
+          ...(session.agentId !== null ? { agent_id: session.agentId } : {}),
+        });
       }
       const roomRow = store.getRoom(session.roomId);
       if (!roomRow) {
         // Room was deleted by another process; do not claim to be joined.
-        session.agentId = null;
+        // The identity survives.
         session.roomId = null;
-        return ok({ joined: false, note: "active room was deleted; rejoin" });
+        return ok({
+          joined: false,
+          agent_id: session.agentId,
+          note: "active room was deleted; rejoin",
+        });
       }
       const cur = store.getCursor(session.roomId, session.agentId, cursorId());
       return ok({
@@ -637,11 +645,31 @@ server.registerTool(
             "only advances over returned messages, so nothing is skipped: " +
             "`byte_limited: true` means more remain, call again.",
         ),
+      mentions_me: z
+        .boolean()
+        .optional()
+        .describe("REMOVED in v0.6.0; use my_mentions. Passing it is an error."),
+      after_seq: z
+        .number()
+        .optional()
+        .describe("REMOVED in v0.6.0; my_mentions pages with after_id."),
     },
   },
-  async ({ limit, preview_chars, max_bytes }) => {
+  async ({ limit, preview_chars, max_bytes, mentions_me, after_seq }) => {
     try {
       touchSession();
+      // Reject, never strip: a v0.5 caller sending mentions_me expected a
+      // non-advancing filtered peek; silently running an ADVANCING full sync
+      // instead would eat its unread backlog.
+      if (mentions_me !== undefined || after_seq !== undefined) {
+        return fail(
+          "mentions_me/after_seq were removed in v0.6.0: catch_up is now " +
+            "always the full room sync and ADVANCES your marker. For messages " +
+            "directed at you use my_mentions (cross-room inbox, never advances " +
+            "markers, pages with after_id). This call was rejected instead of " +
+            "silently changing semantics.",
+        );
+      }
       const { agentId, roomId } = requireActive();
       const result = store.catchUp(
         roomId,
@@ -699,9 +727,19 @@ server.registerTool(
         .max(400_000)
         .optional()
         .describe("Serialized-size budget for the response (default 100000)"),
+      after_id: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe(
+          "Paging cursor: pass the prior response's next_after_id to see " +
+            "entries beyond limit/byte cuts without waiting for rooms to be " +
+            "read. Paging state only; it moves no read marker.",
+        ),
     },
   },
-  async ({ limit, preview_chars, max_bytes }) => {
+  async ({ limit, preview_chars, max_bytes, after_id }) => {
     try {
       touchSession();
       if (session.agentId === null) {
@@ -710,7 +748,14 @@ server.registerTool(
         );
       }
       return ok(
-        store.myMentions(session.agentId, limit ?? 50, preview_chars, max_bytes),
+        store.myMentions(
+          session.agentId,
+          limit ?? 50,
+          preview_chars,
+          max_bytes,
+          cursorId(),
+          after_id ?? 0,
+        ),
       );
     } catch (e) {
       return fail(asMessage(e));
@@ -743,6 +788,10 @@ server.registerTool(
         .positive()
         .optional()
         .describe("Return messages older than this seq (for pagination)"),
+      mentions_me: z
+        .boolean()
+        .optional()
+        .describe("REMOVED in v0.6.0; use my_mentions. Passing it is an error."),
       preview_chars: z
         .number()
         .int()
@@ -767,9 +816,16 @@ server.registerTool(
         ),
     },
   },
-  async ({ limit, before_seq, preview_chars, max_bytes }) => {
+  async ({ limit, before_seq, mentions_me, preview_chars, max_bytes }) => {
     try {
       touchSession();
+      if (mentions_me !== undefined) {
+        return fail(
+          "mentions_me was removed from read_history in v0.6.0; use " +
+            "my_mentions for the cross-room directed inbox or search_messages " +
+            "to find topics.",
+        );
+      }
       const { roomId } = requireActive();
       return ok(
         store.readHistory(roomId, limit ?? 50, before_seq, preview_chars, max_bytes),
@@ -1111,8 +1167,7 @@ server.registerTool(
       }
       const result = store.deleteRoom(target.id);
       if (session.roomId === target.id) {
-        session.roomId = null;
-        session.agentId = null;
+        session.roomId = null; // identity survives; only the room is gone
       }
       return ok({ deleted_room: target.id, name: target.name, ...result });
     } catch (e) {

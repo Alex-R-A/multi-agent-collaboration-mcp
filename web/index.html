@@ -504,6 +504,35 @@
         color: var(--accent);
         border-color: var(--accent-line);
       }
+      #older.gapped {
+        color: var(--accent);
+        border-color: var(--accent-line);
+      }
+
+      #markall {
+        display: block;
+        margin: -10px auto 18px;
+        font-size: 10.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--accent);
+        padding: 4px 12px;
+      }
+      #markall:hover {
+        text-decoration: underline;
+      }
+
+      .msg.superseded {
+        opacity: 0.62;
+      }
+      .chip.super {
+        color: var(--danger);
+        border-color: rgba(217, 107, 87, 0.4);
+        cursor: pointer;
+      }
+      .chip.super:hover {
+        background: rgba(217, 107, 87, 0.1);
+      }
 
       .day-sep {
         display: flex;
@@ -1082,6 +1111,7 @@
             </div>
             <div id="results" hidden></div>
             <button id="older" hidden>Load earlier messages</button>
+            <button id="markall" hidden>Mark all as read</button>
             <div id="msgs" role="log"></div>
           </div>
           <button id="jump" hidden></button>
@@ -1140,7 +1170,7 @@
         "live-dot", "filter", "rooms", "mobile-title", "rooms-toggle",
         "room-head", "room-name", "room-desc", "room-stats",
         "pinned", "pinned-preview", "pinned-body",
-        "banner", "stream-wrap", "stream", "older", "msgs", "jump", "placeholder",
+        "banner", "stream-wrap", "stream", "older", "markall", "msgs", "jump", "placeholder",
         "composer", "compose-join", "join-name", "join-btn", "join-error",
         "compose-box", "reply-target", "compose-text", "send", "compose-ident",
         "ident-btn", "leave-btn", "compose-error",
@@ -1165,6 +1195,15 @@
         // initial semantics (older-button, empty placeholder, no animations).
         pendingInitial: false,
         searchMode: false, // search results are displayed instead of the tail
+        // Server-side read marker for the joined identity in the current room
+        // (-1 = unknown/not fetched yet) and whether the rendered window has a
+        // GAP of unfetched messages between the marker and its oldest row.
+        // While a gap exists, auto read-marking is suspended: advancing the
+        // monotonic marker over unfetched messages would silently erase their
+        // my_mentions entries without them ever being rendered.
+        marker: -1,
+        gap: false,
+        drafts: {}, // per-room compose drafts, in memory only
       };
 
       const IDENT_KEY = "agent-chat.identity";
@@ -1685,6 +1724,23 @@
             chips.append(chip);
           }
         }
+        if (m.supersedes_seq) {
+          const chip = document.createElement("button");
+          chip.className = "chip reply";
+          chip.textContent = "supersedes #" + m.supersedes_seq;
+          chip.title = "this message corrects #" + m.supersedes_seq;
+          chip.addEventListener("click", () => jumpToSeq(m.supersedes_seq));
+          chips.append(chip);
+        }
+        if (m.superseded_by) {
+          row.classList.add("superseded");
+          const chip = document.createElement("button");
+          chip.className = "chip super";
+          chip.textContent = "superseded by #" + m.superseded_by;
+          chip.title = "a later message corrects this one";
+          chip.addEventListener("click", () => jumpToSeq(m.superseded_by));
+          chips.append(chip);
+        }
         if (chips.childNodes.length) {
           chips.className = "chips";
           row.append(chips);
@@ -1767,6 +1823,7 @@
             el.msgs.textContent = "";
             appendMsgs(rows, false);
             updateOlderButton();
+            computeGap();
             if (rows.length === 0) {
               showPlaceholder(
                 "Nothing here yet.",
@@ -1821,6 +1878,9 @@
           }
           updateOlderButton();
           if (!data.messages.length) el.older.hidden = true;
+          const hadGap = state.gap;
+          computeGap();
+          if (hadGap && !state.gap) maybeMarkRead(); // gap closed by paging
         } catch {
           noteFail();
         } finally {
@@ -1980,7 +2040,16 @@
         }
         el.joinBtn.disabled = true;
         try {
-          await postJson("/api/join", { room: room.id, name });
+          // Joining under a new name: soft-leave the old membership first, or
+          // the abandoned identity lingers as a present ghost member forever
+          // (visible in list_agents, blocking prune's unread-refusal).
+          const prev = loadJoined()[String(room.id)];
+          if (prev && prev !== name) {
+            await postJson("/api/leave", { room: room.id, name: prev }).catch(
+              () => {},
+            );
+          }
+          const j = await postJson("/api/join", { room: room.id, name });
           try {
             localStorage.setItem(IDENT_KEY, name);
           } catch {}
@@ -1988,7 +2057,9 @@
           joined[String(room.id)] = name;
           saveJoined(joined);
           state.lastReadSent = 0;
+          state.marker = j.last_read_seq ?? 0;
           renderComposer();
+          computeGap();
           maybeMarkRead();
           el.composeText.focus();
         } catch (e) {
@@ -2029,6 +2100,7 @@
             reply_to_seq: state.replyTo ? state.replyTo.seq : null,
           });
           el.composeText.value = "";
+          delete state.drafts[room.id];
           autosize();
           clearReply();
           if (state.searchMode) exitSearch();
@@ -2054,6 +2126,36 @@
       // Report how far this human has actually read (rendered while the tab is
       // visible), monotonically. Keeps agents' read receipts on us truthful and
       // keeps prune's unread-refusal from wedging on a joined-but-idle human.
+      function computeGap() {
+        const first = state.msgs[0];
+        state.gap =
+          joinedHere() &&
+          !!first &&
+          state.marker >= 0 &&
+          first.seq > state.marker + 1;
+        el.markall.hidden = !state.gap;
+        el.older.classList.toggle("gapped", state.gap);
+        el.older.textContent = state.gap
+          ? "Load earlier messages (unread above)"
+          : "Load earlier messages";
+      }
+
+      // Learn the server-side marker (after reload/room switch) so gap logic
+      // has a baseline before any auto-marking is allowed.
+      async function fetchMarker() {
+        const room = state.current;
+        if (!room || !joinedHere()) return;
+        try {
+          const me = await fetchJson(
+            `/api/me?room=${room.id}&name=${encodeURIComponent(identity())}`,
+          );
+          if (state.current !== room) return;
+          state.marker = me.joined ? me.last_read_seq : -1;
+          computeGap();
+          maybeMarkRead();
+        } catch {}
+      }
+
       function maybeMarkRead() {
         const room = state.current;
         if (!room || !joinedHere()) return;
@@ -2062,27 +2164,37 @@
         // above the jump pill have not been seen, and agents treat this
         // marker as a read receipt.
         if (!state.follow) return;
+        // Never auto-advance over a gap of unfetched messages, and never
+        // before the server-side marker is known (marker is monotonic, so a
+        // premature advance is unrecoverable).
+        if (state.marker < 0 || state.gap) return;
         const last = state.msgs.length
           ? state.msgs[state.msgs.length - 1].seq
           : 0;
         if (last <= state.lastReadSent) return;
         state.lastReadSent = last;
-        postJson("/api/read", { room: room.id, name: identity(), seq: last }).catch(
-          () => {
+        postJson("/api/read", { room: room.id, name: identity(), seq: last })
+          .then((r) => {
+            state.marker = r.last_read_seq;
+          })
+          .catch(() => {
             state.lastReadSent = 0; // retry on the next batch
-          },
-        );
+          });
       }
 
       // ---- room switching ---------------------------------------------------
 
       function openRoom(room) {
+        // Preserve the draft being typed in the room we are leaving.
+        if (state.current) state.drafts[state.current.id] = el.composeText.value;
         state.current = room;
         state.msgs = [];
         state.newCount = 0;
         state.follow = true;
         state.replyTo = null;
         state.lastReadSent = 0;
+        state.marker = -1;
+        state.gap = false;
         try {
           localStorage.setItem(ROOM_KEY, JSON.stringify({ id: room.id }));
         } catch {}
@@ -2102,9 +2214,13 @@
         renderRoomHead();
         renderComposer();
         renderRooms();
+        el.composeText.value = state.drafts[room.id] || "";
+        autosize();
+        computeGap();
         hidePlaceholder();
         document.body.classList.remove("show-rooms");
         loadNew(true);
+        fetchMarker();
       }
 
       // ---- wiring ------------------------------------------------------------
@@ -2128,6 +2244,25 @@
       });
 
       el.older.addEventListener("click", loadOlder);
+      el.markall.addEventListener("click", async () => {
+        // Deliberate user action: skip the unfetched backlog and mark the
+        // whole room read (same semantics as an agent's bare mark_read).
+        const room = state.current;
+        const last = state.msgs.length
+          ? state.msgs[state.msgs.length - 1].seq
+          : 0;
+        if (!room || !joinedHere() || !last) return;
+        try {
+          const r = await postJson("/api/read", {
+            room: room.id,
+            name: identity(),
+            seq: last,
+          });
+          state.marker = r.last_read_seq;
+          state.lastReadSent = Math.max(state.lastReadSent, last);
+          computeGap();
+        } catch {}
+      });
       el.filter.addEventListener("input", renderRooms);
       el.roomsToggle.addEventListener("click", () =>
         document.body.classList.toggle("show-rooms"),
