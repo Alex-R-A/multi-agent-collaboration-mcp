@@ -2,7 +2,6 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { randomUUID } from "node:crypto";
-import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
@@ -28,20 +27,19 @@ function shq(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
-// The poller resolves the same built-in default database on its own, so the
-// advertised command needs --db ONLY when this server runs on an overridden
-// path (AGENT_CHAT_DB reaches the MCP process, never a background shell).
-const IS_DEFAULT_DB =
-  store.path === join(homedir(), ".agent-chat-mcp", "chat.db");
-// The agent-id placeholder is pre-quoted too: self-asserted ids may contain
-// spaces or shell metacharacters, and an unquoted substitution would split
-// arguments or execute $().
-const POLLER_CMD = IS_DEFAULT_DB
-  ? `bash ${shq(POLLER)} --agent '<your_agent_id>' [--mentions-only]`
-  : `bash ${shq(POLLER)} --agent '<your_agent_id>' --db ${shq(store.path)} [--mentions-only]`;
-const DB_NOTE = IS_DEFAULT_DB
-  ? ""
-  : " Pass --db exactly as shown: this server runs on a non-default database, and AGENT_CHAT_DB reaches only the MCP server process, not your background shell.";
+/**
+ * The exact background-poller invocation for a known agent id, safe to run
+ * verbatim: every value is shell-quoted (self-asserted ids may contain
+ * quotes, spaces, or $(), which a hand-substituted placeholder cannot
+ * survive). ONE hardcoded database is the rule: the poller resolves the same
+ * built-in default on its own, and the testing-only override (AGENT_CHAT_DB /
+ * --db) is deliberately NEVER advertised to clients -- a client must not
+ * learn from any tool text that another database is possible.
+ */
+function pollerCmd(agentId: string): string {
+  return `bash ${shq(POLLER)} --agent ${shq(agentId)}`;
+}
+const POLLER_CMD = `${pollerCmd("<your_agent_id>")} [--mentions-only]`;
 
 const INSTRUCTIONS = `Shared chat room for AI agents, backed by one SQLite file; each agent runs its own copy of this server, and the file is the coordination channel. Your identity and active room are remembered for the session.
 
@@ -55,7 +53,7 @@ To wait for activity without busy-looping tool calls, run this poller as a BACKG
 
   ${POLLER_CMD}
 
-${DB_NOTE ? DB_NOTE.trim() + " " : ""}Default scope is ALL rooms you are present in; --room <id|name> scopes to one. catch_up first so your markers are the baseline; your own posts never wake it; --mentions-only fires only on messages directed at you. Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override; requires --room). Exit codes: 0 updates, 124 timeout, 2 error. cursor:'private' note: the poller reads IDENTITY-level markers (the MAX across twin sessions); a lagging private session should use --room with --since = its own last_read_seq from whoami.`;
+Prefer the poller_cmd string join_room returns: it is this command pre-quoted for your exact agent id (hand-substituting an id containing quote characters breaks the shell quoting). Default scope is ALL rooms you are present in; --room <id|name> scopes to one. catch_up first so your markers are the baseline; your own posts never wake it; --mentions-only fires only on messages directed at you. Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override; requires --room). Exit codes: 0 updates, 124 timeout, 2 error. cursor:'private' note: the poller reads IDENTITY-level markers (the MAX across twin sessions); a lagging private session should use --room with --since = its own last_read_seq from whoami.`;
 
 // One stdio server process serves one agent. We remember its identity and
 // active room for the session so the agent need not repeat them on every call.
@@ -429,6 +427,9 @@ server.registerTool(
         last_read_seq: cur.last_read_seq,
         unread: store.unreadCount(target.id, cur.last_read_seq, id),
         members: store.listAgents(target.id, 5).filter((a) => a.present).length,
+        // Ready-to-run background poller invocation, shell-quoted for THIS
+        // id (see the server instructions for its options and semantics).
+        poller_cmd: pollerCmd(id),
         // Surface staleness at the session-start checkpoint, where it is seen
         // once without per-call noise. True => this server is running old code;
         // reconnect the MCP. See server_info for the latest commit.

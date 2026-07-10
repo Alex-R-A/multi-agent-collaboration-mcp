@@ -1278,6 +1278,11 @@
         // monotonic marker over unfetched messages would silently erase their
         // my_mentions entries without them ever being rendered.
         marker: -1,
+        // Which identity `marker`/`lastReadSent` were established for: /api/read
+        // posts are refused when the live identity no longer matches (another
+        // tab renaming would otherwise graft the old identity's marker onto
+        // the new name).
+        markerIdent: null,
         gap: false,
         drafts: {}, // per-room compose drafts, in memory only
         // Incremented on every openRoom: async completions capture it so a
@@ -1306,18 +1311,29 @@
           localStorage.setItem(GHOST_KEY, JSON.stringify(g));
         } catch {}
       }
+      let ghostRetryActive = false;
       async function retryGhosts() {
-        const ghosts = loadGhosts();
-        if (!ghosts.length) return;
-        const remaining = [];
-        for (const g of ghosts) {
-          try {
-            await postJson("/api/leave", { room: g.room, name: g.name });
-          } catch {
-            remaining.push(g);
+        if (ghostRetryActive) return; // overlapping sweeps would race the ledger
+        ghostRetryActive = true;
+        try {
+          for (const g of loadGhosts()) {
+            try {
+              await postJson("/api/leave", { room: g.room, name: g.name });
+            } catch {
+              continue; // still unreachable; keep the entry for the next sweep
+            }
+            // Remove exactly this entry from the CURRENT ledger: a wholesale
+            // save of a pre-loop snapshot would erase entries recorded while
+            // these retries were in flight.
+            saveGhosts(
+              loadGhosts().filter(
+                (x) => !(x.room === g.room && x.name === g.name),
+              ),
+            );
           }
+        } finally {
+          ghostRetryActive = false;
         }
-        saveGhosts(remaining);
       }
 
       function identity() {
@@ -2161,6 +2177,9 @@
 
       function exitSearch(scrollToBottom = true) {
         const wasSearching = state.searchMode;
+        // Invalidate any search still in flight: without this, a delayed
+        // response re-opens search mode over the freshly restored stream.
+        state.searchSeq += 1;
         state.searchMode = false;
         el.searchBar.hidden = true;
         el.results.hidden = true;
@@ -2246,19 +2265,28 @@
           // ledger for retry on later joins, INCLUDING the current room's
           // old name, which the map overwrite below would otherwise orphan.
           const joinedMap = loadJoined();
-          const ghosts = loadGhosts();
+          const newGhosts = [];
           for (const [rid, storedName] of Object.entries(joinedMap)) {
             if (!storedName || storedName === name) continue;
             try {
               await postJson("/api/leave", { room: Number(rid), name: storedName });
             } catch {
-              if (!ghosts.some((g) => g.room === Number(rid) && g.name === storedName)) {
-                ghosts.push({ room: Number(rid), name: storedName });
-              }
+              newGhosts.push({ room: Number(rid), name: storedName });
             }
             delete joinedMap[rid];
           }
-          saveGhosts(ghosts);
+          // Merge the new failures into the CURRENT ledger at save time: a
+          // snapshot-wholesale save would erase entries another tab (or a
+          // concurrent retry sweep) touched since this function started.
+          if (newGhosts.length) {
+            const ledger = loadGhosts();
+            for (const g of newGhosts) {
+              if (!ledger.some((x) => x.room === g.room && x.name === g.name)) {
+                ledger.push(g);
+              }
+            }
+            saveGhosts(ledger);
+          }
           joinedMap[String(room.id)] = name;
           saveJoined(joinedMap);
           retryGhosts();
@@ -2266,8 +2294,20 @@
           // shown now; re-render it even after a room switch so a stale
           // successful rename cannot leave it showing the old identity.
           renderComposer();
-          // A delayed response must not mutate another visit's marker/UI.
-          if (!sameView(room, epoch)) return;
+          // A delayed response must not mutate another visit's marker/UI --
+          // but a RENAME was global, so the room shown now still carries the
+          // old identity's marker state: reset it and re-baseline (fetchMarker
+          // no-ops unless the new identity is joined there).
+          if (!sameView(room, epoch)) {
+            if (prevIdentity !== name) {
+              state.lastReadSent = 0;
+              state.marker = -1;
+              state.markerIdent = null;
+              computeGap();
+              fetchMarker();
+            }
+            return;
+          }
           // An identity change invalidates every in-flight operation that
           // was issued under the OLD identity in this same room (their
           // markers belong to the old name); a first join must not, or it
@@ -2275,6 +2315,7 @@
           if (prevIdentity && prevIdentity !== name) state.roomEpoch += 1;
           state.lastReadSent = 0;
           state.marker = j.last_read_seq ?? 0;
+          state.markerIdent = name;
           computeGap();
           maybeMarkRead();
           el.composeText.focus();
@@ -2288,16 +2329,22 @@
       async function leaveCurrent() {
         const room = state.current;
         const epoch = state.roomEpoch;
-        if (!room) return;
+        const name = identity();
+        if (!room || !name) return;
         try {
-          await postJson("/api/leave", { room: room.id, name: identity() });
+          await postJson("/api/leave", { room: room.id, name });
         } catch (e) {
           if (sameView(room, epoch)) el.composeError.textContent = e.message;
           return;
         }
+        // Drop the mapping only while it still records THIS leave's identity:
+        // a stale completion arriving after a rename must not delete the
+        // newer name's still-live membership mapping.
         const joined = loadJoined();
-        delete joined[String(room.id)];
-        saveJoined(joined);
+        if (joined[String(room.id)] === name) {
+          delete joined[String(room.id)];
+          saveJoined(joined);
+        }
         // Composer/reply belong to whatever room is shown NOW.
         if (!sameView(room, epoch)) return;
         clearReply();
@@ -2370,13 +2417,20 @@
       async function fetchMarker() {
         const room = state.current;
         const epoch = state.roomEpoch;
-        if (!room || !joinedHere()) return;
+        const name = identity();
+        if (!room || !name || !joinedHere()) return;
         try {
           const me = await fetchJson(
-            `/api/me?room=${room.id}&name=${encodeURIComponent(identity())}`,
+            `/api/me?room=${room.id}&name=${encodeURIComponent(name)}`,
           );
           if (!sameView(room, epoch)) return;
+          // The identity may have moved (another tab renaming) between the
+          // request and this completion; the epoch bump from the storage
+          // listener usually catches that, but its event delivery is async,
+          // so re-check before baselining the wrong identity's marker.
+          if (identity() !== name) return;
           state.marker = me.joined ? me.last_read_seq : -1;
+          state.markerIdent = name;
           computeGap();
           maybeMarkRead();
         } catch {}
@@ -2385,7 +2439,13 @@
       function maybeMarkRead() {
         const room = state.current;
         const epoch = state.roomEpoch;
-        if (!room || !joinedHere()) return;
+        const name = identity();
+        if (!room || !name || !joinedHere()) return;
+        // The marker baseline must belong to THIS identity: after another
+        // tab renames, marker/gap state still describes the old name until
+        // fetchMarker re-baselines; posting meanwhile would graft the old
+        // identity's read position onto the new name.
+        if (state.markerIdent !== name) return;
         if (document.visibilityState !== "visible") return;
         // Only claim messages as read while pinned to the bottom: arrivals
         // above the jump pill have not been seen, and agents treat this
@@ -2404,7 +2464,7 @@
           : 0;
         if (last <= state.lastReadSent) return;
         state.lastReadSent = last;
-        postJson("/api/read", { room: room.id, name: identity(), seq: last })
+        postJson("/api/read", { room: room.id, name, seq: last })
           .then((r) => {
             // A delayed response must not mutate another visit's state.
             if (sameView(room, epoch)) state.marker = r.last_read_seq;
@@ -2484,6 +2544,7 @@
         state.replyTo = null;
         state.lastReadSent = 0;
         state.marker = -1;
+        state.markerIdent = null;
         state.gap = false;
         state.roomEpoch += 1;
         try {
@@ -2541,14 +2602,18 @@
         // whole room read (same semantics as an agent's bare mark_read).
         const room = state.current;
         const epoch = state.roomEpoch;
+        const name = identity();
         const last = state.msgs.length
           ? state.msgs[state.msgs.length - 1].seq
           : 0;
-        if (!room || !joinedHere() || !last) return;
+        if (!room || !name || !joinedHere() || !last) return;
+        // Same identity guard as maybeMarkRead: never advance a marker whose
+        // baseline was fetched for a different (pre-rename) identity.
+        if (state.markerIdent !== name) return;
         try {
           const r = await postJson("/api/read", {
             room: room.id,
-            name: identity(),
+            name,
             seq: last,
           });
           // A delayed response must not mutate another visit's state.
@@ -2609,6 +2674,26 @@
         el.deleteConfirm.hidden = true;
       });
       document.addEventListener("visibilitychange", maybeMarkRead);
+
+      // Another tab changing the identity or the membership map invalidates
+      // every in-flight operation issued under the old identity in THIS tab:
+      // its marker state belongs to the old name, and a delayed /api/read
+      // would otherwise graft it onto the new identity. (storage events fire
+      // only for OTHER documents, so same-tab writes never loop through here;
+      // a discarded in-flight initial load re-arms via pendingInitial.)
+      window.addEventListener("storage", (e) => {
+        if (e.key !== IDENT_KEY && e.key !== JOINED_KEY) return;
+        state.roomEpoch += 1;
+        state.lastReadSent = 0;
+        state.marker = -1;
+        state.markerIdent = null;
+        state.gap = false;
+        renderComposer();
+        if (state.current) {
+          computeGap();
+          fetchMarker();
+        }
+      });
 
       setInterval(() => loadNew(false), POLL_MS);
       setInterval(loadRooms, ROOMS_MS);

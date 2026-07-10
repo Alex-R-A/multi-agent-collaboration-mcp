@@ -49,6 +49,11 @@ const port = await new Promise((resolve, reject) => {
   });
 });
 const base = `http://127.0.0.1:${port}`;
+check(
+  "PORT=0 bound a real ephemeral port (printed URL is usable, not :0)",
+  Number.isInteger(port) && port > 0,
+  port,
+);
 
 async function post(path, payload) {
   const r = await fetch(base + path, {

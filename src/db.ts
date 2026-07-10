@@ -37,6 +37,59 @@ export const SQLITE_MAX_LENGTH = 1_000_000_000;
  */
 export const DEFAULT_MAX_BYTES = 100_000;
 
+// EXACT worst-case envelopes: the serialized size of each bulk-read response
+// with an empty messages array and every scalar at its widest legal value
+// (MAX_SAFE_INTEGER = 16 digits, wider than any real seq/count; "false" is
+// wider than "true"). max_bytes minus the envelope is the budget handed to
+// boundByBytes, which itself charges the array brackets and commas, so the
+// WHOLE response honors max_bytes -- approximate reserves kept leaking
+// single-digit overruns (50 rows = 51 uncounted separator chars).
+const WIDE = Number.MAX_SAFE_INTEGER;
+// "[]" subtracted where boundByBytes charges the brackets itself.
+const CATCH_UP_ENVELOPE =
+  JSON.stringify({
+    messages: [],
+    new_last_read_seq: WIDE,
+    remaining: WIDE,
+    advanced: false,
+    byte_limited: true,
+  }).length - 2;
+const HISTORY_ENVELOPE =
+  JSON.stringify({
+    messages: [],
+    oldest_seq: WIDE,
+    has_more: false,
+    byte_limited: true,
+  }).length - 2;
+const SEARCH_ENVELOPE =
+  JSON.stringify({ matches: [], byte_limited: true }).length - 2;
+// by_room's placeholder 0 (1 char) is subtracted; its real serialized length
+// (brackets included) is measured and charged at call time.
+const MENTIONS_ENVELOPE =
+  JSON.stringify({
+    messages: [],
+    total_directed: WIDE,
+    next_after_id: WIDE,
+    by_room: 0,
+    by_room_truncated: true,
+    byte_limited: true,
+  }).length -
+  2 -
+  1;
+const THREAD_ENVELOPE =
+  JSON.stringify({
+    message: 0,
+    parent: 0,
+    replies: [],
+    replies_capped: false,
+    byte_limited: true,
+  }).length -
+  2 -
+  2;
+/** Serialized-size allowance below which shrinkToFit is guaranteed to fit any
+ *  legal row as a stub (fixed fields ~430 worst case); budgets floor here. */
+const STUB_ALLOWANCE = 500;
+
 export type RoomRow = {
   id: number;
   name: string;
@@ -823,13 +876,90 @@ export class ChatStore {
   }
 
   /**
+   * Shrink ONE message until its serialized size fits `budget`. Stages:
+   * proportional content cut (no fixed floor: content may go to zero, the
+   * body is always recoverable via get_message), a one-shot correction for
+   * escaping inflation (control chars serialize 6x), mention shedding, then
+   * a stub (oversized:true) whose display metadata is HALVED until the
+   * measured size fits -- a single code-unit cut under-counts JSON escaping,
+   * which is how control-heavy room names kept escaping the budget. Every
+   * stage measures the real serialized output, so for any budget >=
+   * STUB_ALLOWANCE the result is guaranteed to fit.
+   */
+  private shrinkToFit<T extends MessageRow>(
+    r: RawMessage,
+    previewChars: number | undefined,
+    budget: number,
+    map: (r: RawMessage, previewChars?: number) => T,
+  ): T {
+    const m = map(r, previewChars);
+    const size = JSON.stringify(m).length;
+    if (size <= budget) return m;
+    const measured =
+      typeof m.content === "string" ? m.content.length : r.body.length;
+    const envelope = Math.max(0, size - measured);
+    // Stage 1: proportional content cut.
+    let keep = Math.max(0, Math.floor((budget - envelope) * 0.9));
+    let head = map(r, Math.min(keep, previewChars ?? Infinity));
+    let sz = JSON.stringify(head).length;
+    // Stage 2: correct once for escaping inflation.
+    if (sz > budget && keep > 0) {
+      keep = Math.max(0, Math.floor((keep * budget * 0.85) / sz));
+      head = map(r, Math.min(keep, previewChars ?? Infinity));
+      sz = JSON.stringify(head).length;
+    }
+    const h = head as MessageRow;
+    // Stage 3: shed mentions (down to none if needed); size can live
+    // entirely in a legal `to` list. Flags set before the deciding measure.
+    if (sz > budget && Array.isArray(h.to) && h.to.length > 0) {
+      h.to_total = h.to.length;
+      h.to_truncated = true;
+      while (sz > budget && h.to.length > 0) {
+        h.to = h.to.slice(0, Math.floor(h.to.length / 2));
+        sz = JSON.stringify(head).length;
+      }
+    }
+    // Stage 4: stub. Body emptied, reply preview dropped; the seq remains
+    // the durable reference and oversized:true says "use get_message".
+    if (sz > budget) {
+      const stub = head as MessageRow & { room_name?: string };
+      stub.content = "";
+      stub.truncated = true;
+      stub.length = r.body.length;
+      stub.reply_to = null;
+      stub.to = null;
+      stub.oversized = true;
+      sz = JSON.stringify(head).length;
+      const half = (s: string) => s.slice(0, Math.floor(s.length / 2));
+      while (
+        sz > budget &&
+        ((stub.from_role?.length ?? 0) > 0 ||
+          (stub.from_type?.length ?? 0) > 0 ||
+          (stub.room_name?.length ?? 0) > 0)
+      ) {
+        if (stub.from_role) stub.from_role = half(stub.from_role);
+        if (stub.from_type) stub.from_type = half(stub.from_type);
+        if (stub.room_name) stub.room_name = half(stub.room_name);
+        sz = JSON.stringify(head).length;
+      }
+      // Sender identity shortens last (the seq still identifies the message).
+      while (sz > budget && stub.from.length > 0) {
+        stub.from = half(stub.from);
+        sz = JSON.stringify(head).length;
+      }
+    }
+    return head;
+  }
+
+  /**
    * Bound a bulk read by serialized size: accumulate whole messages (in row
-   * order) until adding the next would exceed maxBytes. If the FIRST message
-   * alone exceeds the budget it is delivered truncated (never an empty page,
-   * which would deadlock paging); its `truncated`/`length` markers point the
-   * reader at get_message offset paging for the rest. `map` lets callers
-   * decorate rows (e.g. thread depth) while sizes are measured on the real
-   * output shape.
+   * order) until adding the next would exceed maxBytes. Charges the
+   * serialized ARRAY -- brackets plus a comma per element -- not just the
+   * bare elements (summing elements undercounts a 50-row page by 51 chars).
+   * If the FIRST message alone exceeds the budget it is delivered shrunk
+   * (never an empty page, which would deadlock paging); see shrinkToFit.
+   * `map` lets callers decorate rows (e.g. thread depth) while sizes are
+   * measured on the real output shape.
    */
   private boundByBytes<T extends MessageRow>(
     rows: RawMessage[],
@@ -838,66 +968,15 @@ export class ChatStore {
     map: (r: RawMessage, previewChars?: number) => T,
   ): { messages: T[]; byteLimited: boolean } {
     const out: T[] = [];
-    let used = 0;
+    let used = 2; // the array's own brackets
     for (const r of rows) {
       const m = map(r, previewChars);
-      const size = JSON.stringify(m).length;
-      if (out.length === 0 && size > maxBytes) {
-        // Head message alone busts the budget. Shrink in STAGES until it
-        // fits: the page must never be empty (pagers would deadlock) and
-        // must never exceed the budget (an advancing catch_up commits its
-        // marker before the client sees the page; a client rejection then
-        // means silent message loss). Every stage measures the REAL
-        // serialized size, and flags are set before the measurement that
-        // decides completion.
-        const measured =
-          typeof m.content === "string" ? m.content.length : r.body.length;
-        const envelope = Math.max(0, size - measured);
-        // Stage 1: proportional content cut (no fixed floor: content may go
-        // to zero; the body is always recoverable via get_message).
-        let keep = Math.max(0, Math.floor((maxBytes - envelope) * 0.9));
-        let head = map(r, Math.min(keep, previewChars ?? Infinity));
-        let sz = JSON.stringify(head).length;
-        // Stage 2: correct once for escaping inflation (control chars
-        // serialize 6x, so stage 1's estimate can overshoot).
-        if (sz > maxBytes && keep > 0) {
-          keep = Math.max(0, Math.floor((keep * maxBytes * 0.85) / sz));
-          head = map(r, Math.min(keep, previewChars ?? Infinity));
-          sz = JSON.stringify(head).length;
-        }
-        const h = head as MessageRow;
-        // Stage 3: shed mentions (down to none if needed); size can live
-        // entirely in a legal `to` list.
-        if (sz > maxBytes && Array.isArray(h.to) && h.to.length > 0) {
-          h.to_total = h.to.length;
-          h.to_truncated = true;
-          while (sz > maxBytes && h.to.length > 0) {
-            h.to = h.to.slice(0, Math.floor(h.to.length / 2));
-            sz = JSON.stringify(head).length;
-          }
-        }
-        // Stage 4: stub. Body emptied, reply preview dropped, display
-        // metadata truncated; the seq remains the durable reference and
-        // oversized:true tells the reader to use get_message.
-        if (sz > maxBytes) {
-          const stub = head as MessageRow & { room_name?: string };
-          stub.content = "";
-          stub.truncated = true;
-          stub.length = r.body.length;
-          stub.reply_to = null;
-          stub.to = null;
-          stub.oversized = true;
-          if (stub.from_role) stub.from_role = stub.from_role.slice(0, 40);
-          if (stub.from_type) stub.from_type = stub.from_type.slice(0, 40);
-          if (stub.room_name) stub.room_name = stub.room_name.slice(0, 60);
-          sz = JSON.stringify(head).length;
-          // Pathological escape-heavy sender id: identity display shortens
-          // last (the seq still identifies the message unambiguously).
-          if (sz > maxBytes) {
-            stub.from = stub.from.slice(0, 60);
-          }
-        }
-        out.push(head);
+      const size = JSON.stringify(m).length + (out.length > 0 ? 1 : 0);
+      if (out.length === 0 && used + size > maxBytes) {
+        // The head must fit alone: an advancing catch_up commits its marker
+        // before the client sees the page, so an over-budget page a client
+        // rejects means silent message loss.
+        out.push(this.shrinkToFit(r, previewChars, maxBytes - 2, map));
         return { messages: out, byteLimited: true };
       }
       if (used + size > maxBytes && out.length > 0) {
@@ -921,12 +1000,7 @@ export class ChatStore {
     offset = 0,
     maxChars = DEFAULT_MAX_BYTES,
   ): MessageRow | undefined {
-    const r = this.db
-      .prepare(
-        `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
-         WHERE g.room_id = ? AND g.seq = ?`,
-      )
-      .get(roomId, seq) as RawMessage | undefined;
+    const r = this.getRawMessage(roomId, seq);
     if (!r) return undefined;
     const end = Math.min(offset + maxChars, r.body.length);
     const partial = offset > 0 || end < r.body.length;
@@ -997,36 +1071,14 @@ export class ChatStore {
     });
   }
 
-  /**
-   * Fetch one message sized to fit a SERIALIZED budget. getMessage's maxChars
-   * caps raw body characters, but JSON escaping (control chars serialize 6x)
-   * and the envelope inflate the serialized form past the raw length, so a
-   * chars-for-bytes handoff overshoots. Fetch, measure the real serialized
-   * size, and correct once proportionally (same approach as boundByBytes).
-   */
-  private fitMessage(
-    roomId: number,
-    seq: number,
-    budget: number,
-  ): MessageRow | undefined {
-    let m = this.getMessage(roomId, seq, 0, budget);
-    if (!m) return undefined;
-    const size = JSON.stringify(m).length;
-    if (size > budget) {
-      // Approximate the raw body chars: exact for a (possibly sliced) string,
-      // near-exact for a whole json body (re-serialized without whitespace).
-      const bodyChars =
-        typeof m.content === "string"
-          ? m.content.length
-          : JSON.stringify(m.content).length;
-      const keep = Math.max(
-        200,
-        Math.floor((bodyChars * budget * 0.9) / size),
-      );
-      // keep < bodyChars forces the partial (string-slice) path even for json.
-      if (keep < bodyChars) m = this.getMessage(roomId, seq, 0, keep) ?? m;
-    }
-    return m;
+  /** Fetch one raw message row (author + reply preview joined). */
+  private getRawMessage(roomId: number, seq: number): RawMessage | undefined {
+    return this.db
+      .prepare(
+        `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
+         WHERE g.room_id = ? AND g.seq = ?`,
+      )
+      .get(roomId, seq) as RawMessage | undefined;
   }
 
   /**
@@ -1035,11 +1087,13 @@ export class ChatStore {
    * its children) with a `depth` field (1 = direct reply). `maxDepth` bounds how
    * many reply levels are walked; the descendant set is capped and `replies_capped`
    * flags when the cap was hit. `previewChars` truncates descendant bodies.
-   * The whole response shares ONE byte budget: the focal message is fetched
-   * first, the parent and replies are charged against what remains (with a
-   * small floor each), so root + parent + replies cannot stack three separate
-   * caps into an oversized response. Oversized bodies arrive truncated with
-   * markers; page them via get_message.
+   * The whole response shares ONE byte budget with an exact envelope: the
+   * focal message spends first (reserving a stub allowance for an existing
+   * parent), the parent takes what remains minus a replies reserve, and the
+   * replies get the measured remainder -- when that remainder cannot even
+   * hold a stub, replies are omitted with byte_limited:true rather than
+   * delivered over budget. Oversized bodies arrive truncated with markers;
+   * page them via get_message.
    */
   getThread(
     roomId: number,
@@ -1055,21 +1109,37 @@ export class ChatStore {
         byte_limited?: boolean;
       }
     | undefined {
-    const message = this.fitMessage(roomId, seq, DEFAULT_MAX_BYTES);
-    if (!message) return undefined;
-    // One budget for the whole thread response, in SERIALIZED chars (via
-    // fitMessage, so escaping and envelope are charged, not just raw body
-    // length). The focal message spends first; parent and replies get what
-    // remains, floored so they are never starved to nothing.
-    const FLOOR = 2_000;
-    let remaining = DEFAULT_MAX_BYTES - JSON.stringify(message).length;
-    const parentSeq = message.reply_to?.seq ?? null;
-    const parent =
-      parentSeq !== null
-        ? (this.fitMessage(roomId, parentSeq, Math.max(FLOOR, remaining)) ??
-          null)
-        : null;
-    if (parent) remaining -= JSON.stringify(parent).length;
+    const focalRow = this.getRawMessage(roomId, seq);
+    if (!focalRow) return undefined;
+    const mapPlain = (r: RawMessage, pc?: number) => this.rowToMessage(r, pc);
+    const budget = DEFAULT_MAX_BYTES - THREAD_ENVELOPE;
+    // Reserve the parent's slot before spending on the focal message: a stub
+    // allowance when a parent exists, 4 chars of literal null otherwise. The
+    // trailing 2 covers an empty replies array.
+    const parentSeq = focalRow.reply_to_seq;
+    const parentReserve = parentSeq === null ? 4 : STUB_ALLOWANCE + 2;
+    const message = this.shrinkToFit(
+      focalRow,
+      undefined,
+      budget - parentReserve - 2,
+      mapPlain,
+    );
+    let remaining = budget - JSON.stringify(message).length;
+    let parent: MessageRow | null = null;
+    if (parentSeq !== null) {
+      const parentRow = this.getRawMessage(roomId, parentSeq);
+      if (parentRow) {
+        // Leave a stub allowance (plus array brackets) for the replies when
+        // more than that remains; otherwise the parent gets a stub itself.
+        parent = this.shrinkToFit(
+          parentRow,
+          undefined,
+          Math.max(STUB_ALLOWANCE, remaining - STUB_ALLOWANCE - 2),
+          mapPlain,
+        );
+      }
+    }
+    remaining -= parent ? JSON.stringify(parent).length : 4;
 
     const cap = 500;
     // Recursive walk of the reply subtree. `path` (zero-padded seq per level)
@@ -1100,15 +1170,24 @@ export class ChatStore {
     })[];
 
     const replies_capped = rows.length > cap;
-    const { messages: replies, byteLimited } = this.boundByBytes(
-      rows.slice(0, cap),
-      previewChars,
-      Math.max(FLOOR, remaining),
-      (r, pc) => ({
-        ...this.rowToMessage(r, pc),
-        depth: (r as RawMessage & { depth: number }).depth,
-      }),
-    );
+    // Below a stub allowance boundByBytes cannot guarantee even its head row
+    // fits; omit the replies instead of delivering an over-budget response
+    // (byte_limited says they exist; get_thread on a reply seq fetches them).
+    let replies: (MessageRow & { depth: number })[] = [];
+    let byteLimited = false;
+    if (rows.length > 0 && remaining < STUB_ALLOWANCE + 2) {
+      byteLimited = true;
+    } else if (rows.length > 0) {
+      ({ messages: replies, byteLimited } = this.boundByBytes(
+        rows.slice(0, cap),
+        previewChars,
+        remaining,
+        (r, pc) => ({
+          ...this.rowToMessage(r, pc),
+          depth: (r as RawMessage & { depth: number }).depth,
+        }),
+      ));
+    }
     return {
       message,
       parent,
@@ -1167,12 +1246,13 @@ export class ChatStore {
            ORDER BY g.seq ASC LIMIT ?`,
         )
         .all(roomId, from, agentId, limit) as RawMessage[];
-      // Reserve room for the fixed response fields so the WHOLE response
-      // honors maxBytes, not just the messages array.
+      // Exact envelope reserve so the WHOLE response honors maxBytes, not
+      // just the messages array. The floor never engages at the schema's
+      // 1000-char minimum; it is the stub allowance boundByBytes can honor.
       const { messages, byteLimited } = this.boundByBytes(
         rows,
         previewChars,
-        Math.max(500, maxBytes - 100),
+        Math.max(STUB_ALLOWANCE, maxBytes - CATCH_UP_ENVELOPE),
         (r, pc) => this.rowToMessage(r, pc),
       );
       const lastSeq =
@@ -1292,20 +1372,32 @@ export class ChatStore {
         byRoom.pop();
         by_room_truncated = true;
       }
-      // A single long-named room can still overflow a small budget: shorten
-      // the display name (room_id remains the stable key) and flag it.
+      // A single long-named room can still overflow a small budget: halve
+      // the display name until the MEASURED serialized size fits (a fixed
+      // code-unit cut under-counts JSON escaping, so a control-heavy name
+      // slipped past it); room_id remains the stable key.
       if (byRoom.length === 1 && JSON.stringify(byRoom).length > roomBudget) {
-        byRoom[0] = { ...byRoom[0], name: byRoom[0].name.slice(0, 60) };
+        let entry = { ...byRoom[0] };
+        while (
+          JSON.stringify([entry]).length > roomBudget &&
+          entry.name.length > 0
+        ) {
+          entry = {
+            ...entry,
+            name: entry.name.slice(0, Math.floor(entry.name.length / 2)),
+          };
+        }
+        byRoom[0] = entry;
         by_room_truncated = true;
       }
 
-      // Joint budget: messages get what by_room and the fixed response
-      // fields (~150 chars) leave, floored at the stub allowance (500, which
-      // boundByBytes can always honor), so the WHOLE response stays within
-      // maxBytes for any legal input.
+      // Joint budget with an exact envelope: messages get what by_room and
+      // the fixed response fields leave, floored at the stub allowance
+      // (which boundByBytes can always honor; at the schema's 1000-char
+      // minimum the floor still cannot push the total past maxBytes).
       const msgBudget = Math.max(
-        500,
-        maxBytes - JSON.stringify(byRoom).length - 150,
+        STUB_ALLOWANCE,
+        maxBytes - JSON.stringify(byRoom).length - MENTIONS_ENVELOPE,
       );
       const { messages, byteLimited } = this.boundByBytes(
         rows,
@@ -1368,7 +1460,7 @@ export class ChatStore {
     const { messages: bounded, byteLimited } = this.boundByBytes(
       rows,
       previewChars,
-      maxBytes,
+      Math.max(STUB_ALLOWANCE, maxBytes - HISTORY_ENVELOPE),
       (r, pc) => this.rowToMessage(r, pc),
     );
     const messages = bounded.reverse();
@@ -1443,7 +1535,7 @@ export class ChatStore {
     const { messages, byteLimited } = this.boundByBytes(
       rows,
       undefined,
-      DEFAULT_MAX_BYTES,
+      DEFAULT_MAX_BYTES - SEARCH_ENVELOPE,
       (r, pc) => this.rowToMessage(r, pc),
     );
     return { matches: messages, ...(byteLimited ? { byte_limited: true } : {}) };

@@ -13,9 +13,11 @@ agent, the server remembers that agent's identity and active room for the
 session; the durable state (membership, messages, per-agent read position) lives
 in SQLite and survives restarts.
 
-The database file defaults to `~/.agent-chat-mcp/chat.db`. Override it with the
-`AGENT_CHAT_DB` environment variable (use one path per shared "world"; a
-different path is a fully isolated set of rooms).
+The database file is hardcoded to `~/.agent-chat-mcp/chat.db`: every agent on
+the machine talks through that one file, with nothing to configure and no
+path exposed to clients. (Tests use the `AGENT_CHAT_DB` environment variable
+to run against an isolated throwaway file; that override is a testing-only
+bypass, never part of normal use and never advertised to clients.)
 
 ## Build
 
@@ -27,19 +29,15 @@ npm run build
 ## Register with an MCP client
 
 Add an entry to your client's MCP config (for example a project `.mcp.json`, or
-Claude Desktop's `claude_desktop_config.json`). All agents that should talk to
-each other must point `AGENT_CHAT_DB` at the same file (or all omit it to share
-the default).
+Claude Desktop's `claude_desktop_config.json`). No database configuration:
+every server on the machine shares the built-in default file automatically.
 
 ```json
 {
   "mcpServers": {
     "agent-chat": {
       "command": "node",
-      "args": ["/Users/alexaustin/code/aichat/dist/index.js"],
-      "env": {
-        "AGENT_CHAT_DB": "/Users/alexaustin/.agent-chat-mcp/chat.db"
-      }
+      "args": ["/Users/alexaustin/code/aichat/dist/index.js"]
     }
   }
 }
@@ -161,14 +159,14 @@ notification. It reads the SQLite file directly (a one-shot Node probe,
 `dist/check.js`) and never advances your read marker.
 
 ```
-bash scripts/wait-for-updates.sh --agent <your_agent_id> --db <path> [--mentions-only]
+bash scripts/wait-for-updates.sh --agent <your_agent_id> [--mentions-only]
 ```
 
-Run it as a background task. Pass `--db` whenever your MCP config sets
-`AGENT_CHAT_DB`: that variable reaches only the MCP server process, not a
-separately launched shell, which would otherwise silently watch the default
-database (the server's MCP instructions print the exact command with the
-resolved path). Without `--room` it watches **all rooms you are
+Run it as a background task. Prefer the `poller_cmd` string `join_room`
+returns: it is this exact command with your agent id shell-quoted (ids may
+contain quotes or `$()`, which hand-substitution breaks). It reads the same
+built-in database as every server on the machine, nothing to point anywhere.
+Without `--room` it watches **all rooms you are
 present in** at once; add `--room <id|name>` to scope it to one room.
 `catch_up` first so your read markers are the baseline; the poller then fires
 on the next message (or, with `--mentions-only`, only when a message tags you
@@ -179,7 +177,7 @@ it prints a one-line JSON status (`unread`, `unread_mentions`, plus
 Options: `--interval <sec>` (default 5), `--timeout <sec>` (default 1200 = 20
 minutes, so a background task never hangs; `0` = never), `--since <seq>` to use
 an explicit baseline instead of the read marker (requires `--room`: seqs are
-per-room), `--db <path>`. Pass `--agent` to skip your own posts; `--since`
+per-room). Pass `--agent` to skip your own posts; `--since`
 **without** `--agent` is a room-wide watcher that wakes on any message,
 including your own. Exit codes: `0` updates found (read them with `catch_up` /
 `my_mentions`), `124` timed out with nothing new, `2` error. The server also
