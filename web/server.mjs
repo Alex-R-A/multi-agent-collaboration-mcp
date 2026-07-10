@@ -207,12 +207,21 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
 function markRead(d, roomId, name, seq) {
   const m = membership(d, roomId, name);
   if (!m) return { error: "join the room first (POST /api/join)" };
+  // Clamp to the room's latest seq (parity with the MCP server's mark_read):
+  // the monotonic max() below makes an unclamped over-large value permanent,
+  // wedging the marker above every future message.
+  const { latest } = d
+    .prepare(
+      "SELECT COALESCE(MAX(seq), 0) AS latest FROM messages WHERE room_id = ?",
+    )
+    .get(roomId);
+  const eff = Math.min(seq, latest);
   // Monotonic, mirroring the identity-marker semantics agents rely on for
   // read receipts and prune refusal.
   d.prepare(
     `UPDATE memberships SET last_read_seq = max(last_read_seq, ?), last_seen = datetime('now')
      WHERE room_id = ? AND agent_id = ?`,
-  ).run(seq, roomId, name);
+  ).run(eff, roomId, name);
   const row = d
     .prepare(
       "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
@@ -233,14 +242,44 @@ function leaveRoom(d, roomId, name) {
 
 // Mentions are parsed server-side from @tokens so every client gets the same
 // semantics; ids are stored as tagged even if that agent never joined,
-// matching how agent mentions behave.
+// matching how agent mentions behave. Trailing dots/dashes are stripped:
+// "ask @bob." tags bob, not "bob.".
 function parseMentions(body) {
   const out = [];
   for (const m of body.matchAll(/@([\w][\w.-]{0,199})/g)) {
-    if (!out.includes(m[1])) out.push(m[1]);
+    const id = m[1].replace(/[.-]+$/, "");
+    if (id && !out.includes(id)) out.push(id);
     if (out.length >= 100) break;
   }
   return out;
+}
+
+// Full-text search over the room's messages via the FTS index the MCP server
+// maintains; best matches first. FTS5 syntax errors surface to the caller.
+function searchMessages(roomId, q, limit) {
+  const d = getDb();
+  if (!d) return null;
+  const rows = d
+    .prepare(
+      `SELECT g.seq, g.agent_id AS "from", a.role, a.type, g.body, g.format,
+              g.mentions, g.reply_to_seq, g.created_at AS at
+       FROM messages_fts f
+       JOIN messages g ON g.id = f.rowid
+       LEFT JOIN agents a ON a.id = g.agent_id
+       WHERE f.body MATCH ? AND g.room_id = ?
+       ORDER BY rank LIMIT ?`,
+    )
+    .all(q, roomId, limit);
+  for (const r of rows) {
+    if (r.mentions) {
+      try {
+        r.mentions = JSON.parse(r.mentions);
+      } catch {
+        r.mentions = null;
+      }
+    }
+  }
+  return rows;
 }
 
 function sendJson(res, status, payload) {
@@ -252,6 +291,22 @@ function sendJson(res, status, payload) {
 }
 
 async function handlePost(url, req, res) {
+  // A foreign web page can fire no-preflight POSTs at localhost from the
+  // operator's browser; reject any non-local Origin. Requests without an
+  // Origin header (curl, scripts) stay allowed: local processes can already
+  // write the database file directly, so this is browser-context hygiene,
+  // not authentication.
+  const origin = req.headers.origin;
+  if (origin) {
+    let local = false;
+    try {
+      const h = new URL(origin).hostname;
+      local = h === "127.0.0.1" || h === "localhost" || h === "[::1]" || h === "::1";
+    } catch {}
+    if (!local) {
+      return sendJson(res, 403, { error: "cross-origin writes are not allowed" });
+    }
+  }
   const d = getWriteDb();
   if (!d) {
     return sendJson(res, 503, {
@@ -263,6 +318,9 @@ async function handlePost(url, req, res) {
     payload = JSON.parse(await readBody(req));
   } catch (e) {
     return sendJson(res, 400, { error: String((e && e.message) || e) });
+  }
+  if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
+    return sendJson(res, 400, { error: "request body must be a JSON object" });
   }
   const roomId = Number(payload.room);
   if (!Number.isInteger(roomId) || roomId <= 0) {
@@ -362,6 +420,29 @@ const server = createServer(async (req, res) => {
           error: `No database at ${DB_PATH}.`,
         });
       return sendJson(res, 200, { messages });
+    }
+    if (url.pathname === "/api/search") {
+      const roomId = Number(url.searchParams.get("room"));
+      if (!Number.isInteger(roomId) || roomId <= 0)
+        return sendJson(res, 400, { error: "room must be a positive integer" });
+      const q = (url.searchParams.get("q") || "").trim();
+      if (!q) return sendJson(res, 400, { error: "q is required" });
+      const limit = Math.max(
+        1,
+        Math.min(Number(url.searchParams.get("limit")) || 30, 100),
+      );
+      try {
+        const matches = searchMessages(roomId, q, limit);
+        if (matches === null)
+          return sendJson(res, 200, {
+            matches: [],
+            error: `No database at ${DB_PATH}.`,
+          });
+        return sendJson(res, 200, { matches, q });
+      } catch (e) {
+        // Most commonly an FTS5 syntax error in q; a 400 the UI can display.
+        return sendJson(res, 400, { error: String((e && e.message) || e) });
+      }
     }
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("not found");

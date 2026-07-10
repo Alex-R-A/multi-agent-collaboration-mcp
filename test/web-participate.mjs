@@ -117,6 +117,49 @@ try {
   const rejoin = await post("/api/join", { room: 1, name: "alex" });
   const again = await post("/api/post", { room: 1, name: "alex", body: "back" });
   check("rejoin revives posting", rejoin.status === 200 && again.status === 200 && again.data.seq === 4, { rejoin: rejoin.data, again: again.data });
+
+  // mention parsing strips trailing punctuation ("@bot." tags bot)
+  const punct = await post("/api/post", { room: 1, name: "alex", body: "thanks @bot." }); // seq 5
+  const tail = await (await fetch(`${base}/api/messages?room=1&after=4`)).json();
+  check(
+    "trailing punctuation stripped from mentions",
+    Array.isArray(tail.messages[0].mentions) && tail.messages[0].mentions[0] === "bot",
+    tail.messages[0],
+  );
+
+  // a JSON `null` body is a 400 validation error, not a 500
+  const nul = await fetch(base + "/api/post", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: "null",
+  });
+  check("null JSON payload is a 400", nul.status === 400, nul.status);
+
+  // the read marker clamps to the room's latest seq (monotonic max would
+  // otherwise make an oversized value permanent)
+  const big = await post("/api/read", { room: 1, name: "alex", seq: 9_999_999 });
+  check("read marker clamped to latest", big.data.last_read_seq === punct.data.seq, big.data);
+
+  // full-text search: finds the web post, surfaces FTS syntax errors as 400
+  const s1 = await (await fetch(`${base}/api/search?room=1&q=${encodeURIComponent("hello web")}`)).json();
+  check("search finds the web post", Array.isArray(s1.matches) && s1.matches.some((m) => m.seq === 3), s1);
+  const s2 = await fetch(`${base}/api/search?room=1&q=${encodeURIComponent('"unbalanced (')}`);
+  check("fts syntax error is a 400", s2.status === 400, s2.status);
+
+  // browser drive-by protection: foreign origins rejected, local allowed,
+  // no Origin header (curl/scripts) allowed
+  const evil = await fetch(base + "/api/post", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: "https://evil.example" },
+    body: JSON.stringify({ room: 1, name: "alex", body: "csrf attempt" }),
+  });
+  check("foreign-origin write rejected", evil.status === 403, evil.status);
+  const localOk = await fetch(base + "/api/post", {
+    method: "POST",
+    headers: { "Content-Type": "application/json", Origin: `http://127.0.0.1:${port}` },
+    body: JSON.stringify({ room: 1, name: "alex", body: "local origin ok" }),
+  });
+  check("local-origin write allowed", localOk.status === 200, localOk.status);
 } finally {
   child.kill();
   rmSync(dir, { recursive: true, force: true });

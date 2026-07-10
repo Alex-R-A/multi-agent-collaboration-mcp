@@ -348,11 +348,36 @@
         display: none;
       }
 
+      #room-tools {
+        display: flex;
+        flex-direction: column;
+        align-items: flex-end;
+        gap: 7px;
+        flex: none;
+      }
+
       #room-stats {
         font-size: 11px;
         color: var(--text-faint);
         white-space: nowrap;
-        padding-bottom: 4px;
+      }
+
+      #search {
+        width: 220px;
+        font-family: var(--font-mono);
+        font-size: 11.5px;
+        color: var(--text);
+        background: var(--bg);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 5px 9px;
+      }
+      #search::placeholder {
+        color: var(--text-faint);
+      }
+      #search:focus {
+        outline: none;
+        border-color: var(--accent-line);
       }
 
       /* ---- pinned intro --------------------------------------------------- */
@@ -657,6 +682,81 @@
         background: var(--accent-soft);
       }
 
+      /* Directed at you: an @mention of your identity or a reply to your
+         message. Amber bar so agent traffic aimed at the human stands out. */
+      .msg.directed {
+        border-left-color: var(--accent);
+        background: linear-gradient(
+          90deg,
+          rgba(224, 163, 74, 0.07),
+          var(--hue-bg, transparent) 55%
+        );
+      }
+
+      .body a {
+        color: var(--accent);
+        text-decoration-color: var(--accent-line);
+        text-underline-offset: 2px;
+        word-break: break-all;
+      }
+      .body a:hover {
+        text-decoration-color: var(--accent);
+      }
+
+      /* ---- search mode ------------------------------------------------------ */
+
+      #search-bar {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        max-width: 920px;
+        margin: 0 auto 14px;
+        border: 1px solid var(--accent-line);
+        border-radius: 8px;
+        background: var(--accent-soft);
+        padding: 8px 12px;
+        font-size: 11.5px;
+        color: var(--text-dim);
+      }
+      #search-info {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #search-back {
+        margin-left: auto;
+        flex: none;
+        font-size: 10.5px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        color: var(--accent);
+      }
+      #search-back:hover {
+        text-decoration: underline;
+      }
+
+      #results {
+        max-width: 920px;
+        margin: 0 auto;
+      }
+      .result {
+        cursor: pointer;
+      }
+      .result:hover {
+        background: var(--surface-2);
+      }
+      .result .go {
+        opacity: 0;
+        color: var(--accent);
+        font-size: 10px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        transition: opacity 0.15s;
+      }
+      .result:hover .go {
+        opacity: 0.9;
+      }
+
       .msg.fresh {
         animation: rise 0.35s ease-out, wash 1.6s ease-out;
       }
@@ -909,6 +1009,13 @@
         #banner {
           width: calc(100% - 32px);
         }
+        #composer {
+          padding-left: 16px;
+          padding-right: 16px;
+        }
+        #search {
+          width: 150px;
+        }
       }
 
       @media (prefers-reduced-motion: reduce) {
@@ -947,7 +1054,17 @@
             <h1 id="room-name"></h1>
             <p id="room-desc"></p>
           </div>
-          <div id="room-stats"></div>
+          <div id="room-tools">
+            <div id="room-stats"></div>
+            <input
+              id="search"
+              type="search"
+              placeholder="Search room"
+              autocomplete="off"
+              spellcheck="false"
+              title="Full-text search (FTS5 syntax: AND by default, OR, NOT, quoted phrases, prefix*)"
+            />
+          </div>
         </header>
         <details id="pinned" hidden>
           <summary>
@@ -959,8 +1076,13 @@
         <div id="banner" hidden>Connection lost. Retrying.</div>
         <section id="stream-wrap" hidden>
           <div id="stream">
+            <div id="search-bar" hidden>
+              <span id="search-info"></span>
+              <button id="search-back">Back to live</button>
+            </div>
+            <div id="results" hidden></div>
             <button id="older" hidden>Load earlier messages</button>
-            <div id="msgs"></div>
+            <div id="msgs" role="log"></div>
           </div>
           <button id="jump" hidden></button>
         </section>
@@ -1022,6 +1144,7 @@
         "composer", "compose-join", "join-name", "join-btn", "join-error",
         "compose-box", "reply-target", "compose-text", "send", "compose-ident",
         "ident-btn", "leave-btn", "compose-error",
+        "search", "search-bar", "search-info", "search-back", "results",
       ]) el[id.replace(/-(\w)/g, (_, c) => c.toUpperCase())] = document.getElementById(id);
 
       const state = {
@@ -1037,6 +1160,11 @@
         replyTo: null, // { seq, label } the composer is replying to
         sending: false,
         lastReadSent: 0, // highest seq reported to /api/read for this room
+        // An initial load that could not run (a poll fetch held the lock, or it
+        // failed) is deferred here so the next tick retries it with FULL
+        // initial semantics (older-button, empty placeholder, no animations).
+        pendingInitial: false,
+        searchMode: false, // search results are displayed instead of the tail
       };
 
       const IDENT_KEY = "agent-chat.identity";
@@ -1151,6 +1279,40 @@
         return m.role || m.type || m.from;
       }
 
+      // Append text with http(s) URLs as clickable links. Everything goes in
+      // via textContent/append (never innerHTML); href is only ever the
+      // regex-matched http(s) token, so no javascript: vectors.
+      function linkify(node, text) {
+        for (const part of text.split(/(https?:\/\/[^\s<>"')\]]+)/g)) {
+          if (/^https?:\/\//.test(part)) {
+            const trail = part.match(/[.,;:!?]+$/)?.[0] ?? "";
+            const url = trail ? part.slice(0, -trail.length) : part;
+            const a = document.createElement("a");
+            a.href = url;
+            a.textContent = url;
+            a.target = "_blank";
+            a.rel = "noopener noreferrer";
+            node.append(a);
+            if (trail) node.append(trail);
+          } else if (part) {
+            node.append(part);
+          }
+        }
+      }
+
+      /** True when the message is aimed at this human: an @mention of their
+       *  identity or a reply to one of their messages. */
+      function directedAtMe(m) {
+        const me = identity();
+        if (!me || m.from === me) return false;
+        if (Array.isArray(m.mentions) && m.mentions.includes(me)) return true;
+        if (m.reply_to_seq) {
+          const parent = state.msgs.find((x) => x.seq === m.reply_to_seq);
+          if (parent && parent.from === me) return true;
+        }
+        return false;
+      }
+
       async function fetchJson(url) {
         const r = await fetch(url);
         if (!r.ok) throw new Error("HTTP " + r.status);
@@ -1180,7 +1342,15 @@
         const q = el.filter.value.trim().toLowerCase();
         const scroll = el.rooms.scrollTop;
         el.rooms.textContent = "";
-        const shown = state.rooms.filter(
+        // Most recently active first (UTC strings compare lexicographically);
+        // quiet rooms keep id order at the bottom.
+        const sorted = [...state.rooms].sort((a, b) => {
+          const A = a.last_activity || "";
+          const B = b.last_activity || "";
+          if (A !== B) return A < B ? 1 : -1;
+          return a.id - b.id;
+        });
+        const shown = sorted.filter(
           (r) =>
             !q ||
             r.name.toLowerCase().includes(q) ||
@@ -1270,11 +1440,38 @@
               state.seen[cur.id] = cur.last_activity;
               saveSeen();
               renderRoomHead();
+            } else {
+              // The open room was deleted by another process. Stop polling a
+              // ghost and say so instead of failing on the next post.
+              const gone = state.current.name;
+              state.current = null;
+              state.searchMode = false;
+              el.streamWrap.hidden = true;
+              el.roomHead.hidden = true;
+              el.pinned.hidden = true;
+              renderComposer();
+              updateTitle();
+              showPlaceholder(
+                "This room was deleted.",
+                `"${gone}" no longer exists; pick another room on the left.`,
+              );
             }
+          } else if (state.rooms.length && el.placeholder.hidden === false) {
+            // Recovered from "Loading..."/error with no room selected.
+            showPlaceholder(
+              "Pick a room.",
+              "Rooms are listed on the left; the amber dot marks activity you have not seen.",
+            );
           }
           renderRooms();
         } catch {
           noteFail();
+          if (!state.current) {
+            showPlaceholder(
+              "Cannot reach the viewer server.",
+              "Retrying automatically.",
+            );
+          }
         } finally {
           state.loadingRooms = false;
         }
@@ -1358,7 +1555,7 @@
         wrap.className = "body-wrap";
         const body = document.createElement("div");
         body.className = "body";
-        body.textContent = m.body;
+        linkify(body, m.body);
         wrap.append(body);
         const lines = (m.body.match(/\n/g) || []).length + 1;
         if (m.body.length > 1600 || lines > 20) {
@@ -1377,7 +1574,21 @@
         container.append(wrap);
       }
 
-      function jumpToSeq(seq) {
+      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+      // Scroll a message into view, paging older history in (bounded) when the
+      // target is not loaded yet. Retries briefly when the fetch lock is busy.
+      async function jumpToSeq(seq) {
+        for (let i = 0; i < 20; i++) {
+          if (el.msgs.querySelector(`[data-seq="${seq}"]`)) break;
+          const first = state.msgs[0];
+          if (!first || first.seq <= 1 || first.seq <= seq) break;
+          const changed = await loadOlder();
+          if (!changed) {
+            if (el.older.hidden) break; // history exhausted or room switched
+            await sleep(150); // fetch lock was busy; retry
+          }
+        }
         const target = el.msgs.querySelector(`[data-seq="${seq}"]`);
         if (!target) return;
         target.scrollIntoView({ block: "center" });
@@ -1408,7 +1619,11 @@
           !prev.reply_to_seq === !m.reply_to_seq;
 
         const row = document.createElement("article");
-        row.className = "msg" + (grouped ? " grouped" : "") + (fresh ? " fresh" : "");
+        row.className =
+          "msg" +
+          (grouped ? " grouped" : "") +
+          (fresh ? " fresh" : "") +
+          (directedAtMe(m) ? " directed" : "");
         row.dataset.seq = m.seq;
         applyHue(row, m.from);
 
@@ -1506,6 +1721,12 @@
         el.older.hidden = !first || first.seq <= 1;
       }
 
+      function updateTitle() {
+        const badge = state.newCount > 0 ? `(${state.newCount}) ` : "";
+        const room = state.current ? state.current.name + " - " : "";
+        document.title = badge + room + "agent-chat";
+      }
+
       function updateJump() {
         if (state.newCount > 0 && !state.follow) {
           el.jump.hidden = false;
@@ -1514,11 +1735,20 @@
         } else {
           el.jump.hidden = true;
         }
+        updateTitle();
       }
 
       async function loadNew(initial) {
         const room = state.current;
-        if (!room || state.loadingMsgs) return;
+        if (!room || state.searchMode) return;
+        if (state.loadingMsgs) {
+          if (initial) state.pendingInitial = true;
+          return;
+        }
+        if (state.pendingInitial) {
+          initial = true;
+          state.pendingInitial = false;
+        }
         state.loadingMsgs = true;
         try {
           const last = state.msgs.length
@@ -1559,23 +1789,27 @@
           }
           maybeMarkRead();
         } catch {
+          if (initial) state.pendingInitial = true; // retry with initial semantics
           noteFail();
         } finally {
           state.loadingMsgs = false;
         }
       }
 
+      // Returns true when it prepended messages (used by jumpToSeq to detect
+      // progress); false on busy, error, or exhausted history.
       async function loadOlder() {
         const room = state.current;
         const first = state.msgs[0];
-        if (!room || !first || state.loadingMsgs) return;
+        if (!room || !first || state.loadingMsgs) return false;
         state.loadingMsgs = true;
         el.older.disabled = true;
+        let changed = false;
         try {
           const data = await fetchJson(
             `/api/messages?room=${room.id}&before=${first.seq}&limit=${PAGE}`,
           );
-          if (state.current !== room || data.error || !data.messages) return;
+          if (state.current !== room || data.error || !data.messages) return false;
           if (data.messages.length) {
             const prevHeight = el.stream.scrollHeight;
             const prevTop = el.stream.scrollTop;
@@ -1583,6 +1817,7 @@
             rebuildStream();
             el.stream.scrollTop =
               el.stream.scrollHeight - prevHeight + prevTop;
+            changed = true;
           }
           updateOlderButton();
           if (!data.messages.length) el.older.hidden = true;
@@ -1591,6 +1826,100 @@
         } finally {
           el.older.disabled = false;
           state.loadingMsgs = false;
+        }
+        return changed;
+      }
+
+      // ---- search mode --------------------------------------------------------
+
+      function renderResult(m) {
+        const row = document.createElement("article");
+        row.className = "msg result";
+        applyHue(row, m.from);
+
+        const head = document.createElement("div");
+        head.className = "msg-head";
+        const who = document.createElement("span");
+        who.className = "who";
+        who.textContent = label(m);
+        head.append(who);
+        if (label(m) !== m.from) {
+          const id = document.createElement("span");
+          id.className = "who-id";
+          id.textContent = m.from;
+          head.append(id);
+        }
+        const meta = document.createElement("span");
+        meta.className = "msg-meta";
+        const seq = document.createElement("span");
+        seq.className = "seq";
+        seq.textContent = "#" + m.seq;
+        const time = document.createElement("span");
+        time.textContent = fmtTime(parseUtc(m.at));
+        const go = document.createElement("span");
+        go.className = "go";
+        go.textContent = "view in stream";
+        meta.append(seq, time, go);
+        head.append(meta);
+        row.append(head);
+
+        const body = document.createElement("div");
+        body.className = "body";
+        body.textContent = flat(m.body, 320);
+        row.append(body);
+
+        row.addEventListener("click", () => {
+          exitSearch(false);
+          jumpToSeq(m.seq);
+        });
+        return row;
+      }
+
+      async function enterSearch() {
+        const room = state.current;
+        const q = el.search.value.trim();
+        if (!room) return;
+        if (!q) return exitSearch();
+        let data;
+        try {
+          const r = await fetch(
+            `/api/search?room=${room.id}&q=${encodeURIComponent(q)}&limit=50`,
+          );
+          data = await r.json().catch(() => ({}));
+          if (!r.ok || data.error) throw new Error(data.error || "HTTP " + r.status);
+        } catch (e) {
+          data = { matches: [], failed: e.message };
+        }
+        if (state.current !== room) return;
+        state.searchMode = true;
+        el.msgs.hidden = true;
+        el.older.hidden = true;
+        hidePlaceholder();
+        el.searchBar.hidden = false;
+        el.results.hidden = false;
+        el.results.textContent = "";
+        el.searchInfo.textContent = data.failed
+          ? "Search failed: " + data.failed
+          : data.matches.length
+            ? `${data.matches.length} match(es) for "${q}", best first. Click one to view it in the stream.`
+            : `No matches for "${q}".`;
+        for (const m of data.matches || []) el.results.append(renderResult(m));
+        el.stream.scrollTop = 0;
+      }
+
+      function exitSearch(scrollToBottom = true) {
+        const wasSearching = state.searchMode;
+        state.searchMode = false;
+        el.searchBar.hidden = true;
+        el.results.hidden = true;
+        el.results.textContent = "";
+        el.msgs.hidden = false;
+        updateOlderButton();
+        if (!wasSearching) return;
+        loadNew(false); // catch up on the tail that was paused during search
+        if (scrollToBottom) {
+          state.follow = true;
+          requestAnimationFrame(scrollBottom);
         }
       }
 
@@ -1702,6 +2031,7 @@
           el.composeText.value = "";
           autosize();
           clearReply();
+          if (state.searchMode) exitSearch();
           state.follow = true;
           state.newCount = 0;
           updateJump();
@@ -1728,6 +2058,10 @@
         const room = state.current;
         if (!room || !joinedHere()) return;
         if (document.visibilityState !== "visible") return;
+        // Only claim messages as read while pinned to the bottom: arrivals
+        // above the jump pill have not been seen, and agents treat this
+        // marker as a read receipt.
+        if (!state.follow) return;
         const last = state.msgs.length
           ? state.msgs[state.msgs.length - 1].seq
           : 0;
@@ -1758,6 +2092,12 @@
         el.older.hidden = true;
         el.streamWrap.hidden = false;
         el.pinned.open = false;
+        state.searchMode = false;
+        el.search.value = "";
+        el.searchBar.hidden = true;
+        el.results.hidden = true;
+        el.results.textContent = "";
+        el.msgs.hidden = false;
         updateJump();
         renderRoomHead();
         renderComposer();
@@ -1770,11 +2110,13 @@
       // ---- wiring ------------------------------------------------------------
 
       el.stream.addEventListener("scroll", () => {
+        const was = state.follow;
         state.follow = nearBottom();
         if (state.follow && state.newCount > 0) {
           state.newCount = 0;
           updateJump();
         }
+        if (!was && state.follow) maybeMarkRead(); // caught up by scrolling
       });
 
       el.jump.addEventListener("click", () => {
@@ -1782,6 +2124,7 @@
         state.newCount = 0;
         updateJump();
         scrollBottom();
+        maybeMarkRead();
       });
 
       el.older.addEventListener("click", loadOlder);
@@ -1813,7 +2156,23 @@
           e.preventDefault();
           sendMessage();
         }
+        if (e.key === "Escape") clearReply();
       });
+      el.joinName.addEventListener("keydown", (e) => {
+        // Escape backs out of "Change name" when already joined.
+        if (e.key === "Escape" && joinedHere()) renderComposer();
+      });
+      el.search.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          enterSearch();
+        }
+        if (e.key === "Escape") {
+          el.search.value = "";
+          exitSearch();
+        }
+      });
+      el.searchBack.addEventListener("click", () => exitSearch());
       document.addEventListener("visibilitychange", maybeMarkRead);
 
       setInterval(() => loadNew(false), POLL_MS);
