@@ -1,9 +1,11 @@
 #!/usr/bin/env node
-// One-shot, read-only probe: does a room have unread messages (or unread
-// messages directed at an agent: its mentions or replies to its messages),
-// relative to its read marker (or an explicit --since)?
+// One-shot, read-only probe: does an agent have unread messages (or unread
+// messages directed at it: its mentions or replies to its messages)?
+// Default scope is ALL rooms the agent is currently present in; pass --room
+// to scope to one room (with an optional --since seq baseline; seqs are
+// per-room, so --since requires --room).
 // Exit 0 = updates exist, 1 = none yet, 2 = error. Prints a JSON status line.
-// Used by scripts/wait-for-updates.sh to poll without touching the read marker.
+// Used by scripts/wait-for-updates.sh to poll without touching read markers.
 //
 // The --agent baseline is the IDENTITY-level marker (memberships.last_read_seq,
 // the MAX across that identity's sessions); per-session private cursors are
@@ -68,7 +70,12 @@ function resolveDbPath(override?: string): string {
 }
 
 const args = parseArgs(process.argv.slice(2));
-if (!args.room) fail("--room is required");
+if (!args.room && !args.agent) {
+  fail("--agent is required (watches all your rooms) unless --room is given");
+}
+if (args.since !== undefined && args.room === undefined) {
+  fail("--since requires --room (seq baselines are per-room)");
+}
 if (args.mentionsOnly && !args.agent) {
   fail("--mentions-only requires --agent");
 }
@@ -92,6 +99,48 @@ try {
   const db = new Database(path);
   db.pragma("busy_timeout = 2000");
   db.pragma("query_only = ON");
+
+  if (!args.room) {
+    // All-rooms watch: unread relative to each present membership's marker.
+    const agent = args.agent;
+    if (!agent) fail("--agent is required when watching all rooms");
+    const { n: rooms } = db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM memberships WHERE agent_id = ? AND left_at IS NULL",
+      )
+      .get(agent) as { n: number };
+    if (rooms === 0) fail(`agent "${agent}" is not a member of any room`);
+    const { c: unread } = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM messages g
+         JOIN memberships mb ON mb.room_id = g.room_id
+              AND mb.agent_id = ? AND mb.left_at IS NULL
+         WHERE g.seq > mb.last_read_seq AND g.agent_id != ?`,
+      )
+      .get(agent, agent) as { c: number };
+    const { c: unreadMentions } = db
+      .prepare(
+        `SELECT COUNT(*) AS c FROM messages g
+         JOIN memberships mb ON mb.room_id = g.room_id
+              AND mb.agent_id = ? AND mb.left_at IS NULL
+         WHERE g.seq > mb.last_read_seq AND g.agent_id != ?
+           AND ${directedAt("g")}`,
+      )
+      .get(agent, agent, agent, agent) as { c: number };
+    db.close();
+    const hasUpdates = args.mentionsOnly ? unreadMentions > 0 : unread > 0;
+    process.stdout.write(
+      JSON.stringify({
+        agent,
+        rooms,
+        unread,
+        unread_mentions: unreadMentions,
+        mentions_only: args.mentionsOnly,
+        has_updates: hasUpdates,
+      }) + "\n",
+    );
+    process.exit(hasUpdates ? 0 : 1);
+  }
 
   let room = /^\d+$/.test(args.room)
     ? (db.prepare("SELECT id FROM rooms WHERE id = ?").get(Number(args.room)) as

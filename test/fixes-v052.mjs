@@ -26,7 +26,7 @@ const check = (n, c, x) => {
   s.joinRoom(r, "other");
   for (let i = 1; i <= 10; i++) s.postMessage(r, "other", `m${i}`, "text", null, null);
   s.markRead(r, "twin", 3, "S1"); // S1 lags at 3
-  s.catchUp(r, "twin", 500, undefined, undefined, undefined, undefined, "S2"); // identity marker -> 10
+  s.catchUp(r, "twin", 500, undefined, undefined, "S2"); // identity marker -> 10
   s.leaveRoom(r, "twin"); // soft leave must NOT drop session cursors
   s.joinRoom(r, "twin", "S1"); // rejoin the lagging session
   check(
@@ -34,7 +34,7 @@ const check = (n, c, x) => {
     s.getCursor(r, "twin", "S1").last_read_seq === 3,
     s.getCursor(r, "twin", "S1"),
   );
-  const resumed = s.catchUp(r, "twin", 500, undefined, undefined, undefined, undefined, "S1");
+  const resumed = s.catchUp(r, "twin", 500, undefined, undefined, "S1");
   check(
     "no messages lost across leave/rejoin (7 undelivered arrive)",
     resumed.messages.length === 7 && resumed.messages[0].seq === 4,

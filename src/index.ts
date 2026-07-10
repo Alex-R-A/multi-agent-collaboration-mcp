@@ -22,7 +22,7 @@ const POLLER = join(
 
 const INSTRUCTIONS = `Shared chat room for AI agents, backed by one SQLite file. Each agent runs its own copy of this server; the file is the coordination channel. Your identity and active room are remembered for the session.
 
-Typical flow: list_rooms -> join_room (capture the returned agent_id if you did not supply one; read the pinned intro) -> list_agents to see who is present -> catch_up (consumes the backlog and advances your read marker) or read_history (browse without advancing) -> post_message. Tag participants with the "to" list; reference an earlier message with reply_to_seq (replies come back with a reply_to preview). catch_up later returns only new messages from OTHER agents; your own posts are never returned by catch_up (use read_history or search_messages to see them). To sync the room use plain catch_up; catch_up with mentions_me is a filtered peek that hides broadcasts and is NOT a room sync, so never conclude the room is quiet from a mentions_me result while its unread_total/hidden_by_filter are > 0.
+Typical flow: list_rooms -> join_room (capture the returned agent_id if you did not supply one; read the pinned intro) -> list_agents to see who is present -> catch_up (consumes the backlog and advances your read marker) or read_history (browse without advancing) -> post_message. Tag participants with the "to" list; reference an earlier message with reply_to_seq (replies come back with a reply_to preview). catch_up later returns only new messages from OTHER agents; your own posts are never returned by catch_up (use read_history or search_messages to see them). To sync a room use catch_up (always the full stream). To find what needs YOU across every room you have joined, use my_mentions: a single cross-room inbox of unread messages directed at you (mentions and replies), a peek that never advances markers; entries clear when you actually read their room. Its by_room also reports each room's TOTAL unread (broadcasts included), so an empty inbox with nonzero by_room unread means rooms still have traffic, not silence.
 
 When you create a room, name it for the TOPIC it will discuss (kebab-case, e.g. 'auth-refactor-review'), not for participants or generic labels: names are how agents find rooms in list_rooms.
 
@@ -30,9 +30,9 @@ Bulk reads are byte-bounded by default (~100k serialized): byte_limited:true mea
 
 Waiting for activity without busy-looping tool calls: run this bash poller as a BACKGROUND task. It exits 0 the moment there is something new (so its exit IS your notification), prints a one-line JSON status (unread, unread_mentions, latest_seq), and otherwise quits after 20 minutes so it never hangs.
 
-  bash ${POLLER} --room <id|name> --agent <your_agent_id> [--mentions-only]
+  bash ${POLLER} --agent <your_agent_id> [--mentions-only]
 
-Call catch_up first so your read marker is the baseline; the poller then fires on the next message from another agent (your own posts are skipped, so posting will not wake it), or, with --mentions-only, only when a message tags you or replies to a message you wrote. Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override). Exit codes: 0 = updates (read them with catch_up), 124 = timed out with nothing new, 2 = error. NOTE for cursor:'private' sessions: --agent reads the IDENTITY-level marker (the MAX across your twin sessions), so a lagging private session should pass --since with its own last_read_seq from whoami instead.`;
+Without --room it watches ALL rooms you are present in at once; add --room <id|name> to scope it to one room. Call catch_up (per room) first so your read markers are the baseline; the poller then fires on the next message from another agent (your own posts are skipped, so posting will not wake it), or, with --mentions-only, only when a message tags you or replies to a message you wrote (my_mentions then shows exactly those). Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override; requires --room since seqs are per-room). Exit codes: 0 = updates (read them with catch_up / my_mentions), 124 = timed out with nothing new, 2 = error. NOTE for cursor:'private' sessions: baselines are IDENTITY-level markers (the MAX across your twin sessions), so a lagging private session should use --room with --since = its own last_read_seq from whoami.`;
 
 // One stdio server process serves one agent. We remember its identity and
 // active room for the session so the agent need not repeat them on every call.
@@ -601,18 +601,12 @@ server.registerTool(
     title: "Catch up on new messages",
     description:
       "Return messages from OTHER agents posted since you last read (seq > your " +
-      "last_read marker), oldest first. Your own messages are never returned here " +
-      "(use read_history/search_messages to see them). By default ADVANCES your " +
-      "read marker so the next call only returns what is new; `remaining` reports " +
-      "how many are still unread. Set mentions_me=true to see ONLY messages " +
-      "directed at you (mentions or replies to you); this is NOT a room catch-up: " +
-      "it is a PEEK that HIDES broadcasts and other agents' traffic and does NOT " +
-      "advance your marker. Its result reports `unread_total` (all unread from " +
-      "others) and `hidden_by_filter` (how many unread it is hiding); if either " +
-      "is > 0 do NOT conclude the room is quiet, call plain catch_up (no " +
-      "mentions_me) to read the stream. To page more directed messages than " +
-      "`limit`, call again with after_seq = the prior `next_after_seq` until " +
-      "`remaining` is 0.",
+      "last_read marker), oldest first, and ADVANCE your read marker so the " +
+      "next call only returns what is new; `remaining` reports how many are " +
+      "still unread. Your own messages are never returned here (use " +
+      "read_history/search_messages to see them). This is THE room sync and it " +
+      "is unfiltered by design; to find what is directed at you across every " +
+      "room, use my_mentions (a cross-room inbox that never moves markers).",
     inputSchema: {
       limit: z
         .number()
@@ -621,22 +615,6 @@ server.registerTool(
         .max(500)
         .optional()
         .describe("Max messages to return this call (default 50)"),
-      mentions_me: z
-        .boolean()
-        .optional()
-        .describe(
-          "Only messages directed at you: your `to` mentions or replies to a " +
-            "message you wrote (peek, no advance)",
-        ),
-      after_seq: z
-        .number()
-        .int()
-        .nonnegative()
-        .optional()
-        .describe(
-          "Cursor for mentions_me paging: pass the prior next_after_seq " +
-            "(only valid together with mentions_me)",
-        ),
       preview_chars: z
         .number()
         .int()
@@ -661,30 +639,79 @@ server.registerTool(
         ),
     },
   },
-  async ({ limit, mentions_me, after_seq, preview_chars, max_bytes }) => {
+  async ({ limit, preview_chars, max_bytes }) => {
     try {
       touchSession();
       const { agentId, roomId } = requireActive();
-      // Fail loudly instead of silently ignoring the cursor: an advancing
-      // catch_up pages by moving the marker, so after_seq means the caller
-      // misunderstands which mode it is in.
-      if (after_seq !== undefined && !mentions_me) {
-        return fail(
-          "after_seq only applies to mentions_me peek paging; plain catch_up " +
-            "pages by advancing your read marker -- just call it again",
-        );
-      }
       const result = store.catchUp(
         roomId,
         agentId,
         limit ?? 50,
-        mentions_me ? agentId : undefined,
-        after_seq,
         preview_chars,
         max_bytes,
         cursorId(),
       );
       return ok(result);
+    } catch (e) {
+      return fail(asMessage(e));
+    }
+  },
+);
+
+server.registerTool(
+  "my_mentions",
+  {
+    title: "My mentions inbox (all rooms)",
+    description:
+      "Cross-room INBOX: unread messages directed at you (your @mentions, or " +
+      "replies to messages you wrote) across EVERY room you are present in, " +
+      "oldest first, each tagged with room_id/room_name. Rooms you left are " +
+      "muted. Strictly a PEEK: it never advances read markers; an entry clears " +
+      "once you actually read its room (catch_up or mark_read there), so the " +
+      "normal workflow drains the inbox. Needs only an identity, not an " +
+      "active room (join_room once first). `by_room` lists every room with ANY " +
+      "unread from others: `directed` (aimed at you) and `unread` (total, " +
+      "broadcasts included). An EMPTY inbox with nonzero by_room `unread` " +
+      "means those rooms still have traffic to sync with catch_up, not " +
+      "silence.",
+    inputSchema: {
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .max(500)
+        .optional()
+        .describe("Max inbox entries to return (default 50)"),
+      preview_chars: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe(
+          "If set, truncate each returned body to this many characters " +
+            "(truncated:true + length mark the cut; fetch full bodies with " +
+            "get_message in that room)",
+        ),
+      max_bytes: z
+        .number()
+        .int()
+        .min(1000)
+        .max(400_000)
+        .optional()
+        .describe("Serialized-size budget for the response (default 100000)"),
+    },
+  },
+  async ({ limit, preview_chars, max_bytes }) => {
+    try {
+      touchSession();
+      if (session.agentId === null) {
+        return fail(
+          "join a room first with join_room to establish your identity",
+        );
+      }
+      return ok(
+        store.myMentions(session.agentId, limit ?? 50, preview_chars, max_bytes),
+      );
     } catch (e) {
       return fail(asMessage(e));
     }
@@ -699,9 +726,9 @@ server.registerTool(
       "Browse messages WITHOUT changing your read marker. With no before_seq you " +
       "get the most recent `limit` messages (e.g. the last 5). To page backward " +
       "through older messages, pass before_seq = the oldest_seq from the previous " +
-      "call. Set mentions_me=true to list only messages directed at you (across " +
-      "all of history, read or not). Messages are returned oldest-first; each " +
-      "message that replies to another carries a `reply_to` preview.",
+      "call. Messages are returned oldest-first; each message that replies to " +
+      "another carries a `reply_to` preview. For unread messages directed at " +
+      "you, use my_mentions; to find a topic, use search_messages.",
     inputSchema: {
       limit: z
         .number()
@@ -716,13 +743,6 @@ server.registerTool(
         .positive()
         .optional()
         .describe("Return messages older than this seq (for pagination)"),
-      mentions_me: z
-        .boolean()
-        .optional()
-        .describe(
-          "Only messages directed at you: your `to` mentions or replies to a " +
-            "message you wrote",
-        ),
       preview_chars: z
         .number()
         .int()
@@ -747,19 +767,12 @@ server.registerTool(
         ),
     },
   },
-  async ({ limit, before_seq, mentions_me, preview_chars, max_bytes }) => {
+  async ({ limit, before_seq, preview_chars, max_bytes }) => {
     try {
       touchSession();
-      const { agentId, roomId } = requireActive();
+      const { roomId } = requireActive();
       return ok(
-        store.readHistory(
-          roomId,
-          limit ?? 50,
-          before_seq,
-          mentions_me ? agentId : undefined,
-          preview_chars,
-          max_bytes,
-        ),
+        store.readHistory(roomId, limit ?? 50, before_seq, preview_chars, max_bytes),
       );
     } catch (e) {
       return fail(asMessage(e));

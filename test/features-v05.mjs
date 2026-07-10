@@ -34,7 +34,7 @@ for (let i = 0; i < 5; i++) s.postMessage(room, "bob", BODY, "text", null, null)
 const seen = [];
 let byteLimitedPages = 0;
 for (let guard = 0; guard < 10; guard++) {
-  const r = s.catchUp(room, "alice", 50, undefined, undefined, undefined, 5000);
+  const r = s.catchUp(room, "alice", 50, undefined, 5000);
   if (r.byte_limited) byteLimitedPages++;
   for (const m of r.messages) seen.push(m.seq);
   check(
@@ -49,7 +49,7 @@ check(true, "drained 5 msgs in order, no loss, no overlap");
 
 // --- head message alone exceeds the budget: truncated, never an empty page -
 s.postMessage(room, "bob", "y".repeat(20_000), "text", null, null); // seq 6
-const big = s.catchUp(room, "alice", 50, undefined, undefined, undefined, 5000);
+const big = s.catchUp(room, "alice", 50, undefined, 5000);
 check(big.messages.length === 1 && big.messages[0].seq === 6, "oversized head still delivered");
 check(big.messages[0].truncated === true && big.messages[0].length === 20_000, "oversized head truncated with full length");
 check(big.new_last_read_seq === 6 && big.byte_limited === true, "marker advanced past oversized head; byte_limited set");
@@ -127,15 +127,15 @@ s.upsertAgent("twin", null, null, null);
 s.joinRoom(room, "twin", "S1");
 s.joinRoom(room, "twin", "S2");
 const base = s.getMembership(room, "twin").last_read_seq; // 0: sees whole room
-const t1 = s.catchUp(room, "twin", 500, undefined, undefined, undefined, undefined, "S1");
-const t2 = s.catchUp(room, "twin", 500, undefined, undefined, undefined, undefined, "S2");
+const t1 = s.catchUp(room, "twin", 500, undefined, undefined, "S1");
+const t2 = s.catchUp(room, "twin", 500, undefined, undefined, "S2");
 check(base === 0 && t1.messages.length === 11 && t2.messages.length === 11, "both private sessions receive the full stream");
 check(s.getMembership(room, "twin").last_read_seq === 11, "identity marker advanced to MAX across sessions");
 // New message: both sessions get it once each; shared-mode splitting is
 // covered by test/concurrent-catchup.mjs and must stay intact.
 s.postMessage(room, "bob", "for the twins", "text", null, null); // seq 12
-const t1b = s.catchUp(room, "twin", 500, undefined, undefined, undefined, undefined, "S1");
-const t2b = s.catchUp(room, "twin", 500, undefined, undefined, undefined, undefined, "S2");
+const t1b = s.catchUp(room, "twin", 500, undefined, undefined, "S1");
+const t2b = s.catchUp(room, "twin", 500, undefined, undefined, "S2");
 check(t1b.messages.length === 1 && t2b.messages.length === 1, "each private session sees the new message exactly once");
 // mark_read on one session does not move the other.
 s.markRead(room, "twin", 5, "S1");
@@ -159,7 +159,7 @@ s.close();
   v.joinRoom(r, "a");
   v.joinRoom(r, "b");
   v.postMessage(r, "b", "z".repeat(300_000), "text", null, null);
-  const page = v.catchUp(r, "a", 50, undefined, undefined, 150_000, 100_000);
+  const page = v.catchUp(r, "a", 50, 150_000, 100_000);
   const size = JSON.stringify(page.messages).length;
   check(size <= 100_000, `preview_chars > max_bytes stays within budget (${size})`);
   check(
@@ -169,7 +169,7 @@ s.close();
   // Adversarial escaping: control chars serialize 6x, the estimate must
   // self-correct via the re-measure.
   v.postMessage(r, "b", "\u0001".repeat(30_000), "text", null, null);
-  const esc = v.catchUp(r, "a", 50, undefined, undefined, undefined, 50_000);
+  const esc = v.catchUp(r, "a", 50, undefined, 50_000);
   const escSize = JSON.stringify(esc.messages).length;
   check(escSize <= 50_000, `heavy-escaping body stays within budget (${escSize})`);
   v.close();
@@ -188,7 +188,7 @@ s.close();
   v.joinRoom(r, "other");
   for (let i = 0; i < 10; i++) v.postMessage(r, "other", `m${i}`, "text", null, null);
   v.markRead(r, "twin", 3, "S1"); // S1 lags at 3
-  v.catchUp(r, "twin", 500, undefined, undefined, undefined, undefined, "S2"); // identity MAX -> 10
+  v.catchUp(r, "twin", 500, undefined, undefined, "S2"); // identity MAX -> 10
   const raw = new Database(dbPath);
   raw
     .prepare(
@@ -201,7 +201,7 @@ s.close();
     v.getCursor(r, "twin", "S1").last_read_seq === 3,
     "resume join preserves a dormant session cursor",
   );
-  const resumed = v.catchUp(r, "twin", 500, undefined, undefined, undefined, undefined, "S1");
+  const resumed = v.catchUp(r, "twin", 500, undefined, undefined, "S1");
   check(resumed.messages.length === 7, "dormant session resumes with its full backlog");
 
   // --- prune refusal must see lagging private session cursors ---------------

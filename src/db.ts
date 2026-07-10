@@ -97,6 +97,9 @@ export type MessageRow = {
   superseded_by?: number;
 };
 
+/** An inbox entry: a message plus the room it lives in. */
+export type MentionRow = MessageRow & { room_id: number; room_name: string };
+
 type RawMessage = {
   seq: number;
   agent_id: string;
@@ -1043,17 +1046,16 @@ export class ChatStore {
   }
 
   /**
-   * Unread messages (seq > last_read_seq), oldest first.
-   * Without mentionsMe: advances the read marker.
-   * With mentionsMe: a filtered PEEK that does NOT advance the marker, so the
-   * broadcast messages it skips are not silently marked read.
+   * Unread messages (seq > last_read_seq), oldest first; ADVANCES the read
+   * marker over exactly the rows returned. Mention filtering deliberately does
+   * NOT exist here: a filtered view of one room's stream gets mistaken for a
+   * room sync (an agent concludes "quiet" while broadcasts sit unread). The
+   * mentions inbox is myMentions: cross-room and never marker-advancing.
    */
   catchUp(
     roomId: number,
     agentId: string,
     limit: number,
-    mentionsMe?: string,
-    afterSeq?: number,
     previewChars?: number,
     maxBytes: number = DEFAULT_MAX_BYTES,
     sessionId: string | null = null,
@@ -1063,77 +1065,7 @@ export class ChatStore {
     remaining: number;
     advanced: boolean;
     byte_limited?: boolean;
-    next_after_seq?: number;
-    unread_total?: number;
-    hidden_by_filter?: number;
-    hint?: string;
   } {
-    if (mentionsMe !== undefined) {
-      // Peek mode: filtered, never advances the marker. The rows fetch and the
-      // three counts run in one DEFERRED (read) transaction so they all see a
-      // single snapshot; otherwise a concurrent writer landing between the
-      // separate SELECTs could yield inconsistent numbers (e.g. hidden_by_filter
-      // exceeding unread_total). Deferred, not immediate: reads take no lock.
-      const peek = this.db.transaction(() => {
-        const cursor = this.getCursor(roomId, agentId, sessionId);
-        if (!cursor) throw new Error("not a member of this room");
-        const from = cursor.last_read_seq;
-        // Page forward through unread mentions without moving the marker:
-        // afterSeq (clamped to >= the marker) is the cursor for the next page.
-        const lower = afterSeq !== undefined ? Math.max(from, afterSeq) : from;
-        const rows = this.db
-          .prepare(
-            `SELECT ${MESSAGE_COLS} FROM ${MESSAGE_FROM}
-             WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
-               AND ${directedAt("g")}
-             ORDER BY g.seq ASC LIMIT ?`,
-          )
-          .all(roomId, lower, agentId, mentionsMe, mentionsMe, limit) as RawMessage[];
-        const { messages, byteLimited } = this.boundByBytes(
-          rows,
-          previewChars,
-          maxBytes,
-          (r, pc) => this.rowToMessage(r, pc),
-        );
-        const lastSeq =
-          messages.length > 0 ? messages[messages.length - 1].seq : lower;
-        const { c } = this.db
-          .prepare(
-            `SELECT COUNT(*) AS c FROM messages g
-             WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
-               AND ${directedAt("g")}`,
-          )
-          .get(roomId, lastSeq, agentId, mentionsMe, mentionsMe) as { c: number };
-        // Marker-relative totals (NOT page-relative like `remaining`): the peek
-        // hides everything not directed at you, so report how much it is hiding
-        // so an empty/exhausted peek is not mistaken for "nothing new".
-        const unread_total = this.unreadCount(roomId, from, agentId);
-        const { c: hidden_by_filter } = this.db
-          .prepare(
-            `SELECT COUNT(*) AS c FROM messages g
-             WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
-               AND NOT ${directedAt("g")}`,
-          )
-          .get(roomId, from, agentId, mentionsMe, mentionsMe) as { c: number };
-        return {
-          messages,
-          new_last_read_seq: from,
-          remaining: c,
-          advanced: false,
-          ...(byteLimited ? { byte_limited: true } : {}),
-          next_after_seq: lastSeq,
-          unread_total,
-          hidden_by_filter,
-          ...(hidden_by_filter > 0
-            ? {
-                hint: `${hidden_by_filter} unread message(s) are not directed at you and are hidden by mentions_me; call catch_up without mentions_me to read the room stream before assuming there is nothing new.`,
-              }
-            : {}),
-        };
-      });
-      return peek.deferred();
-    }
-
     // Advancing path: read the cursor, fetch, and advance inside one IMMEDIATE
     // transaction so a concurrent same-identity call serializes behind it and
     // reads the updated cursor instead of returning overlapping messages.
@@ -1174,15 +1106,102 @@ export class ChatStore {
   }
 
   /**
+   * Cross-room mentions INBOX: unread messages directed at the agent (its
+   * @mentions, or replies to its messages) across every room it is currently
+   * present in; rooms it soft-left are muted. Oldest first (messages.id is a
+   * global total order across rooms), each row tagged room_id/room_name.
+   *
+   * Strictly a PEEK: no read marker moves. An entry clears when its room is
+   * actually read (catch_up / mark_read there), so the normal workflow drains
+   * the inbox without a second cursor system. Baselines are identity-level
+   * markers, so a lagging private-cursor session may see fewer entries than
+   * its own cursor would imply (same caveat as the poller).
+   *
+   * by_room lists EVERY present room with any unread from others, reporting
+   * both `directed` and total `unread` (broadcasts included): an empty inbox
+   * with nonzero unread means rooms have traffic to sync, not silence. Rows
+   * and counts read one DEFERRED snapshot so they cannot disagree.
+   */
+  myMentions(
+    agentId: string,
+    limit: number,
+    previewChars?: number,
+    maxBytes: number = DEFAULT_MAX_BYTES,
+  ): {
+    messages: MentionRow[];
+    total_directed: number;
+    by_room: { room_id: number; name: string; unread: number; directed: number }[];
+    byte_limited?: boolean;
+  } {
+    const tx = this.db.transaction(() => {
+      const rows = this.db
+        .prepare(
+          `SELECT ${MESSAGE_COLS}, g.room_id AS room_id, r.name AS room_name
+           FROM ${MESSAGE_FROM}
+           JOIN memberships mb ON mb.room_id = g.room_id
+                AND mb.agent_id = ? AND mb.left_at IS NULL
+           JOIN rooms r ON r.id = g.room_id
+           WHERE g.seq > mb.last_read_seq AND g.agent_id != ?
+             AND ${directedAt("g")}
+           ORDER BY g.id ASC LIMIT ?`,
+        )
+        .all(agentId, agentId, agentId, agentId, limit) as (RawMessage & {
+        room_id: number;
+        room_name: string;
+      })[];
+      const { messages, byteLimited } = this.boundByBytes(
+        rows,
+        previewChars,
+        maxBytes,
+        (r, pc) => {
+          const extra = r as RawMessage & { room_id: number; room_name: string };
+          return {
+            ...this.rowToMessage(r, pc),
+            room_id: extra.room_id,
+            room_name: extra.room_name,
+          };
+        },
+      );
+      // All four placeholders bind the same agent id; textual order is the
+      // SUM(CASE directedAt) pair, then the membership join, then the author
+      // exclusion.
+      const byRoom = this.db
+        .prepare(
+          `SELECT g.room_id AS room_id, r.name AS name, COUNT(*) AS unread,
+                  SUM(CASE WHEN ${directedAt("g")} THEN 1 ELSE 0 END) AS directed
+           FROM messages g
+           JOIN memberships mb ON mb.room_id = g.room_id
+                AND mb.agent_id = ? AND mb.left_at IS NULL
+           JOIN rooms r ON r.id = g.room_id
+           WHERE g.seq > mb.last_read_seq AND g.agent_id != ?
+           GROUP BY g.room_id, r.name
+           ORDER BY g.room_id`,
+        )
+        .all(agentId, agentId, agentId, agentId) as {
+        room_id: number;
+        name: string;
+        unread: number;
+        directed: number;
+      }[];
+      const total_directed = byRoom.reduce((a, r) => a + r.directed, 0);
+      return {
+        messages,
+        total_directed,
+        by_room: byRoom,
+        ...(byteLimited ? { byte_limited: true } : {}),
+      };
+    });
+    return tx.deferred();
+  }
+
+  /**
    * Read-only browse (never advances the read marker). No beforeSeq => latest
-   * `limit`; else older than beforeSeq. With mentionsMe, only messages directed
-   * at that agent.
+   * `limit`; else older than beforeSeq.
    */
   readHistory(
     roomId: number,
     limit: number,
     beforeSeq?: number,
-    mentionsMe?: string,
     previewChars?: number,
     maxBytes: number = DEFAULT_MAX_BYTES,
   ): {
@@ -1196,10 +1215,6 @@ export class ChatStore {
     if (beforeSeq !== undefined) {
       conds.push("g.seq < ?");
       params.push(beforeSeq);
-    }
-    if (mentionsMe !== undefined) {
-      conds.push(directedAt("g"));
-      params.push(mentionsMe, mentionsMe);
     }
     const where = conds.join(" AND ");
     const rows = this.db
@@ -1219,20 +1234,14 @@ export class ChatStore {
     const messages = bounded.reverse();
     const oldest = messages.length > 0 ? messages[0].seq : null;
 
-    // has_more: are there older messages matching the same filter?
+    // has_more: are there older messages?
     let has_more = false;
     if (oldest !== null) {
-      const moreConds = ["room_id = ?", "seq < ?"];
-      const moreParams: (number | string)[] = [roomId, oldest];
-      if (mentionsMe !== undefined) {
-        moreConds.push(directedAt("messages"));
-        moreParams.push(mentionsMe, mentionsMe);
-      }
       has_more = !!this.db
         .prepare(
-          `SELECT 1 FROM messages WHERE ${moreConds.join(" AND ")} LIMIT 1`,
+          "SELECT 1 FROM messages WHERE room_id = ? AND seq < ? LIMIT 1",
         )
-        .get(...moreParams);
+        .get(roomId, oldest);
     }
     return {
       messages,

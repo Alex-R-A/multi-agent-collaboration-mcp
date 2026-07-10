@@ -1,25 +1,28 @@
 #!/usr/bin/env bash
 #
-# Block until a chat room has updates, then exit. Designed to run as a
-# background task: when it exits 0, there is something new to read.
+# Block until there is something new for an agent, then exit. Designed to run
+# as a background task: when it exits 0, there is something new to read.
 #
 # Usage:
-#   wait-for-updates.sh --room <id|name> --agent <agent_id> [options]
+#   wait-for-updates.sh --agent <agent_id> [options]           # ALL your rooms
+#   wait-for-updates.sh --room <id|name> --agent <agent_id>    # one room
 #
 # Options:
-#   --room <id|name>     room to watch (required)
-#   --agent <agent_id>   your identity; baseline is its read marker, and your own
-#                        posts are skipped (required unless --since is given)
+#   --agent <agent_id>   your identity; baselines are its read markers, and your
+#                        own posts are skipped (required unless --room + --since)
+#   --room <id|name>     scope the watch to one room (default: every room the
+#                        agent is currently present in)
 #   --mentions-only      only fire when a message tags --agent or replies to one
 #                        of its messages
-#   --since <seq>        use this seq as the baseline instead of the read marker.
-#                        Without --agent this is a room-wide watcher: it has no
-#                        identity, so it wakes on ANY message, including yours.
+#   --since <seq>        use this seq as the baseline instead of the read marker
+#                        (requires --room: seqs are per-room). Without --agent
+#                        this is a room-wide watcher: it has no identity, so it
+#                        wakes on ANY message, including yours.
 #                        Private-cursor sessions (join_room cursor:'private')
-#                        should pass --since with their own last_read_seq from
-#                        whoami: the --agent marker is identity-level (the MAX
-#                        across twin sessions), which can hide a lagging
-#                        session's backlog.
+#                        should pass --room with --since = their own
+#                        last_read_seq from whoami: markers are identity-level
+#                        (the MAX across twin sessions), which can hide a
+#                        lagging session's backlog.
 #   --interval <sec>     poll interval (default 5)
 #   --timeout <sec>      give up after this many seconds of no updates
 #                        (default 1200 = 20 minutes; 0 = never)
@@ -57,10 +60,10 @@ if ! [[ "$timeout" =~ ^[0-9]+$ ]]; then
   echo "wait-for-updates: --timeout must be a non-negative integer" >&2; exit 2
 fi
 
-# No passthrough flags means no --room (check.ts requires it). Guard explicitly:
+# No passthrough flags means neither --agent nor --room. Guard explicitly:
 # expanding an empty array as "${probe_args[@]}" below trips `set -u` on bash 3.2.
 if [[ ${#probe_args[@]} -eq 0 ]]; then
-  echo "wait-for-updates: --room is required" >&2; exit 2
+  echo "wait-for-updates: --agent (all-rooms watch) or --room is required" >&2; exit 2
 fi
 
 if [[ ! -f "$CHECK" ]]; then
