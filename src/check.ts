@@ -14,7 +14,7 @@
 import Database from "better-sqlite3";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { directedAt } from "./db.js";
 
 type Args = {
@@ -63,9 +63,10 @@ function parseArgs(argv: string[]): Args {
 }
 
 function resolveDbPath(override?: string): string {
-  if (override && override.trim().length > 0) return override.trim();
+  // Absolute always: a relative path silently means a different file per cwd.
+  if (override && override.trim().length > 0) return resolve(override.trim());
   const env = process.env.AGENT_CHAT_DB;
-  if (env && env.trim().length > 0) return env.trim();
+  if (env && env.trim().length > 0) return resolve(env.trim());
   return join(homedir(), ".agent-chat-mcp", "chat.db");
 }
 

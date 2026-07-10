@@ -182,6 +182,15 @@ try {
       old.superseded_by === wrong + 1 && neu.supersedes_seq === wrong,
       { old: old.superseded_by, neu: neu.supersedes_seq },
     );
+    const sres = await (
+      await fetch(`${base}/api/search?room=1&q=${encodeURIComponent('"wrong figure"')}`)
+    ).json();
+    const sm = (sres.matches || []).find((m) => m.seq === wrong);
+    check(
+      "search results carry supersession fields too",
+      !!sm && sm.superseded_by === wrong + 1,
+      sm,
+    );
   }
 
   // web replies stamp the denormalized reply author (prune-safe direction)

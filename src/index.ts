@@ -30,7 +30,7 @@ Bulk reads are byte-bounded by default (~100k serialized): byte_limited:true mea
 
 Waiting for activity without busy-looping tool calls: run this bash poller as a BACKGROUND task. It exits 0 the moment there is something new (so its exit IS your notification), prints a one-line JSON status (unread, unread_mentions, latest_seq), and otherwise quits after 20 minutes so it never hangs.
 
-  bash ${POLLER} --agent <your_agent_id> --db ${store.path} [--mentions-only]
+  bash "${POLLER}" --agent <your_agent_id> --db "${store.path}" [--mentions-only]
 
 ALWAYS pass --db as shown: AGENT_CHAT_DB in your MCP config reaches only the MCP server process, not a background shell, which would otherwise silently watch the default database. Without --room it watches ALL rooms you are present in at once; add --room <id|name> to scope it to one room. Call catch_up (per room) first so your read markers are the baseline; the poller then fires on the next message from another agent (your own posts are skipped, so posting will not wake it), or, with --mentions-only, only when a message tags you or replies to a message you wrote (my_mentions then shows exactly those). Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override; requires --room since seqs are per-room). Exit codes: 0 = updates (read them with catch_up / my_mentions), 124 = timed out with nothing new, 2 = error. NOTE for cursor:'private' sessions: baselines are IDENTITY-level markers (the MAX across your twin sessions), so a lagging private session should use --room with --since = its own last_read_seq from whoami.`;
 
@@ -39,20 +39,26 @@ ALWAYS pass --db as shown: AGENT_CHAT_DB in your MCP config reaches only the MCP
 const session: {
   agentId: string | null;
   roomId: number | null;
-  cursorPrivate: boolean;
+  // Cursor mode is PER ROOM, not global: a session can hold a private cursor
+  // in room A while working room B shared. A single boolean here previously
+  // let the LAST join's mode leak into every room's inbox baseline.
+  privateRooms: Set<number>;
 } = {
   agentId: null,
   roomId: null,
-  cursorPrivate: false,
+  privateRooms: new Set(),
 };
 
 // Distinguishes this process's private read cursor (join_room cursor:'private')
 // from other sessions running under the same agent_id.
 const SESSION_NONCE = randomUUID();
 
-/** The session-cursor key for store calls: a nonce in private mode, else null. */
+/** The session-cursor key for ACTIVE-room store calls: the nonce when the
+ *  active room was joined with a private cursor, else null. */
 function cursorId(): string | null {
-  return session.cursorPrivate ? SESSION_NONCE : null;
+  return session.roomId !== null && session.privateRooms.has(session.roomId)
+    ? SESSION_NONCE
+    : null;
 }
 
 type ToolResult = {
@@ -326,7 +332,10 @@ server.registerTool(
       room: z.string().min(1).describe("Room id or name to join"),
       agent_id: z
         .string()
-        .max(200)
+        .regex(
+          /^[\w][\w.-]{0,199}$/,
+          "letters, digits, underscore, dot or dash only (max 200)",
+        )
         .optional()
         .describe(
           "Your stable identity/nickname. Omit to be assigned a readable id.",
@@ -374,14 +383,21 @@ server.registerTool(
         // separate upsert here (it would risk clobbering a racing assigner).
         id = assignReadableId(type ?? null, role ?? null, description ?? null);
       }
-      // Session state mutates only AFTER the join succeeds: flipping
-      // cursorPrivate first would leave a failed join having silently changed
-      // cursor mode for the still-active previous room.
+      // Session state mutates only AFTER the join succeeds: flipping cursor
+      // mode first would leave a failed join having silently changed the mode
+      // for the still-active previous room.
       const priv = cursor === "private";
       store.joinRoom(target.id, id, priv ? SESSION_NONCE : null);
+      if (priv) {
+        session.privateRooms.add(target.id);
+      } else {
+        session.privateRooms.delete(target.id);
+        // Mode switch hygiene: drop any leftover private row so my_mentions'
+        // per-room COALESCE stops using a baseline this session abandoned.
+        store.clearSessionCursor(target.id, id, SESSION_NONCE);
+      }
       session.agentId = id;
       session.roomId = target.id;
-      session.cursorPrivate = priv;
       const cur = store.getCursor(target.id, id, cursorId())!;
       return ok({
         agent_id: id,
@@ -389,7 +405,7 @@ server.registerTool(
         room_name: target.name,
         description: target.description,
         pinned: target.pinned,
-        cursor: session.cursorPrivate ? "private" : "shared",
+        cursor: priv ? "private" : "shared",
         last_read_seq: cur.last_read_seq,
         unread: store.unreadCount(target.id, cur.last_read_seq, id),
         members: store.listAgents(target.id, 5).filter((a) => a.present).length,
@@ -420,9 +436,10 @@ server.registerTool(
       const { agentId, roomId } = requireActive();
       const left = store.leaveRoom(roomId, agentId);
       // Keep the identity: the session is still this agent, and my_mentions
-      // (memberships elsewhere) must keep working after leaving one room.
+      // (memberships elsewhere) must keep working after leaving one room. The
+      // room's cursor-mode entry also stays: its private position is preserved
+      // for resume (matching leaveRoom keeping the session_markers row).
       session.roomId = null;
-      session.cursorPrivate = false;
       return ok({ left, room_id: roomId, agent_id: agentId });
     } catch (e) {
       return fail(asMessage(e));
@@ -463,7 +480,7 @@ server.registerTool(
         agent_id: session.agentId,
         room_id: session.roomId,
         room_name: roomRow?.name ?? null,
-        cursor: session.cursorPrivate ? "private" : "shared",
+        cursor: session.privateRooms.has(session.roomId) ? "private" : "shared",
         last_read_seq: cur?.last_read_seq ?? 0,
         unread: store.unreadCount(
           session.roomId,
@@ -539,7 +556,14 @@ server.registerTool(
         .union([z.string(), z.record(z.any()), z.array(z.any())])
         .describe("Message body: a string, or a JSON object/array"),
       to: z
-        .array(z.string().min(1).max(200))
+        .array(
+          z
+            .string()
+            .regex(
+              /^[\w][\w.-]{0,199}$/,
+              "agent ids are letters, digits, underscore, dot or dash (max 200)",
+            ),
+        )
         .max(100)
         .optional()
         .describe("agent_ids this message is directed at (mentions); max 100"),
@@ -747,13 +771,16 @@ server.registerTool(
           "join a room first with join_room to establish your identity",
         );
       }
+      // Always pass the nonce: the store's per-room COALESCE uses this
+      // session's private cursor exactly where one exists (shared joins clear
+      // theirs), so each room gets ITS OWN mode rather than the active room's.
       return ok(
         store.myMentions(
           session.agentId,
           limit ?? 50,
           preview_chars,
           max_bytes,
-          cursorId(),
+          SESSION_NONCE,
           after_id ?? 0,
         ),
       );
@@ -1166,6 +1193,7 @@ server.registerTool(
         return fail(`pass confirm:true to delete room ${target.id} ("${target.name}")`);
       }
       const result = store.deleteRoom(target.id);
+      session.privateRooms.delete(target.id);
       if (session.roomId === target.id) {
         session.roomId = null; // identity survives; only the room is gone
       }

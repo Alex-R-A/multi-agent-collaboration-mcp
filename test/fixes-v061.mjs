@@ -141,5 +141,48 @@ const check = (n, c, x) => {
   s.close();
 }
 
+// --- cursor mode switch: shared rejoin clears the stale private baseline ----
+{
+  const s = new ChatStore(":memory:");
+  const r = s.createRoom("r", null, null).id;
+  s.upsertAgent("twin", null, null, null);
+  s.upsertAgent("other", null, null, null);
+  s.joinRoom(r, "twin", "SX"); // private cursor for session SX
+  s.joinRoom(r, "other");
+  s.postMessage(r, "other", "ping @twin", "text", ["twin"], null); // seq 1
+  s.catchUp(r, "twin", 50); // identity marker -> 1 (read via shared cursor)
+  const before = s.myMentions("twin", 50, undefined, undefined, "SX");
+  check(
+    "private row feeds the inbox while the session is private",
+    before.messages.length === 1,
+    before.messages,
+  );
+  s.joinRoom(r, "twin"); // rejoin SHARED
+  s.clearSessionCursor(r, "twin", "SX"); // what the MCP layer now does on shared joins
+  const after = s.myMentions("twin", 50, undefined, undefined, "SX");
+  check(
+    "shared rejoin clears the stale private baseline from the inbox",
+    after.messages.length === 0,
+    after.messages,
+  );
+  s.close();
+}
+
+// --- small max_bytes stays a real bound (floor cannot exceed the budget) ----
+{
+  const s = new ChatStore(":memory:");
+  const r = s.createRoom("busy", null, null).id;
+  s.upsertAgent("hero", null, null, null);
+  s.upsertAgent("n", null, null, null);
+  s.joinRoom(r, "hero");
+  s.joinRoom(r, "n");
+  for (let i = 0; i < 10; i++)
+    s.postMessage(r, "n", "hello @hero " + "x".repeat(300), "text", ["hero"], null);
+  const inbox = s.myMentions("hero", 50, undefined, 1000);
+  const size = JSON.stringify(inbox).length;
+  check(`max_bytes=1000 respected within slack (${size} <= 1600)`, size <= 1600, size);
+  check("byte_limited flagged when trimmed", inbox.byte_limited === true, inbox.byte_limited);
+}
+
 console.log(`\n${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"}`);
 process.exit(failures === 0 ? 0 : 1);

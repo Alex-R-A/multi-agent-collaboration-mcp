@@ -15,18 +15,25 @@
 import { createServer } from "node:http";
 import { readFileSync, existsSync } from "node:fs";
 import { homedir } from "node:os";
-import { join, dirname } from "node:path";
+import { join, dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const PORT = Number(process.env.AGENT_CHAT_VIEWER_PORT) || 8787;
+// PORT=0 is meaningful (bind an ephemeral port; used by tests), so a falsy
+// check must not swallow it.
+const rawPort = process.env.AGENT_CHAT_VIEWER_PORT;
+const PORT =
+  rawPort !== undefined && rawPort.trim() !== "" && Number.isFinite(Number(rawPort))
+    ? Number(rawPort)
+    : 8787;
 
 // Same resolution the server uses (kept in sync deliberately, not imported, so
 // the viewer needs no build output and never runs migrations against the file).
+// Absolute always: a relative override means a different file per cwd.
 function resolveDbPath() {
   const override = process.env.AGENT_CHAT_DB;
-  if (override && override.trim().length > 0) return override.trim();
+  if (override && override.trim().length > 0) return resolve(override.trim());
   return join(homedir(), ".agent-chat-mcp", "chat.db");
 }
 const DB_PATH = resolveDbPath();
@@ -189,6 +196,16 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
   if (!m || m.left_at !== null) {
     return { error: "join the room first (POST /api/join)" };
   }
+  // The column check is cached from open time; if an MCP server migrated the
+  // shared file AFTER this viewer started, pick the column up now instead of
+  // writing NULL reply authors until a viewer restart.
+  if (!wdbHasReplyAgent) {
+    wdbHasReplyAgent = !!d
+      .prepare(
+        "SELECT 1 FROM pragma_table_info('messages') WHERE name = 'reply_to_agent'",
+      )
+      .get();
+  }
   const mentionsJson =
     mentions && mentions.length > 0 ? JSON.stringify(mentions) : null;
   // Same shape as ChatStore.postMessage: validate the reply target and
@@ -316,7 +333,10 @@ function searchMessages(roomId, q, limit) {
   const rows = d
     .prepare(
       `SELECT g.seq, g.agent_id AS "from", a.role, a.type, g.body, g.format,
-              g.mentions, g.reply_to_seq, g.created_at AS at
+              g.mentions, g.reply_to_seq, g.supersedes_seq, g.created_at AS at,
+              (SELECT s.seq FROM messages s
+                WHERE s.room_id = g.room_id AND s.supersedes_seq = g.seq
+                ORDER BY s.seq DESC LIMIT 1) AS superseded_by
        FROM messages_fts f
        JOIN messages g ON g.id = f.rowid
        LEFT JOIN agents a ON a.id = g.agent_id

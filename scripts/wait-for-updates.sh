@@ -73,6 +73,16 @@ fi
 
 start=$(date +%s)
 while true; do
+  # Deadline first: never launch a probe past the timeout, so a caller's
+  # timing contract holds even when a probe plus sleep straddles the line.
+  if [[ "$timeout" -gt 0 ]]; then
+    now=$(date +%s)
+    if (( now - start >= timeout )); then
+      echo '{"timed_out":true}' >&2
+      exit 124
+    fi
+  fi
+
   if out=$(node "$CHECK" "${probe_args[@]}"); then
     echo "$out"          # exit 0 from probe => updates exist
     exit 0
@@ -91,12 +101,10 @@ while true; do
   if [[ "$timeout" -gt 0 ]]; then
     now=$(date +%s)
     elapsed=$(( now - start ))
-    if (( elapsed >= timeout )); then
-      echo '{"timed_out":true}' >&2
-      exit 124
-    fi
-    # Never sleep past the deadline: clamp the nap to the time remaining.
+    # Never sleep past the deadline: clamp the nap to the time remaining
+    # (the top-of-loop check exits once the deadline has passed).
     remaining=$(( timeout - elapsed ))
+    if (( remaining < 1 )); then remaining=1; fi
     sleep "$(( interval < remaining ? interval : remaining ))"
   else
     sleep "$interval"

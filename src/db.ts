@@ -1,15 +1,17 @@
 import Database from "better-sqlite3";
 import { mkdirSync } from "node:fs";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
 
 /**
  * Resolve the shared database file. All agents on a machine talk through one
  * file by default; override with AGENT_CHAT_DB for isolated rooms / testing.
+ * Always ABSOLUTE: a relative override would point tools launched from other
+ * working directories (the poller, most commonly) at a different file.
  */
 function resolveDbPath(): string {
   const override = process.env.AGENT_CHAT_DB;
-  if (override && override.trim().length > 0) return override.trim();
+  if (override && override.trim().length > 0) return resolve(override.trim());
   return join(homedir(), ".agent-chat-mcp", "chat.db");
 }
 
@@ -474,6 +476,20 @@ export class ChatStore {
         )
         .run(roomId);
     }
+  }
+
+  /**
+   * Drop THIS session's private cursor for a room: called when a session
+   * joins a room in SHARED mode, so a leftover private row from an earlier
+   * private join cannot keep feeding my_mentions a stale baseline that the
+   * session's own catch_up (now shared) no longer uses.
+   */
+  clearSessionCursor(roomId: number, agentId: string, sessionId: string): void {
+    this.db
+      .prepare(
+        "DELETE FROM session_markers WHERE room_id = ? AND agent_id = ? AND session_id = ?",
+      )
+      .run(roomId, agentId, sessionId);
   }
 
   /**
@@ -1218,8 +1234,10 @@ export class ChatStore {
         by_room_truncated = true;
       }
 
+      // The floor must never exceed the caller's own budget: with a small
+      // max_bytes, a fixed 2000 floor would overshoot it by itself.
       const msgBudget = Math.max(
-        2_000,
+        Math.min(2_000, maxBytes),
         maxBytes - JSON.stringify(byRoom).length,
       );
       const { messages, byteLimited } = this.boundByBytes(

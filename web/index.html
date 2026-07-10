@@ -1308,6 +1308,13 @@
         );
       }
 
+      // Compare rooms by id: the periodic /api/rooms refresh REPLACES the
+      // current room object, so object-identity checks wrongly treat a live
+      // room as switched and drop valid in-flight results.
+      function sameRoom(room) {
+        return !!room && !!state.current && state.current.id === room.id;
+      }
+
       async function postJson(url, payload) {
         const r = await fetch(url, {
           method: "POST",
@@ -1851,6 +1858,31 @@
         el.msgs.append(frag);
       }
 
+      // Live supersession patch: when a fresh message corrects one that is
+      // already rendered, annotate the old row in place. Full loads carry the
+      // annotation from the server; incremental polling must patch the DOM.
+      function patchSuperseded(targetSeq, bySeq) {
+        const entry = state.msgs.find((x) => x.seq === targetSeq);
+        if (entry) entry.superseded_by = bySeq;
+        const row = el.msgs.querySelector(`[data-seq="${targetSeq}"]`);
+        if (!row) return;
+        row.classList.add("superseded");
+        const old = row.querySelector(".chip.super");
+        if (old) old.remove(); // a newer superseder replaces the marker
+        let chips = row.querySelector(".chips");
+        if (!chips) {
+          chips = document.createElement("div");
+          chips.className = "chips";
+          row.append(chips);
+        }
+        const chip = document.createElement("button");
+        chip.className = "chip super";
+        chip.textContent = "superseded by #" + bySeq;
+        chip.title = "a later message corrects this one";
+        chip.addEventListener("click", () => jumpToSeq(bySeq));
+        chips.append(chip);
+      }
+
       function appendMsgs(rows, fresh) {
         let prev = state.msgs[state.msgs.length - 1] || null;
         const frag = document.createDocumentFragment();
@@ -1860,6 +1892,11 @@
           prev = m;
         }
         el.msgs.append(frag);
+        if (fresh) {
+          for (const m of rows) {
+            if (m.supersedes_seq) patchSuperseded(m.supersedes_seq, m.seq);
+          }
+        }
       }
 
       function updateOlderButton() {
@@ -1904,7 +1941,7 @@
             `/api/messages?room=${room.id}&after=${initial ? 0 : last}&limit=${PAGE}`,
           );
           noteOk();
-          if (state.current !== room || data.error || !data.messages) return;
+          if (!sameRoom(room) || data.error || !data.messages) return;
           const rows = initial
             ? data.messages
             : data.messages.filter((m) => m.seq > last);
@@ -1956,7 +1993,7 @@
           const data = await fetchJson(
             `/api/messages?room=${room.id}&before=${first.seq}&limit=${PAGE}`,
           );
-          if (state.current !== room || data.error || !data.messages) return false;
+          if (!sameRoom(room) || data.error || !data.messages) return false;
           if (data.messages.length) {
             const prevHeight = el.stream.scrollHeight;
             const prevTop = el.stream.scrollTop;
@@ -2040,7 +2077,7 @@
         } catch (e) {
           data = { matches: [], failed: e.message };
         }
-        if (state.current !== room) return;
+        if (!sameRoom(room)) return;
         state.searchMode = true;
         el.msgs.hidden = true;
         el.older.hidden = true;
@@ -2130,15 +2167,25 @@
         }
         el.joinBtn.disabled = true;
         try {
-          // Joining under a new name: soft-leave the old membership first, or
-          // the abandoned identity lingers as a present ghost member forever
-          // (visible in list_agents, blocking prune's unread-refusal).
-          const prev = loadJoined()[String(room.id)];
-          if (prev && prev !== name) {
-            await postJson("/api/leave", { room: room.id, name: prev }).catch(
-              () => {},
-            );
-          }
+          // Renaming: soft-leave EVERY membership recorded under another name,
+          // not just this room's, or the abandoned identity lingers as a
+          // present ghost member in each other joined room (visible in
+          // list_agents, blocking prune's unread-refusal) until each room is
+          // individually revisited.
+          const joinedMap = loadJoined();
+          const stale = Object.entries(joinedMap).filter(
+            ([, storedName]) => storedName && storedName !== name,
+          );
+          await Promise.all(
+            stale.map(([rid, storedName]) =>
+              postJson("/api/leave", {
+                room: Number(rid),
+                name: storedName,
+              }).catch(() => {}),
+            ),
+          );
+          for (const [rid] of stale) delete joinedMap[rid];
+          saveJoined(joinedMap);
           const j = await postJson("/api/join", { room: room.id, name });
           try {
             localStorage.setItem(IDENT_KEY, name);
@@ -2189,22 +2236,27 @@
             body,
             reply_to_seq: state.replyTo ? state.replyTo.seq : null,
           });
-          el.composeText.value = "";
           delete state.drafts[room.id];
-          autosize();
-          clearReply();
-          if (state.searchMode) exitSearch();
-          state.follow = true;
-          state.newCount = 0;
-          updateJump();
+          if (sameRoom(room)) {
+            // Only touch the shared composer/stream state if the user is
+            // still in this room; after a switch, the textarea, reply chip,
+            // search mode, and follow flag all belong to the OTHER room.
+            el.composeText.value = "";
+            autosize();
+            clearReply();
+            if (state.searchMode) exitSearch();
+            state.follow = true;
+            state.newCount = 0;
+            updateJump();
+          }
         } catch (e) {
-          el.composeError.textContent = e.message;
+          if (sameRoom(room)) el.composeError.textContent = e.message;
         } finally {
           state.sending = false;
           el.send.disabled = false;
-          el.composeText.focus();
+          if (sameRoom(room)) el.composeText.focus();
         }
-        loadNew(false); // pull the just-posted message into the stream
+        if (sameRoom(room)) loadNew(false); // pull the just-posted message in
       }
 
       function autosize() {
@@ -2239,7 +2291,7 @@
           const me = await fetchJson(
             `/api/me?room=${room.id}&name=${encodeURIComponent(identity())}`,
           );
-          if (state.current !== room) return;
+          if (!sameRoom(room)) return;
           state.marker = me.joined ? me.last_read_seq : -1;
           computeGap();
           maybeMarkRead();
@@ -2254,6 +2306,10 @@
         // above the jump pill have not been seen, and agents treat this
         // marker as a read receipt.
         if (!state.follow) return;
+        // Re-derive the gap from current state rather than trusting a stale
+        // flag: non-initial appends (including the degraded recovery path
+        // after a dropped initial load) never ran computeGap.
+        computeGap();
         // Never auto-advance over a gap of unfetched messages, and never
         // before the server-side marker is known (marker is monotonic, so a
         // premature advance is unrecoverable).
@@ -2265,10 +2321,11 @@
         state.lastReadSent = last;
         postJson("/api/read", { room: room.id, name: identity(), seq: last })
           .then((r) => {
-            state.marker = r.last_read_seq;
+            // A delayed response must not mutate another room's state.
+            if (sameRoom(room)) state.marker = r.last_read_seq;
           })
           .catch(() => {
-            state.lastReadSent = 0; // retry on the next batch
+            if (sameRoom(room)) state.lastReadSent = 0; // retry next batch
           });
       }
 
@@ -2297,8 +2354,8 @@
           return;
         }
         el.deleteYes.disabled = false;
-        el.deleteConfirm.hidden = true;
-        // Forget every local trace of the room.
+        // Forget every local trace of the deleted room regardless of where
+        // the user is now.
         const joined = loadJoined();
         delete joined[String(room.id)];
         saveJoined(joined);
@@ -2309,18 +2366,23 @@
           const saved = JSON.parse(localStorage.getItem(ROOM_KEY));
           if (saved && saved.id === room.id) localStorage.removeItem(ROOM_KEY);
         } catch {}
-        state.current = null;
-        state.searchMode = false;
-        el.streamWrap.hidden = true;
-        el.roomHead.hidden = true;
-        el.pinned.hidden = true;
-        renderComposer();
-        updateTitle();
-        showPlaceholder(
-          "Room deleted.",
-          `"${room.name}" and all of its data are gone. Pick another room on the left.`,
-          true,
-        );
+        // Tear down the UI only if the deleted room is still the one shown;
+        // after a switch, the current room's view (and draft) must survive.
+        if (sameRoom(room)) {
+          el.deleteConfirm.hidden = true;
+          state.current = null;
+          state.searchMode = false;
+          el.streamWrap.hidden = true;
+          el.roomHead.hidden = true;
+          el.pinned.hidden = true;
+          renderComposer();
+          updateTitle();
+          showPlaceholder(
+            "Room deleted.",
+            `"${room.name}" and all of its data are gone. Pick another room on the left.`,
+            true,
+          );
+        }
         loadRooms();
       }
 
@@ -2401,6 +2463,8 @@
             name: identity(),
             seq: last,
           });
+          // A delayed response must not mutate another room's state.
+          if (!sameRoom(room)) return;
           state.marker = r.last_read_seq;
           state.lastReadSent = Math.max(state.lastReadSent, last);
           computeGap();
