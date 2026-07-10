@@ -2,6 +2,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { randomUUID } from "node:crypto";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
@@ -27,19 +28,31 @@ function shq(s: string): string {
   return `'${s.replace(/'/g, "'\\''")}'`;
 }
 
-const INSTRUCTIONS = `Shared chat room for AI agents, backed by one SQLite file. Each agent runs its own copy of this server; the file is the coordination channel. Your identity and active room are remembered for the session.
+// The poller resolves the same built-in default database on its own, so the
+// advertised command needs --db ONLY when this server runs on an overridden
+// path (AGENT_CHAT_DB reaches the MCP process, never a background shell).
+const IS_DEFAULT_DB =
+  store.path === join(homedir(), ".agent-chat-mcp", "chat.db");
+const POLLER_CMD = IS_DEFAULT_DB
+  ? `bash ${shq(POLLER)} --agent <your_agent_id> [--mentions-only]`
+  : `bash ${shq(POLLER)} --agent <your_agent_id> --db ${shq(store.path)} [--mentions-only]`;
+const DB_NOTE = IS_DEFAULT_DB
+  ? ""
+  : " Pass --db exactly as shown: this server runs on a non-default database, and AGENT_CHAT_DB reaches only the MCP server process, not your background shell.";
 
-Typical flow: list_rooms -> join_room (capture the returned agent_id if you did not supply one; read the pinned intro) -> list_agents to see who is present -> catch_up (consumes the backlog and advances your read marker) or read_history (browse without advancing) -> post_message. Tag participants with the "to" list; reference an earlier message with reply_to_seq (replies come back with a reply_to preview). catch_up later returns only new messages from OTHER agents; your own posts are never returned by catch_up (use read_history or search_messages to see them). To sync a room use catch_up (always the full stream). To find what needs YOU across every room you have joined, use my_mentions: a single cross-room inbox of unread messages directed at you (mentions and replies), a peek that never advances markers; entries clear when you actually read their room. Its by_room also reports each room's TOTAL unread (broadcasts included), so an empty inbox with nonzero by_room unread means rooms still have traffic, not silence.
+const INSTRUCTIONS = `Shared chat room for AI agents, backed by one SQLite file; each agent runs its own copy of this server, and the file is the coordination channel. Your identity and active room are remembered for the session.
 
-When you create a room, name it for the TOPIC it will discuss (kebab-case, e.g. 'auth-refactor-review'), not for participants or generic labels: names are how agents find rooms in list_rooms.
+Typical flow: list_rooms -> join_room (capture the returned agent_id if you did not supply one; read the pinned intro) -> list_agents -> catch_up (consumes the backlog, advances your read marker) or read_history (no marker change) -> post_message. Tag participants with "to"; reference earlier messages with reply_to_seq. catch_up never returns your own posts (use read_history/search_messages for those) and is THE room sync, always unfiltered. my_mentions is the cross-room inbox of unread messages directed at you (mentions and replies): a peek that never moves markers; entries clear when you read their room; page with after_id = next_after_id. Its by_room also reports each room's TOTAL unread, so an empty inbox with nonzero by_room unread means rooms have traffic, not silence.
 
-Bulk reads are byte-bounded by default (~100k serialized): byte_limited:true means more remain, call again to page. Oversized bodies arrive with truncated:true and length; page the full text via get_message offset/max_chars. post_message returns crossed (messages from others you had NOT read when posting) with the seq range: if crossed > 0, catch_up before acting on your own assumptions, since contradicting messages may have landed while you wrote. Before starting exclusive work (editing a file, taking a task), call claim with a key like "file:src/db.ts": exactly one claimant wins; release_claim when done; list_claims shows holders; claims expire after their TTL so a crashed holder cannot block forever. To correct yourself, post_message with supersedes_seq pointing at your own earlier message; readers see superseded_by on the old one. If you run MULTIPLE sessions under one agent_id, pass cursor:'private' to join_room so each session keeps its own read position (the default 'shared' cursor splits the backlog once across sessions, which is right for work queues, wrong for independent views).
+Name rooms for their TOPIC (kebab-case, e.g. 'auth-refactor-review'), never for participants or generic labels: list_rooms names are how agents find rooms.
 
-Waiting for activity without busy-looping tool calls: run this bash poller as a BACKGROUND task. It exits 0 the moment there is something new (so its exit IS your notification), prints a one-line JSON status (unread, unread_mentions, latest_seq), and otherwise quits after 20 minutes so it never hangs.
+Bulk reads are byte-bounded (~100k serialized). byte_limited:true = more remain (catch_up/read_history: call again; my_mentions: pass after_id). Oversized bodies arrive truncated:true with length; page them via get_message offset. post_message returns crossed (messages from others you had NOT read when posting): if > 0, catch_up before acting, contradicting messages may have landed while you wrote. Before exclusive work, claim a key like "file:src/db.ts": exactly one claimant wins; release_claim when done; claims expire after their TTL, so a crashed holder cannot block forever. Correct yourself with post_message supersedes_seq on your own earlier message; readers see superseded_by on it. Running MULTIPLE sessions under one agent_id? Pass cursor:'private' to join_room for an independent read position (the default 'shared' splits the backlog once across sessions: right for work queues, wrong for independent views).
 
-  bash ${shq(POLLER)} --agent <your_agent_id> --db ${shq(store.path)} [--mentions-only]
+To wait for activity without busy-looping tool calls, run this poller as a BACKGROUND task; it exits 0 when there is something new (its exit is your notification) with a one-line JSON status (unread, unread_mentions), or exits after --timeout with nothing new:
 
-ALWAYS pass --db as shown: AGENT_CHAT_DB in your MCP config reaches only the MCP server process, not a background shell, which would otherwise silently watch the default database. Without --room it watches ALL rooms you are present in at once; add --room <id|name> to scope it to one room. Call catch_up (per room) first so your read markers are the baseline; the poller then fires on the next message from another agent (your own posts are skipped, so posting will not wake it), or, with --mentions-only, only when a message tags you or replies to a message you wrote (my_mentions then shows exactly those). Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override; requires --room since seqs are per-room). Exit codes: 0 = updates (read them with catch_up / my_mentions), 124 = timed out with nothing new, 2 = error. NOTE for cursor:'private' sessions: baselines are IDENTITY-level markers (the MAX across your twin sessions), so a lagging private session should use --room with --since = its own last_read_seq from whoami.`;
+  ${POLLER_CMD}
+
+${DB_NOTE ? DB_NOTE.trim() + " " : ""}Default scope is ALL rooms you are present in; --room <id|name> scopes to one. catch_up first so your markers are the baseline; your own posts never wake it; --mentions-only fires only on messages directed at you. Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override; requires --room). Exit codes: 0 updates, 124 timeout, 2 error. cursor:'private' note: the poller reads IDENTITY-level markers (the MAX across twin sessions); a lagging private session should use --room with --since = its own last_read_seq from whoami.`;
 
 // One stdio server process serves one agent. We remember its identity and
 // active room for the session so the agent need not repeat them on every call.
@@ -181,13 +194,11 @@ server.registerTool(
   {
     title: "Server info",
     description:
-      "Report the running server's version and build identity (git commit and " +
-      "build time) so you can confirm exactly which build is deployed. `commit` " +
-      'carries a -dirty suffix if built from an uncommitted tree, or is "unknown" ' +
-      "when built outside a git checkout. `stale` is true when a newer build has " +
-      "been deployed since this process started; reconnect the MCP to load it (a " +
-      "stdio server does not hot-reload). `latest_commit`/`latest_built_at` name " +
-      "that newer build when stale.",
+      "Report this server's version and build identity (git commit, build " +
+      "time). `stale:true` = a newer build was deployed since this process " +
+      "started; reconnect the MCP to load it (stdio servers do not " +
+      "hot-reload); `latest_commit`/`latest_built_at` name it. `commit` gets " +
+      "a -dirty suffix for uncommitted builds.",
     inputSchema: {},
   },
   async () => {
@@ -214,14 +225,10 @@ server.registerTool(
   {
     title: "Current time",
     description:
-      "Report the current time so you can date-stamp reasoning and tell whether " +
-      "it is morning or night. Returns `iso` (ISO 8601 local time with offset, " +
-      "e.g. 2026-07-08T03:35:13-04:00: the instant, the local wall-clock, and the " +
-      "zone offset in one string), `unix` (UTC epoch SECONDS, i.e. " +
-      "Date.now()/1000 floored, for arithmetic), `at` (local wall-clock " +
-      "'YYYY-MM-DD HH:MM:SS') and `timezone` (IANA name). `unix` shares its unit " +
-      "and clock with each message's `unix`, so `now.unix - message.unix` is the " +
-      "message's age in seconds.",
+      "Current time: `iso` (local ISO 8601 with zone offset), `unix` (UTC " +
+      "epoch SECONDS), `at` (local 'YYYY-MM-DD HH:MM:SS'), `timezone` (IANA " +
+      "name). `unix` matches each message's `unix`, so now.unix - " +
+      "message.unix = the message's age in seconds.",
     inputSchema: {},
   },
   async () => {
@@ -245,13 +252,10 @@ server.registerTool(
   {
     title: "Create room",
     description:
-      "Create a new chat room. Rooms must exist before agents can join. " +
-      "Name the room after the TOPIC under discussion (kebab-case, e.g. " +
-      "'b414-fix-design', 'auth-refactor-review'), never after participants " +
-      "or generic labels ('alex-room', 'chat-1'): agents discover rooms by " +
-      "scanning list_rooms names, so the name is the primary retrieval key. " +
-      "`pinned` is an intro/purpose note shown to every agent when they join. " +
-      "Returns the new room id.",
+      "Create a chat room (rooms must exist before agents can join). Name it " +
+      "for the TOPIC (kebab-case, e.g. 'auth-refactor-review'), never for " +
+      "participants or generic labels: list_rooms names are how agents find " +
+      "rooms. `pinned` is an intro shown to every joiner. Returns the room id.",
     inputSchema: {
       name: z
         .string()
@@ -326,18 +330,16 @@ server.registerTool(
   {
     title: "Join room",
     description:
-      "Join a room (by id or name) under an identity. If agent_id is omitted a " +
-      "readable id (e.g. clever-otter) is generated and returned; reuse it later " +
-      "to resume the same identity and read position. Supplying type/role/description lets other " +
-      "agents understand who you are. Read the returned `pinned` intro first. " +
-      "Sets this room as active for the session. If the returned `server_stale` " +
-      "is true, this MCP server is running outdated code; tell the user to " +
-      "reconnect it (see server_info for details). `cursor` controls the read " +
-      "position when several sessions share one agent_id: 'shared' (default) is " +
-      "one marker for the identity, so concurrent sessions SPLIT the backlog " +
-      "(each message delivered once, work-queue style); 'private' gives THIS " +
-      "session its own cursor (initialized from the shared marker), so it sees " +
-      "the full stream independently of its twins.",
+      "Join a room (id or name) under an identity; sets it active for the " +
+      "session. Omit agent_id to get a generated readable id (returned; reuse " +
+      "it later to resume the same identity and read position). " +
+      "type/role/description tell other agents who you are. Read the returned " +
+      "`pinned` intro. `server_stale:true` = this server runs outdated code; " +
+      "tell the user to reconnect the MCP. `cursor` (for several sessions " +
+      "sharing one agent_id): 'shared' (default) = one marker per identity, " +
+      "concurrent sessions SPLIT the backlog (work-queue style); 'private' = " +
+      "this session keeps its own cursor (starting from the shared marker) " +
+      "and sees the full stream independently.",
     inputSchema: {
       room: z.string().min(1).describe("Room id or name to join"),
       agent_id: z
@@ -435,9 +437,9 @@ server.registerTool(
   {
     title: "Leave room",
     description:
-      "Leave the active room. This is a soft leave: your read position is kept, " +
-      "so rejoining later resumes where you left off. Clears the session's " +
-      "active room.",
+      "Soft-leave the active room: your read position is kept, rejoining " +
+      "resumes it. Clears the active room; your identity is kept (my_mentions " +
+      "and later joins still work).",
     inputSchema: {},
   },
   async () => {
@@ -509,11 +511,9 @@ server.registerTool(
   {
     title: "List agents in room",
     description:
-      "List agents in the active room with type/role/description, plus per-agent " +
-      "`last_read_seq` (how far they have read; compare to a message seq for a " +
-      "read receipt), `last_seen`, `idle_seconds`, and liveness flags `present` " +
-      "(has not left) and `active` (seen within active_within_minutes). " +
-      "Optional filter matches id/type/role/description substrings.",
+      "List agents in the active room: type/role/description, `last_read_seq` " +
+      "(read receipt: compare to a message seq), `last_seen`, `idle_seconds`, " +
+      "`present` (has not left), `active` (seen within active_within_minutes).",
     inputSchema: {
       filter: z
         .string()
@@ -545,22 +545,16 @@ server.registerTool(
   {
     title: "Post message",
     description:
-      "Post a message to the active room. `content` may be plain text or a JSON " +
-      "object/array. `to` is an optional list of agent_ids this message is " +
-      "directed at (mentions). `reply_to_seq` tags another message (e.g. reply " +
-      "to message 8). Returns the assigned message number (seq) and, for each " +
-      "tagged id, `recipients`: a per-recipient delivery status to decide " +
-      "whether to wait for a reply. Each entry has `status` (`unknown` = never " +
-      "joined so the tag reaches no one, `left` = joined then left, `idle` = " +
-      "present but not seen recently, `active` = present and seen recently), " +
-      "`idle_seconds` since last seen, and `last_read_seq` (compare to this " +
-      "`seq`: if below it, they have not read this message yet). The response's " +
-      "`crossed` counts messages from others YOU had not read when you posted " +
-      "(with `crossed_range`): if > 0, catch_up, since contradicting messages " +
-      "may have landed while you wrote. `supersedes_seq` marks YOUR OWN earlier " +
-      "message as superseded by this one (readers see `superseded_by` on it); " +
-      "use it for corrections/retractions instead of leaving both versions " +
-      "standing with equal weight.",
+      "Post to the active room. `content` is text or a JSON object/array; " +
+      "`to` = agent_ids the message is directed at (mentions); `reply_to_seq` " +
+      "tags an earlier message. Returns the assigned `seq` plus, per tagged " +
+      "id, `recipients`: `status` (unknown = never joined, the tag reaches no " +
+      "one; left; idle; active), `idle_seconds`, and `last_read_seq` (below " +
+      "this seq = they have not read it yet). `crossed` counts messages from " +
+      "others YOU had not read at post time (`crossed_range`): if > 0, " +
+      "catch_up, contradicting messages may have landed while you wrote. " +
+      "`supersedes_seq` marks YOUR OWN earlier message as corrected (readers " +
+      "see `superseded_by` on it) instead of leaving both versions standing.",
     inputSchema: {
       content: z
         .union([z.string(), z.record(z.any()), z.array(z.any())])
@@ -664,10 +658,9 @@ server.registerTool(
         .positive()
         .optional()
         .describe(
-          "If set, truncate each returned body to this many characters. " +
-            "Truncated messages carry `truncated:true` and `length` (full " +
-            "length); fetch the complete body with get_message. A truncated " +
-            "json message comes back as a partial string, not a parsed object.",
+          "Truncate each body to this many chars; cut bodies carry " +
+            "truncated:true + length (full body via get_message). Truncated " +
+            "json = partial string, not an object.",
         ),
       max_bytes: z
         .number()
@@ -676,9 +669,9 @@ server.registerTool(
         .max(400_000)
         .optional()
         .describe(
-          "Serialized-size budget for this page (default 100000). The marker " +
-            "only advances over returned messages, so nothing is skipped: " +
-            "`byte_limited: true` means more remain, call again.",
+          "Serialized-size budget per page (default 100000). The marker " +
+            "advances only over returned messages; byte_limited:true = more " +
+            "remain, call again.",
         ),
       mentions_me: z
         .boolean()
@@ -728,15 +721,13 @@ server.registerTool(
     description:
       "Cross-room INBOX: unread messages directed at you (your @mentions, or " +
       "replies to messages you wrote) across EVERY room you are present in, " +
-      "oldest first, each tagged with room_id/room_name. Rooms you left are " +
-      "muted. Strictly a PEEK: it never advances read markers; an entry clears " +
-      "once you actually read its room (catch_up or mark_read there), so the " +
-      "normal workflow drains the inbox. Needs only an identity, not an " +
-      "active room (join_room once first). `by_room` lists every room with ANY " +
-      "unread from others: `directed` (aimed at you) and `unread` (total, " +
-      "broadcasts included). An EMPTY inbox with nonzero by_room `unread` " +
-      "means those rooms still have traffic to sync with catch_up, not " +
-      "silence.",
+      "oldest first, tagged room_id/room_name; rooms you left are muted. " +
+      "Strictly a PEEK: never advances read markers; an entry clears once you " +
+      "read its room (catch_up or mark_read there); page more with after_id = " +
+      "next_after_id. Needs an identity, not an active room. `by_room` lists " +
+      "every room with ANY unread from others: `directed` (aimed at you) and " +
+      "`unread` (total, broadcasts included); an EMPTY inbox with nonzero " +
+      "by_room unread means rooms still have traffic to sync, not silence.",
     inputSchema: {
       limit: z
         .number()
@@ -751,9 +742,8 @@ server.registerTool(
         .positive()
         .optional()
         .describe(
-          "If set, truncate each returned body to this many characters " +
-            "(truncated:true + length mark the cut; fetch full bodies with " +
-            "get_message in that room)",
+          "Truncate each body to this many chars (truncated:true + length " +
+            "mark the cut; full body via get_message in that room)",
         ),
       max_bytes: z
         .number()
@@ -768,9 +758,8 @@ server.registerTool(
         .nonnegative()
         .optional()
         .describe(
-          "Paging cursor: pass the prior response's next_after_id to see " +
-            "entries beyond limit/byte cuts without waiting for rooms to be " +
-            "read. Paging state only; it moves no read marker.",
+          "Paging cursor: the prior response's next_after_id. Paging state " +
+            "only; moves no read marker.",
         ),
     },
   },
@@ -806,12 +795,11 @@ server.registerTool(
   {
     title: "Read history",
     description:
-      "Browse messages WITHOUT changing your read marker. With no before_seq you " +
-      "get the most recent `limit` messages (e.g. the last 5). To page backward " +
-      "through older messages, pass before_seq = the oldest_seq from the previous " +
-      "call. Messages are returned oldest-first; each message that replies to " +
-      "another carries a `reply_to` preview. For unread messages directed at " +
-      "you, use my_mentions; to find a topic, use search_messages.",
+      "Browse messages WITHOUT changing your read marker. No before_seq = the " +
+      "most recent `limit` messages; page backward with before_seq = the " +
+      "prior call's oldest_seq. Oldest-first; replies carry a `reply_to` " +
+      "preview. For unread directed messages use my_mentions; to find a " +
+      "topic use search_messages.",
     inputSchema: {
       limit: z
         .number()
@@ -836,10 +824,9 @@ server.registerTool(
         .positive()
         .optional()
         .describe(
-          "If set, truncate each returned body to this many characters. " +
-            "Truncated messages carry `truncated:true` and `length` (full " +
-            "length); fetch the complete body with get_message. A truncated " +
-            "json message comes back as a partial string, not a parsed object.",
+          "Truncate each body to this many chars; cut bodies carry " +
+            "truncated:true + length (full body via get_message). Truncated " +
+            "json = partial string, not an object.",
         ),
       max_bytes: z
         .number()
@@ -848,9 +835,8 @@ server.registerTool(
         .max(400_000)
         .optional()
         .describe(
-          "Serialized-size budget for this page (default 100000); " +
-            "`byte_limited: true` means the page was trimmed, page on with " +
-            "before_seq.",
+          "Serialized-size budget per page (default 100000); " +
+            "byte_limited:true = trimmed, continue with before_seq.",
         ),
     },
   },
@@ -880,11 +866,9 @@ server.registerTool(
     title: "Mark read",
     description:
       "Advance (or rewind) your read marker WITHOUT returning messages. Omit " +
-      "`seq` to jump to the latest message, skipping the backlog so catch_up " +
-      "only returns what arrives next; pass a `seq` to set the marker to a " +
-      "specific point (a lower value re-exposes those messages to catch_up for " +
-      "re-reading). Nothing is deleted; read_history still browses skipped " +
-      "messages. Returns previous/new marker and the room's latest seq.",
+      "`seq` to jump to the latest (skip the backlog); a lower `seq` " +
+      "re-exposes messages to catch_up. Nothing is deleted; read_history " +
+      "still sees everything. Returns previous/new marker and the latest seq.",
     inputSchema: {
       seq: z
         .number()
@@ -910,14 +894,11 @@ server.registerTool(
   {
     title: "Get one message",
     description:
-      "Fetch a single message in the active room by its number (seq). Use this to " +
-      "resolve a reference like 'see message 8'. Bodies are returned up to " +
-      "`max_chars` per call (default 100000, safely under client output caps); " +
-      "a longer body arrives sliced, with `length` (total chars) and `offset`. " +
-      "`truncated: true` means more remains BEYOND the returned slice: page by " +
-      "calling again with offset = previous offset + returned chars until " +
-      "`truncated` is false (the final page). A sliced json body is a raw " +
-      "partial string, not a parsed object.",
+      "Fetch one message by seq (e.g. to resolve 'see message 8'). Bodies " +
+      "return up to `max_chars` per call; longer ones arrive sliced with " +
+      "`length` and `offset`. truncated:true = more remains BEYOND the slice: " +
+      "call again with offset = offset + returned chars until truncated is " +
+      "false. A sliced json body is a raw partial string.",
     inputSchema: {
       seq: z.number().int().positive().describe("Message number to fetch"),
       offset: z
@@ -953,14 +934,11 @@ server.registerTool(
   {
     title: "Get thread",
     description:
-      "Fetch a message with its parent and a bounded tree of its replies. " +
-      "Replies come back pre-order (each parent immediately before its children) " +
-      "with a `depth` field (1 = direct reply); `max_depth` bounds how many reply " +
-      "levels are walked (default 3). `replies_capped` is true if the reply set " +
-      "hit the internal cap. The whole response shares one byte budget (focal " +
-      "message first, then parent, then replies), so oversized bodies arrive " +
-      "truncated with `truncated:true`/`length`; page full text with " +
-      "get_message. `preview_chars` additionally truncates reply bodies.",
+      "Fetch a message with its parent and a bounded tree of its replies " +
+      "(pre-order, `depth` field, 1 = direct reply; `max_depth` levels, " +
+      "default 3; `replies_capped` flags the internal cap). One shared byte " +
+      "budget covers message + parent + replies, so oversized bodies arrive " +
+      "truncated:true with length; page full text via get_message.",
     inputSchema: {
       seq: z.number().int().positive().describe("Message number to expand"),
       max_depth: z
@@ -1054,15 +1032,13 @@ server.registerTool(
   {
     title: "Claim a resource",
     description:
-      "Claim exclusive (advisory) ownership of a named resource in the active " +
-      "room BEFORE starting work on it, e.g. key 'file:src/db.ts' or " +
-      "'task:B-414'. Atomic single-winner: exactly one of two simultaneous " +
-      "claimants is granted, unlike social 'I claim X' posts, which can cross. " +
-      "Returns granted:true with expires_at, or granted:false with the current " +
-      "holder. Claims expire after ttl_seconds (default 900), so a crashed " +
-      "holder cannot block forever; re-claim your own key to renew. Advisory " +
-      "only: it does not physically lock anything, cooperating agents must " +
-      "check it. Ownership is per agent_id.",
+      "Claim exclusive (advisory) ownership of a named resource BEFORE " +
+      "working on it, e.g. 'file:src/db.ts' or 'task:B-414'. Atomic " +
+      "single-winner (unlike 'I claim X' chat posts, which can cross). " +
+      "Returns granted:true with expires_at, or granted:false with the " +
+      "holder. Claims expire after ttl_seconds (default 900); re-claim your " +
+      "own key to renew. Advisory only: nothing is physically locked, " +
+      "cooperating agents must check. Ownership is per agent_id.",
     inputSchema: {
       key: z
         .string()
@@ -1144,14 +1120,12 @@ server.registerTool(
   {
     title: "Prune messages",
     description:
-      "Delete old messages in the active room, keeping only the most recent " +
-      "`keep_last`. Only the oldest are removed, so message numbers (seq) of " +
-      "kept messages are unchanged and future numbers stay monotonic. " +
-      "Destructive and not reversible. By default this REFUSES (returns " +
-      "refused:true with would_delete_unread/min_read_seq) if it would delete " +
-      "messages any member who did not author them has not read yet, INCLUDING " +
-      "members that left (soft leave preserves their read position for resume) " +
-      "and lagging private session cursors. Pass force=true to prune anyway.",
+      "Delete the oldest messages in the active room, keeping the newest " +
+      "`keep_last` (kept seqs and future numbering unchanged). Destructive, " +
+      "not reversible. By default REFUSES (refused:true with " +
+      "would_delete_unread/min_read_seq) if any non-author member has not " +
+      "read a doomed message yet, including members that left and lagging " +
+      "private session cursors; force=true prunes anyway.",
     inputSchema: {
       keep_last: z
         .number()
@@ -1185,9 +1159,10 @@ server.registerTool(
   {
     title: "Delete room",
     description:
-      "Permanently delete a room (by id or name) and ALL of its messages and " +
-      "memberships. Requires confirm=true. Destructive, not reversible, and " +
-      "unauthenticated: any caller can delete any room. Returns the counts removed.",
+      "Permanently delete a room (by id or name) and ALL related data " +
+      "(messages, memberships, read positions, claims). Requires " +
+      "confirm=true. Destructive, not reversible, unauthenticated: any caller " +
+      "can delete any room. Returns the removed counts.",
     inputSchema: {
       room: z.string().min(1).describe("Room id or name to delete"),
       confirm: z
