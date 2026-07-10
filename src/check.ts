@@ -64,9 +64,12 @@ function parseArgs(argv: string[]): Args {
 
 function resolveDbPath(override?: string): string {
   // Absolute always: a relative path silently means a different file per cwd.
-  if (override && override.trim().length > 0) return resolve(override.trim());
+  // SQLite sentinels/URIs (":memory:", "file:") pass through untouched.
+  const norm = (t: string): string =>
+    t === ":memory:" || t.startsWith("file:") ? t : resolve(t);
+  if (override && override.trim().length > 0) return norm(override.trim());
   const env = process.env.AGENT_CHAT_DB;
-  if (env && env.trim().length > 0) return resolve(env.trim());
+  if (env && env.trim().length > 0) return norm(env.trim());
   return join(homedir(), ".agent-chat-mcp", "chat.db");
 }
 

@@ -1280,6 +1280,10 @@
         marker: -1,
         gap: false,
         drafts: {}, // per-room compose drafts, in memory only
+        // Incremented on every openRoom: async completions capture it so a
+        // response from a PREVIOUS visit to the same room (A -> B -> A) can
+        // be told apart from the current visit (id comparison alone cannot).
+        roomEpoch: 0,
       };
 
       const IDENT_KEY = "agent-chat.identity";
@@ -1313,6 +1317,12 @@
       // room as switched and drop valid in-flight results.
       function sameRoom(room) {
         return !!room && !!state.current && state.current.id === room.id;
+      }
+
+      // Same room AND same visit: guards every async completion that mutates
+      // view or marker state.
+      function sameView(room, epoch) {
+        return sameRoom(room) && epoch === state.roomEpoch;
       }
 
       async function postJson(url, payload) {
@@ -1923,6 +1933,7 @@
 
       async function loadNew(initial) {
         const room = state.current;
+        const epoch = state.roomEpoch;
         if (!room || state.searchMode) return;
         if (state.loadingMsgs) {
           if (initial) state.pendingInitial = true;
@@ -1941,7 +1952,7 @@
             `/api/messages?room=${room.id}&after=${initial ? 0 : last}&limit=${PAGE}`,
           );
           noteOk();
-          if (!sameRoom(room) || data.error || !data.messages) return;
+          if (!sameView(room, epoch) || data.error || !data.messages) return;
           const rows = initial
             ? data.messages
             : data.messages.filter((m) => m.seq > last);
@@ -1984,6 +1995,7 @@
       // progress); false on busy, error, or exhausted history.
       async function loadOlder() {
         const room = state.current;
+        const epoch = state.roomEpoch;
         const first = state.msgs[0];
         if (!room || !first || state.loadingMsgs) return false;
         state.loadingMsgs = true;
@@ -1993,7 +2005,7 @@
           const data = await fetchJson(
             `/api/messages?room=${room.id}&before=${first.seq}&limit=${PAGE}`,
           );
-          if (!sameRoom(room) || data.error || !data.messages) return false;
+          if (!sameView(room, epoch) || data.error || !data.messages) return false;
           if (data.messages.length) {
             const prevHeight = el.stream.scrollHeight;
             const prevTop = el.stream.scrollTop;
@@ -2046,6 +2058,13 @@
         const go = document.createElement("span");
         go.className = "go";
         go.textContent = "view in stream";
+        if (m.superseded_by) {
+          row.classList.add("superseded");
+          const sup = document.createElement("span");
+          sup.textContent = "superseded by #" + m.superseded_by;
+          sup.style.color = "var(--danger)";
+          meta.append(sup);
+        }
         meta.append(seq, time, go);
         head.append(meta);
         row.append(head);
@@ -2064,6 +2083,7 @@
 
       async function enterSearch() {
         const room = state.current;
+        const epoch = state.roomEpoch;
         const q = el.search.value.trim();
         if (!room) return;
         if (!q) return exitSearch();
@@ -2077,7 +2097,7 @@
         } catch (e) {
           data = { matches: [], failed: e.message };
         }
-        if (!sameRoom(room)) return;
+        if (!sameView(room, epoch)) return;
         state.searchMode = true;
         el.msgs.hidden = true;
         el.older.hidden = true;
@@ -2166,33 +2186,31 @@
           return;
         }
         el.joinBtn.disabled = true;
+        const epoch = state.roomEpoch;
         try {
-          // Renaming: soft-leave EVERY membership recorded under another name,
-          // not just this room's, or the abandoned identity lingers as a
-          // present ghost member in each other joined room (visible in
-          // list_agents, blocking prune's unread-refusal) until each room is
-          // individually revisited.
-          const joinedMap = loadJoined();
-          const stale = Object.entries(joinedMap).filter(
-            ([, storedName]) => storedName && storedName !== name,
-          );
-          await Promise.all(
-            stale.map(([rid, storedName]) =>
-              postJson("/api/leave", {
-                room: Number(rid),
-                name: storedName,
-              }).catch(() => {}),
-            ),
-          );
-          for (const [rid] of stale) delete joinedMap[rid];
-          saveJoined(joinedMap);
+          // Join FIRST: the server validates the new name, and an invalid
+          // rename must not have already torn down the old memberships.
           const j = await postJson("/api/join", { room: room.id, name });
           try {
             localStorage.setItem(IDENT_KEY, name);
           } catch {}
-          const joined = loadJoined();
-          joined[String(room.id)] = name;
-          saveJoined(joined);
+          // Renaming: soft-leave EVERY membership recorded under another name
+          // (else the abandoned identity lingers as a present ghost member in
+          // each other joined room, blocking prune's unread-refusal). Entries
+          // whose leave failed are KEPT so the ghost stays reachable for a
+          // retry instead of becoming unaddressable.
+          const joinedMap = loadJoined();
+          for (const [rid, storedName] of Object.entries(joinedMap)) {
+            if (!storedName || storedName === name) continue;
+            try {
+              await postJson("/api/leave", { room: Number(rid), name: storedName });
+              delete joinedMap[rid];
+            } catch {}
+          }
+          joinedMap[String(room.id)] = name;
+          saveJoined(joinedMap);
+          // A delayed response must not mutate another visit's marker/UI.
+          if (!sameView(room, epoch)) return;
           state.lastReadSent = 0;
           state.marker = j.last_read_seq ?? 0;
           renderComposer();
@@ -2200,7 +2218,7 @@
           maybeMarkRead();
           el.composeText.focus();
         } catch (e) {
-          el.joinError.textContent = e.message;
+          if (sameView(room, epoch)) el.joinError.textContent = e.message;
         } finally {
           el.joinBtn.disabled = false;
         }
@@ -2224,6 +2242,7 @@
 
       async function sendMessage() {
         const room = state.current;
+        const epoch = state.roomEpoch;
         const body = el.composeText.value.trim();
         if (!room || !joinedHere() || !body || state.sending) return;
         state.sending = true;
@@ -2237,7 +2256,7 @@
             reply_to_seq: state.replyTo ? state.replyTo.seq : null,
           });
           delete state.drafts[room.id];
-          if (sameRoom(room)) {
+          if (sameView(room, epoch)) {
             // Only touch the shared composer/stream state if the user is
             // still in this room; after a switch, the textarea, reply chip,
             // search mode, and follow flag all belong to the OTHER room.
@@ -2250,13 +2269,13 @@
             updateJump();
           }
         } catch (e) {
-          if (sameRoom(room)) el.composeError.textContent = e.message;
+          if (sameView(room, epoch)) el.composeError.textContent = e.message;
         } finally {
           state.sending = false;
           el.send.disabled = false;
-          if (sameRoom(room)) el.composeText.focus();
+          if (sameView(room, epoch)) el.composeText.focus();
         }
-        if (sameRoom(room)) loadNew(false); // pull the just-posted message in
+        if (sameView(room, epoch)) loadNew(false); // pull the just-posted message in
       }
 
       function autosize() {
@@ -2286,12 +2305,13 @@
       // has a baseline before any auto-marking is allowed.
       async function fetchMarker() {
         const room = state.current;
+        const epoch = state.roomEpoch;
         if (!room || !joinedHere()) return;
         try {
           const me = await fetchJson(
             `/api/me?room=${room.id}&name=${encodeURIComponent(identity())}`,
           );
-          if (!sameRoom(room)) return;
+          if (!sameView(room, epoch)) return;
           state.marker = me.joined ? me.last_read_seq : -1;
           computeGap();
           maybeMarkRead();
@@ -2300,6 +2320,7 @@
 
       function maybeMarkRead() {
         const room = state.current;
+        const epoch = state.roomEpoch;
         if (!room || !joinedHere()) return;
         if (document.visibilityState !== "visible") return;
         // Only claim messages as read while pinned to the bottom: arrivals
@@ -2321,11 +2342,11 @@
         state.lastReadSent = last;
         postJson("/api/read", { room: room.id, name: identity(), seq: last })
           .then((r) => {
-            // A delayed response must not mutate another room's state.
-            if (sameRoom(room)) state.marker = r.last_read_seq;
+            // A delayed response must not mutate another visit's state.
+            if (sameView(room, epoch)) state.marker = r.last_read_seq;
           })
           .catch(() => {
-            if (sameRoom(room)) state.lastReadSent = 0; // retry next batch
+            if (sameView(room, epoch)) state.lastReadSent = 0; // retry next batch
           });
       }
 
@@ -2344,6 +2365,7 @@
 
       async function confirmDelete() {
         const room = state.current;
+        const epoch = state.roomEpoch;
         if (!room) return;
         el.deleteYes.disabled = true;
         try {
@@ -2368,7 +2390,7 @@
         } catch {}
         // Tear down the UI only if the deleted room is still the one shown;
         // after a switch, the current room's view (and draft) must survive.
-        if (sameRoom(room)) {
+        if (sameView(room, epoch)) {
           el.deleteConfirm.hidden = true;
           state.current = null;
           state.searchMode = false;
@@ -2399,6 +2421,7 @@
         state.lastReadSent = 0;
         state.marker = -1;
         state.gap = false;
+        state.roomEpoch += 1;
         try {
           localStorage.setItem(ROOM_KEY, JSON.stringify({ id: room.id }));
         } catch {}
@@ -2453,6 +2476,7 @@
         // Deliberate user action: skip the unfetched backlog and mark the
         // whole room read (same semantics as an agent's bare mark_read).
         const room = state.current;
+        const epoch = state.roomEpoch;
         const last = state.msgs.length
           ? state.msgs[state.msgs.length - 1].seq
           : 0;
@@ -2463,8 +2487,8 @@
             name: identity(),
             seq: last,
           });
-          // A delayed response must not mutate another room's state.
-          if (!sameRoom(room)) return;
+          // A delayed response must not mutate another visit's state.
+          if (!sameView(room, epoch)) return;
           state.marker = r.last_read_seq;
           state.lastReadSent = Math.max(state.lastReadSent, last);
           computeGap();

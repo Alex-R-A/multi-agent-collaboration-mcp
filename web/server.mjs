@@ -33,7 +33,12 @@ const PORT =
 // Absolute always: a relative override means a different file per cwd.
 function resolveDbPath() {
   const override = process.env.AGENT_CHAT_DB;
-  if (override && override.trim().length > 0) return resolve(override.trim());
+  if (override && override.trim().length > 0) {
+    const t = override.trim();
+    // SQLite sentinels/URIs are not filesystem paths.
+    if (t === ":memory:" || t.startsWith("file:")) return t;
+    return resolve(t);
+  }
   return join(homedir(), ".agent-chat-mcp", "chat.db");
 }
 const DB_PATH = resolveDbPath();

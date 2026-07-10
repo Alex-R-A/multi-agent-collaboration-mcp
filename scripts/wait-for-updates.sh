@@ -73,11 +73,13 @@ fi
 
 start=$(date +%s)
 while true; do
-  # Deadline first: never launch a probe past the timeout, so a caller's
-  # timing contract holds even when a probe plus sleep straddles the line.
+  # Deadline first: never launch a probe past the timeout. Strictly-greater:
+  # whole-second timestamps otherwise expire a 2s timeout after ~1.1s real
+  # time; a timeout must be a FLOOR, so the worst case is now overshoot by
+  # <1s plus an in-flight probe's own runtime (bounded by its busy_timeout).
   if [[ "$timeout" -gt 0 ]]; then
     now=$(date +%s)
-    if (( now - start >= timeout )); then
+    if (( now - start > timeout )); then
       echo '{"timed_out":true}' >&2
       exit 124
     fi

@@ -11,7 +11,13 @@ import { dirname, join, resolve } from "node:path";
  */
 function resolveDbPath(): string {
   const override = process.env.AGENT_CHAT_DB;
-  if (override && override.trim().length > 0) return resolve(override.trim());
+  if (override && override.trim().length > 0) {
+    const t = override.trim();
+    // SQLite sentinels and URIs are not filesystem paths; resolving
+    // ":memory:" would literally create a file named ":memory:" in cwd.
+    if (t === ":memory:" || t.startsWith("file:")) return t;
+    return resolve(t);
+  }
   return join(homedir(), ".agent-chat-mcp", "chat.db");
 }
 
@@ -89,6 +95,10 @@ export type MessageRow = {
   unix: number;
   /** Present only when a preview/byte/slice cap truncated the body. */
   truncated?: boolean;
+  /** Present when the mentions list was cut to fit a byte budget. */
+  to_truncated?: boolean;
+  /** Full mention count before the cut (only with to_truncated). */
+  to_total?: number;
   /** Full character length of the original body (only when truncated). */
   length?: number;
   /** Character offset of a get_message slice (only when slicing). */
@@ -523,13 +533,15 @@ export class ChatStore {
       )
       .run(roomId, agentId);
     if (sessionId !== null) {
-      // Keep a live-but-idle private session's cursor row out of the 7-day
-      // GC: a quiet room advances no cursor, but the process is still alive.
+      // Keep a live session's cursor rows out of the 7-day GC, in EVERY room:
+      // the session may hold private cursors in rooms it is not currently
+      // touching, and another agent's join in such a room must not reap a
+      // cursor whose owner is demonstrably alive.
       this.db
         .prepare(
-          "UPDATE session_markers SET updated_at = datetime('now') WHERE room_id = ? AND agent_id = ? AND session_id = ?",
+          "UPDATE session_markers SET updated_at = datetime('now') WHERE agent_id = ? AND session_id = ?",
         )
-        .run(roomId, agentId, sessionId);
+        .run(agentId, sessionId);
     }
   }
 
@@ -839,6 +851,23 @@ export class ChatStore {
             Math.floor((keep * maxBytes * 0.9) / headSize),
           );
           head = map(r, Math.min(keep, previewChars ?? Infinity));
+        }
+        // Envelope-dominated overflow: content shrinking cannot help when the
+        // size lives in metadata (typically a large `to` list; 100 ids of 200
+        // chars are legal and serialize past 20k). Halve the mentions until
+        // the row fits, marking the cut, so the budget holds for ANY message
+        // and an advancing catch_up can never commit its marker over a
+        // response the client will reject as oversized.
+        const h = head as MessageRow;
+        let finalSize = JSON.stringify(head).length;
+        if (finalSize > maxBytes && Array.isArray(h.to) && h.to.length > 1) {
+          const total = h.to.length;
+          while (finalSize > maxBytes && h.to.length > 1) {
+            h.to = h.to.slice(0, Math.ceil(h.to.length / 2));
+            finalSize = JSON.stringify(head).length;
+          }
+          h.to_truncated = true;
+          h.to_total = total;
         }
         out.push(head);
         return { messages: out, byteLimited: true };
@@ -1231,6 +1260,12 @@ export class ChatStore {
       const roomBudget = Math.floor(maxBytes / 2);
       while (byRoom.length > 1 && JSON.stringify(byRoom).length > roomBudget) {
         byRoom.pop();
+        by_room_truncated = true;
+      }
+      // A single long-named room can still overflow a small budget: shorten
+      // the display name (room_id remains the stable key) and flag it.
+      if (byRoom.length === 1 && JSON.stringify(byRoom).length > roomBudget) {
+        byRoom[0] = { ...byRoom[0], name: byRoom[0].name.slice(0, 60) };
         by_room_truncated = true;
       }
 

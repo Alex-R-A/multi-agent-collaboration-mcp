@@ -184,5 +184,72 @@ const check = (n, c, x) => {
   check("byte_limited flagged when trimmed", inbox.byte_limited === true, inbox.byte_limited);
 }
 
+// --- envelope-dominated messages still honor the byte budget -----------------
+{
+  const s = new ChatStore(":memory:");
+  const r = s.createRoom("r", null, null).id;
+  s.upsertAgent("a", null, null, null);
+  s.upsertAgent("b", null, null, null);
+  s.joinRoom(r, "a");
+  s.joinRoom(r, "b");
+  // 100 valid 200-char ASCII mention ids: ~20k of pure envelope.
+  const ids = Array.from({ length: 100 }, (_, i) => "m" + String(i) + "x".repeat(195));
+  s.postMessage(r, "b", "short body", "text", ids, null);
+  const page = s.catchUp(r, "a", 50, undefined, 1000);
+  const size = JSON.stringify(page.messages).length;
+  check(`catch_up envelope bounded (${size} <= 1300)`, size <= 1300, size);
+  check(
+    "mentions cut is flagged with the original count",
+    page.messages[0].to_truncated === true && page.messages[0].to_total === 100,
+    page.messages[0].to_total,
+  );
+  s.markRead(r, "a", 0); // rewind to test the inbox path on the same message
+  const inbox = s.myMentions("a", 50, undefined, 1000);
+  const isize = JSON.stringify(inbox).length;
+  check(`my_mentions envelope bounded (${isize} <= 1600)`, isize <= 1600, isize);
+  s.close();
+}
+
+// --- AGENT_CHAT_DB=:memory: stays the SQLite sentinel ------------------------
+{
+  const saved = process.env.AGENT_CHAT_DB;
+  process.env.AGENT_CHAT_DB = ":memory:";
+  const s = new ChatStore();
+  check("':memory:' env override is not path-resolved", s.path === ":memory:", s.path);
+  s.close();
+  if (saved === undefined) delete process.env.AGENT_CHAT_DB;
+  else process.env.AGENT_CHAT_DB = saved;
+}
+
+// --- touch refreshes ALL of a session's cursors against the 7-day GC ---------
+{
+  const dir = mkdtempSync(join(tmpdir(), "aichat-gc-"));
+  const dbPath = join(dir, "t.db");
+  const s = new ChatStore(dbPath);
+  const ra = s.createRoom("a", null, null).id;
+  const rb = s.createRoom("b", null, null).id;
+  s.upsertAgent("twin", null, null, null);
+  s.upsertAgent("other", null, null, null);
+  s.joinRoom(ra, "twin", "S1");
+  s.joinRoom(rb, "twin", "S1"); // private cursors in BOTH rooms
+  s.joinRoom(rb, "other");
+  const raw = new Database(dbPath);
+  raw
+    .prepare("UPDATE session_markers SET updated_at = datetime('now', '-8 days') WHERE session_id = 'S1'")
+    .run();
+  raw.close();
+  // The session is active in room A only; the touch must shield room B too.
+  s.touch(ra, "twin", "S1");
+  s.joinRoom(rb, "other", "SZ"); // triggers the GC pass in room B
+  const rawB = new Database(dbPath);
+  const survived = rawB
+    .prepare("SELECT COUNT(*) AS c FROM session_markers WHERE room_id = ? AND session_id = 'S1'")
+    .get(rb).c;
+  rawB.close();
+  check("inactive-room private cursor survives GC while its session is alive", survived === 1, survived);
+  s.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 console.log(`\n${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"}`);
 process.exit(failures === 0 ? 0 : 1);

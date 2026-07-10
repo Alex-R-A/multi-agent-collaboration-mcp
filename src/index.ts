@@ -20,6 +20,13 @@ const POLLER = join(
   "wait-for-updates.sh",
 );
 
+// Single-quote paths for the copy-pasteable poller command: double quotes
+// would let a path containing $() or backticks execute when pasted into a
+// shell. Embedded single quotes are escaped with the '\'' idiom.
+function shq(s: string): string {
+  return `'${s.replace(/'/g, "'\\''")}'`;
+}
+
 const INSTRUCTIONS = `Shared chat room for AI agents, backed by one SQLite file. Each agent runs its own copy of this server; the file is the coordination channel. Your identity and active room are remembered for the session.
 
 Typical flow: list_rooms -> join_room (capture the returned agent_id if you did not supply one; read the pinned intro) -> list_agents to see who is present -> catch_up (consumes the backlog and advances your read marker) or read_history (browse without advancing) -> post_message. Tag participants with the "to" list; reference an earlier message with reply_to_seq (replies come back with a reply_to preview). catch_up later returns only new messages from OTHER agents; your own posts are never returned by catch_up (use read_history or search_messages to see them). To sync a room use catch_up (always the full stream). To find what needs YOU across every room you have joined, use my_mentions: a single cross-room inbox of unread messages directed at you (mentions and replies), a peek that never advances markers; entries clear when you actually read their room. Its by_room also reports each room's TOTAL unread (broadcasts included), so an empty inbox with nonzero by_room unread means rooms still have traffic, not silence.
@@ -30,7 +37,7 @@ Bulk reads are byte-bounded by default (~100k serialized): byte_limited:true mea
 
 Waiting for activity without busy-looping tool calls: run this bash poller as a BACKGROUND task. It exits 0 the moment there is something new (so its exit IS your notification), prints a one-line JSON status (unread, unread_mentions, latest_seq), and otherwise quits after 20 minutes so it never hangs.
 
-  bash "${POLLER}" --agent <your_agent_id> --db "${store.path}" [--mentions-only]
+  bash ${shq(POLLER)} --agent <your_agent_id> --db ${shq(store.path)} [--mentions-only]
 
 ALWAYS pass --db as shown: AGENT_CHAT_DB in your MCP config reaches only the MCP server process, not a background shell, which would otherwise silently watch the default database. Without --room it watches ALL rooms you are present in at once; add --room <id|name> to scope it to one room. Call catch_up (per room) first so your read markers are the baseline; the poller then fires on the next message from another agent (your own posts are skipped, so posting will not wake it), or, with --mentions-only, only when a message tags you or replies to a message you wrote (my_mentions then shows exactly those). Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override; requires --room since seqs are per-room). Exit codes: 0 = updates (read them with catch_up / my_mentions), 124 = timed out with nothing new, 2 = error. NOTE for cursor:'private' sessions: baselines are IDENTITY-level markers (the MAX across your twin sessions), so a lagging private session should use --room with --since = its own last_read_seq from whoami.`;
 
@@ -110,7 +117,10 @@ function touchSession(): void {
     const now = Date.now();
     if (now - lastTouchMs < TOUCH_INTERVAL_MS) return;
     lastTouchMs = now;
-    store.touch(session.roomId, session.agentId, cursorId());
+    // Always pass the nonce (not cursorId()): the ACTIVE room may be shared
+    // while this session holds private cursors in other rooms, and those rows
+    // must stay refreshed against the 7-day GC too.
+    store.touch(session.roomId, session.agentId, SESSION_NONCE);
   }
 }
 
@@ -332,10 +342,10 @@ server.registerTool(
       room: z.string().min(1).describe("Room id or name to join"),
       agent_id: z
         .string()
-        .regex(
-          /^[\w][\w.-]{0,199}$/,
-          "letters, digits, underscore, dot or dash only (max 200)",
-        )
+        .max(200)
+        .refine((s) => !/[\u0000-\u001f\u007f]/.test(s), {
+          message: "control characters are not allowed in agent ids",
+        })
         .optional()
         .describe(
           "Your stable identity/nickname. Omit to be assigned a readable id.",
@@ -559,10 +569,11 @@ server.registerTool(
         .array(
           z
             .string()
-            .regex(
-              /^[\w][\w.-]{0,199}$/,
-              "agent ids are letters, digits, underscore, dot or dash (max 200)",
-            ),
+            .min(1)
+            .max(200)
+            .refine((s) => !/[\u0000-\u001f\u007f]/.test(s), {
+              message: "control characters are not allowed in agent ids",
+            }),
         )
         .max(100)
         .optional()
