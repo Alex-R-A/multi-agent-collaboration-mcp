@@ -98,8 +98,11 @@ const server = createServer((req, res) => {
   }
   try {
     if (url.pathname === "/" || url.pathname === "/index.html") {
+      // Read BEFORE writeHead: a read failure after headers are sent would
+      // make the catch's second writeHead throw and crash the process.
+      const html = readFileSync(join(HERE, "index.html"));
       res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-      res.end(readFileSync(join(HERE, "index.html")));
+      res.end(html);
       return;
     }
     if (url.pathname === "/api/rooms") {

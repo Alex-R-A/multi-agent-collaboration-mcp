@@ -21,7 +21,10 @@ export const SQLITE_MAX_LENGTH = 1_000_000_000;
  * read_history, get_thread replies, search_messages). Chosen conservatively
  * below observed MCP client output caps (~200k chars): an oversized response
  * fails AFTER the read marker committed, silently skipping messages, so the
- * budget must make responses that always fit.
+ * budget must make responses that always fit. The unit is serialized JSON
+ * characters (UTF-16 code units, `JSON.stringify(x).length`) -- the same unit
+ * as the client cap -- NOT UTF-8 bytes; multibyte content is larger on the
+ * wire but clients cap on chars/tokens, so chars are the correct accounting.
  */
 export const DEFAULT_MAX_BYTES = 100_000;
 
@@ -217,7 +220,10 @@ export class ChatStore {
     this.ensureColumn("messages", "supersedes_seq", "INTEGER");
 
     this.db.exec(`
-      CREATE INDEX IF NOT EXISTS idx_messages_room_seq ON messages(room_id, seq);
+      -- UNIQUE(room_id, seq) already provides an implicit (room_id, seq) index
+      -- (sqlite_autoindex, same query plans); an explicit duplicate only taxes
+      -- every insert. Drop it from database files created by older builds.
+      DROP INDEX IF EXISTS idx_messages_room_seq;
       CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(room_id, reply_to_seq);
       CREATE INDEX IF NOT EXISTS idx_messages_supersedes ON messages(room_id, supersedes_seq);
 
@@ -461,17 +467,15 @@ export class ChatStore {
     }
   }
 
-  /** Soft leave: keep the row (and read position) but mark not present. */
-  leaveRoom(roomId: number, agentId: string, sessionId: string | null = null): boolean {
-    if (sessionId !== null) {
-      // The session cursor's reads are already folded into the identity marker
-      // (MAX on advance), so dropping the row loses nothing on resume.
-      this.db
-        .prepare(
-          "DELETE FROM session_markers WHERE room_id = ? AND agent_id = ? AND session_id = ?",
-        )
-        .run(roomId, agentId, sessionId);
-    }
+  /**
+   * Soft leave: keep the membership row (and read position) but mark not
+   * present. Private session cursors are deliberately KEPT: the identity
+   * marker is the MAX across sessions, so a lagging session's true position
+   * exists ONLY in its session_markers row -- deleting it here would jump the
+   * session forward to its fastest twin's position on rejoin, silently
+   * skipping the gap. Dead rows are reaped by the 7-day GC in joinRoom.
+   */
+  leaveRoom(roomId: number, agentId: string): boolean {
     const info = this.db
       .prepare(
         `UPDATE memberships SET left_at = datetime('now'), last_seen = datetime('now')
@@ -625,7 +629,9 @@ export class ChatStore {
    * poster had not read at post time (cursor-relative), with the seq range, so
    * a poster learns in the same call that it may have posted over unseen
    * traffic. supersedesSeq marks the poster's OWN earlier message as
-   * superseded by this one (validated in-transaction).
+   * superseded by this one. Both replyToSeq and supersedesSeq are validated
+   * in-transaction, so a concurrent prune cannot slip a dangling reference
+   * between a pre-check and the insert.
    */
   postMessage(
     roomId: number,
@@ -645,6 +651,17 @@ export class ChatStore {
     const mentionsJson =
       mentions && mentions.length > 0 ? JSON.stringify(mentions) : null;
     const tx = this.db.transaction(() => {
+      if (replyToSeq !== null) {
+        // Existence only -- never fetch the body, which can be huge.
+        const parent = this.db
+          .prepare("SELECT 1 FROM messages WHERE room_id = ? AND seq = ?")
+          .get(roomId, replyToSeq);
+        if (!parent) {
+          throw new Error(
+            `reply_to_seq ${replyToSeq} does not exist in this room`,
+          );
+        }
+      }
       if (supersedesSeq !== null) {
         const target = this.db
           .prepare(
@@ -894,6 +911,38 @@ export class ChatStore {
   }
 
   /**
+   * Fetch one message sized to fit a SERIALIZED budget. getMessage's maxChars
+   * caps raw body characters, but JSON escaping (control chars serialize 6x)
+   * and the envelope inflate the serialized form past the raw length, so a
+   * chars-for-bytes handoff overshoots. Fetch, measure the real serialized
+   * size, and correct once proportionally (same approach as boundByBytes).
+   */
+  private fitMessage(
+    roomId: number,
+    seq: number,
+    budget: number,
+  ): MessageRow | undefined {
+    let m = this.getMessage(roomId, seq, 0, budget);
+    if (!m) return undefined;
+    const size = JSON.stringify(m).length;
+    if (size > budget) {
+      // Approximate the raw body chars: exact for a (possibly sliced) string,
+      // near-exact for a whole json body (re-serialized without whitespace).
+      const bodyChars =
+        typeof m.content === "string"
+          ? m.content.length
+          : JSON.stringify(m.content).length;
+      const keep = Math.max(
+        200,
+        Math.floor((bodyChars * budget * 0.9) / size),
+      );
+      // keep < bodyChars forces the partial (string-slice) path even for json.
+      if (keep < bodyChars) m = this.getMessage(roomId, seq, 0, keep) ?? m;
+    }
+    return m;
+  }
+
+  /**
    * A message plus its parent (if any) and a bounded, depth-annotated tree of
    * its replies. Descendants come back pre-order (each parent immediately before
    * its children) with a `depth` field (1 = direct reply). `maxDepth` bounds how
@@ -919,17 +968,18 @@ export class ChatStore {
         byte_limited?: boolean;
       }
     | undefined {
-    const message = this.getMessage(roomId, seq);
+    const message = this.fitMessage(roomId, seq, DEFAULT_MAX_BYTES);
     if (!message) return undefined;
-    // One budget for the whole thread response. The focal message spends
-    // first; parent and replies get what remains, floored so they are never
-    // starved to nothing.
+    // One budget for the whole thread response, in SERIALIZED chars (via
+    // fitMessage, so escaping and envelope are charged, not just raw body
+    // length). The focal message spends first; parent and replies get what
+    // remains, floored so they are never starved to nothing.
     const FLOOR = 2_000;
     let remaining = DEFAULT_MAX_BYTES - JSON.stringify(message).length;
     const parentSeq = message.reply_to?.seq ?? null;
     const parent =
       parentSeq !== null
-        ? (this.getMessage(roomId, parentSeq, 0, Math.max(FLOOR, remaining)) ??
+        ? (this.fitMessage(roomId, parentSeq, Math.max(FLOOR, remaining)) ??
           null)
         : null;
     if (parent) remaining -= JSON.stringify(parent).length;

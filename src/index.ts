@@ -32,7 +32,7 @@ Waiting for activity without busy-looping tool calls: run this bash poller as a 
 
   bash ${POLLER} --room <id|name> --agent <your_agent_id> [--mentions-only]
 
-Call catch_up first so your read marker is the baseline; the poller then fires on the next message from another agent (your own posts are skipped, so posting will not wake it), or, with --mentions-only, only when a message tags you or replies to a message you wrote. Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override). Exit codes: 0 = updates (read them with catch_up), 124 = timed out with nothing new, 2 = error.`;
+Call catch_up first so your read marker is the baseline; the poller then fires on the next message from another agent (your own posts are skipped, so posting will not wake it), or, with --mentions-only, only when a message tags you or replies to a message you wrote. Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override). Exit codes: 0 = updates (read them with catch_up), 124 = timed out with nothing new, 2 = error. NOTE for cursor:'private' sessions: --agent reads the IDENTITY-level marker (the MAX across your twin sessions), so a lagging private session should pass --since with its own last_read_seq from whoami instead.`;
 
 // One stdio server process serves one agent. We remember its identity and
 // active room for the session so the agent need not repeat them on every call.
@@ -90,9 +90,20 @@ function requireActive(): { agentId: string; roomId: number } {
   return { agentId: session.agentId, roomId: session.roomId };
 }
 
-/** Mark the active agent (and its private cursor, if any) alive on any tool invocation. */
+/**
+ * Mark the active agent (and its private cursor, if any) alive on tool
+ * invocations. Throttled: every tool call otherwise costs a write transaction
+ * on the shared file (cross-process lock contention for pure reads like
+ * list_rooms). 30s granularity is far inside both consumers' tolerances: the
+ * `active` liveness window is minutes and the session GC is days.
+ */
+let lastTouchMs = 0;
+const TOUCH_INTERVAL_MS = 30_000;
 function touchSession(): void {
   if (session.agentId !== null && session.roomId !== null) {
+    const now = Date.now();
+    if (now - lastTouchMs < TOUCH_INTERVAL_MS) return;
+    lastTouchMs = now;
     store.touch(session.roomId, session.agentId, cursorId());
   }
 }
@@ -229,13 +240,19 @@ server.registerTool(
       name: z
         .string()
         .min(1)
+        .max(200)
         .describe(
           "Unique room name; name it for the discussion topic (kebab-case), " +
             "not for participants",
         ),
-      description: z.string().optional().describe("What this room is for"),
+      description: z
+        .string()
+        .max(2000)
+        .optional()
+        .describe("What this room is for"),
       pinned: z
         .string()
+        .max(10_000)
         .optional()
         .describe("Pinned intro/conventions shown to joiners"),
     },
@@ -243,13 +260,28 @@ server.registerTool(
   async ({ name, description, pinned }) => {
     try {
       touchSession();
+      // Room references are resolved id-first (resolveRoom), so an all-digit
+      // name would be shadowed by any room with that numeric id -- and
+      // delete_room resolves the same way, making the ambiguity destructive.
+      if (/^\d+$/.test(name)) {
+        return fail(
+          "room names cannot be all digits (ambiguous with room ids); " +
+            "pick a descriptive kebab-case topic name",
+        );
+      }
       if (store.getRoomByName(name)) {
         return fail(`a room named "${name}" already exists`);
       }
       const room = store.createRoom(name, description ?? null, pinned ?? null);
       return ok({ room_id: room.id, name: room.name });
     } catch (e) {
-      return fail(asMessage(e));
+      // Two processes can pass the pre-check together; the loser's INSERT
+      // hits UNIQUE(rooms.name). Same outcome, friendlier message.
+      const msg = asMessage(e);
+      if (/UNIQUE constraint failed: rooms\.name/.test(msg)) {
+        return fail(`a room named "${name}" already exists`);
+      }
+      return fail(msg);
     }
   },
 );
@@ -294,20 +326,24 @@ server.registerTool(
       room: z.string().min(1).describe("Room id or name to join"),
       agent_id: z
         .string()
+        .max(200)
         .optional()
         .describe(
           "Your stable identity/nickname. Omit to be assigned a readable id.",
         ),
       type: z
         .string()
+        .max(100)
         .optional()
         .describe("Agent type, e.g. 'claude', 'codex', 'gpt'"),
       role: z
         .string()
+        .max(200)
         .optional()
         .describe("Your role in the room, e.g. 'reviewer', 'planner'"),
       description: z
         .string()
+        .max(2000)
         .optional()
         .describe("Short description of who you are / what you do"),
       cursor: z
@@ -382,7 +418,7 @@ server.registerTool(
     try {
       touchSession();
       const { agentId, roomId } = requireActive();
-      const left = store.leaveRoom(roomId, agentId, cursorId());
+      const left = store.leaveRoom(roomId, agentId);
       session.agentId = null;
       session.roomId = null;
       session.cursorPrivate = false;
@@ -495,7 +531,7 @@ server.registerTool(
         .union([z.string(), z.record(z.any()), z.array(z.any())])
         .describe("Message body: a string, or a JSON object/array"),
       to: z
-        .array(z.string().min(1))
+        .array(z.string().min(1).max(200))
         .max(100)
         .optional()
         .describe("agent_ids this message is directed at (mentions); max 100"),
@@ -520,9 +556,6 @@ server.registerTool(
     try {
       touchSession();
       const { agentId, roomId } = requireActive();
-      if (reply_to_seq !== undefined && !store.getMessage(roomId, reply_to_seq)) {
-        return fail(`reply_to_seq ${reply_to_seq} does not exist in this room`);
-      }
       const isText = typeof content === "string";
       const body = isText ? (content as string) : JSON.stringify(content);
       if (Buffer.byteLength(body, "utf8") > SQLITE_MAX_LENGTH) {
@@ -598,9 +631,12 @@ server.registerTool(
       after_seq: z
         .number()
         .int()
-        .positive()
+        .nonnegative()
         .optional()
-        .describe("Cursor for mentions_me paging: pass the prior next_after_seq"),
+        .describe(
+          "Cursor for mentions_me paging: pass the prior next_after_seq " +
+            "(only valid together with mentions_me)",
+        ),
       preview_chars: z
         .number()
         .int()
@@ -629,6 +665,15 @@ server.registerTool(
     try {
       touchSession();
       const { agentId, roomId } = requireActive();
+      // Fail loudly instead of silently ignoring the cursor: an advancing
+      // catch_up pages by moving the marker, so after_seq means the caller
+      // misunderstands which mode it is in.
+      if (after_seq !== undefined && !mentions_me) {
+        return fail(
+          "after_seq only applies to mentions_me peek paging; plain catch_up " +
+            "pages by advancing your read marker -- just call it again",
+        );
+      }
       const result = store.catchUp(
         roomId,
         agentId,
@@ -847,7 +892,10 @@ server.registerTool(
       "Set or update the pinned intro/conventions for the active room. Pass an " +
       "empty string to clear it. Joiners see this in join_room.",
     inputSchema: {
-      text: z.string().describe("Pinned intro text (empty string clears it)"),
+      text: z
+        .string()
+        .max(10_000)
+        .describe("Pinned intro text (empty string clears it)"),
     },
   },
   async ({ text }) => {
@@ -923,6 +971,7 @@ server.registerTool(
         .describe("Claim lifetime in seconds (default 900 = 15 minutes)"),
       note: z
         .string()
+        .max(2000)
         .optional()
         .describe("What you are doing with it (shown to other agents)"),
     },

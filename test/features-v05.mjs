@@ -226,9 +226,12 @@ s.close();
   v.postMessage(r, "a", "small reply", "text", null, 2); // seq 3
   const t = v.getThread(r, 2, 3);
   const total = JSON.stringify(t).length;
-  check(total <= 130_000, `thread shares one budget (${total} <= 130000)`);
+  // v0.5.2: the focal message is charged at SERIALIZED size (fitMessage), so
+  // the whole response now genuinely fits the 100k budget, and the parent
+  // receives the real remainder (~10k) instead of the 2k starvation floor.
+  check(total <= 100_000, `thread shares one budget (${total} <= 100000)`);
   check(t.message.truncated === true, "focal message truncated under the budget");
-  check(t.parent.truncated === true && t.parent.content.length <= 4_000, "parent charged against remainder");
+  check(t.parent.truncated === true && t.parent.content.length <= 12_000, "parent charged against remainder, not a fresh cap");
   check(t.replies.length === 1 && t.replies[0].content === "small reply", "replies still delivered");
   v.close();
 }

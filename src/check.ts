@@ -4,6 +4,11 @@
 // relative to its read marker (or an explicit --since)?
 // Exit 0 = updates exist, 1 = none yet, 2 = error. Prints a JSON status line.
 // Used by scripts/wait-for-updates.sh to poll without touching the read marker.
+//
+// The --agent baseline is the IDENTITY-level marker (memberships.last_read_seq,
+// the MAX across that identity's sessions); per-session private cursors are
+// keyed by a process-internal nonce this probe cannot see. A private-cursor
+// session lagging its twin should pass --since with its own last_read_seq.
 import Database from "better-sqlite3";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -82,9 +87,11 @@ if (!existsSync(path)) fail(`db not found: ${path}`);
 // exit 1 and the poller would misread a broken probe as a quiet room.
 try {
   // Read-write open (not readonly): readonly connections to a WAL database fail
-  // when the -wal/-shm sidecars are absent. We only run SELECTs.
+  // when the -wal/-shm sidecars are absent. query_only enforces the read-only
+  // contract structurally instead of by convention.
   const db = new Database(path);
   db.pragma("busy_timeout = 2000");
+  db.pragma("query_only = ON");
 
   let room = /^\d+$/.test(args.room)
     ? (db.prepare("SELECT id FROM rooms WHERE id = ?").get(Number(args.room)) as

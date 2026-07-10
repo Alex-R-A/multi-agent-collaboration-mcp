@@ -15,6 +15,11 @@
 #   --since <seq>        use this seq as the baseline instead of the read marker.
 #                        Without --agent this is a room-wide watcher: it has no
 #                        identity, so it wakes on ANY message, including yours.
+#                        Private-cursor sessions (join_room cursor:'private')
+#                        should pass --since with their own last_read_seq from
+#                        whoami: the --agent marker is identity-level (the MAX
+#                        across twin sessions), which can hide a lagging
+#                        session's backlog.
 #   --interval <sec>     poll interval (default 5)
 #   --timeout <sec>      give up after this many seconds of no updates
 #                        (default 1200 = 20 minutes; 0 = never)
