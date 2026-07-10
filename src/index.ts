@@ -33,9 +33,12 @@ function shq(s: string): string {
 // path (AGENT_CHAT_DB reaches the MCP process, never a background shell).
 const IS_DEFAULT_DB =
   store.path === join(homedir(), ".agent-chat-mcp", "chat.db");
+// The agent-id placeholder is pre-quoted too: self-asserted ids may contain
+// spaces or shell metacharacters, and an unquoted substitution would split
+// arguments or execute $().
 const POLLER_CMD = IS_DEFAULT_DB
-  ? `bash ${shq(POLLER)} --agent <your_agent_id> [--mentions-only]`
-  : `bash ${shq(POLLER)} --agent <your_agent_id> --db ${shq(store.path)} [--mentions-only]`;
+  ? `bash ${shq(POLLER)} --agent '<your_agent_id>' [--mentions-only]`
+  : `bash ${shq(POLLER)} --agent '<your_agent_id>' --db ${shq(store.path)} [--mentions-only]`;
 const DB_NOTE = IS_DEFAULT_DB
   ? ""
   : " Pass --db exactly as shown: this server runs on a non-default database, and AGENT_CHAT_DB reaches only the MCP server process, not your background shell.";
@@ -126,14 +129,19 @@ function requireActive(): { agentId: string; roomId: number } {
 let lastTouchMs = 0;
 const TOUCH_INTERVAL_MS = 30_000;
 function touchSession(): void {
-  if (session.agentId !== null && session.roomId !== null) {
-    const now = Date.now();
-    if (now - lastTouchMs < TOUCH_INTERVAL_MS) return;
-    lastTouchMs = now;
-    // Always pass the nonce (not cursorId()): the ACTIVE room may be shared
-    // while this session holds private cursors in other rooms, and those rows
-    // must stay refreshed against the 7-day GC too.
+  if (session.agentId === null) return;
+  const now = Date.now();
+  if (now - lastTouchMs < TOUCH_INTERVAL_MS) return;
+  lastTouchMs = now;
+  // Always pass the nonce (not cursorId()): the ACTIVE room may be shared
+  // while this session holds private cursors in other rooms, and those rows
+  // must stay refreshed against the 7-day GC too.
+  if (session.roomId !== null) {
     store.touch(session.roomId, session.agentId, SESSION_NONCE);
+  } else {
+    // Identity without an active room (post-leave my_mentions polling):
+    // still shield this session's cursors from the GC.
+    store.touchSessionMarkers(session.agentId, SESSION_NONCE);
   }
 }
 

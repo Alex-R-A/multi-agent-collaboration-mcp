@@ -1284,10 +1284,41 @@
         // response from a PREVIOUS visit to the same room (A -> B -> A) can
         // be told apart from the current visit (id comparison alone cannot).
         roomEpoch: 0,
+        searchSeq: 0, // orders concurrent search requests
       };
 
       const IDENT_KEY = "agent-chat.identity";
       const JOINED_KEY = "agent-chat.joined";
+      const GHOST_KEY = "agent-chat.ghosts";
+
+      // Memberships whose soft-leave failed (e.g. server briefly down during
+      // a rename): tracked so later joins can retry the leave instead of the
+      // ghost becoming permanently unaddressable.
+      function loadGhosts() {
+        try {
+          return JSON.parse(localStorage.getItem(GHOST_KEY)) || [];
+        } catch {
+          return [];
+        }
+      }
+      function saveGhosts(g) {
+        try {
+          localStorage.setItem(GHOST_KEY, JSON.stringify(g));
+        } catch {}
+      }
+      async function retryGhosts() {
+        const ghosts = loadGhosts();
+        if (!ghosts.length) return;
+        const remaining = [];
+        for (const g of ghosts) {
+          try {
+            await postJson("/api/leave", { room: g.room, name: g.name });
+          } catch {
+            remaining.push(g);
+          }
+        }
+        saveGhosts(remaining);
+      }
 
       function identity() {
         return localStorage.getItem(IDENT_KEY) || "";
@@ -1952,7 +1983,13 @@
             `/api/messages?room=${room.id}&after=${initial ? 0 : last}&limit=${PAGE}`,
           );
           noteOk();
-          if (!sameView(room, epoch) || data.error || !data.messages) return;
+          if (!sameView(room, epoch) || data.error || !data.messages) {
+            // A discarded INITIAL load for the room still shown (epoch bumped
+            // by a rename) must re-arm, or the stream stays empty till a
+            // failure path happens to set pendingInitial.
+            if (initial && sameRoom(room)) state.pendingInitial = true;
+            return;
+          }
           const rows = initial
             ? data.messages
             : data.messages.filter((m) => m.seq > last);
@@ -2065,6 +2102,11 @@
           sup.style.color = "var(--danger)";
           meta.append(sup);
         }
+        if (m.supersedes_seq) {
+          const cor = document.createElement("span");
+          cor.textContent = "supersedes #" + m.supersedes_seq;
+          meta.append(cor);
+        }
         meta.append(seq, time, go);
         head.append(meta);
         row.append(head);
@@ -2087,6 +2129,9 @@
         const q = el.search.value.trim();
         if (!room) return;
         if (!q) return exitSearch();
+        // Order concurrent searches: a slow older query must not overwrite a
+        // newer query's already-rendered results.
+        const mySeq = ++state.searchSeq;
         let data;
         try {
           const r = await fetch(
@@ -2097,7 +2142,7 @@
         } catch (e) {
           data = { matches: [], failed: e.message };
         }
-        if (!sameView(room, epoch)) return;
+        if (!sameView(room, epoch) || mySeq !== state.searchSeq) return;
         state.searchMode = true;
         el.msgs.hidden = true;
         el.older.hidden = true;
@@ -2187,6 +2232,7 @@
         }
         el.joinBtn.disabled = true;
         const epoch = state.roomEpoch;
+        const prevIdentity = identity();
         try {
           // Join FIRST: the server validates the new name, and an invalid
           // rename must not have already torn down the old memberships.
@@ -2195,25 +2241,40 @@
             localStorage.setItem(IDENT_KEY, name);
           } catch {}
           // Renaming: soft-leave EVERY membership recorded under another name
-          // (else the abandoned identity lingers as a present ghost member in
-          // each other joined room, blocking prune's unread-refusal). Entries
-          // whose leave failed are KEPT so the ghost stays reachable for a
-          // retry instead of becoming unaddressable.
+          // (else the abandoned identity lingers as a present ghost member,
+          // blocking prune's unread-refusal). Failed leaves go to the ghost
+          // ledger for retry on later joins, INCLUDING the current room's
+          // old name, which the map overwrite below would otherwise orphan.
           const joinedMap = loadJoined();
+          const ghosts = loadGhosts();
           for (const [rid, storedName] of Object.entries(joinedMap)) {
             if (!storedName || storedName === name) continue;
             try {
               await postJson("/api/leave", { room: Number(rid), name: storedName });
-              delete joinedMap[rid];
-            } catch {}
+            } catch {
+              if (!ghosts.some((g) => g.room === Number(rid) && g.name === storedName)) {
+                ghosts.push({ room: Number(rid), name: storedName });
+              }
+            }
+            delete joinedMap[rid];
           }
+          saveGhosts(ghosts);
           joinedMap[String(room.id)] = name;
           saveJoined(joinedMap);
+          retryGhosts();
+          // The composer reflects the GLOBAL identity for whatever room is
+          // shown now; re-render it even after a room switch so a stale
+          // successful rename cannot leave it showing the old identity.
+          renderComposer();
           // A delayed response must not mutate another visit's marker/UI.
           if (!sameView(room, epoch)) return;
+          // An identity change invalidates every in-flight operation that
+          // was issued under the OLD identity in this same room (their
+          // markers belong to the old name); a first join must not, or it
+          // would drop its own visit's in-flight initial load.
+          if (prevIdentity && prevIdentity !== name) state.roomEpoch += 1;
           state.lastReadSent = 0;
           state.marker = j.last_read_seq ?? 0;
-          renderComposer();
           computeGap();
           maybeMarkRead();
           el.composeText.focus();
@@ -2226,16 +2287,19 @@
 
       async function leaveCurrent() {
         const room = state.current;
+        const epoch = state.roomEpoch;
         if (!room) return;
         try {
           await postJson("/api/leave", { room: room.id, name: identity() });
         } catch (e) {
-          el.composeError.textContent = e.message;
+          if (sameView(room, epoch)) el.composeError.textContent = e.message;
           return;
         }
         const joined = loadJoined();
         delete joined[String(room.id)];
         saveJoined(joined);
+        // Composer/reply belong to whatever room is shown NOW.
+        if (!sameView(room, epoch)) return;
         clearReply();
         renderComposer();
       }
@@ -2551,6 +2615,7 @@
 
       (async function init() {
         showPlaceholder("Loading...", "");
+        retryGhosts(); // clean up any leaves that failed in a prior session
         await loadRooms();
         let savedId = null;
         try {

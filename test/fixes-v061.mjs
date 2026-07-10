@@ -135,7 +135,7 @@ const check = (n, c, x) => {
   }
   const inbox = s.myMentions("hero", 50, undefined, 2000);
   const size = JSON.stringify(inbox).length;
-  check(`whole inbox response respects max_bytes (${size} <= 2600)`, size <= 2600, size);
+  check(`whole inbox response respects max_bytes (${size} <= 2000)`, size <= 2000, size);
   check("by_room truncation is flagged", inbox.by_room_truncated === true, inbox);
   check("total_directed still counts every room (pre-truncation)", inbox.total_directed === 0, inbox.total_directed);
   s.close();
@@ -180,11 +180,11 @@ const check = (n, c, x) => {
     s.postMessage(r, "n", "hello @hero " + "x".repeat(300), "text", ["hero"], null);
   const inbox = s.myMentions("hero", 50, undefined, 1000);
   const size = JSON.stringify(inbox).length;
-  check(`max_bytes=1000 respected within slack (${size} <= 1600)`, size <= 1600, size);
+  check(`max_bytes=1000 is a hard bound (${size} <= 1000)`, size <= 1000, size);
   check("byte_limited flagged when trimmed", inbox.byte_limited === true, inbox.byte_limited);
 }
 
-// --- envelope-dominated messages still honor the byte budget -----------------
+// --- envelope-dominated messages: HARD byte bound on the whole response -----
 {
   const s = new ChatStore(":memory:");
   const r = s.createRoom("r", null, null).id;
@@ -192,12 +192,14 @@ const check = (n, c, x) => {
   s.upsertAgent("b", null, null, null);
   s.joinRoom(r, "a");
   s.joinRoom(r, "b");
-  // 100 valid 200-char ASCII mention ids: ~20k of pure envelope.
-  const ids = Array.from({ length: 100 }, (_, i) => "m" + String(i) + "x".repeat(195));
+  // 100 valid mention ids INCLUDING the reader (an earlier version of this
+  // test generated ids that never mentioned the reader, making the inbox
+  // half vacuous).
+  const ids = ["a", ...Array.from({ length: 99 }, (_, i) => "m" + i + "x".repeat(190))];
   s.postMessage(r, "b", "short body", "text", ids, null);
   const page = s.catchUp(r, "a", 50, undefined, 1000);
-  const size = JSON.stringify(page.messages).length;
-  check(`catch_up envelope bounded (${size} <= 1300)`, size <= 1300, size);
+  const size = JSON.stringify(page).length;
+  check(`catch_up WHOLE response hard-bounded (${size} <= 1000)`, size <= 1000, size);
   check(
     "mentions cut is flagged with the original count",
     page.messages[0].to_truncated === true && page.messages[0].to_total === 100,
@@ -206,7 +208,56 @@ const check = (n, c, x) => {
   s.markRead(r, "a", 0); // rewind to test the inbox path on the same message
   const inbox = s.myMentions("a", 50, undefined, 1000);
   const isize = JSON.stringify(inbox).length;
-  check(`my_mentions envelope bounded (${isize} <= 1600)`, isize <= 1600, isize);
+  check(`my_mentions WHOLE response hard-bounded (${isize} <= 1000)`, isize <= 1000, isize);
+  check("inbox is non-vacuous (the reader IS mentioned)", inbox.messages.length === 1, inbox.messages.length);
+  s.close();
+}
+
+// --- reviewer repro pack: hard bound under hostile-but-legal metadata -------
+{
+  const s = new ChatStore(":memory:");
+  const r = s.createRoom("room-" + "x".repeat(195), null, null).id; // legal long name
+  const bigSender = "sender-" + "s".repeat(170); // legal long id
+  s.upsertAgent("a", null, null, null);
+  s.upsertAgent(bigSender, "t".repeat(100), "r".repeat(200), null); // long metadata
+  s.joinRoom(r, "a");
+  s.joinRoom(r, bigSender);
+  s.postMessage(
+    r,
+    bigSender,
+    "nine printable ids",
+    "text",
+    ["a", ...Array.from({ length: 8 }, (_, i) => "n" + i + "y".repeat(190))],
+    null,
+  );
+  s.postMessage(r, bigSender, String.fromCharCode(1).repeat(400), "text", ["a"], null);
+  s.postMessage(r, bigSender, "plain body from a long-metadata sender", "text", null, null);
+
+  let pages = 0;
+  for (;;) {
+    const p = s.catchUp(r, "a", 50, undefined, 1000);
+    const sz = JSON.stringify(p).length;
+    check(`repro catch_up page ${++pages} hard-bounded (${sz} <= 1000)`, sz <= 1000, sz);
+    if (p.remaining === 0) break;
+    if (pages > 10) {
+      check("catch_up paging terminates", false, pages);
+      break;
+    }
+  }
+  s.markRead(r, "a", 0);
+  let afterId = 0;
+  let ipages = 0;
+  for (;;) {
+    const p = s.myMentions("a", 50, undefined, 1000, null, afterId);
+    const sz = JSON.stringify(p).length;
+    check(`repro inbox page ${++ipages} hard-bounded (${sz} <= 1000)`, sz <= 1000, sz);
+    if (p.messages.length === 0) break;
+    afterId = p.next_after_id;
+    if (ipages > 10) {
+      check("inbox paging terminates", false, ipages);
+      break;
+    }
+  }
   s.close();
 }
 

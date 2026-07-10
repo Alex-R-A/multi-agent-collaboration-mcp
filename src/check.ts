@@ -64,9 +64,9 @@ function parseArgs(argv: string[]): Args {
 
 function resolveDbPath(override?: string): string {
   // Absolute always: a relative path silently means a different file per cwd.
-  // SQLite sentinels/URIs (":memory:", "file:") pass through untouched.
-  const norm = (t: string): string =>
-    t === ":memory:" || t.startsWith("file:") ? t : resolve(t);
+  // Only the ":memory:" sentinel passes through (URI parsing is not enabled
+  // on these opens, so "file:" strings are literal paths).
+  const norm = (t: string): string => (t === ":memory:" ? t : resolve(t));
   if (override && override.trim().length > 0) return norm(override.trim());
   const env = process.env.AGENT_CHAT_DB;
   if (env && env.trim().length > 0) return norm(env.trim());
