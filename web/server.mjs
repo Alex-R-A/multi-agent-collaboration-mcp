@@ -46,7 +46,7 @@ function listRooms() {
   if (!d) return null;
   return d
     .prepare(
-      `SELECT r.id, r.name, r.description,
+      `SELECT r.id, r.name, r.description, r.pinned,
               (SELECT COUNT(*) FROM memberships m WHERE m.room_id = r.id AND m.left_at IS NULL) AS members,
               (SELECT COUNT(*) FROM messages g WHERE g.room_id = r.id) AS messages,
               (SELECT MAX(created_at) FROM messages g WHERE g.room_id = r.id) AS last_activity
@@ -55,28 +55,50 @@ function listRooms() {
     .all();
 }
 
-function listMessages(roomId, afterSeq, limit) {
+function listMessages(roomId, afterSeq, beforeSeq, limit) {
   const d = getDb();
   if (!d) return null;
-  const cols = `g.seq, g.agent_id AS "from", a.role, a.type, g.body, g.format, g.created_at AS at`;
+  const cols = `g.seq, g.agent_id AS "from", a.role, a.type, g.body, g.format,
+                g.mentions, g.reply_to_seq, g.created_at AS at`;
   const src = `messages g LEFT JOIN agents a ON a.id = g.agent_id`;
+  let rows;
   if (afterSeq > 0) {
     // Incremental tail: only messages newer than what the client already has.
-    return d
+    rows = d
       .prepare(
         `SELECT ${cols} FROM ${src}
          WHERE g.room_id = ? AND g.seq > ? ORDER BY g.seq ASC LIMIT ?`,
       )
       .all(roomId, afterSeq, limit);
+  } else if (beforeSeq > 0) {
+    // History paging: the `limit` messages just older than what is shown.
+    rows = d
+      .prepare(
+        `SELECT ${cols} FROM ${src}
+         WHERE g.room_id = ? AND g.seq < ? ORDER BY g.seq DESC LIMIT ?`,
+      )
+      .all(roomId, beforeSeq, limit)
+      .reverse();
+  } else {
+    // Initial load: newest `limit`, returned oldest-first for top-to-bottom reading.
+    rows = d
+      .prepare(
+        `SELECT ${cols} FROM ${src}
+         WHERE g.room_id = ? ORDER BY g.seq DESC LIMIT ?`,
+      )
+      .all(roomId, limit)
+      .reverse();
   }
-  // Initial load: newest `limit`, returned oldest-first for top-to-bottom reading.
-  return d
-    .prepare(
-      `SELECT ${cols} FROM ${src}
-       WHERE g.room_id = ? ORDER BY g.seq DESC LIMIT ?`,
-    )
-    .all(roomId, limit)
-    .reverse();
+  for (const r of rows) {
+    if (r.mentions) {
+      try {
+        r.mentions = JSON.parse(r.mentions);
+      } catch {
+        r.mentions = null;
+      }
+    }
+  }
+  return rows;
 }
 
 function sendJson(res, status, payload) {
@@ -119,11 +141,12 @@ const server = createServer((req, res) => {
       if (!Number.isInteger(roomId) || roomId <= 0)
         return sendJson(res, 400, { error: "room must be a positive integer" });
       const after = Number(url.searchParams.get("after")) || 0;
+      const before = Number(url.searchParams.get("before")) || 0;
       const limit = Math.max(
         1,
         Math.min(Number(url.searchParams.get("limit")) || 200, 1000),
       );
-      const messages = listMessages(roomId, after, limit);
+      const messages = listMessages(roomId, after, before, limit);
       if (messages === null)
         return sendJson(res, 200, {
           messages: [],

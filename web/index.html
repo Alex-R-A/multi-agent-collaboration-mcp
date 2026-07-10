@@ -3,316 +3,1421 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>agent-chat viewer</title>
+    <title>agent-chat</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2314110c'/%3E%3Ccircle cx='16' cy='16' r='6' fill='%23e0a34a'/%3E%3C/svg%3E"
+    />
     <style>
+      @import url("https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Red+Hat+Mono:ital,wght@0,300..700;1,300..700&display=swap");
+
+      :root {
+        --bg: #14110c;
+        --surface: #1b1712;
+        --surface-2: #221d16;
+        --surface-3: #2a241b;
+        --line: #2e2820;
+        --line-soft: #262019;
+        --text: #ece4d4;
+        --text-dim: #a89c85;
+        --text-faint: #6f6553;
+        --accent: #e0a34a;
+        --accent-soft: rgba(224, 163, 74, 0.13);
+        --accent-line: rgba(224, 163, 74, 0.35);
+        --danger: #d96b57;
+        --font-display: "Instrument Serif", "Iowan Old Style", Georgia, serif;
+        --font-mono: "Red Hat Mono", ui-monospace, "SF Mono", Menlo, Consolas,
+          monospace;
+      }
+
       * {
         box-sizing: border-box;
       }
+
+      /* The display rules below (flex/grid) would otherwise override the UA's
+         [hidden] { display: none } and quietly un-hide elements. */
+      [hidden] {
+        display: none !important;
+      }
+
+      html,
+      body {
+        height: 100%;
+      }
+
       body {
         margin: 0;
-        height: 100vh;
-        display: flex;
-        flex-direction: column;
-        font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
-        color: #1a1a1a;
-        background: #f4f4f5;
+        font-family: var(--font-mono);
+        font-size: 13px;
+        line-height: 1.55;
+        color: var(--text);
+        background:
+          radial-gradient(1100px 700px at 88% -12%, rgba(224, 163, 74, 0.06), transparent 60%),
+          radial-gradient(900px 900px at -10% 110%, rgba(224, 163, 74, 0.03), transparent 55%),
+          var(--bg);
       }
-      header {
-        display: flex;
-        align-items: center;
-        gap: 12px;
-        padding: 10px 16px;
-        background: #fff;
-        border-bottom: 1px solid #ddd;
+
+      ::selection {
+        background: var(--accent);
+        color: #1a1206;
       }
-      header h1 {
-        margin: 0;
-        font-size: 14px;
-        font-weight: 600;
-        color: #6b7280;
-        letter-spacing: 0.02em;
-      }
-      #room-title {
-        font-weight: 600;
-      }
+
       button {
         font: inherit;
+        color: inherit;
+        background: none;
+        border: none;
         cursor: pointer;
+        padding: 0;
       }
-      #back {
-        border: 1px solid #ccc;
-        background: #fff;
+
+      :focus-visible {
+        outline: 1px solid var(--accent);
+        outline-offset: 2px;
+        border-radius: 2px;
+      }
+
+      * {
+        scrollbar-width: thin;
+        scrollbar-color: var(--line) transparent;
+      }
+      *::-webkit-scrollbar {
+        width: 10px;
+        height: 10px;
+      }
+      *::-webkit-scrollbar-thumb {
+        background: var(--line);
+        border: 3px solid transparent;
         border-radius: 6px;
-        padding: 4px 10px;
+        background-clip: content-box;
       }
-      #back:hover {
-        border-color: #999;
+      *::-webkit-scrollbar-track {
+        background: transparent;
       }
-      main {
-        flex: 1;
+
+      /* ---- shell ---------------------------------------------------------- */
+
+      #app {
+        display: grid;
+        grid-template-columns: 300px 1fr;
+        height: 100vh;
+        height: 100dvh;
+      }
+
+      /* ---- sidebar -------------------------------------------------------- */
+
+      #sidebar {
+        display: flex;
+        flex-direction: column;
         min-height: 0;
+        border-right: 1px solid var(--line-soft);
+        background: linear-gradient(180deg, var(--surface) 0%, #181410 100%);
+      }
+
+      .masthead {
+        padding: 20px 18px 14px;
+        border-bottom: 1px solid var(--line-soft);
+      }
+
+      .wordmark {
+        font-family: var(--font-display);
+        font-style: italic;
+        font-size: 24px;
+        letter-spacing: 0.01em;
+        color: var(--text);
         display: flex;
-      }
-      #rooms {
-        flex: 1;
-        overflow: auto;
-        padding: 16px;
-        display: flex;
-        flex-direction: column;
-        gap: 8px;
-      }
-      .room {
-        text-align: left;
-        border: 1px solid #ddd;
-        background: #fff;
-        border-radius: 8px;
-        padding: 12px 14px;
-        display: flex;
-        flex-direction: column;
-        gap: 3px;
-      }
-      .room:hover {
-        border-color: #888;
-      }
-      .room-name {
-        font-weight: 600;
-      }
-      .room-meta {
-        font-size: 12px;
-        color: #6b7280;
-      }
-      .room-desc {
-        font-size: 13px;
-        color: #4b5563;
-        margin-top: 2px;
-      }
-      .placeholder {
-        padding: 24px;
-        color: #6b7280;
-      }
-      #chat {
-        flex: 1;
-        min-height: 0;
-        display: flex;
-      }
-      #messages {
-        flex: 1;
-        overflow: auto;
-        padding: 12px 16px;
-        display: flex;
-        flex-direction: column;
+        align-items: baseline;
         gap: 10px;
       }
-      .msg {
+
+      .wordmark em {
+        color: var(--accent);
+        font-style: italic;
+      }
+
+      .dot {
+        width: 8px;
+        height: 8px;
+        border-radius: 50%;
+        background: var(--text-faint);
+        align-self: center;
+        flex: none;
+        transition: background 0.3s;
+      }
+      .dot.ok {
+        background: var(--accent);
+        animation: pulse 2.4s ease-out infinite;
+      }
+      .dot.bad {
+        background: var(--danger);
+        animation: none;
+      }
+
+      @keyframes pulse {
+        0% {
+          box-shadow: 0 0 0 0 rgba(224, 163, 74, 0.45);
+        }
+        70% {
+          box-shadow: 0 0 0 9px rgba(224, 163, 74, 0);
+        }
+        100% {
+          box-shadow: 0 0 0 0 rgba(224, 163, 74, 0);
+        }
+      }
+
+      .tagline {
+        margin-top: 3px;
+        font-size: 10.5px;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+        color: var(--text-faint);
+      }
+
+      .filter-wrap {
+        padding: 12px 14px 6px;
+      }
+
+      #filter {
+        width: 100%;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        color: var(--text);
+        background: var(--bg);
+        border: 1px solid var(--line);
+        border-radius: 6px;
         padding: 7px 10px;
-        border-radius: 4px;
-        line-height: 1.45;
+      }
+      #filter::placeholder {
+        color: var(--text-faint);
+      }
+      #filter:focus {
+        outline: none;
+        border-color: var(--accent-line);
+      }
+
+      #rooms {
+        flex: 1;
+        overflow-y: auto;
+        padding: 8px 10px 16px;
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+      }
+
+      .room-card {
+        text-align: left;
+        width: 100%;
+        border-radius: 8px;
+        padding: 9px 11px 9px 13px;
+        border-left: 2px solid transparent;
+        position: relative;
+        transition: background 0.15s;
+      }
+      .room-card:hover {
+        background: var(--surface-2);
+      }
+      .room-card[aria-current="true"] {
+        background: var(--surface-2);
+        border-left-color: var(--accent);
+      }
+
+      .room-card .name {
+        font-weight: 600;
+        font-size: 12.5px;
+        color: var(--text);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+        padding-right: 14px;
+      }
+
+      .room-card .meta {
+        margin-top: 2px;
+        font-size: 10.5px;
+        color: var(--text-faint);
+      }
+
+      .room-card .desc {
+        margin-top: 3px;
+        font-size: 11px;
+        color: var(--text-dim);
+        display: -webkit-box;
+        -webkit-line-clamp: 2;
+        -webkit-box-orient: vertical;
+        overflow: hidden;
+      }
+
+      .room-card .activity {
+        position: absolute;
+        top: 12px;
+        right: 11px;
+        width: 6px;
+        height: 6px;
+        border-radius: 50%;
+        background: var(--accent);
+      }
+
+      .card-in {
+        animation: rise 0.35s ease-out backwards;
+      }
+
+      .side-note {
+        padding: 20px 16px;
+        color: var(--text-faint);
+        font-size: 12px;
+        line-height: 1.6;
+      }
+
+      /* ---- main ----------------------------------------------------------- */
+
+      #main {
+        display: flex;
+        flex-direction: column;
+        min-height: 0;
+        min-width: 0;
+        position: relative;
+      }
+
+      #main::before {
+        content: "";
+        position: absolute;
+        inset: 0;
+        background-image: radial-gradient(
+          circle,
+          rgba(236, 228, 212, 0.03) 1px,
+          transparent 1px
+        );
+        background-size: 26px 26px;
+        pointer-events: none;
+      }
+
+      #mobile-bar {
+        display: none;
+        align-items: center;
+        gap: 12px;
+        padding: 10px 14px;
+        border-bottom: 1px solid var(--line-soft);
+        background: var(--surface);
+      }
+      #rooms-toggle {
+        font-size: 11px;
+        letter-spacing: 0.12em;
+        text-transform: uppercase;
+        color: var(--accent);
+        border: 1px solid var(--accent-line);
+        border-radius: 6px;
+        padding: 5px 10px;
+      }
+      #mobile-title {
+        font-family: var(--font-display);
+        font-style: italic;
+        font-size: 17px;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      #room-head {
+        display: flex;
+        align-items: flex-end;
+        justify-content: space-between;
+        gap: 18px;
+        padding: 18px 26px 14px;
+        border-bottom: 1px solid var(--line-soft);
+        background: rgba(20, 17, 12, 0.75);
+        backdrop-filter: blur(6px);
+        z-index: 2;
+      }
+
+      #room-name {
+        margin: 0;
+        font-family: var(--font-display);
+        font-weight: 400;
+        font-size: 27px;
+        line-height: 1.15;
+        letter-spacing: 0.005em;
+      }
+
+      #room-desc {
+        margin: 3px 0 0;
+        font-size: 12px;
+        color: var(--text-dim);
+        max-width: 62ch;
+      }
+      #room-desc:empty {
+        display: none;
+      }
+
+      #room-stats {
+        font-size: 11px;
+        color: var(--text-faint);
+        white-space: nowrap;
+        padding-bottom: 4px;
+      }
+
+      /* ---- pinned intro --------------------------------------------------- */
+
+      #pinned {
+        margin: 12px auto 0;
+        width: calc(100% - 52px);
+        max-width: 920px;
+        border: 1px solid var(--accent-line);
+        border-left-width: 3px;
+        border-radius: 8px;
+        background: var(--accent-soft);
+        z-index: 1;
+      }
+
+      #pinned summary {
+        list-style: none;
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        padding: 8px 12px;
+        cursor: pointer;
+        min-width: 0;
+      }
+      #pinned summary::-webkit-details-marker {
+        display: none;
+      }
+      #pinned summary::before {
+        content: "";
+        flex: none;
+        width: 7px;
+        height: 7px;
+        border-right: 1.5px solid var(--accent);
+        border-bottom: 1.5px solid var(--accent);
+        transform: rotate(-45deg);
+        transition: transform 0.2s;
+        margin-top: -2px;
+      }
+      #pinned[open] summary::before {
+        transform: rotate(45deg);
+        margin-top: -4px;
+      }
+
+      .pin-label {
+        font-size: 10px;
+        font-weight: 600;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+        color: var(--accent);
+        flex: none;
+      }
+
+      #pinned-preview {
+        font-size: 11.5px;
+        color: var(--text-dim);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      #pinned[open] #pinned-preview {
+        visibility: hidden;
+      }
+
+      #pinned-body {
+        margin: 0;
+        padding: 2px 14px 12px 29px;
+        font-family: var(--font-mono);
+        font-size: 12px;
+        color: var(--text);
         white-space: pre-wrap;
         word-break: break-word;
       }
-      .who {
-        font-weight: 600;
+
+      /* ---- banner --------------------------------------------------------- */
+
+      #banner {
+        margin: 10px auto 0;
+        width: calc(100% - 52px);
+        max-width: 920px;
+        border: 1px solid rgba(217, 107, 87, 0.4);
+        border-radius: 8px;
+        background: rgba(217, 107, 87, 0.1);
+        color: var(--danger);
+        font-size: 11.5px;
+        padding: 7px 12px;
+        z-index: 1;
       }
-      .who-id {
-        color: #6b7280;
-        font-weight: 400;
+
+      /* ---- stream --------------------------------------------------------- */
+
+      #stream-wrap {
+        flex: 1;
+        min-height: 0;
+        position: relative;
+        display: flex;
+        flex-direction: column;
+      }
+
+      #stream {
+        flex: 1;
+        overflow-y: auto;
+        padding: 18px 26px 30px;
+        overscroll-behavior: contain;
+      }
+
+      #msgs {
+        max-width: 920px;
+        margin: 0 auto;
+      }
+
+      #older {
+        display: block;
+        margin: 0 auto 18px;
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--text-dim);
+        border: 1px solid var(--line);
+        border-radius: 6px;
+        padding: 6px 12px;
+        background: var(--surface);
+      }
+      #older:hover {
+        color: var(--accent);
+        border-color: var(--accent-line);
+      }
+
+      .day-sep {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        margin: 22px 0 14px;
+        color: var(--text-faint);
+        font-size: 10.5px;
+        letter-spacing: 0.16em;
+        text-transform: uppercase;
+      }
+      .day-sep::before,
+      .day-sep::after {
+        content: "";
+        flex: 1;
+        height: 1px;
+        background: var(--line-soft);
+      }
+
+      .msg {
+        position: relative;
+        border-left: 2px solid var(--hue-bar, var(--line));
+        background: var(--hue-bg, transparent);
+        border-radius: 0 6px 6px 0;
+        padding: 6px 12px 7px 14px;
+        margin-top: 10px;
+      }
+      .msg.grouped {
+        margin-top: 1px;
+        padding-top: 3px;
+        padding-bottom: 5px;
+      }
+
+      .msg-head {
+        display: flex;
+        align-items: baseline;
+        gap: 8px;
+        min-width: 0;
+      }
+
+      .msg .who {
+        font-weight: 600;
+        font-size: 12.5px;
+        color: var(--hue-name, var(--text));
+        white-space: nowrap;
+      }
+      .msg .who-id {
+        font-size: 10.5px;
+        color: var(--text-faint);
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+
+      .msg-meta {
+        margin-left: auto;
+        flex: none;
+        font-size: 10.5px;
+        color: var(--text-faint);
+        display: flex;
+        gap: 10px;
+      }
+      .msg-meta .seq {
+        color: var(--text-faint);
+      }
+      .msg.grouped .msg-meta {
+        position: absolute;
+        top: 3px;
+        right: 12px;
+        opacity: 0;
+        transition: opacity 0.15s;
+      }
+      .msg.grouped:hover .msg-meta {
+        opacity: 1;
+      }
+
+      .msg .body {
+        margin-top: 2px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        font-size: 13px;
+        color: var(--text);
+      }
+
+      .body-wrap.clamped .body {
+        max-height: 22em;
+        overflow: hidden;
+        -webkit-mask-image: linear-gradient(180deg, #000 78%, transparent);
+        mask-image: linear-gradient(180deg, #000 78%, transparent);
+      }
+      .expand {
+        margin-top: 4px;
+        font-size: 10.5px;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--accent);
+      }
+      .expand:hover {
+        text-decoration: underline;
+      }
+
+      pre.json {
+        margin: 4px 0 0;
+        padding: 9px 11px;
+        font-family: var(--font-mono);
         font-size: 12px;
+        line-height: 1.5;
+        color: var(--text);
+        background: rgba(0, 0, 0, 0.28);
+        border: 1px solid var(--line-soft);
+        border-radius: 6px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        overflow-x: auto;
+      }
+
+      details.json-fold {
+        margin-top: 4px;
+      }
+      details.json-fold summary {
+        list-style: none;
+        cursor: pointer;
+        display: inline-flex;
+        align-items: center;
+        gap: 7px;
+        font-size: 10.5px;
+        letter-spacing: 0.1em;
+        text-transform: uppercase;
+        color: var(--text-dim);
+        border: 1px solid var(--line);
+        border-radius: 5px;
+        padding: 3px 9px;
+        background: var(--surface);
+      }
+      details.json-fold summary::-webkit-details-marker {
+        display: none;
+      }
+      details.json-fold summary:hover {
+        color: var(--accent);
+        border-color: var(--accent-line);
+      }
+      details.json-fold summary::before {
+        content: "";
+        width: 5px;
+        height: 5px;
+        border-right: 1.5px solid currentColor;
+        border-bottom: 1.5px solid currentColor;
+        transform: rotate(-45deg);
+        transition: transform 0.2s;
+      }
+      details.json-fold[open] summary::before {
+        transform: rotate(45deg);
+      }
+
+      .chips {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 5px;
+        margin-top: 5px;
+      }
+
+      .chip {
+        font-size: 10.5px;
+        color: var(--text-dim);
+        border: 1px solid var(--line);
+        border-radius: 999px;
+        padding: 1px 9px;
+        background: var(--surface);
+      }
+      .chip.reply {
+        color: var(--accent);
+        border-color: var(--accent-line);
+        cursor: pointer;
+      }
+      .chip.reply:hover {
+        background: var(--accent-soft);
+      }
+
+      .msg.fresh {
+        animation: rise 0.35s ease-out, wash 1.6s ease-out;
+      }
+      .msg.flash {
+        animation: wash 1.6s ease-out;
+      }
+
+      @keyframes rise {
+        from {
+          opacity: 0;
+          transform: translateY(7px);
+        }
+      }
+      @keyframes wash {
+        0% {
+          background-color: var(--accent-soft);
+        }
+        100% {
+          background-color: var(--hue-bg, transparent);
+        }
+      }
+
+      /* ---- jump pill ------------------------------------------------------ */
+
+      #jump {
+        position: absolute;
+        left: 50%;
+        bottom: 20px;
+        transform: translateX(-50%);
+        background: var(--accent);
+        color: #1a1206;
+        font-weight: 600;
+        font-size: 11.5px;
+        letter-spacing: 0.04em;
+        border-radius: 999px;
+        padding: 8px 16px;
+        box-shadow: 0 6px 18px rgba(0, 0, 0, 0.45);
+        animation: rise 0.25s ease-out;
+        z-index: 3;
+      }
+      #jump:hover {
+        filter: brightness(1.08);
+      }
+
+      /* ---- placeholder ---------------------------------------------------- */
+
+      .placeholder {
+        position: absolute;
+        inset: 0;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 8px;
+        text-align: center;
+        padding: 30px;
+        z-index: 1;
+      }
+      .placeholder .big {
+        font-family: var(--font-display);
+        font-style: italic;
+        font-size: 26px;
+        color: var(--text-dim);
+      }
+      .placeholder .hint {
+        font-size: 12px;
+        color: var(--text-faint);
+        max-width: 52ch;
+        line-height: 1.7;
+      }
+
+      /* ---- responsive ------------------------------------------------------ */
+
+      @media (max-width: 860px) {
+        #app {
+          grid-template-columns: 1fr;
+        }
+        #sidebar {
+          position: fixed;
+          inset: 0 25% 0 0;
+          min-width: 280px;
+          z-index: 10;
+          transform: translateX(-102%);
+          transition: transform 0.25s ease-out;
+          box-shadow: 18px 0 40px rgba(0, 0, 0, 0.5);
+        }
+        body.show-rooms #sidebar {
+          transform: translateX(0);
+        }
+        #mobile-bar {
+          display: flex;
+        }
+        #room-head,
+        #stream {
+          padding-left: 16px;
+          padding-right: 16px;
+        }
+        #pinned,
+        #banner {
+          width: calc(100% - 32px);
+        }
+      }
+
+      @media (prefers-reduced-motion: reduce) {
+        *,
+        *::before,
+        *::after {
+          animation: none !important;
+          transition: none !important;
+        }
       }
     </style>
   </head>
   <body>
-    <header>
-      <h1>agent-chat</h1>
-      <button id="back" hidden>&larr; Rooms</button>
-      <span id="room-title"></span>
-    </header>
-    <main>
-      <section id="rooms"></section>
-      <section id="chat" hidden><div id="messages"></div></section>
-    </main>
+    <div id="app">
+      <aside id="sidebar">
+        <div class="masthead">
+          <div class="wordmark">
+            agent<em>-</em>chat
+            <span id="live-dot" class="dot" title="waiting for first poll"></span>
+          </div>
+          <div class="tagline">read-only coordination log</div>
+        </div>
+        <div class="filter-wrap">
+          <input id="filter" type="search" placeholder="Filter rooms" autocomplete="off" />
+        </div>
+        <nav id="rooms" aria-label="Rooms"></nav>
+      </aside>
+
+      <main id="main">
+        <div id="mobile-bar">
+          <button id="rooms-toggle" aria-label="Show rooms">Rooms</button>
+          <span id="mobile-title"></span>
+        </div>
+        <header id="room-head" hidden>
+          <div>
+            <h1 id="room-name"></h1>
+            <p id="room-desc"></p>
+          </div>
+          <div id="room-stats"></div>
+        </header>
+        <details id="pinned" hidden>
+          <summary>
+            <span class="pin-label">Pinned</span>
+            <span id="pinned-preview"></span>
+          </summary>
+          <pre id="pinned-body"></pre>
+        </details>
+        <div id="banner" hidden>Connection lost. Retrying.</div>
+        <section id="stream-wrap" hidden>
+          <div id="stream">
+            <button id="older" hidden>Load earlier messages</button>
+            <div id="msgs"></div>
+          </div>
+          <button id="jump" hidden></button>
+        </section>
+        <div id="placeholder" class="placeholder" hidden></div>
+      </main>
+    </div>
 
     <script>
-      const STORAGE_KEY = "agent-chat.room";
-      const POLL_MS = 1500;
+      "use strict";
 
-      const el = {
-        rooms: document.getElementById("rooms"),
-        chat: document.getElementById("chat"),
-        messages: document.getElementById("messages"),
-        back: document.getElementById("back"),
-        title: document.getElementById("room-title"),
+      const ROOM_KEY = "agent-chat.room";
+      const SEEN_KEY = "agent-chat.seen";
+      const POLL_MS = 1500;
+      const ROOMS_MS = 6000;
+      const PAGE = 400;
+      const GROUP_GAP_MS = 3 * 60 * 1000;
+
+      const el = {};
+      for (const id of [
+        "live-dot", "filter", "rooms", "mobile-title", "rooms-toggle",
+        "room-head", "room-name", "room-desc", "room-stats",
+        "pinned", "pinned-preview", "pinned-body",
+        "banner", "stream-wrap", "stream", "older", "msgs", "jump", "placeholder",
+      ]) el[id.replace(/-(\w)/g, (_, c) => c.toUpperCase())] = document.getElementById(id);
+
+      const state = {
+        rooms: [],
+        current: null, // room object from /api/rooms
+        msgs: [],
+        follow: true,
+        newCount: 0,
+        failures: 0,
+        loadingMsgs: false,
+        loadingRooms: false,
+        seen: loadSeen(),
       };
 
-      let currentRoom = null; // { id, name }
-      let lastSeq = 0;
-      let pollTimer = null;
+      // ---- utilities ------------------------------------------------------
 
-      el.back.addEventListener("click", showRooms);
+      function loadSeen() {
+        try {
+          return JSON.parse(localStorage.getItem(SEEN_KEY)) || {};
+        } catch {
+          return {};
+        }
+      }
+      function saveSeen() {
+        try {
+          localStorage.setItem(SEEN_KEY, JSON.stringify(state.seen));
+        } catch {}
+      }
 
-      // Stable, subtle per-username background so each agent's lines share a tint.
-      function userColor(name) {
-        let h = 0;
-        for (let i = 0; i < name.length; i++)
-          h = (h * 31 + name.charCodeAt(i)) % 360;
-        return `hsl(${h}, 60%, 92%)`;
+      // Stable hue per agent id (FNV-1a), rendered at fixed OKLCH lightness so
+      // every identity is distinguishable but none shouts.
+      function hue(id) {
+        let h = 0x811c9dc5;
+        for (let i = 0; i < id.length; i++) {
+          h ^= id.charCodeAt(i);
+          h = Math.imul(h, 0x01000193);
+        }
+        return (h >>> 0) % 360;
+      }
+
+      function applyHue(node, id) {
+        const h = hue(id);
+        node.style.setProperty("--hue-name", `oklch(78% 0.11 ${h})`);
+        node.style.setProperty("--hue-bar", `oklch(62% 0.12 ${h} / 0.75)`);
+        node.style.setProperty("--hue-bg", `oklch(72% 0.1 ${h} / 0.045)`);
+      }
+
+      // `at` is SQLite UTC "YYYY-MM-DD HH:MM:SS".
+      function parseUtc(at) {
+        return new Date(at.replace(" ", "T") + "Z");
+      }
+
+      function fmtTime(d) {
+        return d.toLocaleTimeString([], {
+          hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+        });
+      }
+
+      function fmtDay(d) {
+        const now = new Date();
+        const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+        const that = new Date(d.getFullYear(), d.getMonth(), d.getDate());
+        const days = Math.round((today - that) / 86400000);
+        if (days === 0) return "Today";
+        if (days === 1) return "Yesterday";
+        return d.toLocaleDateString([], {
+          weekday: "short", year: "numeric", month: "short", day: "numeric",
+        });
+      }
+
+      function fmtRel(at) {
+        const s = Math.max(0, (Date.now() - parseUtc(at).getTime()) / 1000);
+        if (s < 60) return "now";
+        if (s < 3600) return Math.floor(s / 60) + "m";
+        if (s < 86400) return Math.floor(s / 3600) + "h";
+        return Math.floor(s / 86400) + "d";
+      }
+
+      function flat(s, n) {
+        const f = String(s).replace(/\s+/g, " ").trim();
+        return f.length > n ? f.slice(0, n) + "..." : f;
+      }
+
+      function label(m) {
+        return m.role || m.type || m.from;
       }
 
       async function fetchJson(url) {
         const r = await fetch(url);
-        if (!r.ok) throw new Error(`HTTP ${r.status}`);
+        if (!r.ok) throw new Error("HTTP " + r.status);
         return r.json();
       }
 
-      async function showRooms() {
-        stopPolling();
-        currentRoom = null;
-        el.chat.hidden = true;
-        el.back.hidden = true;
-        el.title.textContent = "";
-        el.rooms.hidden = false;
-        el.rooms.innerHTML = '<div class="placeholder">Loading...</div>';
-
-        let data;
-        try {
-          data = await fetchJson("/api/rooms");
-        } catch (e) {
-          el.rooms.textContent = "";
-          return placeholder(el.rooms, `Failed to load rooms: ${e.message}`);
+      function noteOk() {
+        state.failures = 0;
+        el.banner.hidden = true;
+        el.liveDot.className = "dot ok";
+        el.liveDot.title = "connected, polling";
+      }
+      function noteFail() {
+        state.failures++;
+        if (state.failures >= 2) {
+          el.banner.hidden = false;
+          el.liveDot.className = "dot bad";
+          el.liveDot.title = "connection lost";
         }
-        el.rooms.textContent = "";
-        if (data.error) return placeholder(el.rooms, data.error);
-        if (!data.rooms.length)
-          return placeholder(el.rooms, "No chat rooms yet.");
+      }
 
-        for (const room of data.rooms) {
+      // ---- sidebar --------------------------------------------------------
+
+      let firstRoomsRender = true;
+
+      function renderRooms() {
+        const q = el.filter.value.trim().toLowerCase();
+        const scroll = el.rooms.scrollTop;
+        el.rooms.textContent = "";
+        const shown = state.rooms.filter(
+          (r) =>
+            !q ||
+            r.name.toLowerCase().includes(q) ||
+            (r.description || "").toLowerCase().includes(q),
+        );
+        if (state.rooms.length === 0) {
+          const note = document.createElement("div");
+          note.className = "side-note";
+          note.textContent =
+            "No rooms yet. Agents create rooms with create_room; they will appear here.";
+          el.rooms.append(note);
+          return;
+        }
+        if (shown.length === 0) {
+          const note = document.createElement("div");
+          note.className = "side-note";
+          note.textContent = "No rooms match the filter.";
+          el.rooms.append(note);
+          return;
+        }
+        shown.forEach((room, i) => {
           const card = document.createElement("button");
-          card.className = "room";
+          card.className = "room-card";
+          if (firstRoomsRender) {
+            card.classList.add("card-in");
+            card.style.animationDelay = Math.min(i * 30, 300) + "ms";
+          }
+          if (state.current && state.current.id === room.id) {
+            card.setAttribute("aria-current", "true");
+          }
 
           const name = document.createElement("div");
-          name.className = "room-name";
+          name.className = "name";
           name.textContent = room.name;
           card.append(name);
 
           const meta = document.createElement("div");
-          meta.className = "room-meta";
-          meta.textContent =
-            `${room.messages} messages · ${room.members} present` +
-            (room.last_activity ? ` · last ${room.last_activity} UTC` : "");
+          meta.className = "meta";
+          const bits = [
+            room.messages + " msg" + (room.messages === 1 ? "" : "s"),
+            room.members + " present",
+          ];
+          if (room.last_activity) bits.push(fmtRel(room.last_activity));
+          meta.textContent = bits.join("  /  ");
           card.append(meta);
 
           if (room.description) {
             const desc = document.createElement("div");
-            desc.className = "room-desc";
+            desc.className = "desc";
             desc.textContent = room.description;
             card.append(desc);
           }
 
-          card.addEventListener("click", () => openRoom(room.id, room.name));
+          const isOpen = state.current && state.current.id === room.id;
+          if (
+            !isOpen &&
+            room.last_activity &&
+            state.seen[room.id] !== room.last_activity
+          ) {
+            const dot = document.createElement("span");
+            dot.className = "activity";
+            dot.title = "new activity since you last viewed this room";
+            card.append(dot);
+          }
+
+          card.addEventListener("click", () => openRoom(room));
           el.rooms.append(card);
+        });
+        firstRoomsRender = false;
+        el.rooms.scrollTop = scroll;
+      }
+
+      async function loadRooms() {
+        if (state.loadingRooms) return;
+        state.loadingRooms = true;
+        try {
+          const data = await fetchJson("/api/rooms");
+          noteOk();
+          if (data.error && !data.rooms.length) {
+            showPlaceholder("No database yet.", data.error);
+          }
+          state.rooms = data.rooms || [];
+          if (state.current) {
+            const cur = state.rooms.find((r) => r.id === state.current.id);
+            if (cur) {
+              state.current = cur;
+              state.seen[cur.id] = cur.last_activity;
+              saveSeen();
+              renderRoomHead();
+            }
+          }
+          renderRooms();
+        } catch {
+          noteFail();
+        } finally {
+          state.loadingRooms = false;
         }
       }
 
-      function placeholder(container, text) {
-        const p = document.createElement("div");
-        p.className = "placeholder";
-        p.textContent = text;
-        container.append(p);
+      // ---- room head / pinned ----------------------------------------------
+
+      function renderRoomHead() {
+        const r = state.current;
+        el.roomHead.hidden = !r;
+        if (!r) return;
+        el.roomName.textContent = r.name;
+        el.roomDesc.textContent = r.description || "";
+        el.roomStats.textContent =
+          r.messages + " messages  /  " + r.members + " present";
+        el.mobileTitle.textContent = r.name;
+        if (r.pinned) {
+          el.pinned.hidden = false;
+          el.pinnedPreview.textContent = flat(r.pinned, 110);
+          el.pinnedBody.textContent = r.pinned;
+        } else {
+          el.pinned.hidden = true;
+        }
       }
 
-      function openRoom(id, name) {
-        currentRoom = { id, name };
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(currentRoom));
-        lastSeq = 0;
-        el.messages.textContent = "";
-        el.rooms.hidden = true;
-        el.chat.hidden = false;
-        el.back.hidden = false;
-        el.title.textContent = name;
-        loadNew(true).then(startPolling);
+      // ---- stream ----------------------------------------------------------
+
+      function showPlaceholder(big, hint) {
+        el.placeholder.hidden = false;
+        el.placeholder.textContent = "";
+        const b = document.createElement("div");
+        b.className = "big";
+        b.textContent = big;
+        el.placeholder.append(b);
+        if (hint) {
+          const h = document.createElement("div");
+          h.className = "hint";
+          h.textContent = hint;
+          el.placeholder.append(h);
+        }
+      }
+      function hidePlaceholder() {
+        el.placeholder.hidden = true;
       }
 
       function nearBottom() {
-        const m = el.messages;
-        return m.scrollHeight - m.scrollTop - m.clientHeight < 80;
+        const s = el.stream;
+        return s.scrollHeight - s.scrollTop - s.clientHeight < 120;
+      }
+      function scrollBottom() {
+        el.stream.scrollTop = el.stream.scrollHeight;
       }
 
-      // In-flight guard: a fetch outlasting the poll interval would let two
-      // overlapping calls read the same lastSeq and append duplicates.
-      let loading = false;
-      async function loadNew(initial) {
-        if (!currentRoom || loading) return;
-        loading = true;
-        try {
-          const stick = initial || nearBottom();
-          const data = await fetchJson(
-            `/api/messages?room=${currentRoom.id}&after=${lastSeq}&limit=500`,
-          );
-          if (!currentRoom || data.error || !data.messages) return;
-          for (const msg of data.messages) {
-            el.messages.append(renderMessage(msg));
-            if (msg.seq > lastSeq) lastSeq = msg.seq;
-          }
-          if (stick && data.messages.length)
-            el.messages.scrollTop = el.messages.scrollHeight;
-        } catch {
-          // transient fetch failure: the next poll tick retries
-        } finally {
-          loading = false;
-        }
-      }
-
-      function renderMessage(msg) {
-        const row = document.createElement("div");
-        row.className = "msg";
-        // Color by the stable agent id, not the label, so an agent keeps one
-        // tint even if two agents share a role.
-        row.style.background = userColor(msg.from);
-
-        const label = msg.role || msg.type || msg.from;
-        const who = document.createElement("span");
-        who.className = "who";
-        who.textContent = label;
-        row.append(who);
-
-        // Show the raw id, muted, when a friendly label stands in for it.
-        if (label !== msg.from) {
-          const id = document.createElement("span");
-          id.className = "who-id";
-          id.textContent = " " + msg.from;
-          row.append(id);
-        }
-
-        const sep = document.createElement("span");
-        sep.textContent = ": ";
-        row.append(sep);
-
-        const text = document.createElement("span");
-        // textContent, never innerHTML: message bodies are agent-controlled.
-        text.textContent =
-          typeof msg.body === "string" ? msg.body : String(msg.body);
-        row.append(text);
-        return row;
-      }
-
-      function startPolling() {
-        stopPolling();
-        pollTimer = setInterval(() => loadNew(false), POLL_MS);
-      }
-      function stopPolling() {
-        if (pollTimer) clearInterval(pollTimer);
-        pollTimer = null;
-      }
-
-      // Reopen the remembered room on load, else show the room list.
-      (function init() {
-        const saved = localStorage.getItem(STORAGE_KEY);
-        if (saved) {
+      function renderBody(container, m) {
+        if (m.format === "json") {
+          let parsed;
           try {
-            const r = JSON.parse(saved);
-            if (r && r.id) return openRoom(r.id, r.name);
-          } catch {}
+            parsed = JSON.parse(m.body);
+          } catch {
+            parsed = undefined;
+          }
+          if (parsed !== undefined) {
+            const pretty = JSON.stringify(parsed, null, 2);
+            const pre = document.createElement("pre");
+            pre.className = "json";
+            pre.textContent = pretty;
+            if (pretty.length > 600) {
+              const fold = document.createElement("details");
+              fold.className = "json-fold";
+              const sum = document.createElement("summary");
+              sum.textContent = "json  /  " + pretty.length + " chars";
+              fold.append(sum, pre);
+              container.append(fold);
+            } else {
+              container.append(pre);
+            }
+            return;
+          }
         }
-        showRooms();
+        const wrap = document.createElement("div");
+        wrap.className = "body-wrap";
+        const body = document.createElement("div");
+        body.className = "body";
+        body.textContent = m.body;
+        wrap.append(body);
+        const lines = (m.body.match(/\n/g) || []).length + 1;
+        if (m.body.length > 1600 || lines > 20) {
+          wrap.classList.add("clamped");
+          const btn = document.createElement("button");
+          btn.className = "expand";
+          btn.textContent = "Show all (" + m.body.length + " chars)";
+          btn.addEventListener("click", () => {
+            const clamped = wrap.classList.toggle("clamped");
+            btn.textContent = clamped
+              ? "Show all (" + m.body.length + " chars)"
+              : "Collapse";
+          });
+          wrap.append(btn);
+        }
+        container.append(wrap);
+      }
+
+      function jumpToSeq(seq) {
+        const target = el.msgs.querySelector(`[data-seq="${seq}"]`);
+        if (!target) return;
+        target.scrollIntoView({ block: "center" });
+        target.classList.remove("flash");
+        void target.offsetWidth; // restart the animation
+        target.classList.add("flash");
+      }
+
+      // Build the DOM nodes for one message (day separator included when the
+      // calendar day changes against `prev`).
+      function buildMsg(m, prev, fresh) {
+        const nodes = [];
+        const d = parseUtc(m.at);
+        const prevD = prev ? parseUtc(prev.at) : null;
+        const newDay = !prevD || prevD.toDateString() !== d.toDateString();
+        if (newDay) {
+          const sep = document.createElement("div");
+          sep.className = "day-sep";
+          sep.textContent = fmtDay(d);
+          nodes.push(sep);
+        }
+
+        const grouped =
+          !newDay &&
+          prev &&
+          prev.from === m.from &&
+          d - prevD < GROUP_GAP_MS &&
+          !prev.reply_to_seq === !m.reply_to_seq;
+
+        const row = document.createElement("article");
+        row.className = "msg" + (grouped ? " grouped" : "") + (fresh ? " fresh" : "");
+        row.dataset.seq = m.seq;
+        applyHue(row, m.from);
+
+        const head = document.createElement("div");
+        head.className = "msg-head";
+        if (!grouped) {
+          const who = document.createElement("span");
+          who.className = "who";
+          who.textContent = label(m);
+          head.append(who);
+          if (label(m) !== m.from) {
+            const id = document.createElement("span");
+            id.className = "who-id";
+            id.textContent = m.from;
+            head.append(id);
+          }
+        }
+        const meta = document.createElement("span");
+        meta.className = "msg-meta";
+        const seq = document.createElement("span");
+        seq.className = "seq";
+        seq.textContent = "#" + m.seq;
+        const time = document.createElement("span");
+        time.textContent = fmtTime(d);
+        time.title = m.at + " UTC";
+        meta.append(seq, time);
+        head.append(meta);
+        row.append(head);
+
+        renderBody(row, m);
+
+        const chips = document.createElement("div");
+        if (m.reply_to_seq) {
+          const chip = document.createElement("button");
+          chip.className = "chip reply";
+          const parent = state.msgs.find((x) => x.seq === m.reply_to_seq);
+          chip.textContent =
+            "reply to #" + m.reply_to_seq + (parent ? "  " + label(parent) : "");
+          chip.title = "jump to message #" + m.reply_to_seq;
+          chip.addEventListener("click", () => jumpToSeq(m.reply_to_seq));
+          chips.append(chip);
+        }
+        if (Array.isArray(m.mentions)) {
+          for (const id of m.mentions) {
+            const chip = document.createElement("span");
+            chip.className = "chip";
+            chip.textContent = "@" + id;
+            chips.append(chip);
+          }
+        }
+        if (chips.childNodes.length) {
+          chips.className = "chips";
+          row.append(chips);
+        }
+
+        nodes.push(row);
+        return nodes;
+      }
+
+      function rebuildStream() {
+        el.msgs.textContent = "";
+        const frag = document.createDocumentFragment();
+        let prev = null;
+        for (const m of state.msgs) {
+          for (const n of buildMsg(m, prev, false)) frag.append(n);
+          prev = m;
+        }
+        el.msgs.append(frag);
+      }
+
+      function appendMsgs(rows, fresh) {
+        let prev = state.msgs[state.msgs.length - 1] || null;
+        const frag = document.createDocumentFragment();
+        for (const m of rows) {
+          for (const n of buildMsg(m, prev, fresh)) frag.append(n);
+          state.msgs.push(m);
+          prev = m;
+        }
+        el.msgs.append(frag);
+      }
+
+      function updateOlderButton() {
+        const first = state.msgs[0];
+        el.older.hidden = !first || first.seq <= 1;
+      }
+
+      function updateJump() {
+        if (state.newCount > 0 && !state.follow) {
+          el.jump.hidden = false;
+          el.jump.textContent =
+            state.newCount + " new  /  jump to latest";
+        } else {
+          el.jump.hidden = true;
+        }
+      }
+
+      async function loadNew(initial) {
+        const room = state.current;
+        if (!room || state.loadingMsgs) return;
+        state.loadingMsgs = true;
+        try {
+          const last = state.msgs.length
+            ? state.msgs[state.msgs.length - 1].seq
+            : 0;
+          const data = await fetchJson(
+            `/api/messages?room=${room.id}&after=${initial ? 0 : last}&limit=${PAGE}`,
+          );
+          noteOk();
+          if (state.current !== room || data.error || !data.messages) return;
+          const rows = initial
+            ? data.messages
+            : data.messages.filter((m) => m.seq > last);
+          if (initial) {
+            state.msgs = [];
+            el.msgs.textContent = "";
+            appendMsgs(rows, false);
+            updateOlderButton();
+            if (rows.length === 0) {
+              showPlaceholder(
+                "Nothing here yet.",
+                "Messages agents post in this room will stream in live.",
+              );
+            } else {
+              hidePlaceholder();
+            }
+            requestAnimationFrame(scrollBottom);
+          } else if (rows.length) {
+            hidePlaceholder();
+            const stick = state.follow || nearBottom();
+            appendMsgs(rows, true);
+            if (stick) {
+              requestAnimationFrame(scrollBottom);
+            } else {
+              state.newCount += rows.length;
+              updateJump();
+            }
+          }
+        } catch {
+          noteFail();
+        } finally {
+          state.loadingMsgs = false;
+        }
+      }
+
+      async function loadOlder() {
+        const room = state.current;
+        const first = state.msgs[0];
+        if (!room || !first || state.loadingMsgs) return;
+        state.loadingMsgs = true;
+        el.older.disabled = true;
+        try {
+          const data = await fetchJson(
+            `/api/messages?room=${room.id}&before=${first.seq}&limit=${PAGE}`,
+          );
+          if (state.current !== room || data.error || !data.messages) return;
+          if (data.messages.length) {
+            const prevHeight = el.stream.scrollHeight;
+            const prevTop = el.stream.scrollTop;
+            state.msgs = data.messages.concat(state.msgs);
+            rebuildStream();
+            el.stream.scrollTop =
+              el.stream.scrollHeight - prevHeight + prevTop;
+          }
+          updateOlderButton();
+          if (!data.messages.length) el.older.hidden = true;
+        } catch {
+          noteFail();
+        } finally {
+          el.older.disabled = false;
+          state.loadingMsgs = false;
+        }
+      }
+
+      // ---- room switching ---------------------------------------------------
+
+      function openRoom(room) {
+        state.current = room;
+        state.msgs = [];
+        state.newCount = 0;
+        state.follow = true;
+        try {
+          localStorage.setItem(ROOM_KEY, JSON.stringify({ id: room.id }));
+        } catch {}
+        state.seen[room.id] = room.last_activity;
+        saveSeen();
+        el.msgs.textContent = "";
+        el.older.hidden = true;
+        el.streamWrap.hidden = false;
+        el.pinned.open = false;
+        updateJump();
+        renderRoomHead();
+        renderRooms();
+        hidePlaceholder();
+        document.body.classList.remove("show-rooms");
+        loadNew(true);
+      }
+
+      // ---- wiring ------------------------------------------------------------
+
+      el.stream.addEventListener("scroll", () => {
+        state.follow = nearBottom();
+        if (state.follow && state.newCount > 0) {
+          state.newCount = 0;
+          updateJump();
+        }
+      });
+
+      el.jump.addEventListener("click", () => {
+        state.follow = true;
+        state.newCount = 0;
+        updateJump();
+        scrollBottom();
+      });
+
+      el.older.addEventListener("click", loadOlder);
+      el.filter.addEventListener("input", renderRooms);
+      el.roomsToggle.addEventListener("click", () =>
+        document.body.classList.toggle("show-rooms"),
+      );
+
+      setInterval(() => loadNew(false), POLL_MS);
+      setInterval(loadRooms, ROOMS_MS);
+
+      (async function init() {
+        showPlaceholder("Loading...", "");
+        await loadRooms();
+        let savedId = null;
+        try {
+          const saved = JSON.parse(localStorage.getItem(ROOM_KEY));
+          if (saved && saved.id) savedId = saved.id;
+        } catch {}
+        const room = state.rooms.find((r) => r.id === savedId);
+        if (room) {
+          openRoom(room);
+        } else if (state.rooms.length) {
+          showPlaceholder(
+            "Pick a room.",
+            "Rooms are listed on the left; the amber dot marks activity you have not seen.",
+          );
+        }
       })();
     </script>
   </body>
