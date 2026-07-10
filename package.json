@@ -19,7 +19,7 @@
     "web": "node web/server.mjs",
     "prepare": "npm run build",
     "pretest": "npm run build",
-    "test": "node test/concurrent-catchup.mjs && node test/peek-hidden-broadcasts.mjs && node test/features-v05.mjs && node test/fixes-v052.mjs"
+    "test": "node test/concurrent-catchup.mjs && node test/peek-hidden-broadcasts.mjs && node test/features-v05.mjs && node test/fixes-v052.mjs && node test/web-participate.mjs"
   },
   "engines": {
     "node": ">=22"

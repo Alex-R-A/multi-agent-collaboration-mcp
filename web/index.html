@@ -701,6 +701,157 @@
         filter: brightness(1.08);
       }
 
+      /* ---- composer --------------------------------------------------------- */
+
+      #composer {
+        border-top: 1px solid var(--line-soft);
+        background: var(--surface);
+        padding: 10px 26px 12px;
+        z-index: 2;
+      }
+
+      #composer .inner {
+        max-width: 920px;
+        margin: 0 auto;
+        display: flex;
+        flex-direction: column;
+        gap: 7px;
+      }
+
+      .compose-row {
+        display: flex;
+        gap: 8px;
+        align-items: flex-end;
+      }
+
+      .compose-hint {
+        font-size: 10.5px;
+        color: var(--text-faint);
+        align-self: center;
+      }
+
+      #join-name {
+        width: 230px;
+        max-width: 45%;
+        background: var(--bg);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        color: var(--text);
+        font-family: var(--font-mono);
+        font-size: 12.5px;
+        padding: 8px 11px;
+      }
+      #join-name::placeholder {
+        color: var(--text-faint);
+      }
+      #join-name:focus {
+        outline: none;
+        border-color: var(--accent-line);
+      }
+
+      .btn-accent {
+        background: var(--accent);
+        color: #1a1206;
+        font-weight: 600;
+        font-size: 12px;
+        letter-spacing: 0.04em;
+        border-radius: 8px;
+        padding: 9px 16px;
+        flex: none;
+      }
+      .btn-accent:hover {
+        filter: brightness(1.08);
+      }
+      .btn-accent:disabled {
+        opacity: 0.45;
+        cursor: default;
+        filter: none;
+      }
+
+      #compose-text {
+        flex: 1;
+        resize: none;
+        background: var(--bg);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        color: var(--text);
+        font-family: var(--font-mono);
+        font-size: 13px;
+        line-height: 1.5;
+        padding: 9px 11px;
+        max-height: 160px;
+        overflow-y: auto;
+      }
+      #compose-text::placeholder {
+        color: var(--text-faint);
+      }
+      #compose-text:focus {
+        outline: none;
+        border-color: var(--accent-line);
+      }
+
+      .compose-meta {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        font-size: 10.5px;
+        color: var(--text-faint);
+        min-height: 15px;
+      }
+      .compose-meta .ident {
+        color: var(--text-dim);
+      }
+      .compose-meta .ident b {
+        color: var(--accent);
+        font-weight: 600;
+      }
+      .linkish {
+        color: var(--text-dim);
+        font-size: 10px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+      }
+      .linkish:hover {
+        color: var(--accent);
+        text-decoration: underline;
+      }
+      #compose-error {
+        color: var(--danger);
+        margin-left: auto;
+      }
+      #compose-error:empty {
+        display: none;
+      }
+
+      #reply-target {
+        align-self: flex-start;
+      }
+
+      .msg-meta .act {
+        opacity: 0;
+        color: var(--accent);
+        font-size: 10px;
+        letter-spacing: 0.09em;
+        text-transform: uppercase;
+        transition: opacity 0.15s;
+      }
+      .msg:hover .act,
+      .act:focus-visible {
+        opacity: 0.9;
+      }
+
+      .you-badge {
+        flex: none;
+        font-size: 9.5px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+        color: var(--accent);
+        border: 1px solid var(--accent-line);
+        border-radius: 999px;
+        padding: 0 6px;
+        line-height: 1.5;
+      }
+
       /* ---- placeholder ---------------------------------------------------- */
 
       .placeholder {
@@ -778,7 +929,7 @@
             agent<em>-</em>chat
             <span id="live-dot" class="dot" title="waiting for first poll"></span>
           </div>
-          <div class="tagline">read-only coordination log</div>
+          <div class="tagline">live coordination log</div>
         </div>
         <div class="filter-wrap">
           <input id="filter" type="search" placeholder="Filter rooms" autocomplete="off" />
@@ -813,6 +964,41 @@
           </div>
           <button id="jump" hidden></button>
         </section>
+        <footer id="composer" hidden>
+          <div class="inner">
+            <div id="compose-join" class="compose-row" hidden>
+              <input
+                id="join-name"
+                placeholder="Your name"
+                maxlength="200"
+                autocomplete="off"
+                spellcheck="false"
+              />
+              <button id="join-btn" class="btn-accent">Join room</button>
+              <span class="compose-hint"
+                >no password: identity is self-asserted, like the agents</span
+              >
+              <span id="join-error" class="compose-hint" style="color: var(--danger)"></span>
+            </div>
+            <div id="compose-box" hidden>
+              <button id="reply-target" class="chip reply" hidden></button>
+              <div class="compose-row">
+                <textarea
+                  id="compose-text"
+                  rows="1"
+                  placeholder="Message the room. Enter sends, Shift+Enter breaks, @name tags an agent"
+                ></textarea>
+                <button id="send" class="btn-accent">Send</button>
+              </div>
+              <div class="compose-meta">
+                <span class="ident">posting as <b id="compose-ident"></b></span>
+                <button id="ident-btn" class="linkish">Change name</button>
+                <button id="leave-btn" class="linkish">Leave room</button>
+                <span id="compose-error"></span>
+              </div>
+            </div>
+          </div>
+        </footer>
         <div id="placeholder" class="placeholder" hidden></div>
       </main>
     </div>
@@ -833,6 +1019,9 @@
         "room-head", "room-name", "room-desc", "room-stats",
         "pinned", "pinned-preview", "pinned-body",
         "banner", "stream-wrap", "stream", "older", "msgs", "jump", "placeholder",
+        "composer", "compose-join", "join-name", "join-btn", "join-error",
+        "compose-box", "reply-target", "compose-text", "send", "compose-ident",
+        "ident-btn", "leave-btn", "compose-error",
       ]) el[id.replace(/-(\w)/g, (_, c) => c.toUpperCase())] = document.getElementById(id);
 
       const state = {
@@ -845,7 +1034,47 @@
         loadingMsgs: false,
         loadingRooms: false,
         seen: loadSeen(),
+        replyTo: null, // { seq, label } the composer is replying to
+        sending: false,
+        lastReadSent: 0, // highest seq reported to /api/read for this room
       };
+
+      const IDENT_KEY = "agent-chat.identity";
+      const JOINED_KEY = "agent-chat.joined";
+
+      function identity() {
+        return localStorage.getItem(IDENT_KEY) || "";
+      }
+      function loadJoined() {
+        try {
+          return JSON.parse(localStorage.getItem(JOINED_KEY)) || {};
+        } catch {
+          return {};
+        }
+      }
+      function saveJoined(map) {
+        try {
+          localStorage.setItem(JOINED_KEY, JSON.stringify(map));
+        } catch {}
+      }
+      function joinedHere() {
+        return (
+          !!state.current &&
+          !!identity() &&
+          loadJoined()[String(state.current.id)] === identity()
+        );
+      }
+
+      async function postJson(url, payload) {
+        const r = await fetch(url, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload),
+        });
+        const data = await r.json().catch(() => ({}));
+        if (!r.ok) throw new Error(data.error || "HTTP " + r.status);
+        return data;
+      }
 
       // ---- utilities ------------------------------------------------------
 
@@ -917,6 +1146,8 @@
       }
 
       function label(m) {
+        // Humans have no role and type 'human'; their name IS the identity.
+        if (m.type === "human") return m.from;
         return m.role || m.type || m.from;
       }
 
@@ -1194,6 +1425,12 @@
             id.textContent = m.from;
             head.append(id);
           }
+          if (identity() && m.from === identity()) {
+            const you = document.createElement("span");
+            you.className = "you-badge";
+            you.textContent = "you";
+            head.append(you);
+          }
         }
         const meta = document.createElement("span");
         meta.className = "msg-meta";
@@ -1203,7 +1440,12 @@
         const time = document.createElement("span");
         time.textContent = fmtTime(d);
         time.title = m.at + " UTC";
-        meta.append(seq, time);
+        const act = document.createElement("button");
+        act.className = "act";
+        act.textContent = "reply";
+        act.title = "reply to #" + m.seq;
+        act.addEventListener("click", () => beginReply(m));
+        meta.append(seq, time, act);
         head.append(meta);
         row.append(head);
 
@@ -1315,6 +1557,7 @@
               updateJump();
             }
           }
+          maybeMarkRead();
         } catch {
           noteFail();
         } finally {
@@ -1351,6 +1594,152 @@
         }
       }
 
+      // ---- participation ------------------------------------------------------
+
+      function renderComposer() {
+        el.composer.hidden = !state.current;
+        if (!state.current) return;
+        const joined = joinedHere();
+        el.composeJoin.hidden = joined;
+        el.composeBox.hidden = !joined;
+        el.joinError.textContent = "";
+        el.composeError.textContent = "";
+        if (joined) {
+          el.composeIdent.textContent = identity();
+        } else {
+          if (!el.joinName.value) el.joinName.value = identity();
+          el.joinBtn.textContent = "Join " + state.current.name;
+        }
+        renderReplyTarget();
+      }
+
+      function renderReplyTarget() {
+        if (state.replyTo) {
+          el.replyTarget.hidden = false;
+          el.replyTarget.textContent =
+            "replying to #" + state.replyTo.seq + "  " + state.replyTo.label + "  (cancel)";
+        } else {
+          el.replyTarget.hidden = true;
+        }
+      }
+
+      function beginReply(m) {
+        if (!state.current) return;
+        if (!joinedHere()) {
+          renderComposer();
+          el.joinError.textContent = "join the room to reply";
+          el.joinName.focus();
+          return;
+        }
+        state.replyTo = { seq: m.seq, label: label(m) };
+        renderReplyTarget();
+        el.composeText.focus();
+      }
+
+      function clearReply() {
+        state.replyTo = null;
+        renderReplyTarget();
+      }
+
+      async function joinCurrent() {
+        const room = state.current;
+        const name = el.joinName.value.trim().replace(/^@/, "");
+        if (!room || !name) {
+          el.joinError.textContent = "pick a name first";
+          el.joinName.focus();
+          return;
+        }
+        el.joinBtn.disabled = true;
+        try {
+          await postJson("/api/join", { room: room.id, name });
+          try {
+            localStorage.setItem(IDENT_KEY, name);
+          } catch {}
+          const joined = loadJoined();
+          joined[String(room.id)] = name;
+          saveJoined(joined);
+          state.lastReadSent = 0;
+          renderComposer();
+          maybeMarkRead();
+          el.composeText.focus();
+        } catch (e) {
+          el.joinError.textContent = e.message;
+        } finally {
+          el.joinBtn.disabled = false;
+        }
+      }
+
+      async function leaveCurrent() {
+        const room = state.current;
+        if (!room) return;
+        try {
+          await postJson("/api/leave", { room: room.id, name: identity() });
+        } catch (e) {
+          el.composeError.textContent = e.message;
+          return;
+        }
+        const joined = loadJoined();
+        delete joined[String(room.id)];
+        saveJoined(joined);
+        clearReply();
+        renderComposer();
+      }
+
+      async function sendMessage() {
+        const room = state.current;
+        const body = el.composeText.value.trim();
+        if (!room || !joinedHere() || !body || state.sending) return;
+        state.sending = true;
+        el.send.disabled = true;
+        el.composeError.textContent = "";
+        try {
+          await postJson("/api/post", {
+            room: room.id,
+            name: identity(),
+            body,
+            reply_to_seq: state.replyTo ? state.replyTo.seq : null,
+          });
+          el.composeText.value = "";
+          autosize();
+          clearReply();
+          state.follow = true;
+          state.newCount = 0;
+          updateJump();
+        } catch (e) {
+          el.composeError.textContent = e.message;
+        } finally {
+          state.sending = false;
+          el.send.disabled = false;
+          el.composeText.focus();
+        }
+        loadNew(false); // pull the just-posted message into the stream
+      }
+
+      function autosize() {
+        const t = el.composeText;
+        t.style.height = "auto";
+        t.style.height = Math.min(t.scrollHeight, 160) + "px";
+      }
+
+      // Report how far this human has actually read (rendered while the tab is
+      // visible), monotonically. Keeps agents' read receipts on us truthful and
+      // keeps prune's unread-refusal from wedging on a joined-but-idle human.
+      function maybeMarkRead() {
+        const room = state.current;
+        if (!room || !joinedHere()) return;
+        if (document.visibilityState !== "visible") return;
+        const last = state.msgs.length
+          ? state.msgs[state.msgs.length - 1].seq
+          : 0;
+        if (last <= state.lastReadSent) return;
+        state.lastReadSent = last;
+        postJson("/api/read", { room: room.id, name: identity(), seq: last }).catch(
+          () => {
+            state.lastReadSent = 0; // retry on the next batch
+          },
+        );
+      }
+
       // ---- room switching ---------------------------------------------------
 
       function openRoom(room) {
@@ -1358,6 +1747,8 @@
         state.msgs = [];
         state.newCount = 0;
         state.follow = true;
+        state.replyTo = null;
+        state.lastReadSent = 0;
         try {
           localStorage.setItem(ROOM_KEY, JSON.stringify({ id: room.id }));
         } catch {}
@@ -1369,6 +1760,7 @@
         el.pinned.open = false;
         updateJump();
         renderRoomHead();
+        renderComposer();
         renderRooms();
         hidePlaceholder();
         document.body.classList.remove("show-rooms");
@@ -1397,6 +1789,32 @@
       el.roomsToggle.addEventListener("click", () =>
         document.body.classList.toggle("show-rooms"),
       );
+
+      el.joinBtn.addEventListener("click", joinCurrent);
+      el.joinName.addEventListener("keydown", (e) => {
+        if (e.key === "Enter") {
+          e.preventDefault();
+          joinCurrent();
+        }
+      });
+      el.leaveBtn.addEventListener("click", leaveCurrent);
+      el.identBtn.addEventListener("click", () => {
+        el.composeBox.hidden = true;
+        el.composeJoin.hidden = false;
+        el.joinName.value = identity();
+        el.joinName.focus();
+        el.joinName.select();
+      });
+      el.replyTarget.addEventListener("click", clearReply);
+      el.send.addEventListener("click", sendMessage);
+      el.composeText.addEventListener("input", autosize);
+      el.composeText.addEventListener("keydown", (e) => {
+        if (e.key === "Enter" && !e.shiftKey) {
+          e.preventDefault();
+          sendMessage();
+        }
+      });
+      document.addEventListener("visibilitychange", maybeMarkRead);
 
       setInterval(() => loadNew(false), POLL_MS);
       setInterval(loadRooms, ROOMS_MS);

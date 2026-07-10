@@ -1,8 +1,12 @@
-// Read-only web viewer for the agent-chat SQLite database.
+// Web viewer + human participation for the agent-chat SQLite database.
 //
 // Standalone ESM script (no build step): it opens the same file the MCP
-// servers write to and serves one HTML page plus two JSON endpoints. No auth,
-// bound to localhost, consistent with the project's design.
+// servers write to and serves one HTML page plus JSON endpoints. Reads use a
+// query_only handle; participation (join/post/read/leave) uses a separate
+// writable handle whose message insert mirrors ChatStore.postMessage's
+// IMMEDIATE-transaction seq allocation, so web posts are safe against
+// concurrent agent writers. No auth, bound to localhost: identity is
+// self-asserted by design, exactly like the agents themselves.
 //
 //   Run:  node web/server.mjs     (or: npm run web)
 //   Port: AGENT_CHAT_VIEWER_PORT  (default 8787)
@@ -101,6 +105,144 @@ function listMessages(roomId, afterSeq, beforeSeq, limit) {
   return rows;
 }
 
+// Writable handle for participation endpoints only. Kept separate from the
+// query_only read handle so a bug in a read path can never write.
+let wdb = null;
+function getWriteDb() {
+  if (wdb) return wdb;
+  if (!existsSync(DB_PATH)) return null;
+  wdb = new Database(DB_PATH, { fileMustExist: true });
+  wdb.pragma("busy_timeout = 5000");
+  return wdb;
+}
+
+const MAX_BODY_CHARS = 100_000; // matches the agents' per-page read budget
+const NAME_RE = /^[\w][\w.-]{0,199}$/; // sane self-asserted ids, no whitespace
+
+function readBody(req, cap = 400_000) {
+  return new Promise((resolve, reject) => {
+    let size = 0;
+    const chunks = [];
+    req.on("data", (c) => {
+      size += c.length;
+      if (size > cap) {
+        reject(new Error("request body too large"));
+        req.destroy();
+        return;
+      }
+      chunks.push(c);
+    });
+    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("error", reject);
+  });
+}
+
+function membership(d, roomId, name) {
+  return d
+    .prepare(
+      "SELECT left_at FROM memberships WHERE room_id = ? AND agent_id = ?",
+    )
+    .get(roomId, name);
+}
+
+// { error } results become 400s; { status: ... } results become 200s.
+function joinRoom(d, roomId, name) {
+  const room = d.prepare("SELECT id FROM rooms WHERE id = ?").get(roomId);
+  if (!room) return { error: `no room ${roomId}` };
+  // Never overwrite an existing agent's type/role: identity is self-asserted,
+  // and a human deliberately resuming an agent id keeps that id's metadata.
+  d.prepare(
+    "INSERT INTO agents (id, type) VALUES (?, 'human') ON CONFLICT(id) DO NOTHING",
+  ).run(name);
+  d.prepare(
+    "INSERT OR IGNORE INTO memberships (room_id, agent_id) VALUES (?, ?)",
+  ).run(roomId, name);
+  d.prepare(
+    "UPDATE memberships SET left_at = NULL, last_seen = datetime('now') WHERE room_id = ? AND agent_id = ?",
+  ).run(roomId, name);
+  return { joined: true, agent_id: name, room_id: roomId };
+}
+
+function postMessage(d, roomId, name, body, replyToSeq, mentions) {
+  const m = membership(d, roomId, name);
+  if (!m || m.left_at !== null) {
+    return { error: "join the room first (POST /api/join)" };
+  }
+  const mentionsJson =
+    mentions && mentions.length > 0 ? JSON.stringify(mentions) : null;
+  // Same shape as ChatStore.postMessage: validate the reply target and
+  // allocate the next per-room seq inside one IMMEDIATE transaction, so a
+  // concurrent agent writer cannot take the same seq and the reply reference
+  // cannot dangle against a racing prune.
+  const tx = d.transaction(() => {
+    if (replyToSeq !== null) {
+      const parent = d
+        .prepare("SELECT 1 FROM messages WHERE room_id = ? AND seq = ?")
+        .get(roomId, replyToSeq);
+      if (!parent) {
+        throw new Error(`reply_to_seq ${replyToSeq} does not exist in this room`);
+      }
+    }
+    const { next } = d
+      .prepare(
+        "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM messages WHERE room_id = ?",
+      )
+      .get(roomId);
+    d.prepare(
+      `INSERT INTO messages (room_id, seq, agent_id, format, body, mentions, reply_to_seq)
+       VALUES (?, ?, ?, 'text', ?, ?, ?)`,
+    ).run(roomId, next, name, body, mentionsJson, replyToSeq);
+    d.prepare(
+      "UPDATE memberships SET last_seen = datetime('now') WHERE room_id = ? AND agent_id = ?",
+    ).run(roomId, name);
+    return next;
+  });
+  try {
+    return { seq: tx.immediate() };
+  } catch (e) {
+    return { error: String((e && e.message) || e) };
+  }
+}
+
+function markRead(d, roomId, name, seq) {
+  const m = membership(d, roomId, name);
+  if (!m) return { error: "join the room first (POST /api/join)" };
+  // Monotonic, mirroring the identity-marker semantics agents rely on for
+  // read receipts and prune refusal.
+  d.prepare(
+    `UPDATE memberships SET last_read_seq = max(last_read_seq, ?), last_seen = datetime('now')
+     WHERE room_id = ? AND agent_id = ?`,
+  ).run(seq, roomId, name);
+  const row = d
+    .prepare(
+      "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
+    )
+    .get(roomId, name);
+  return { last_read_seq: row.last_read_seq };
+}
+
+function leaveRoom(d, roomId, name) {
+  const info = d
+    .prepare(
+      `UPDATE memberships SET left_at = datetime('now'), last_seen = datetime('now')
+       WHERE room_id = ? AND agent_id = ? AND left_at IS NULL`,
+    )
+    .run(roomId, name);
+  return { left: info.changes > 0, room_id: roomId };
+}
+
+// Mentions are parsed server-side from @tokens so every client gets the same
+// semantics; ids are stored as tagged even if that agent never joined,
+// matching how agent mentions behave.
+function parseMentions(body) {
+  const out = [];
+  for (const m of body.matchAll(/@([\w][\w.-]{0,199})/g)) {
+    if (!out.includes(m[1])) out.push(m[1]);
+    if (out.length >= 100) break;
+  }
+  return out;
+}
+
 function sendJson(res, status, payload) {
   res.writeHead(status, {
     "Content-Type": "application/json; charset=utf-8",
@@ -109,7 +251,71 @@ function sendJson(res, status, payload) {
   res.end(JSON.stringify(payload));
 }
 
-const server = createServer((req, res) => {
+async function handlePost(url, req, res) {
+  const d = getWriteDb();
+  if (!d) {
+    return sendJson(res, 503, {
+      error: `No database at ${DB_PATH}. Start an agent-chat MCP server first.`,
+    });
+  }
+  let payload;
+  try {
+    payload = JSON.parse(await readBody(req));
+  } catch (e) {
+    return sendJson(res, 400, { error: String((e && e.message) || e) });
+  }
+  const roomId = Number(payload.room);
+  if (!Number.isInteger(roomId) || roomId <= 0) {
+    return sendJson(res, 400, { error: "room must be a positive integer id" });
+  }
+  const name = typeof payload.name === "string" ? payload.name.trim() : "";
+  if (!NAME_RE.test(name)) {
+    return sendJson(res, 400, {
+      error:
+        "name must be 1-200 chars: letters, digits, underscore, dot or dash (no spaces)",
+    });
+  }
+
+  if (url.pathname === "/api/join") {
+    const r = joinRoom(d, roomId, name);
+    return sendJson(res, r.error ? 400 : 200, r);
+  }
+  if (url.pathname === "/api/leave") {
+    return sendJson(res, 200, leaveRoom(d, roomId, name));
+  }
+  if (url.pathname === "/api/read") {
+    const seq = Number(payload.seq);
+    if (!Number.isInteger(seq) || seq < 0) {
+      return sendJson(res, 400, { error: "seq must be a non-negative integer" });
+    }
+    const r = markRead(d, roomId, name, seq);
+    return sendJson(res, r.error ? 400 : 200, r);
+  }
+  if (url.pathname === "/api/post") {
+    const body = typeof payload.body === "string" ? payload.body.trim() : "";
+    if (!body) return sendJson(res, 400, { error: "message body is empty" });
+    if (body.length > MAX_BODY_CHARS) {
+      return sendJson(res, 400, {
+        error: `message exceeds ${MAX_BODY_CHARS} chars`,
+      });
+    }
+    let replyTo = null;
+    if (payload.reply_to_seq !== undefined && payload.reply_to_seq !== null) {
+      replyTo = Number(payload.reply_to_seq);
+      if (!Number.isInteger(replyTo) || replyTo <= 0) {
+        return sendJson(res, 400, {
+          error: "reply_to_seq must be a positive integer",
+        });
+      }
+    }
+    const r = postMessage(d, roomId, name, body, replyTo, parseMentions(body));
+    return sendJson(res, r.error ? 400 : 200, r);
+  }
+  res.writeHead(404, { "Content-Type": "text/plain" });
+  res.end("not found");
+}
+
+const server = createServer(async (req, res) => {
   let url;
   try {
     url = new URL(req.url, `http://${req.headers.host}`);
@@ -119,6 +325,9 @@ const server = createServer((req, res) => {
     return;
   }
   try {
+    if (req.method === "POST" && url.pathname.startsWith("/api/")) {
+      return await handlePost(url, req, res);
+    }
     if (url.pathname === "/" || url.pathname === "/index.html") {
       // Read BEFORE writeHead: a read failure after headers are sent would
       // make the catch's second writeHead throw and crash the process.
@@ -157,12 +366,18 @@ const server = createServer((req, res) => {
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("not found");
   } catch (err) {
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
     sendJson(res, 500, { error: String((err && err.message) || err) });
   }
 });
 
 server.listen(PORT, "127.0.0.1", () => {
+  // Report the real bound port so PORT=0 (ephemeral, used by tests) works.
+  const port = server.address().port;
   const present = existsSync(DB_PATH) ? "" : "  (not found yet)";
-  console.log(`agent-chat viewer: http://127.0.0.1:${PORT}`);
+  console.log(`agent-chat viewer: http://127.0.0.1:${port}`);
   console.log(`database: ${DB_PATH}${present}`);
 });
