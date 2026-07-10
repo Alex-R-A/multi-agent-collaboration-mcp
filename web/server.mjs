@@ -260,6 +260,30 @@ function markRead(d, roomId, name, seq) {
   return { last_read_seq: row.last_read_seq };
 }
 
+// Full room deletion, mirroring ChatStore.deleteRoom: messages first (so the
+// FTS delete-trigger fires), then memberships, session markers, claims, and
+// the room row, in one IMMEDIATE transaction. Unauthenticated by design,
+// exactly like the MCP delete_room tool.
+function deleteRoomFull(d, roomId) {
+  const tx = d.transaction(() => {
+    const room = d.prepare("SELECT name FROM rooms WHERE id = ?").get(roomId);
+    if (!room) return { error: `no room ${roomId}` };
+    const { c: messages } = d
+      .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = ?")
+      .get(roomId);
+    const { c: members } = d
+      .prepare("SELECT COUNT(*) AS c FROM memberships WHERE room_id = ?")
+      .get(roomId);
+    d.prepare("DELETE FROM messages WHERE room_id = ?").run(roomId);
+    d.prepare("DELETE FROM memberships WHERE room_id = ?").run(roomId);
+    d.prepare("DELETE FROM session_markers WHERE room_id = ?").run(roomId);
+    d.prepare("DELETE FROM claims WHERE room_id = ?").run(roomId);
+    d.prepare("DELETE FROM rooms WHERE id = ?").run(roomId);
+    return { deleted_room: roomId, name: room.name, messages, members };
+  });
+  return tx.immediate();
+}
+
 function leaveRoom(d, roomId, name) {
   const info = d
     .prepare(
@@ -356,6 +380,21 @@ async function handlePost(url, req, res) {
   if (!Number.isInteger(roomId) || roomId <= 0) {
     return sendJson(res, 400, { error: "room must be a positive integer id" });
   }
+
+  if (url.pathname === "/api/delete-room") {
+    // No identity required (parity with the MCP delete_room tool), but the
+    // same explicit confirm gate: destructive and irreversible.
+    if (payload.confirm !== true) {
+      return sendJson(res, 400, {
+        error:
+          "pass confirm:true to permanently delete the room and ALL of its " +
+          "messages, memberships, and claims (irreversible)",
+      });
+    }
+    const r = deleteRoomFull(d, roomId);
+    return sendJson(res, r.error ? 400 : 200, r);
+  }
+
   const name = typeof payload.name === "string" ? payload.name.trim() : "";
   if (!NAME_RE.test(name)) {
     return sendJson(res, 400, {

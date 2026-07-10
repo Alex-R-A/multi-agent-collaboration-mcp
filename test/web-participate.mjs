@@ -194,6 +194,38 @@ try {
     raw.close();
     check("web reply stamps reply_to_agent", row.reply_to_agent === "bot", row);
   }
+
+  // full room deletion cascades to every related table
+  {
+    const s = new ChatStore(DB);
+    const rid = s.createRoom("doomed", null, null).id;
+    s.upsertAgent("ghost", null, null, null);
+    s.joinRoom(rid, "ghost", "SX"); // membership + session marker
+    s.postMessage(rid, "ghost", "to be erased", "text", null, null);
+    s.claimResource(rid, "file:x", "ghost", 900, null);
+    s.close();
+
+    const noConfirm = await post("/api/delete-room", { room: rid, confirm: false });
+    check("delete without confirm:true is rejected", noConfirm.status === 400, noConfirm);
+    const del = await post("/api/delete-room", { room: rid, confirm: true });
+    check(
+      "delete-room succeeds with counts",
+      del.status === 200 && del.data.messages === 1 && del.data.members === 1 && del.data.name === "doomed",
+      del,
+    );
+    const raw = new Database(DB);
+    const remains = {
+      room: raw.prepare("SELECT COUNT(*) AS c FROM rooms WHERE id = ?").get(rid).c,
+      msgs: raw.prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = ?").get(rid).c,
+      members: raw.prepare("SELECT COUNT(*) AS c FROM memberships WHERE room_id = ?").get(rid).c,
+      markers: raw.prepare("SELECT COUNT(*) AS c FROM session_markers WHERE room_id = ?").get(rid).c,
+      claims: raw.prepare("SELECT COUNT(*) AS c FROM claims WHERE room_id = ?").get(rid).c,
+    };
+    raw.close();
+    check("messages/memberships/markers/claims/room all cascaded", Object.values(remains).every((v) => v === 0), remains);
+    const missing = await post("/api/delete-room", { room: rid, confirm: true });
+    check("deleting a missing room is a 400", missing.status === 400, missing);
+  }
 } finally {
   child.kill();
   rmSync(dir, { recursive: true, force: true });

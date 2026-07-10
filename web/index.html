@@ -451,6 +451,52 @@
         word-break: break-word;
       }
 
+      .danger-link:hover {
+        color: var(--danger);
+      }
+
+      /* ---- delete confirmation --------------------------------------------- */
+
+      #delete-confirm {
+        display: flex;
+        align-items: center;
+        gap: 14px;
+        margin: 10px auto 0;
+        width: calc(100% - 52px);
+        max-width: 920px;
+        border: 1px solid rgba(217, 107, 87, 0.5);
+        border-left-width: 3px;
+        border-radius: 8px;
+        background: rgba(217, 107, 87, 0.1);
+        padding: 9px 12px;
+        font-size: 11.5px;
+        color: var(--text);
+        z-index: 1;
+      }
+      #delete-info {
+        color: var(--text-dim);
+      }
+      #delete-yes {
+        margin-left: auto;
+        flex: none;
+        background: var(--danger);
+        color: #1a0f0c;
+        font-weight: 600;
+        font-size: 11px;
+        letter-spacing: 0.04em;
+        border-radius: 6px;
+        padding: 6px 12px;
+      }
+      #delete-yes:hover {
+        filter: brightness(1.1);
+      }
+      #delete-yes:disabled {
+        opacity: 0.5;
+      }
+      #delete-no {
+        flex: none;
+      }
+
       /* ---- banner --------------------------------------------------------- */
 
       #banner {
@@ -1093,8 +1139,14 @@
               spellcheck="false"
               title="Full-text search (FTS5 syntax: AND by default, OR, NOT, quoted phrases, prefix*)"
             />
+            <button id="delete-room" class="linkish danger-link">Delete room</button>
           </div>
         </header>
+        <div id="delete-confirm" hidden>
+          <span id="delete-info"></span>
+          <button id="delete-yes">Delete permanently</button>
+          <button id="delete-no" class="linkish">Cancel</button>
+        </div>
         <details id="pinned" hidden>
           <summary>
             <span class="pin-label">Pinned</span>
@@ -1175,6 +1227,7 @@
         "compose-box", "reply-target", "compose-text", "send", "compose-ident",
         "ident-btn", "leave-btn", "compose-error",
         "search", "search-bar", "search-info", "search-back", "results",
+        "delete-room", "delete-confirm", "delete-info", "delete-yes", "delete-no",
       ]) el[id.replace(/-(\w)/g, (_, c) => c.toUpperCase())] = document.getElementById(id);
 
       const state = {
@@ -1488,14 +1541,20 @@
               el.streamWrap.hidden = true;
               el.roomHead.hidden = true;
               el.pinned.hidden = true;
+              el.deleteConfirm.hidden = true;
               renderComposer();
               updateTitle();
               showPlaceholder(
                 "This room was deleted.",
                 `"${gone}" no longer exists; pick another room on the left.`,
+                true,
               );
             }
-          } else if (state.rooms.length && el.placeholder.hidden === false) {
+          } else if (
+            state.rooms.length &&
+            el.placeholder.hidden === false &&
+            !stickyPlaceholder
+          ) {
             // Recovered from "Loading..."/error with no room selected.
             showPlaceholder(
               "Pick a room.",
@@ -1538,7 +1597,11 @@
 
       // ---- stream ----------------------------------------------------------
 
-      function showPlaceholder(big, hint) {
+      // sticky placeholders (deletion notices) survive the periodic rooms
+      // refresh instead of being overwritten by the generic prompt.
+      let stickyPlaceholder = false;
+      function showPlaceholder(big, hint, sticky = false) {
+        stickyPlaceholder = sticky;
         el.placeholder.hidden = false;
         el.placeholder.textContent = "";
         const b = document.createElement("div");
@@ -1553,6 +1616,7 @@
         }
       }
       function hidePlaceholder() {
+        stickyPlaceholder = false;
         el.placeholder.hidden = true;
       }
 
@@ -2182,6 +2246,58 @@
           });
       }
 
+      // ---- room deletion ------------------------------------------------------
+
+      function offerDelete() {
+        const room = state.current;
+        if (!room) return;
+        el.deleteInfo.textContent =
+          `Permanently delete "${room.name}" with all ${room.messages} ` +
+          "message" + (room.messages === 1 ? "" : "s") +
+          ", its memberships, read positions, and claims? This cannot be undone.";
+        el.deleteConfirm.hidden = false;
+        el.deleteYes.focus();
+      }
+
+      async function confirmDelete() {
+        const room = state.current;
+        if (!room) return;
+        el.deleteYes.disabled = true;
+        try {
+          await postJson("/api/delete-room", { room: room.id, confirm: true });
+        } catch (e) {
+          el.deleteInfo.textContent = "Delete failed: " + e.message;
+          el.deleteYes.disabled = false;
+          return;
+        }
+        el.deleteYes.disabled = false;
+        el.deleteConfirm.hidden = true;
+        // Forget every local trace of the room.
+        const joined = loadJoined();
+        delete joined[String(room.id)];
+        saveJoined(joined);
+        delete state.seen[room.id];
+        saveSeen();
+        delete state.drafts[room.id];
+        try {
+          const saved = JSON.parse(localStorage.getItem(ROOM_KEY));
+          if (saved && saved.id === room.id) localStorage.removeItem(ROOM_KEY);
+        } catch {}
+        state.current = null;
+        state.searchMode = false;
+        el.streamWrap.hidden = true;
+        el.roomHead.hidden = true;
+        el.pinned.hidden = true;
+        renderComposer();
+        updateTitle();
+        showPlaceholder(
+          "Room deleted.",
+          `"${room.name}" and all of its data are gone. Pick another room on the left.`,
+          true,
+        );
+        loadRooms();
+      }
+
       // ---- room switching ---------------------------------------------------
 
       function openRoom(room) {
@@ -2215,6 +2331,7 @@
         renderComposer();
         renderRooms();
         el.composeText.value = state.drafts[room.id] || "";
+        el.deleteConfirm.hidden = true;
         autosize();
         computeGap();
         hidePlaceholder();
@@ -2308,6 +2425,11 @@
         }
       });
       el.searchBack.addEventListener("click", () => exitSearch());
+      el.deleteRoom.addEventListener("click", offerDelete);
+      el.deleteYes.addEventListener("click", confirmDelete);
+      el.deleteNo.addEventListener("click", () => {
+        el.deleteConfirm.hidden = true;
+      });
       document.addEventListener("visibilitychange", maybeMarkRead);
 
       setInterval(() => loadNew(false), POLL_MS);
