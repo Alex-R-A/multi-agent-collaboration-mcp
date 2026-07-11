@@ -790,17 +790,25 @@ export class ChatStore {
   }
 
   /**
-   * Room listing, bounded three ways: at most `limit` rows from `offset`,
-   * pinned/description cut to listing previews (flagged; join_room returns the
-   * full pinned), and the whole response trimmed to a serialized-size budget
-   * (control-heavy metadata serializes far larger than its raw length). `total`
-   * is the unfiltered room count; page the rest with `offset`.
+   * Room listing, bounded three ways: at most `limit` rows, pinned/description
+   * cut to listing previews (flagged; join_room returns the full pinned), and
+   * the whole response trimmed to a serialized-size budget (control-heavy
+   * metadata serializes far larger than its raw length). `total` is the
+   * unfiltered room count.
+   *
+   * KEYSET-paged by id (id > afterId), NOT OFFSET: a concurrent delete_room
+   * shifts every OFFSET after the removed row and skips a still-live room
+   * across pages (the same race listClaims avoids). id is unique and the sort
+   * key, so `id > afterId` is immune. Pass the prior page's `next_id` back as
+   * `afterId` for the next page.
    */
   listRooms(
     limit = 200,
-    offset = 0,
-  ): { rooms: RoomSummary[]; total: number; size_trimmed?: boolean } {
+    afterId = 0,
+  ): { rooms: RoomSummary[]; total: number; next_id?: number; size_trimmed?: boolean } {
     const PREVIEW = 300;
+    const lim = Math.max(1, Math.floor(limit));
+    // Fetch one MORE than asked to detect a further page without a tail COUNT.
     const rows = this.db
       .prepare(
         `SELECT r.id, r.name,
@@ -812,16 +820,18 @@ export class ChatStore {
                 (SELECT COUNT(*) FROM memberships m WHERE m.room_id = r.id AND m.left_at IS NULL) AS members,
                 (SELECT COUNT(*) FROM messages g WHERE g.room_id = r.id) AS messages,
                 (SELECT MAX(created_at) FROM messages g WHERE g.room_id = r.id) AS last_activity
-         FROM rooms r ORDER BY r.id LIMIT ? OFFSET ?`,
+         FROM rooms r WHERE r.id > ? ORDER BY r.id LIMIT ?`,
       )
-      .all(Math.max(1, Math.floor(limit)), Math.max(0, Math.floor(offset))) as (RoomSummary & {
+      .all(Math.max(0, Math.floor(afterId)), lim + 1) as (RoomSummary & {
       description_cut: number;
       pinned_cut: number;
     })[];
     const { c: total } = this.db
       .prepare("SELECT COUNT(*) AS c FROM rooms")
       .get() as { c: number };
-    const mapped = rows.map((r) => {
+    const hasMore = rows.length > lim;
+    const page = hasMore ? rows.slice(0, lim) : rows;
+    const mapped = page.map((r) => {
       const { description_cut, pinned_cut, ...rest } = r;
       return {
         ...rest,
@@ -830,7 +840,18 @@ export class ChatStore {
       };
     });
     const { rows: rooms, sizeTrimmed } = fitRows(mapped, LIST_ROW_BUDGET);
-    return { rooms, total, ...(sizeTrimmed ? { size_trimmed: true } : {}) };
+    // More remain if the byte budget cut the page OR a further row existed
+    // beyond `limit`. next_id is the LAST RETURNED room's id (the keyset
+    // cursor); omitted once the listing is exhausted.
+    const more = sizeTrimmed || (hasMore && rooms.length === page.length);
+    const next_id =
+      more && rooms.length > 0 ? rooms[rooms.length - 1].id : undefined;
+    return {
+      rooms,
+      total,
+      ...(next_id !== undefined ? { next_id } : {}),
+      ...(sizeTrimmed ? { size_trimmed: true } : {}),
+    };
   }
 
   /** Present (not soft-left) member count; join_room used to fetch every
@@ -1964,7 +1985,12 @@ export class ChatStore {
     // both shared and private cursors.
     const sessionKey = sessionId ?? "";
     const tx = this.db.transaction(() => {
-      const { rows, exhausted } = this.fetchBounded<
+      // Fetch ONE more than `limit` so a page cut by the ROW limit (not the
+      // byte budget) is detectable. Without the probe, my_mentions was the only
+      // bulk reader with no "more remain" signal when exactly `limit` directed
+      // messages fit inside the byte budget: an agent paging on byte_limited
+      // (the documented signal) then silently under-read its own inbox.
+      const { rows: fetched, exhausted } = this.fetchBounded<
         RawMessage & { gid: number; room_id: number; room_name: string }
       >(
         this.db.prepare(
@@ -1980,9 +2006,11 @@ export class ChatStore {
              AND ${directedAt("g")}
            ORDER BY g.id ASC LIMIT ?`,
         ),
-        [agentId, sessionKey, afterId, agentId, agentId, agentId, limit],
+        [agentId, sessionKey, afterId, agentId, agentId, agentId, limit + 1],
         maxBytes,
       );
+      const hasExtra = fetched.length > limit;
+      const rows = hasExtra ? fetched.slice(0, limit) : fetched;
 
       // Placeholder text order: the SUM(CASE directedAt) pair, the membership
       // join, the session-marker join key, then the author exclusion.
@@ -2066,6 +2094,13 @@ export class ChatStore {
           };
         },
       );
+      // More remain when the byte budget cut the page (byteLimited),
+      // fetchBounded stopped on the raw budget with rows unfetched (!exhausted),
+      // OR a further directed row existed beyond `limit` (hasExtra on a full
+      // page). The last case is the row-limit cut that used to have no signal;
+      // next_after_id has advanced, so paging with after_id delivers the rest.
+      const more =
+        byteLimited || !exhausted || (hasExtra && messages.length === limit);
       const next_after_id =
         messages.length > 0 ? rows[messages.length - 1].gid : afterId;
       return {
@@ -2074,11 +2109,7 @@ export class ChatStore {
         next_after_id,
         by_room: byRoom,
         ...(by_room_truncated ? { by_room_truncated: true } : {}),
-        // !exhausted: fetchBounded left directed rows unfetched (a preview/JSON
-        // shrink could otherwise let boundByBytes fit all it got and hide them).
-        // next_after_id has still advanced, so paging with after_id delivers
-        // them; byte_limited now flags that paging is needed.
-        ...(byteLimited || !exhausted ? { byte_limited: true } : {}),
+        ...(more ? { byte_limited: true } : {}),
       };
     });
     return tx.deferred();

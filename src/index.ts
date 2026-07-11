@@ -355,12 +355,12 @@ server.registerTool(
   {
     title: "List rooms",
     description:
-      "List chat rooms (oldest first, up to `limit` from `offset`; `total` " +
-      "reports how many exist) with present-member count, message count, last " +
-      "activity and pinned intro. Long pinned/descriptions are listing previews " +
-      "(*_truncated flags); join_room returns the full pinned. `truncated:true` " +
-      "= more rows exist (by limit, offset, or a serialized-size cut); page " +
-      "with offset.",
+      "List chat rooms (oldest first by id, up to `limit`; `total` reports how " +
+      "many exist) with present-member count, message count, last activity and " +
+      "pinned intro. Long pinned/descriptions are listing previews (*_truncated " +
+      "flags); join_room returns the full pinned. `next_id` present = more rows " +
+      "exist; page by passing it back as `after_id` (keyset paging, so a room " +
+      "deleted between pages cannot make you skip a live one).",
     inputSchema: z
       .object({
         limit: z
@@ -370,25 +370,29 @@ server.registerTool(
           .max(1000)
           .optional()
           .describe("Max rooms to return (default 200)"),
-        offset: z
+        after_id: z
           .number()
           .int()
           .nonnegative()
           .optional()
-          .describe("Skip this many rooms (paging; default 0)"),
+          .describe(
+            "Keyset paging cursor: the prior page's next_id. Returns rooms " +
+              "whose id sorts after it.",
+          ),
       })
       .strict(),
   },
-  async ({ limit, offset }) => {
+  async ({ limit, after_id }) => {
     try {
       touchSession();
-      const off = offset ?? 0;
-      const { rooms, total, size_trimmed } = store.listRooms(limit ?? 200, off);
-      const more = off + rooms.length < total || !!size_trimmed;
+      const { rooms, total, next_id, size_trimmed } = store.listRooms(
+        limit ?? 200,
+        after_id ?? 0,
+      );
       return ok({
         rooms,
         total,
-        ...(more ? { truncated: true } : {}),
+        ...(next_id !== undefined ? { next_id, truncated: true } : {}),
         ...(size_trimmed ? { size_trimmed: true } : {}),
       });
     } catch (e) {

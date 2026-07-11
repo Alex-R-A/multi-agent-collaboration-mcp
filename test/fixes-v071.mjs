@@ -156,16 +156,17 @@ const throws = (fn, re) => {
   const first = s.listRooms(200, 0);
   check("list_rooms response is serialized-bounded", size(first.rooms) <= 100_000, size(first.rooms));
   check("list_rooms reports the true total", first.total === 60, first.total);
-  // Offset paging reaches rooms past the first page.
+  // Keyset paging (after_id = next_id) reaches rooms past the first
+  // size-trimmed page.
   const seen = new Set();
-  let off = 0;
+  let afterId = 0;
   for (let i = 0; i < 20; i++) {
-    const pg = s.listRooms(200, off);
+    const pg = s.listRooms(200, afterId);
     for (const rm of pg.rooms) seen.add(rm.id);
-    off += pg.rooms.length;
-    if (off >= pg.total || pg.rooms.length === 0) break;
+    if (pg.next_id === undefined || pg.rooms.length === 0) break;
+    afterId = pg.next_id;
   }
-  check("list_rooms offset paging reaches every room", seen.size === 60, seen.size);
+  check("list_rooms keyset paging reaches every room", seen.size === 60, seen.size);
   s.close();
 }
 
