@@ -558,7 +558,10 @@ server.registerTool(
     try {
       touchSession();
       const { agentId, roomId } = requireActive();
-      const left = store.leaveRoom(roomId, agentId);
+      // Pass the private-cursor nonce (when the active room is private under
+      // this identity) so the leave is SESSION-scoped: it marks this session
+      // left without evicting a live twin from the identity-level presence.
+      const left = store.leaveRoom(roomId, agentId, cursorId());
       // Keep the identity: the session is still this agent, and my_mentions
       // (memberships elsewhere) must keep working after leaving one room. The
       // room's cursor-mode entry also stays: its private position is preserved

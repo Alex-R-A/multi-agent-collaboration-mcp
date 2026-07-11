@@ -257,5 +257,51 @@ const NUL = String.fromCharCode(0);
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- 6: session-aware presence -- one twin leaving does not evict a live twin -
+{
+  const s = new ChatStore(":memory:");
+  const r = s.createRoom("r", null, null).id;
+  s.upsertAgent("x", null, null, null);
+  s.joinRoom(r, "x", "sessA"); // private session A
+  s.joinRoom(r, "x", "sessB"); // private session B
+  const leftA = s.leaveRoom(r, "x", "sessA");
+  const afterA = s.getMembership(r, "x");
+  check("session A leave returns true (it left)", leftA === true, leftA);
+  check(
+    "identity STAYS present after one twin leaves (live twin B remains)",
+    afterA.left_at === null && s.presentRoomCount("x") === 1,
+    { left_at: afterA.left_at, present: s.presentRoomCount("x") },
+  );
+  const leftB = s.leaveRoom(r, "x", "sessB");
+  const afterB = s.getMembership(r, "x");
+  check(
+    "identity leaves once the LAST twin leaves",
+    leftB === true && afterB.left_at !== null && s.presentRoomCount("x") === 0,
+    { left_at: afterB.left_at, present: s.presentRoomCount("x") },
+  );
+  s.joinRoom(r, "x", "sessA"); // rejoin clears this session's left flag
+  check(
+    "rejoin restores identity presence",
+    s.getMembership(r, "x").left_at === null && s.presentRoomCount("x") === 1,
+    s.presentRoomCount("x"),
+  );
+  s.close();
+}
+
+// --- 6b: shared (no session) leave stays identity-level ----------------------
+{
+  const s = new ChatStore(":memory:");
+  const r = s.createRoom("r", null, null).id;
+  s.upsertAgent("y", null, null, null);
+  s.joinRoom(r, "y"); // shared, no sessionId
+  const left = s.leaveRoom(r, "y");
+  check(
+    "shared leave marks identity left (no session rows to keep it present)",
+    left === true && s.getMembership(r, "y").left_at !== null,
+    s.getMembership(r, "y").left_at,
+  );
+  s.close();
+}
+
 console.log(`\n${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"}`);
 process.exit(failures === 0 ? 0 : 1);

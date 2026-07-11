@@ -580,12 +580,17 @@ export class ChatStore {
       -- Per-session read cursors for identities running multiple concurrent
       -- sessions (join_room cursor:'private'). The memberships marker stays the
       -- identity-level read receipt (advanced to the MAX across sessions).
+      -- left_at makes presence SESSION-aware: a private session that soft-leaves
+      -- sets its own left_at, and leaveRoom marks the IDENTITY (memberships)
+      -- left only when no un-left session row remains -- so one twin leaving no
+      -- longer evicts a live twin whose poller reads the identity-level flag.
       CREATE TABLE IF NOT EXISTS session_markers (
         room_id       INTEGER NOT NULL REFERENCES rooms(id),
         agent_id      TEXT NOT NULL REFERENCES agents(id),
         session_id    TEXT NOT NULL,
         last_read_seq INTEGER NOT NULL DEFAULT 0,
         updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        left_at       TEXT,
         PRIMARY KEY (room_id, agent_id, session_id)
       );
       -- touch()/touchSessionMarkers refresh a session's rows by session_id
@@ -608,6 +613,10 @@ export class ChatStore {
         PRIMARY KEY (room_id, key)
       );
     `);
+    // Add session_markers.left_at to database files created before presence
+    // became session-aware (the CREATE TABLE above already has it for fresh
+    // files). Runs after the table exists, so ensureColumn's ALTER is valid.
+    this.ensureColumn("session_markers", "left_at", "TEXT");
 
     // Heal legacy embedded NULs in metadata columns too (message bodies are
     // healed above, with their body_len reset). Listing SQL uses substr(), which
@@ -958,7 +967,7 @@ export class ChatStore {
           `INSERT INTO session_markers (room_id, agent_id, session_id, last_read_seq)
            VALUES (?, ?, ?, (SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?))
            ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
-             updated_at = datetime('now')`,
+             updated_at = datetime('now'), left_at = NULL`,
         )
         .run(roomId, agentId, sessionId, roomId, agentId);
       // GC dead session cursors. Live sessions stay off this radar: the
@@ -995,15 +1004,59 @@ export class ChatStore {
    * exists ONLY in its session_markers row -- deleting it here would jump the
    * session forward to its fastest twin's position on rejoin, silently
    * skipping the gap. Dead rows are reaped by the 7-day GC in joinRoom.
+   *
+   * SESSION-aware: with a sessionId, mark THIS private session left (its own
+   * session_markers.left_at) and set the IDENTITY-level memberships.left_at only
+   * when no OTHER session row is still un-left. So one twin leaving no longer
+   * evicts a live twin (whose separate-process poller reads memberships.left_at
+   * and would otherwise exit 2). Presence is keyed on the EXPLICIT session
+   * left_at, not liveness, so a twin that is merely POLLING (making no tool
+   * calls) still counts as present. Residual: if the last un-left session
+   * CRASHES without leaving, the identity lingers present until the 7-day
+   * session GC reaps its row -- a strictly milder error than evicting a live
+   * session, and a rejoin fixes it immediately. Shared-cursor sessions have no
+   * session row, so shared multi-session leave stays identity-level (documented:
+   * the multi-session pattern is cursor:'private').
    */
-  leaveRoom(roomId: number, agentId: string): boolean {
-    const info = this.db
-      .prepare(
-        `UPDATE memberships SET left_at = datetime('now'), last_seen = datetime('now')
-         WHERE room_id = ? AND agent_id = ? AND left_at IS NULL`,
-      )
-      .run(roomId, agentId);
-    return info.changes > 0;
+  leaveRoom(
+    roomId: number,
+    agentId: string,
+    sessionId: string | null = null,
+  ): boolean {
+    const tx = this.db.transaction(() => {
+      let sessionLeft = false;
+      if (sessionId !== null) {
+        const s = this.db
+          .prepare(
+            `UPDATE session_markers SET left_at = datetime('now')
+             WHERE room_id = ? AND agent_id = ? AND session_id = ? AND left_at IS NULL`,
+          )
+          .run(roomId, agentId, sessionId);
+        sessionLeft = s.changes > 0;
+      }
+      // A still-present twin (any OTHER session row with left_at IS NULL) keeps
+      // the identity present. '' never equals a real nonce, so a shared leaver
+      // (sessionId null) compares against every session row.
+      const twin = this.db
+        .prepare(
+          `SELECT 1 FROM session_markers
+           WHERE room_id = ? AND agent_id = ? AND session_id != ? AND left_at IS NULL
+           LIMIT 1`,
+        )
+        .get(roomId, agentId, sessionId ?? "");
+      let identityLeft = false;
+      if (!twin) {
+        const info = this.db
+          .prepare(
+            `UPDATE memberships SET left_at = datetime('now'), last_seen = datetime('now')
+             WHERE room_id = ? AND agent_id = ? AND left_at IS NULL`,
+          )
+          .run(roomId, agentId);
+        identityLeft = info.changes > 0;
+      }
+      return sessionLeft || identityLeft;
+    });
+    return tx.immediate();
   }
 
   /**
