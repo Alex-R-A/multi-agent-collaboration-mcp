@@ -110,6 +110,52 @@ function safeCut(s: string, end: number): string {
   return s.slice(0, c >= 0xd800 && c <= 0xdbff ? end - 1 : end);
 }
 
+/**
+ * Reject text SQLite cannot round-trip losslessly, at WRITE time, so a read
+ * never silently loses data:
+ *  - U+0000 (NUL): SQLite's string functions are C NUL-terminated, so
+ *    substr()/length() stop at the first NUL. A body "abc\0def" reads back as
+ *    "abc" with no truncation flag, and catch_up advances the marker past it,
+ *    so "def" is unrecoverable. Every capped reader has this hazard.
+ *  - lone surrogate: not valid Unicode; SQLite renormalizes it to the
+ *    replacement character, so the stored value's length diverges from the
+ *    JS length we stamped, corrupting truncation/paging math.
+ * Failing loud at write is the only safe option: stripping mutates the
+ * caller's content, and there is no faithful storage for these.
+ */
+// A high surrogate not immediately followed by a low, or a low not preceded by
+// a high: either is an unpaired (lone) surrogate. A native regex is far faster
+// than a per-char JS loop on a large body (a body can be ~1 GB).
+const LONE_SURROGATE =
+  /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+function assertStorable(value: string | null, field: string): void {
+  if (value === null) return;
+  if (value.indexOf("\u0000") !== -1) {
+    throw new Error(
+      `${field} contains a NUL character (U+0000), which SQLite cannot store without silently truncating; remove it`,
+    );
+  }
+  if (LONE_SURROGATE.test(value)) {
+    throw new Error(`${field} contains a lone surrogate (malformed UTF-16); fix the encoding`);
+  }
+}
+
+/**
+ * Trim a metadata listing to a serialized-size budget, dropping WHOLE rows off
+ * the end (still reachable via offset paging). The per-row preview caps bound
+ * one row, but control-heavy metadata serializes ~6x, so 200 rows could still
+ * blow past any client output cap; this caps the response itself. Keeps at
+ * least one row so a page is never empty.
+ */
+function fitRows<T>(rows: T[], budget: number): { rows: T[]; sizeTrimmed: boolean } {
+  if (rows.length === 0 || JSON.stringify(rows).length <= budget) {
+    return { rows, sizeTrimmed: false };
+  }
+  const kept = rows.slice();
+  while (kept.length > 1 && JSON.stringify(kept).length > budget) kept.pop();
+  return { rows: kept, sizeTrimmed: true };
+}
+
 export type RoomRow = {
   id: number;
   name: string;
@@ -216,9 +262,17 @@ type RawMessage = {
   superseded_by: number | null;
 };
 
-/** Full body length in UTF-16 units, tolerant of a missing body_len. */
+/**
+ * Full body length, tolerant of a wrong or missing body_len. The MAX of the
+ * stored length and what we actually fetched: body.length is an exact lower
+ * bound (we hold those characters), so a stale-low body_len (an old build's
+ * codepoint count for astral text, or a lone-surrogate renormalization skew)
+ * can never make us UNDER-report below the characters in hand. When the whole
+ * body was fetched, body.length is exact and wins; only a genuinely capped
+ * fetch of a huge body leans on the stored body_len.
+ */
 function fullLen(r: RawMessage): number {
-  return r.body_len ?? r.body.length;
+  return Math.max(r.body_len ?? 0, r.body.length);
 }
 
 // A message row joined to its author and (for reply previews) its parent.
@@ -274,16 +328,18 @@ export class ChatStore {
   constructor(path = resolveDbPath()) {
     this.path = path;
     if (path !== ":memory:") {
-      // Owner-only: chat content is not for other local users. The directory
-      // is created 0700; existing files are tightened too (installs that
-      // predate this ran under the umask, typically 0644/0755). WAL sidecars
-      // inherit the main file's mode, so tightening chat.db before any write
-      // covers -wal/-shm as they are (re)created; pre-existing sidecars are
-      // tightened explicitly. Best-effort: permissions are a hardening layer,
-      // not a startup gate (and a no-op concept on Windows).
-      mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      // Owner-only: chat content is not for other local users. Tighten only
+      // what is OURS: the database file and its WAL sidecars, and a directory
+      // ONLY IF WE CREATED IT. An earlier version chmod'd dirname(path)
+      // unconditionally, which changed a pre-existing, caller-owned parent
+      // (e.g. a shared project dir, or /tmp for a custom db path) from 0755 to
+      // 0700, affecting unrelated files and other users. mkdirSync(recursive)
+      // returns the FIRST directory it created, or undefined if the path
+      // already existed; chmod only that. Best-effort: permissions are a
+      // hardening layer, not a startup gate (and a no-op concept on Windows).
+      const created = mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
       try {
-        chmodSync(dirname(path), 0o700);
+        if (created) chmodSync(created, 0o700);
         for (const p of [path, `${path}-wal`, `${path}-shm`]) {
           if (existsSync(p)) chmodSync(p, 0o600);
         }
@@ -380,20 +436,31 @@ export class ChatStore {
         WHERE id = NEW.id;
       END;
 
-      -- length() counts CODEPOINTS, an exact UTF-16 count only for BMP text;
-      -- astral rows from old builds report slightly low until a JS process
-      -- re-measures them. Far better than NULL (which forces the capped
-      -- fetched length to stand in for the real one).
-      CREATE TRIGGER IF NOT EXISTS messages_body_len_ai AFTER INSERT ON messages
-      WHEN NEW.body_len IS NULL BEGIN
-        UPDATE messages SET body_len = length(NEW.body) WHERE id = NEW.id;
-      END;
+      -- The former messages_body_len_ai trigger stamped length(NEW.body), which
+      -- counts CODEPOINTS. For astral text that under-counts vs the UTF-16 unit
+      -- paging uses, and the value was never repaired (the JS backfill only
+      -- visits NULLs), so a mixed-version astral insert reported a permanently
+      -- wrong length. Dropped: an old build's insert now leaves body_len NULL,
+      -- fullLen() falls back to the exact fetched body.length, and the next
+      -- new-build startup backfills it precisely.
+      DROP TRIGGER IF EXISTS messages_body_len_ai;
     `);
-    // Backfill body_len (exact UTF-16, so it must be measured in JS) for rows
-    // that predate the column. One row at a time, cursored by id: loading a
-    // batch could hold several ~1 GB bodies at once, and the id cursor keeps
-    // the whole loop a single table pass instead of a rescan per row.
+    // Backfill body_len for rows that predate the column. Exact UTF-16 length
+    // must be measured in JS, so we LOAD the body -- but only for rows small
+    // enough to be safe (length() is a cheap codepoint gate, an upper bound on
+    // UTF-16 units is 2x that, so <= BACKFILL_MAX_CHARS codepoints is at most
+    // ~2x that many UTF-16 units held at once). Giant legacy rows are stamped
+    // with the memory-safe codepoint count via SQL (a low-but-nonzero bound;
+    // fullLen()'s max() lifts it to the fetched length when more is in hand).
+    // Cursored by id so the whole sweep is one table pass, one body resident.
     {
+      const BACKFILL_MAX_CHARS = 1_000_000;
+      this.db
+        .prepare(
+          `UPDATE messages SET body_len = length(body)
+           WHERE body_len IS NULL AND length(body) > ?`,
+        )
+        .run(BACKFILL_MAX_CHARS);
       const next = this.db.prepare(
         "SELECT id, body FROM messages WHERE body_len IS NULL AND id > ? ORDER BY id LIMIT 1",
       );
@@ -502,6 +569,9 @@ export class ChatStore {
     description: string | null,
     pinned: string | null,
   ): RoomRow {
+    assertStorable(name, "room name");
+    assertStorable(description, "room description");
+    assertStorable(pinned, "room pinned intro");
     const info = this.db
       .prepare("INSERT INTO rooms (name, description, pinned) VALUES (?, ?, ?)")
       .run(name, description, pinned);
@@ -511,6 +581,7 @@ export class ChatStore {
   }
 
   setPinned(roomId: number, pinned: string | null): void {
+    assertStorable(pinned, "room pinned intro");
     const info = this.db
       .prepare("UPDATE rooms SET pinned = ? WHERE id = ?")
       .run(pinned, roomId);
@@ -579,12 +650,16 @@ export class ChatStore {
   }
 
   /**
-   * Room listing, bounded two ways: at most `limit` rows, and pinned/
-   * description cut to listing previews (flagged; join_room returns the full
-   * pinned). Unbounded, a few hundred rooms with 10k pinned intros made a
-   * multi-megabyte response no client cap tolerates.
+   * Room listing, bounded three ways: at most `limit` rows from `offset`,
+   * pinned/description cut to listing previews (flagged; join_room returns the
+   * full pinned), and the whole response trimmed to a serialized-size budget
+   * (control-heavy metadata serializes far larger than its raw length). `total`
+   * is the unfiltered room count; page the rest with `offset`.
    */
-  listRooms(limit = 200): { rooms: RoomSummary[]; total: number } {
+  listRooms(
+    limit = 200,
+    offset = 0,
+  ): { rooms: RoomSummary[]; total: number; size_trimmed?: boolean } {
     const PREVIEW = 300;
     const rows = this.db
       .prepare(
@@ -597,16 +672,16 @@ export class ChatStore {
                 (SELECT COUNT(*) FROM memberships m WHERE m.room_id = r.id AND m.left_at IS NULL) AS members,
                 (SELECT COUNT(*) FROM messages g WHERE g.room_id = r.id) AS messages,
                 (SELECT MAX(created_at) FROM messages g WHERE g.room_id = r.id) AS last_activity
-         FROM rooms r ORDER BY r.id LIMIT ?`,
+         FROM rooms r ORDER BY r.id LIMIT ? OFFSET ?`,
       )
-      .all(Math.max(1, Math.floor(limit))) as (RoomSummary & {
+      .all(Math.max(1, Math.floor(limit)), Math.max(0, Math.floor(offset))) as (RoomSummary & {
       description_cut: number;
       pinned_cut: number;
     })[];
     const { c: total } = this.db
       .prepare("SELECT COUNT(*) AS c FROM rooms")
       .get() as { c: number };
-    const rooms = rows.map((r) => {
+    const mapped = rows.map((r) => {
       const { description_cut, pinned_cut, ...rest } = r;
       return {
         ...rest,
@@ -614,7 +689,8 @@ export class ChatStore {
         ...(pinned_cut ? { pinned_truncated: true } : {}),
       };
     });
-    return { rooms, total };
+    const { rows: rooms, sizeTrimmed } = fitRows(mapped, DEFAULT_MAX_BYTES);
+    return { rooms, total, ...(sizeTrimmed ? { size_trimmed: true } : {}) };
   }
 
   /** Present (not soft-left) member count; join_room used to fetch every
@@ -649,6 +725,10 @@ export class ChatStore {
     role: string | null,
     description: string | null,
   ): void {
+    assertStorable(id, "agent id");
+    assertStorable(type, "agent type");
+    assertStorable(role, "agent role");
+    assertStorable(description, "agent description");
     this.db
       .prepare(
         `INSERT INTO agents (id, type, role, description)
@@ -673,6 +753,10 @@ export class ChatStore {
     role: string | null,
     description: string | null,
   ): boolean {
+    assertStorable(id, "agent id");
+    assertStorable(type, "agent type");
+    assertStorable(role, "agent role");
+    assertStorable(description, "agent description");
     const info = this.db
       .prepare(
         `INSERT INTO agents (id, type, role, description)
@@ -772,12 +856,19 @@ export class ChatStore {
    * touching membership state: used when the session has an identity but no
    * active room (post-leave my_mentions polling must still shield cursors).
    */
-  touchSessionMarkers(agentId: string, sessionId: string): void {
+  touchSessionMarkers(_agentId: string, sessionId: string): void {
+    // Key on session_id ALONE, not (agent_id, session_id): the session_id is a
+    // process-unique nonce, and a single process can switch identity
+    // (join_room under a new agent_id). Its earlier identity's private cursor
+    // still belongs to THIS live session, so it must keep being refreshed;
+    // scoping the refresh to the current agent_id let that older cursor age
+    // out and get GC'd, and switching back recreated it at the identity
+    // marker, silently skipping everything the private cursor had not read.
     this.db
       .prepare(
-        "UPDATE session_markers SET updated_at = datetime('now') WHERE agent_id = ? AND session_id = ?",
+        "UPDATE session_markers SET updated_at = datetime('now') WHERE session_id = ?",
       )
-      .run(agentId, sessionId);
+      .run(sessionId);
   }
 
   /**
@@ -882,7 +973,8 @@ export class ChatStore {
     activeWithinMinutes: number,
     filter?: string,
     limit = 200,
-  ): { agents: AgentRow[]; total: number } {
+    offset = 0,
+  ): { agents: AgentRow[]; total: number; size_trimmed?: boolean } {
     const PREVIEW = 300;
     const cols = `SELECT a.id, a.type, a.role,
                          substr(a.description, 1, ${PREVIEW}) AS description,
@@ -896,6 +988,7 @@ export class ChatStore {
                    FROM memberships m JOIN agents a ON a.id = m.agent_id
                    WHERE m.room_id = ?`;
     const lim = Math.max(1, Math.floor(limit));
+    const off = Math.max(0, Math.floor(offset));
     type Row = Omit<AgentRow, "present" | "active"> & {
       left_at: string | null;
       description_cut: number;
@@ -909,8 +1002,8 @@ export class ChatStore {
       const cond = ` AND (IFNULL(a.role,'') LIKE ? ESCAPE '\\' OR IFNULL(a.type,'') LIKE ? ESCAPE '\\'
                         OR IFNULL(a.description,'') LIKE ? ESCAPE '\\' OR a.id LIKE ? ESCAPE '\\')`;
       rows = this.db
-        .prepare(`${cols}${cond} ORDER BY m.joined_at LIMIT ?`)
-        .all(roomId, like, like, like, like, lim) as Row[];
+        .prepare(`${cols}${cond} ORDER BY m.joined_at, a.id LIMIT ? OFFSET ?`)
+        .all(roomId, like, like, like, like, lim, off) as Row[];
       total = (
         this.db.prepare(`${count}${cond}`).get(roomId, like, like, like, like) as {
           c: number;
@@ -918,12 +1011,15 @@ export class ChatStore {
       ).c;
     } else {
       rows = this.db
-        .prepare(`${cols} ORDER BY m.joined_at LIMIT ?`)
-        .all(roomId, lim) as Row[];
+        // a.id tie-break: joined_at is second-resolution and non-unique, so
+        // without it same-second joiners have no total order and offset paging
+        // could skip or duplicate them.
+        .prepare(`${cols} ORDER BY m.joined_at, a.id LIMIT ? OFFSET ?`)
+        .all(roomId, lim, off) as Row[];
       total = (this.db.prepare(count).get(roomId) as { c: number }).c;
     }
     const threshold = activeWithinMinutes * 60;
-    const agents = rows.map((r) => {
+    const mapped = rows.map((r) => {
       const { left_at, description_cut, ...rest } = r;
       return {
         ...rest,
@@ -935,7 +1031,8 @@ export class ChatStore {
           r.idle_seconds <= threshold,
       };
     });
-    return { agents, total };
+    const { rows: agents, sizeTrimmed } = fitRows(mapped, DEFAULT_MAX_BYTES);
+    return { agents, total, ...(sizeTrimmed ? { size_trimmed: true } : {}) };
   }
 
   // --- messages ----------------------------------------------------------
@@ -965,6 +1062,12 @@ export class ChatStore {
     crossed: number;
     crossed_range: { from_seq: number; to_seq: number } | null;
   } {
+    // Reject unstorable text BEFORE the transaction: a body with an embedded
+    // NUL reads back truncated (SQLite substr/length stop at NUL) and catch_up
+    // would advance the marker past the lost tail. mentions are agent ids
+    // (already control-char-validated upstream) but guard defensively.
+    assertStorable(body, "message body");
+    if (mentions) for (const m of mentions) assertStorable(m, "mention id");
     const mentionsJson =
       mentions && mentions.length > 0 ? JSON.stringify(mentions) : null;
     const tx = this.db.transaction(() => {
@@ -1172,6 +1275,45 @@ export class ChatStore {
   }
 
   /**
+   * Pull rows off a query one at a time and STOP once enough RAW body has
+   * accumulated to fill maxBytes, so peak memory is ~maxBytes + one row instead
+   * of limit x per-row-cap (a page of 100 legal 400k bodies used to
+   * materialize ~40 MB to return one message). Serialized size is always >=
+   * raw size, so stopping at maxBytes raw guarantees boundByBytes still has
+   * enough rows to fill the exact serialized budget; it never under-fetches.
+   * Always keeps at least the first row (paging must progress even when the
+   * head alone is oversized). The SQL LIMIT still bounds the row count for
+   * many-tiny-message pages. Draining/breaking the iterator closes it before
+   * the caller runs further queries in the same transaction.
+   */
+  private fetchBounded<T extends { body: string }>(
+    stmt: Database.Statement,
+    params: unknown[],
+    maxBytes: number,
+  ): T[] {
+    const rows: T[] = [];
+    let used = 0;
+    const it = stmt.iterate(...params) as IterableIterator<T>;
+    let res = it.next();
+    while (!res.done) {
+      rows.push(res.value);
+      used += res.value.body ? res.value.body.length : 0;
+      res = it.next();
+      if (used >= maxBytes) {
+        // Grab ONE more row past the budget (if any) as a SENTINEL, then stop:
+        // boundByBytes decides byte_limited from whether rows remain after the
+        // ones it keeps, so cutting off at exactly the budget would hide that
+        // more exist (a lone oversized head would report byte_limited:false
+        // with 99 messages still behind it). Peak memory stays ~2x maxBytes.
+        if (!res.done) rows.push(res.value);
+        if (it.return) it.return();
+        break;
+      }
+    }
+    return rows;
+  }
+
+  /**
    * Bound a bulk read by serialized size: accumulate whole messages (in row
    * order) until adding the next would exceed maxBytes. Charges the
    * serialized ARRAY -- brackets plus a comma per element -- not just the
@@ -1210,75 +1352,75 @@ export class ChatStore {
   }
 
   /**
-   * Fetch one message. Bodies are capped at maxChars per call (default 100k,
-   * safely under client output limits); page a longer body with `offset`. A
-   * partial view carries truncated/length/offset markers, and a sliced json
-   * body is returned as a raw partial string, not a parsed object.
+   * Fetch one message. Bodies are returned up to maxChars per call; page a
+   * longer body with `offset` (advance by the returned `next_offset`). A
+   * partial view carries truncated/length/offset/next_offset markers, and a
+   * sliced json body is returned as a raw partial string, not a parsed object.
+   *
+   * offset, length and next_offset are CODEPOINT counts (= UTF-16 units for
+   * BMP text; they diverge only for astral characters). The window is fetched
+   * with SQLite substr, so memory is bounded by maxChars regardless of offset
+   * or the body's true size (up to ~1 GB) -- a deep page no longer
+   * materializes the whole prefix in JS -- and a codepoint window never splits
+   * a surrogate pair.
    */
   getMessage(
     roomId: number,
     seq: number,
     offset = 0,
     maxChars = DEFAULT_MAX_BYTES,
-  ): MessageRow | undefined {
-    // Fetch capped at offset+maxChars CODEPOINTS: substr counts codepoints,
-    // and N codepoints always cover at least N UTF-16 units, so the fetched
-    // prefix fully contains the requested UTF-16 window. Memory is bounded by
-    // the caller's own window instead of the whole (up to ~1 GB) body; only a
-    // walk into the deep tail of a giant body still pays proportionally.
-    const r = this.getRawMessage(roomId, seq, offset + maxChars);
-    if (!r) return undefined;
-    const total = fullLen(r);
-    let start = offset;
-    // A caller-chosen offset can land BETWEEN a surrogate pair; back the
-    // start up one unit to include the high surrogate rather than emit a
-    // lone low surrogate. The reported `offset` is the actual start, so
-    // pagers stepping by offset + returned chars remain exact.
-    if (
-      start > 0 &&
-      start < r.body.length &&
-      r.body.charCodeAt(start) >= 0xdc00 &&
-      r.body.charCodeAt(start) <= 0xdfff &&
-      r.body.charCodeAt(start - 1) >= 0xd800 &&
-      r.body.charCodeAt(start - 1) <= 0xdbff
-    ) {
-      start -= 1;
-    }
-    let end = Math.min(start + maxChars, total);
-    // Back off a cut that would split a surrogate pair, but never below one
-    // unit past start: a pager stepping by content.length stays exact (the
-    // next page picks up the deferred unit), and an empty page would stall it.
-    if (end < total && end - start > 1) {
-      const c = r.body.charCodeAt(end - 1);
-      if (c >= 0xd800 && c <= 0xdbff) end -= 1;
-    }
-    let chunk = r.body.slice(start, end);
+  ): (MessageRow & { next_offset?: number }) | undefined {
+    const off = Math.max(0, Math.floor(offset));
+    const cap = Math.max(1, Math.floor(maxChars));
+    // Envelope (author, reply preview, flags) with a 1-char body: cheap and
+    // independent of body size.
+    const env = this.getRawMessage(roomId, seq, 1);
+    if (!env) return undefined;
+    // Total length as a scalar + ONLY the requested window. length(body) and
+    // substr(body, off+1, cap) both operate in codepoints; substr materializes
+    // at most `cap` codepoints in JS no matter how deep the offset is.
+    const win = this.db
+      .prepare(
+        `SELECT length(body) AS total, substr(body, ?, ?) AS body
+         FROM messages WHERE room_id = ? AND seq = ?`,
+      )
+      .get(off + 1, cap, roomId, seq) as
+      | { total: number; body: string | null }
+      | undefined;
+    if (!win) return undefined;
+    const total = win.total ?? 0;
+    let chunk = win.body ?? "";
     // Serialized-size correction: maxChars caps RAW characters, but JSON
     // escaping inflates control-heavy bodies up to 6x on the wire (100k NULs
-    // serialized past 600k). Shrink the slice until its serialized form fits
-    // ~maxChars too; the walk contract survives because truncated/offset are
-    // recomputed from the ACTUAL returned chunk.
-    while (chunk.length > 1 && JSON.stringify(chunk).length - 2 > maxChars) {
-      const ratio = maxChars / (JSON.stringify(chunk).length - 2);
+    // would serialize past 600k -- though NUL is now rejected at write). Shrink
+    // until the serialized slice fits ~maxChars; next_offset is recomputed from
+    // the ACTUAL returned chunk, so the walk stays exact.
+    while (chunk.length > 1 && JSON.stringify(chunk).length - 2 > cap) {
+      const ratio = cap / (JSON.stringify(chunk).length - 2);
       chunk = safeCut(
         chunk,
         Math.min(chunk.length - 1, Math.max(1, Math.floor(chunk.length * ratio))),
       );
     }
-    end = start + chunk.length;
-    const partial = start > 0 || end < total;
-    if (!partial) return this.rowToMessage(r);
+    // Codepoints consumed by this slice (bounded, so counting is cheap).
+    let consumed = 0;
+    for (const _ of chunk) consumed++;
+    const partial = off > 0 || off + consumed < total;
+    if (!partial) {
+      // Whole body in hand: parse json / return the string normally.
+      return this.rowToMessage({ ...env, body: chunk, body_len: total });
+    }
     // Build the envelope without parsing the (possibly huge) body.
-    const base = this.rowToMessage({ ...r, body: "", body_len: 0 });
+    const base = this.rowToMessage({ ...env, body: "", body_len: 0 });
     return {
       ...base,
       content: chunk,
-      // truncated means "there is more BEYOND this slice", so the final page
-      // of an offset walk reports false and pagers terminate on it instead of
-      // spinning on empty tail pages.
-      truncated: end < total,
+      // truncated means "there is more BEYOND this slice", so the final page of
+      // an offset walk reports false and pagers terminate instead of spinning.
+      truncated: off + consumed < total,
       length: total,
-      offset: start,
+      offset: off,
+      next_offset: off + consumed,
     };
   }
 
@@ -1412,9 +1554,14 @@ export class ChatStore {
     const cap = 500;
     // Recursive walk of the reply subtree. `path` (zero-padded seq per level)
     // orders siblings numerically and yields pre-order DFS when sorted. Fetch
-    // cap+1 rows to detect (without a separate COUNT) that more were available.
-    const rows = this.db
-      .prepare(
+    // cap+1 rows to detect (without a separate COUNT) that more were available,
+    // but memory-bound via fetchBounded so 500 large replies do not all
+    // materialize (~50 MB) just to trim to the thread budget: it stops after
+    // ~budget raw body plus a sentinel. When it stops by SIZE, replies_capped
+    // may under-report (byte_limited then carries "more replies exist"); when
+    // replies are small it fetches the full cap+1 and reports capping exactly.
+    const rows = this.fetchBounded<RawMessage & { depth: number }>(
+      this.db.prepare(
         `WITH RECURSIVE descendants(seq, depth, path) AS (
            SELECT g.seq, 1, printf('%010d', g.seq)
              FROM messages g
@@ -1432,10 +1579,10 @@ export class ChatStore {
            LEFT JOIN messages p ON p.room_id = g.room_id AND p.seq = g.reply_to_seq
           ORDER BY d.path
           LIMIT @lim`,
-      )
-      .all({ room: roomId, root: seq, maxDepth, lim: cap + 1 }) as (RawMessage & {
-      depth: number;
-    })[];
+      ),
+      [{ room: roomId, root: seq, maxDepth, lim: cap + 1 }],
+      Math.max(STUB_ALLOWANCE, remaining),
+    );
 
     const replies_capped = rows.length > cap;
     // Below a stub allowance boundByBytes cannot guarantee even its head row
@@ -1507,13 +1654,15 @@ export class ChatStore {
       const cursor = this.getCursor(roomId, agentId, sessionId);
       if (!cursor) throw new Error("not a member of this room");
       const from = cursor.last_read_seq;
-      const rows = this.db
-        .prepare(
+      const rows = this.fetchBounded<RawMessage>(
+        this.db.prepare(
           `SELECT ${messageCols(maxBytes)} FROM ${MESSAGE_FROM}
            WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
            ORDER BY g.seq ASC LIMIT ?`,
-        )
-        .all(roomId, from, agentId, limit) as RawMessage[];
+        ),
+        [roomId, from, agentId, limit],
+        maxBytes,
+      );
       // Exact envelope reserve so the WHOLE response honors maxBytes, not
       // just the messages array. The floor never engages at the schema's
       // 1000-char minimum; it is the stub allowance boundByBytes can honor.
@@ -1584,8 +1733,10 @@ export class ChatStore {
     // both shared and private cursors.
     const sessionKey = sessionId ?? "";
     const tx = this.db.transaction(() => {
-      const rows = this.db
-        .prepare(
+      const rows = this.fetchBounded<
+        RawMessage & { gid: number; room_id: number; room_name: string }
+      >(
+        this.db.prepare(
           `SELECT ${messageCols(maxBytes)}, g.id AS gid, g.room_id AS room_id, r.name AS room_name
            FROM ${MESSAGE_FROM}
            JOIN memberships mb ON mb.room_id = g.room_id
@@ -1597,12 +1748,10 @@ export class ChatStore {
              AND g.id > ? AND g.agent_id != ?
              AND ${directedAt("g")}
            ORDER BY g.id ASC LIMIT ?`,
-        )
-        .all(agentId, sessionKey, afterId, agentId, agentId, agentId, limit) as (RawMessage & {
-        gid: number;
-        room_id: number;
-        room_name: string;
-      })[];
+        ),
+        [agentId, sessionKey, afterId, agentId, agentId, agentId, limit],
+        maxBytes,
+      );
 
       // Placeholder text order: the SUM(CASE directedAt) pair, the membership
       // join, the session-marker join key, then the author exclusion.
@@ -1718,12 +1867,14 @@ export class ChatStore {
       params.push(beforeSeq);
     }
     const where = conds.join(" AND ");
-    const rows = this.db
-      .prepare(
+    const rows = this.fetchBounded<RawMessage>(
+      this.db.prepare(
         `SELECT ${messageCols(maxBytes)} FROM ${MESSAGE_FROM}
          WHERE ${where} ORDER BY g.seq DESC LIMIT ?`,
-      )
-      .all(...params, limit) as RawMessage[];
+      ),
+      [...params, limit],
+      maxBytes,
+    );
     // Fetched newest-first; byte-bound in that order (keeping the page nearest
     // the requested position), then present oldest-first for natural reading.
     const { messages: bounded, byteLimited } = this.boundByBytes(
@@ -1785,8 +1936,15 @@ export class ChatStore {
    * Byte-bounded like the other bulk reads; trimming drops the WORST matches
    * (rank order), and byte_limited reports that it happened. `offset` skips
    * that many best matches, making pages BEHIND a byte cut or the limit
-   * reachable (rank order is stable for a given query, so offset paging is
-   * coherent); next_offset points at the first match not returned.
+   * reachable; next_offset points at the first match not returned.
+   *
+   * ORDER BY rank, g.id: the g.id tie-break makes the order TOTAL and stable
+   * (bare `rank` left equal-scoring rows in an arbitrary, run-varying order, so
+   * offset paging could repeat or skip them within a snapshot). Paging is still
+   * only coherent against a fixed corpus: a better-ranked message inserted
+   * BETWEEN pages shifts everything down by one, which no offset scheme over a
+   * relevance sort can avoid; callers wanting exactly-once delivery should page
+   * in one burst.
    */
   searchMessages(
     roomId: number,
@@ -1795,26 +1953,34 @@ export class ChatStore {
     offset = 0,
   ): { matches: MessageRow[]; byte_limited?: boolean; next_offset?: number } {
     const off = Math.max(0, Math.floor(offset));
-    const rows = this.db
-      .prepare(
+    // Fetch one MORE than asked: a full `limit` page does not by itself prove
+    // more exist, so the extra row is the definitive "there is a next page"
+    // probe (a page of exactly `limit` matches used to emit a false
+    // next_offset that returned nothing).
+    const rows = this.fetchBounded<RawMessage>(
+      this.db.prepare(
         `SELECT ${messageCols(DEFAULT_MAX_BYTES)}
          FROM messages_fts f
          JOIN messages g ON g.id = f.rowid
          LEFT JOIN agents a ON a.id = g.agent_id
          LEFT JOIN messages p ON p.room_id = g.room_id AND p.seq = g.reply_to_seq
          WHERE f.body MATCH ? AND g.room_id = ?
-         ORDER BY rank LIMIT ? OFFSET ?`,
-      )
-      .all(query, roomId, limit, off) as RawMessage[];
+         ORDER BY rank, g.id LIMIT ? OFFSET ?`,
+      ),
+      [query, roomId, limit + 1, off],
+      DEFAULT_MAX_BYTES,
+    );
+    const hasExtra = rows.length > limit;
+    const page = hasExtra ? rows.slice(0, limit) : rows;
     const { messages, byteLimited } = this.boundByBytes(
-      rows,
+      page,
       undefined,
       DEFAULT_MAX_BYTES - SEARCH_ENVELOPE,
       (r, pc) => this.rowToMessage(r, pc),
     );
-    // More matches may exist when the byte bound cut the page OR the page
-    // filled to `limit` (the next offset probes for the rest).
-    const more = byteLimited || rows.length === limit;
+    // More remain if the byte bound cut the page, or a genuine extra match
+    // exists beyond `limit`.
+    const more = byteLimited || (hasExtra && messages.length === limit);
     return {
       matches: messages,
       ...(byteLimited ? { byte_limited: true } : {}),
@@ -1930,9 +2096,12 @@ export class ChatStore {
     return tx.immediate();
   }
 
-  /** Hard-delete a room and all of its messages and memberships. */
+  /** Hard-delete a room and all of its messages and memberships. Throws a
+   *  clean "already deleted" error if another process removed it first,
+   *  instead of reporting a false success with zero counts. */
   deleteRoom(roomId: number): { messages: number; members: number } {
     const tx = this.db.transaction(() => {
+      this.requireRoom(roomId);
       const { c: messages } = this.db
         .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = ?")
         .get(roomId) as { c: number };
@@ -1978,6 +2147,8 @@ export class ChatStore {
         expires_at: string;
         expires_in_seconds: number;
       } {
+    assertStorable(key, "claim key");
+    assertStorable(note, "claim note");
     const tx = this.db.transaction(() => {
       // Same deleted-room window as postMessage: fail cleanly, not with a
       // raw FK error from the claims INSERT.
@@ -2062,11 +2233,13 @@ export class ChatStore {
     return tx.immediate();
   }
 
-  /** Active (unexpired) claims in a room, at most `limit` (total rides along);
-   *  notes are cut to listing previews. Expired rows are pruned in passing. */
+  /** Active (unexpired) claims in a room, at most `limit` from `offset` (total
+   *  rides along); notes are cut to listing previews and the whole response is
+   *  trimmed to a serialized-size budget. Expired rows pruned in passing. */
   listClaims(
     roomId: number,
     limit = 200,
+    offset = 0,
   ): {
     claims: {
       key: string;
@@ -2077,6 +2250,7 @@ export class ChatStore {
       expires_in_seconds: number;
     }[];
     total: number;
+    size_trimmed?: boolean;
   } {
     const PREVIEW = 300;
     const tx = this.db.transaction(() => {
@@ -2092,9 +2266,9 @@ export class ChatStore {
                   CASE WHEN length(note) > ${PREVIEW} THEN 1 ELSE 0 END AS note_cut,
                   expires_at,
                   (strftime('%s', expires_at) - strftime('%s', 'now')) AS expires_in_seconds
-           FROM claims WHERE room_id = ? ORDER BY key LIMIT ?`,
+           FROM claims WHERE room_id = ? ORDER BY key LIMIT ? OFFSET ?`,
         )
-        .all(roomId, Math.max(1, Math.floor(limit))) as {
+        .all(roomId, Math.max(1, Math.floor(limit)), Math.max(0, Math.floor(offset))) as {
         key: string;
         holder: string;
         note: string | null;
@@ -2105,11 +2279,12 @@ export class ChatStore {
       const { c: total } = this.db
         .prepare("SELECT COUNT(*) AS c FROM claims WHERE room_id = ?")
         .get(roomId) as { c: number };
-      const claims = rows.map((r) => {
+      const mapped = rows.map((r) => {
         const { note_cut, ...rest } = r;
         return { ...rest, ...(note_cut ? { note_truncated: true } : {}) };
       });
-      return { claims, total };
+      const { rows: claims, sizeTrimmed } = fitRows(mapped, DEFAULT_MAX_BYTES);
+      return { claims, total, ...(sizeTrimmed ? { size_trimmed: true } : {}) };
     });
     return tx.immediate();
   }

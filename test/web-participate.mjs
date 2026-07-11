@@ -86,6 +86,14 @@ try {
   const dangling = await post("/api/post", { room: 1, name: "alex", body: "x", reply_to_seq: 999 });
   check("dangling reply rejected", dangling.status === 400 && /does not exist/.test(dangling.data.error), dangling);
 
+  // A body with an embedded NUL or a lone surrogate is rejected: the web writes
+  // SQL directly, so it must enforce the same round-trip safety the store does
+  // (SQLite substr/length truncate at a NUL, silently dropping the tail).
+  const nulPost = await post("/api/post", { room: 1, name: "alex", body: "abc" + String.fromCharCode(0) + "def" });
+  check("web rejects a NUL body (was silent truncation)", nulPost.status === 400 && /NUL/.test(nulPost.data.error), nulPost);
+  const lonePost = await post("/api/post", { room: 1, name: "alex", body: "x\ud800y" });
+  check("web rejects a lone-surrogate body", lonePost.status === 400 && /surrogate/.test(lonePost.data.error), lonePost);
+
   // the message reads back with human type, parsed mentions, reply ref
   const list = await (await fetch(`${base}/api/messages?room=1`)).json();
   const msg = list.messages.find((m) => m.seq === 3);

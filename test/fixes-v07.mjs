@@ -292,11 +292,25 @@ function mcpClient(env) {
       .prepare("SELECT reply_to_agent, body_len FROM messages WHERE room_id = ? AND seq = 3")
       .get(roomId);
     check(
-      "insert trigger stamps reply_to_agent for old-build writers",
+      "reply_to_agent trigger stamps the author for old-build writers",
       row.reply_to_agent === "author",
       row,
     );
-    check("insert trigger stamps body_len for old-build writers", row.body_len === 9, row);
+    // The body_len trigger was REMOVED (it stamped codepoints, wrong for astral
+    // and never repaired): an old-build insert leaves body_len NULL now.
+    check("old-build insert leaves body_len NULL (no more wrong-value trigger)", row.body_len === null, row);
+    raw.close();
+  }
+  // Reopen with the current build: body_len is backfilled to the exact UTF-16
+  // length, and fullLen() would have used body.length meanwhile anyway.
+  {
+    const s = new ChatStore(DB);
+    s.close();
+    const raw = new Database(DB);
+    const { body_len } = raw
+      .prepare("SELECT body_len FROM messages WHERE room_id = ? AND seq = 3")
+      .get(roomId);
+    check("reopen backfills the old-build row's body_len exactly", body_len === 9, body_len);
     raw.close();
   }
   // Prune the parent, restart: the reply must STILL be directed at the
@@ -379,7 +393,7 @@ function mcpClient(env) {
   for (let i = 0; i < 10; i++) {
     const m = s.getMessage(r, 1, off, 100_000);
     out += m.content;
-    off = m.offset + m.content.length;
+    off = m.next_offset;
     if (!m.truncated) break;
   }
   check("offset walk reassembles the capped-fetch body exactly", out === body, out.length);
@@ -405,16 +419,23 @@ function mcpClient(env) {
   for (let i = 0; i < 100; i++) {
     const m = s.getMessage(r, 1, off, 1000);
     out += m.content;
-    off = m.offset + m.content.length;
+    off = m.next_offset;
     if (!m.truncated) break;
   }
   check("escape-heavy offset walk still reassembles exactly", out === nuls, out.length);
 
-  s.postMessage(r, "b", "ab\u{1F600}cd", "text", null, null); // seq 2: pair at units 2-3
-  const mid = s.getMessage(r, 2, 3, 10);
+  // get_message offsets count CODEPOINTS, so a slice boundary never falls
+  // between a surrogate pair: "ab<emoji>cd" is codepoints a,b,emoji,c,d.
+  // Fetching from codepoint 2 returns the WHOLE emoji first (its high
+  // surrogate), never a lone low surrogate.
+  s.postMessage(r, "b", "ab\u{1F600}cd", "text", null, null); // seq 2
+  const mid = s.getMessage(r, 2, 2, 10);
   check(
-    "offset landing on a low surrogate backs up to include the pair",
-    mid.offset === 2 && mid.content.charCodeAt(0) >= 0xd800 && mid.content.charCodeAt(0) <= 0xdbff,
+    "codepoint offset never splits a surrogate pair",
+    mid.content.charCodeAt(0) >= 0xd800 &&
+      mid.content.charCodeAt(0) <= 0xdbff &&
+      mid.content === "\u{1F600}cd" &&
+      mid.length === 5,
     mid,
   );
   s.close();

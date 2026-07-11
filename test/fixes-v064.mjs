@@ -168,7 +168,7 @@ const check = (n, c, x) => {
     const c = String(page.content);
     if (c.length > 1 && loneHigh(c)) malformed++;
     walked += c;
-    off += c.length;
+    off = page.next_offset; // get_message offsets count codepoints; advance by it
     pages++;
     if (!page.truncated) break;
     if (pages > 60) {

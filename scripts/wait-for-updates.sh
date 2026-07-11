@@ -38,7 +38,10 @@
 # wedged probe wedges the poller (accepted: kill the process).
 #
 # Exit codes: 0 updates found (status JSON printed to stdout), 124 timed out,
-# 2 error, 130/143 killed (SIGINT/SIGTERM).
+# 2 error, 143 killed by SIGTERM. To STOP a poller running in the background
+# (`... &`), send SIGTERM (`kill <pid>`): SIGINT is ignored by an
+# asynchronously-launched shell and will not stop it. SIGINT (exit 130) works
+# only for a foreground poller.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -62,11 +65,15 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if ! [[ "$interval" =~ ^[0-9]+$ ]]; then
-  echo "wait-for-updates: --interval must be a positive integer" >&2; exit 2
+# Digits only AND at most 9 of them: a value past ~2 billion overflows bash's
+# signed-64-bit arithmetic and WRAPS (e.g. a huge --timeout became 0, i.e.
+# "never time out"), so cap the magnitude before any (( )) touches it. 9 digits
+# (< 1e9 seconds ~= 31 years) is far more than any real interval/timeout.
+if ! [[ "$interval" =~ ^[0-9]{1,9}$ ]]; then
+  echo "wait-for-updates: --interval must be a positive integer under 1000000000" >&2; exit 2
 fi
-if ! [[ "$timeout" =~ ^[0-9]+$ ]]; then
-  echo "wait-for-updates: --timeout must be a non-negative integer" >&2; exit 2
+if ! [[ "$timeout" =~ ^[0-9]{1,9}$ ]]; then
+  echo "wait-for-updates: --timeout must be a non-negative integer under 1000000000" >&2; exit 2
 fi
 # Force base 10 BEFORE any arithmetic: bash treats a leading zero as octal,
 # so a validated-but-unnormalized "08" blew up the first (( )) with
@@ -88,15 +95,28 @@ if [[ ! -f "$CHECK" ]]; then
   exit 2
 fi
 
-# Interruptible sleep that dies WITH us: a foreground `sleep` survives the
-# shell being SIGTERMed (reparented, naps out its full interval); running it
-# in the background and killing it from the trap ends both immediately.
+# Every long-lived child (the sleep between polls AND the node probe itself)
+# runs in the BACKGROUND and is waited on, so a signal to this shell can kill
+# it from the trap. A foreground child instead survives the shell being
+# SIGTERMed (reparented, runs to completion): the sleep would nap out its full
+# interval and the probe would keep querying. Both PIDs are tracked; the trap
+# kills whichever is live.
 SLEEP_PID=""
+PROBE_PID=""
+PROBE_TMP=""
 on_signal() {
   local code=$1
   [[ -n "$SLEEP_PID" ]] && kill "$SLEEP_PID" 2>/dev/null
-  exit "$code"
+  [[ -n "$PROBE_PID" ]] && kill "$PROBE_PID" 2>/dev/null
+  exit "$code"   # the EXIT trap removes any in-flight probe temp file
 }
+# EXIT fires on every exit path (normal, signal-trap exit, error), so the
+# probe's mktemp file is never leaked even if a signal lands mid-probe.
+trap 'rm -f "$PROBE_TMP" 2>/dev/null' EXIT
+# TERM is the reliable stop signal for a BACKGROUND poller. A shell launched
+# asynchronously (`cmd &`, the documented run mode) has SIGINT set to SIG_IGN
+# on entry, and a signal ignored at entry cannot be trapped -- so this INT trap
+# only fires for a FOREGROUND poller; exit 130 is a foreground-only outcome.
 trap 'on_signal 130' INT
 trap 'on_signal 143' TERM
 nap() {
@@ -105,6 +125,25 @@ nap() {
   # `wait` returns >128 when interrupted by a trapped signal; the trap exits.
   wait "$SLEEP_PID" 2>/dev/null || true
   SLEEP_PID=""
+}
+# Run the probe as a killable background child, capturing its stdout. Sets
+# PROBE_OUT and returns the probe's exit code.
+PROBE_OUT=""
+run_probe() {
+  # rc defaults to 0 and is captured via `|| rc=$?`: a bare `wait` that returns
+  # nonzero (probe exit 1 = "no updates yet") would otherwise trip `set -e` and
+  # kill the whole poller. Only stdout is captured; the probe's stderr flows to
+  # ours for diagnosis.
+  local rc=0
+  PROBE_TMP=$(mktemp)   # tracked so the EXIT trap can remove it on any exit
+  node "$CHECK" "${probe_args[@]}" >"$PROBE_TMP" &
+  PROBE_PID=$!
+  wait "$PROBE_PID" || rc=$?
+  PROBE_PID=""
+  PROBE_OUT=$(cat "$PROBE_TMP")
+  rm -f "$PROBE_TMP"
+  PROBE_TMP=""
+  return "$rc"
 }
 
 start=$(date +%s)
@@ -121,11 +160,13 @@ while true; do
     fi
   fi
 
-  if out=$(node "$CHECK" "${probe_args[@]}"); then
+  if run_probe; then
+    out=$PROBE_OUT
     echo "$out"          # exit 0 from probe => updates exist
     exit 0
   else
     rc=$?
+    out=$PROBE_OUT
     # Only rc==1 WITH a status line means "no updates yet". Anything else
     # (probe error 2, or the node process dying: 127/137/139/...) must
     # surface, not be mistaken for a quiet room. The -z guard closes the

@@ -347,10 +347,12 @@ server.registerTool(
   {
     title: "List rooms",
     description:
-      "List chat rooms (oldest first, up to `limit`; `total` reports how many " +
-      "exist) with present-member count, message count, last activity and " +
-      "pinned intro. Long pinned/descriptions are listing previews " +
-      "(*_truncated flags); join_room returns the full pinned.",
+      "List chat rooms (oldest first, up to `limit` from `offset`; `total` " +
+      "reports how many exist) with present-member count, message count, last " +
+      "activity and pinned intro. Long pinned/descriptions are listing previews " +
+      "(*_truncated flags); join_room returns the full pinned. `truncated:true` " +
+      "= more rows exist (by limit, offset, or a serialized-size cut); page " +
+      "with offset.",
     inputSchema: z
       .object({
         limit: z
@@ -360,17 +362,26 @@ server.registerTool(
           .max(1000)
           .optional()
           .describe("Max rooms to return (default 200)"),
+        offset: z
+          .number()
+          .int()
+          .nonnegative()
+          .optional()
+          .describe("Skip this many rooms (paging; default 0)"),
       })
       .strict(),
   },
-  async ({ limit }) => {
+  async ({ limit, offset }) => {
     try {
       touchSession();
-      const { rooms, total } = store.listRooms(limit ?? 200);
+      const off = offset ?? 0;
+      const { rooms, total, size_trimmed } = store.listRooms(limit ?? 200, off);
+      const more = off + rooms.length < total || !!size_trimmed;
       return ok({
         rooms,
         total,
-        ...(total > rooms.length ? { truncated: true } : {}),
+        ...(more ? { truncated: true } : {}),
+        ...(size_trimmed ? { size_trimmed: true } : {}),
       });
     } catch (e) {
       return fail(asMessage(e));
@@ -600,11 +611,12 @@ server.registerTool(
   {
     title: "List agents in room",
     description:
-      "List agents in the active room (up to `limit`, `total` rides along): " +
-      "type/role/description, `last_read_seq` (read receipt: compare to a " +
-      "message seq), `last_seen`, `idle_seconds`, `present` (has not left), " +
-      "`active` (seen within active_within_minutes). Long descriptions are " +
-      "listing previews (description_truncated).",
+      "List agents in the active room (up to `limit` from `offset`, `total` " +
+      "rides along): type/role/description, `last_read_seq` (read receipt: " +
+      "compare to a message seq), `last_seen`, `idle_seconds`, `present` (has " +
+      "not left), `active` (seen within active_within_minutes). Long " +
+      "descriptions are listing previews (description_truncated). " +
+      "`truncated:true` = more rows exist; page with offset.",
     inputSchema: z.object({
       filter: z
         .string()
@@ -623,22 +635,32 @@ server.registerTool(
         .max(1000)
         .optional()
         .describe("Max agents to return (default 200)"),
+      offset: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Skip this many agents (paging; default 0)"),
     }).strict(),
   },
-  async ({ filter, active_within_minutes, limit }) => {
+  async ({ filter, active_within_minutes, limit, offset }) => {
     try {
       touchSession();
       const { roomId } = requireActive();
-      const { agents, total } = store.listAgents(
+      const off = offset ?? 0;
+      const { agents, total, size_trimmed } = store.listAgents(
         roomId,
         active_within_minutes ?? 5,
         filter,
         limit ?? 200,
+        off,
       );
+      const more = off + agents.length < total || !!size_trimmed;
       return ok({
         agents,
         total,
-        ...(total > agents.length ? { truncated: true } : {}),
+        ...(more ? { truncated: true } : {}),
+        ...(size_trimmed ? { size_trimmed: true } : {}),
       });
     } catch (e) {
       return fail(asMessage(e));
@@ -1079,9 +1101,10 @@ server.registerTool(
       "Fetch one message by seq (e.g. to resolve 'see message 8'). Bodies " +
       "return up to `max_chars` per call (escape-heavy bodies return fewer: " +
       "the SERIALIZED slice honors max_chars too); longer ones arrive sliced " +
-      "with `length` and `offset`. truncated:true = more remains BEYOND the " +
-      "slice: call again with offset = offset + returned chars until " +
-      "truncated is false. A sliced json body is a raw partial string.",
+      "with `length`, `offset`, and `next_offset`. truncated:true = more " +
+      "remains BEYOND the slice: call again with offset = next_offset until " +
+      "truncated is false. offset/length/next_offset count CHARACTERS " +
+      "(codepoints). A sliced json body is a raw partial string.",
     inputSchema: z.object({
       seq: z.number().int().positive().describe("Message number to fetch"),
       offset: z
@@ -1290,10 +1313,11 @@ server.registerTool(
   {
     title: "List claims",
     description:
-      "List active (unexpired) claims in the active room (up to `limit`, " +
-      "`total` rides along): key, holder, note (listing preview, " +
+      "List active (unexpired) claims in the active room (up to `limit` from " +
+      "`offset`, `total` rides along): key, holder, note (listing preview, " +
       "note_truncated flags a cut), and seconds until expiry. Check before " +
-      "starting work that overlaps someone's claim.",
+      "starting work that overlaps someone's claim. `truncated:true` = more " +
+      "rows exist; page with offset.",
     inputSchema: z
       .object({
         limit: z
@@ -1303,18 +1327,31 @@ server.registerTool(
           .max(1000)
           .optional()
           .describe("Max claims to return (default 200)"),
+        offset: z
+          .number()
+          .int()
+          .nonnegative()
+          .optional()
+          .describe("Skip this many claims (paging; default 0)"),
       })
       .strict(),
   },
-  async ({ limit }) => {
+  async ({ limit, offset }) => {
     try {
       touchSession();
       const { roomId } = requireActive();
-      const { claims, total } = store.listClaims(roomId, limit ?? 200);
+      const off = offset ?? 0;
+      const { claims, total, size_trimmed } = store.listClaims(
+        roomId,
+        limit ?? 200,
+        off,
+      );
+      const more = off + claims.length < total || !!size_trimmed;
       return ok({
         claims,
         total,
-        ...(total > claims.length ? { truncated: true } : {}),
+        ...(more ? { truncated: true } : {}),
+        ...(size_trimmed ? { size_trimmed: true } : {}),
       });
     } catch (e) {
       return fail(asMessage(e));

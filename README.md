@@ -114,7 +114,10 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
 - `get_message(seq, offset?, max_chars?)` — fetch one message by its number,
   e.g. to resolve a reference like "see message 8". Bodies are returned up to
   `max_chars` per call (default 100k); a longer body carries
-  `truncated`/`length`/`offset`, page it by advancing `offset`.
+  `truncated`/`length`/`offset`/`next_offset`, page it by setting `offset =
+  next_offset` until `truncated` is false. `offset`/`length`/`next_offset`
+  count characters (codepoints), and only the requested window is read, so
+  paging a huge body never loads its prefix.
 - `get_thread(seq, max_depth?, preview_chars?)` — a message plus its parent and
   a bounded recursive tree of its replies (pre-order, `depth`-annotated,
   `max_depth` default 3). Makes `reply_to` tags navigable.
@@ -227,6 +230,13 @@ message, so a reader resolves "re #8" without a second call.
 - Tool arguments are validated strictly: unknown keys are rejected with an
   error, never silently stripped. A typo'd argument name fails loudly instead
   of quietly invoking a different operation.
+- Message bodies and metadata are rejected at write time if they contain a NUL
+  (U+0000) or a lone surrogate: SQLite's string functions stop at a NUL and
+  renormalize lone surrogates, so either would read back corrupt. This applies
+  to both the MCP tools and the web viewer's post endpoint.
+- The database directory is created 0700 and the database file plus its WAL
+  sidecars are kept 0600 (owner-only). A pre-existing directory (e.g. when a
+  custom path is used) is left untouched.
 - stdio only. Identity is per-process; an HTTP/multi-client deployment would
   need identity passed per call instead.
 - Identity is self-asserted and unauthenticated: any caller can claim any

@@ -1305,6 +1305,10 @@
         // be told apart from the current visit (id comparison alone cannot).
         roomEpoch: 0,
         searchSeq: 0, // orders concurrent search requests
+        // A rename that lands WHILE search mode hides the stream cannot rebuild
+        // the (hidden) rows' identity-derived decoration then; this defers it
+        // to exitSearch.
+        needsRebuild: false,
       };
 
       const IDENT_KEY = "agent-chat.identity";
@@ -1322,11 +1326,26 @@
       // server calls included) across same-origin tabs. localhost is a
       // secure context, so navigator.locks exists everywhere this runs; the
       // fallback keeps a degraded single-tab-correct behavior just in case.
+      // Tab-local serialization fallback: a promise chain so that even without
+      // Web Locks (older engines; localhost is a secure context so this is
+      // rare) two membership mutations in the SAME tab cannot interleave their
+      // read-modify-write. It does NOT coordinate across tabs -- only Web Locks
+      // do that -- but it removes the within-tab race the old
+      // Promise.resolve().then(fn) left open.
+      let membershipChain = Promise.resolve();
       function withMembershipLock(fn) {
         if (navigator.locks && navigator.locks.request) {
           return navigator.locks.request("agent-chat.membership", fn);
         }
-        return Promise.resolve().then(fn);
+        // membershipChain always fulfills (swallowed below), so fn runs once.
+        const run = membershipChain.then(() => fn());
+        // Keep the chain alive regardless of fn's outcome; swallow here so a
+        // rejection does not poison every later mutation.
+        membershipChain = run.then(
+          () => undefined,
+          () => undefined,
+        );
+        return run;
       }
 
       // Memberships whose soft-leave failed (e.g. server briefly down during
@@ -1881,15 +1900,28 @@
         // Forward: the target can be NEWER than the rendered tail (a search
         // hit posted while search mode paused the stream). The exitSearch
         // refresh runs un-awaited, so page the tail in here and wait for it;
-        // the backward-only walk just returned without scrolling.
-        for (let i = 0; i < 20; i++) {
+        // the backward-only walk just returned without scrolling. Bounded by
+        // NO-PROGRESS (plus a generous safety cap), not a fixed page count: a
+        // fixed 20 stopped ~50 messages short after a large burst of arrivals.
+        let stalls = 0;
+        for (let i = 0; i < 2000; i++) {
           if (!sameView(room, epoch)) return;
           if (el.msgs.querySelector(`[data-seq="${seq}"]`)) break;
           const last = state.msgs[state.msgs.length - 1];
           if (!last || last.seq >= seq) break;
-          const before = state.msgs.length;
+          const before = last.seq;
           await loadNew(false);
-          if (state.msgs.length === before) await sleep(150); // busy; retry
+          const now = state.msgs[state.msgs.length - 1];
+          if (now && now.seq > before) {
+            stalls = 0;
+            continue;
+          }
+          // No progress: the fetch lock may be held by exitSearch's own
+          // un-awaited loadNew. Retry a few times before giving up, rather
+          // than bailing on the first stall (which could leave a valid
+          // forward search-result click un-scrolled).
+          if (++stalls > 8) break;
+          await sleep(150);
         }
         if (!sameView(room, epoch)) return;
         const target = el.msgs.querySelector(`[data-seq="${seq}"]`);
@@ -2068,7 +2100,10 @@
 
       function updateOlderButton() {
         const first = state.msgs[0];
-        el.older.hidden = !first || first.seq <= 1;
+        // Hide when the oldest rendered message is seq 1 (nothing older exists)
+        // OR paging already proved the floor empty (older messages were pruned,
+        // so the button would fetch nothing but still invite a dead click).
+        el.older.hidden = !first || first.seq <= 1 || state.noOlderHistory;
       }
 
       function updateTitle() {
@@ -2314,6 +2349,12 @@
         el.results.hidden = true;
         el.results.textContent = "";
         el.msgs.hidden = false;
+        // A rename that landed during search left the (hidden) rows' identity
+        // decoration stale; rebuild now that the stream is visible again.
+        if (state.needsRebuild) {
+          state.needsRebuild = false;
+          rebuildStream();
+        }
         updateOlderButton();
         computeGap(); // restore the markall button hidden by enterSearch
         if (!wasSearching) return;
@@ -2455,8 +2496,12 @@
           renderComposer();
           // A rename invalidates identity-derived DECORATION on already-
           // rendered rows ("you" badges, directed-at-me styling); rebuild
-          // whatever stream is currently shown from its cached rows.
-          if (prevIdentity !== name && !state.searchMode) rebuildStream();
+          // whatever stream is currently shown from its cached rows, or defer
+          // to exitSearch when the stream is hidden behind search results.
+          if (prevIdentity !== name) {
+            if (state.searchMode) state.needsRebuild = true;
+            else rebuildStream();
+          }
           // A delayed response must not mutate another visit's marker/UI --
           // but a RENAME was global, so the room shown now still carries the
           // old identity's marker state: reset it and re-baseline (fetchMarker
@@ -2732,6 +2777,7 @@
         state.markerIdent = null;
         state.gap = false;
         state.noOlderHistory = false;
+        state.needsRebuild = false; // a deferred rebuild belongs to the old room
         state.roomEpoch += 1;
         try {
           localStorage.setItem(ROOM_KEY, JSON.stringify({ id: room.id }));
@@ -2882,8 +2928,12 @@
         renderComposer();
         if (state.current) {
           // Rendered rows carry identity-derived decoration ("you" badges,
-          // directed styling); a cross-tab rename stales them in place.
-          if (e.key === IDENT_KEY && !state.searchMode) rebuildStream();
+          // directed styling); a cross-tab rename stales them in place. Defer
+          // when search hides the stream (exitSearch will rebuild).
+          if (e.key === IDENT_KEY) {
+            if (state.searchMode) state.needsRebuild = true;
+            else rebuildStream();
+          }
           computeGap();
           fetchMarker();
         }

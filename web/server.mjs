@@ -121,18 +121,33 @@ function getDb() {
   return db;
 }
 
+// This runs on the sidebar's 6-second refresh, so it must stay small: pinned
+// and description are capped to previews in SQL (the sidebar only needs a
+// glimpse; opening a room fetches the full intro), and the row count is
+// bounded. Unbounded, hundreds of rooms with 10k pinned intros made a
+// multi-megabyte response every 6 seconds.
+const ROOM_PREVIEW_CHARS = 2000;
+const ROOMS_MAX = 1000;
 function listRooms() {
   const d = getDb();
   if (!d) return null;
-  return d
+  const rooms = d
     .prepare(
-      `SELECT r.id, r.name, r.description, r.pinned,
+      `SELECT r.id, r.name,
+              substr(r.description, 1, ${ROOM_PREVIEW_CHARS}) AS description,
+              substr(r.pinned, 1, ${ROOM_PREVIEW_CHARS}) AS pinned,
+              CASE WHEN length(r.pinned) > ${ROOM_PREVIEW_CHARS} THEN 1 ELSE NULL END AS pinned_truncated,
               (SELECT COUNT(*) FROM memberships m WHERE m.room_id = r.id AND m.left_at IS NULL) AS members,
               (SELECT COUNT(*) FROM messages g WHERE g.room_id = r.id) AS messages,
               (SELECT MAX(created_at) FROM messages g WHERE g.room_id = r.id) AS last_activity
-       FROM rooms r ORDER BY r.id`,
+       FROM rooms r ORDER BY last_activity DESC, r.id DESC LIMIT ${ROOMS_MAX}`,
     )
     .all();
+  // When there are more than ROOMS_MAX rooms, keep the most-recently-ACTIVE
+  // ones (ordering by id kept the OLDEST, hiding the newest rooms a user is
+  // most likely to want; the client re-sorts by activity anyway).
+  for (const r of rooms) if (r.pinned_truncated == null) delete r.pinned_truncated;
+  return rooms;
 }
 
 // Message columns for the JSON endpoints. Bodies are capped in SQL (substr
@@ -155,27 +170,49 @@ const MSG_COLS = `g.seq, g.agent_id AS "from", a.role, a.type,
                 WHERE s.room_id = g.room_id AND s.supersedes_seq = g.seq
                 ORDER BY s.seq DESC LIMIT 1) AS superseded_by`;
 
-// Aggregate BODY budget per response: the per-row cap alone let a 400-row
-// page of legal 100k bodies serialize to ~40 MB. Collection stops (with at
-// least one row, so paging always progresses) once the running body total
-// passes this; `trimmed` tells the client the page is short for size, NOT
-// because history ran out.
+// Aggregate SERIALIZED budget per response: the per-row cap alone let a 400-row
+// page of legal 100k bodies serialize to ~40 MB, and counting only body.length
+// still undercounted control-heavy rows ~6x (20 rows of ~2M body units
+// serialized to ~12 MB). Measure the ACTUAL serialized size of each row, after
+// its mentions have been parsed and the body-cap flag applied, so the JSON the
+// client receives is what is bounded. Collection stops (with at least one row,
+// so paging always progresses) once the running total passes this; `trimmed`
+// tells the client the page is short for SIZE, not because history ran out.
 const PAGE_BODY_BUDGET = 2_000_000;
 
-// Pull rows off a better-sqlite3 iterator until the body budget is spent.
+// Pull rows off a better-sqlite3 iterator, finalizing each (mentions + body
+// cap) so its measured size matches the wire, until the serialized budget is
+// spent. Measured in UTF-8 BYTES (Buffer.byteLength), the actual wire unit:
+// JSON.stringify(x).length counts UTF-16 units, which undercounts multibyte
+// (e.g. CJK) content ~3x and let a "2 MB" budget serialize to ~6 MB.
 function takeBudgeted(iter) {
   const rows = [];
-  let used = 0;
+  let used = 2; // the array's own brackets (ASCII, 2 bytes)
   let trimmed = false;
   for (const r of iter) {
-    if (rows.length > 0 && used + r.body.length > PAGE_BODY_BUDGET) {
+    finalizeRow(r);
+    const size = Buffer.byteLength(JSON.stringify(r)) + (rows.length > 0 ? 1 : 0);
+    if (rows.length > 0 && used + size > PAGE_BODY_BUDGET) {
       trimmed = true;
       break;
     }
-    used += r.body.length;
+    used += size;
     rows.push(r);
   }
   return { rows, trimmed };
+}
+
+// Parse the mentions JSON and apply the body-cap flag for one row. Done BEFORE
+// measuring in takeBudgeted so the measured size is the real serialized size.
+function finalizeRow(r) {
+  if (r.mentions) {
+    try {
+      r.mentions = JSON.parse(r.mentions);
+    } catch {
+      r.mentions = null;
+    }
+  }
+  finishBodyCap(r);
 }
 
 function listMessages(roomId, afterSeq, beforeSeq, limit) {
@@ -216,16 +253,8 @@ function listMessages(roomId, afterSeq, beforeSeq, limit) {
     );
     taken.rows.reverse();
   }
-  for (const r of taken.rows) {
-    if (r.mentions) {
-      try {
-        r.mentions = JSON.parse(r.mentions);
-      } catch {
-        r.mentions = null;
-      }
-    }
-    finishBodyCap(r);
-  }
+  // Rows are already finalized (mentions parsed, body-cap flag) inside
+  // takeBudgeted so its size measurement matched the wire.
   return taken;
 }
 
@@ -262,6 +291,19 @@ function dbUnavailableError() {
 }
 
 const NAME_RE = /^[\w][\w.-]{0,199}$/; // sane self-asserted ids, no whitespace
+
+// Return a human reason if `s` holds text SQLite cannot round-trip (an
+// embedded NUL -- substr/length truncate at it -- or a lone surrogate), else
+// "". Mirrors the store's assertStorable so a web post is rejected the same way
+// an agent's would be.
+const LONE_SURROGATE = /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
+function badChar(s) {
+  if (s.indexOf("\u0000") !== -1) {
+    return "contains a NUL character (U+0000), which cannot be stored safely";
+  }
+  if (LONE_SURROGATE.test(s)) return "contains a lone surrogate (malformed UTF-16)";
+  return "";
+}
 
 // Cap in BYTES. Sized so a maximal legal post (MAX_BODY_CHARS UTF-16 units,
 // worst case ~3 UTF-8 bytes per unit, plus JSON envelope) still fits.
@@ -473,6 +515,7 @@ function parseMentions(body) {
 function searchMessages(roomId, q, limit) {
   const d = getDb();
   if (!d) return null;
+  // rank, g.id: total, stable order so a size-trimmed page is deterministic.
   const taken = takeBudgeted(
     d
       .prepare(
@@ -481,20 +524,11 @@ function searchMessages(roomId, q, limit) {
          JOIN messages g ON g.id = f.rowid
          LEFT JOIN agents a ON a.id = g.agent_id
          WHERE f.body MATCH ? AND g.room_id = ?
-         ORDER BY rank LIMIT ?`,
+         ORDER BY rank, g.id LIMIT ?`,
       )
       .iterate(q, roomId, limit),
   );
-  for (const r of taken.rows) {
-    if (r.mentions) {
-      try {
-        r.mentions = JSON.parse(r.mentions);
-      } catch {
-        r.mentions = null;
-      }
-    }
-    finishBodyCap(r);
-  }
+  // Rows already finalized inside takeBudgeted.
   return taken;
 }
 
@@ -601,6 +635,11 @@ async function handlePost(url, req, res) {
         error: `message exceeds ${MAX_BODY_CHARS} chars`,
       });
     }
+    // Same well-formedness gate as the MCP store (the web writes SQL directly,
+    // so it must enforce this itself): SQLite substr/length stop at a NUL, and
+    // a lone surrogate is renormalized, so either would read back corrupt.
+    const bad = badChar(body);
+    if (bad) return sendJson(res, 400, { error: `message body ${bad}` });
     let replyTo = null;
     if (payload.reply_to_seq !== undefined && payload.reply_to_seq !== null) {
       replyTo =
@@ -703,7 +742,11 @@ const server = createServer(async (req, res) => {
       if (!Number.isInteger(roomId) || roomId <= 0 || !name)
         return sendJson(res, 400, { error: "room (id) and name are required" });
       const d = getDb();
-      if (!d) return sendJson(res, 200, { joined: false });
+      if (!d)
+        // Distinguish "database not ready" (absent file / stale schema) from a
+        // genuine not-joined: reporting joined:false on a stale schema hid the
+        // real remedy and made gap logic silently wrong.
+        return sendJson(res, 200, { joined: false, error: dbUnavailableError() });
       const m = d
         .prepare(
           "SELECT last_read_seq, left_at FROM memberships WHERE room_id = ? AND agent_id = ?",
