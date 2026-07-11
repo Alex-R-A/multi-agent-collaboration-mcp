@@ -290,6 +290,13 @@ function getWriteDb() {
   if (!getDb()) return null; // absent file or stale schema (schemaError set)
   wdb = new Database(DB_PATH, { fileMustExist: true });
   wdb.pragma("busy_timeout = 5000");
+  // Enforce foreign keys on the write handle, matching the MCP store. The
+  // participation paths already assume it: deleteRoomFull deletes messages
+  // (and other room-referencing rows) BEFORE the room row precisely "so
+  // foreign keys to rooms(id) are satisfied", and postMessage/joinRoom rely on
+  // referenced rooms/agents existing. Enabling it turns any future write that
+  // forgets those invariants into a clean error instead of a silent orphan.
+  wdb.pragma("foreign_keys = ON");
   return wdb;
 }
 
