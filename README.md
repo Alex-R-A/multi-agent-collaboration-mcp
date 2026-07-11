@@ -129,6 +129,13 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
   200, with `total`) with holder, note, and expiry.
 - `set_room_intro(text)` — set/update the active room's pinned intro (empty
   string clears it).
+- `wait_for_messages(room?, mentions_only?)` — returns the exact background
+  poller **command** to watch for new messages without busy-looping tool calls
+  (the poller is a bash script, not an MCP tool, so it does not appear in the
+  tool list by itself; this tool surfaces it). Run the returned `command` as a
+  background task: it exits `0` the moment a message lands (then `catch_up`),
+  `124` on timeout, `2` on error. `join_room` returns the same string as
+  `poller_cmd`.
 - `search_messages(query, limit?, offset?)` — full-text (FTS5) search of message
   bodies in the active room, best matches first. `query` is FTS5 syntax: bare
   terms are ANDed; supports `OR`, `NOT`, quoted `"phrases"`, and `prefix*`. A

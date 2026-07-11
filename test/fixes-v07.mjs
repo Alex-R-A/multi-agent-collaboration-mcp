@@ -89,6 +89,7 @@ function mcpClient(env) {
     if (r.error) throw new Error("unexpected protocol error: " + r.error.message);
     return JSON.parse(r.result.content[0].text);
   };
+  let initResult = null;
   const init = async () => {
     send({
       jsonrpc: "2.0",
@@ -96,10 +97,15 @@ function mcpClient(env) {
       method: "initialize",
       params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "0" } },
     });
-    await waitFor(1);
+    initResult = (await waitFor(1)).result;
     send({ jsonrpc: "2.0", method: "notifications/initialized" });
   };
-  return { child, raw, call, rejectedKeys, init };
+  const listTools = async () => {
+    const id = ++nextId;
+    send({ jsonrpc: "2.0", id, method: "tools/list", params: {} });
+    return (await waitFor(id)).result.tools;
+  };
+  return { child, raw, call, rejectedKeys, listTools, instructions: () => initResult && initResult.instructions, init };
 }
 
 // --- strict schemas: unknown keys are rejected, not silently stripped ---------
@@ -183,6 +189,78 @@ function mcpClient(env) {
     rest.messages.map((m) => m.seq),
   );
   c3.child.kill();
+
+  // --- wait_for_messages: the poller is discoverable as a TOOL ----------------
+  // The recurring failure was an agent told "turn on a poller" grepping the
+  // tool list, finding nothing, and stalling even though join_room already
+  // returned the command. A named tool that returns the command fixes that.
+  const cp = mcpClient({ AGENT_CHAT_DB: DB });
+  await cp.init();
+  const tools = await cp.listTools();
+  const wfm = tools.find((t) => t.name === "wait_for_messages");
+  check(
+    "wait_for_messages appears in the tool list (mentions 'poller')",
+    !!wfm && /poller/i.test(wfm.description || ""),
+    wfm && wfm.name,
+  );
+  check(
+    "server instructions point at the wait_for_messages tool",
+    /wait_for_messages/.test(cp.instructions() || ""),
+    (cp.instructions() || "").length,
+  );
+  // Before joining: needs an identity.
+  const preJoin = await cp.raw("wait_for_messages", {});
+  check(
+    "wait_for_messages before join_room asks you to establish identity",
+    !!(preJoin.result && preJoin.result.isError) &&
+      /join a room first/.test(preJoin.result.content[0].text),
+    preJoin,
+  );
+  await cp.call("join_room", { room: "strict", agent_id: "poller-user" });
+  const w = await cp.call("wait_for_messages", {});
+  check(
+    "wait_for_messages returns a runnable command for THIS identity",
+    typeof w.command === "string" &&
+      w.command.includes("wait-for-updates.sh") &&
+      w.command.includes("--agent 'poller-user'") &&
+      !w.command.includes("--room") &&
+      !w.command.includes("--mentions-only"),
+    w.command,
+  );
+  const wScoped = await cp.call("wait_for_messages", { room: "strict", mentions_only: true });
+  check(
+    "wait_for_messages honors room + mentions_only (room resolved to its id)",
+    wScoped.command.includes("--room '1'") && wScoped.command.includes("--mentions-only"),
+    wScoped.command,
+  );
+  const wWasteful = await cp.raw("wait_for_messages", { rooms: "strict" });
+  check(
+    "wait_for_messages rejects unknown keys (strict) too",
+    cp.rejectedKeys(wWasteful, "rooms"),
+    wWasteful,
+  );
+  const wBadRoom = await cp.raw("wait_for_messages", { room: "no-such-room" });
+  check(
+    "wait_for_messages rejects a nonexistent room instead of emitting a broken command",
+    !!(wBadRoom.result && wBadRoom.result.isError) &&
+      /no room/.test(wBadRoom.result.content[0].text),
+    wBadRoom,
+  );
+  // The returned command must actually RUN and produce a valid poller verdict,
+  // not crash. poller-user joined a room with an unread backlog (seqs 1-3 from
+  // "other"), so the deterministic result is exit 0 = "new messages".
+  const parts = w.command.match(/^bash (.+) --agent '(.+)'$/);
+  const runnable = spawnSync(
+    "bash",
+    [parts[1].replace(/^'|'$/g, ""), "--agent", parts[2], "--timeout", "3", "--interval", "1"],
+    { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 15_000 },
+  );
+  check(
+    "the command wait_for_messages returned actually runs (unread backlog -> exit 0)",
+    runnable.status === 0 && /has_updates":true/.test(runnable.stdout),
+    { status: runnable.status, stdout: runnable.stdout, stderr: runnable.stderr },
+  );
+  cp.child.kill();
   c.child.kill();
   rmSync(dir, { recursive: true, force: true });
 }

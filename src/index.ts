@@ -36,8 +36,14 @@ function shq(s: string): string {
  * --db) is deliberately NEVER advertised to clients -- a client must not
  * learn from any tool text that another database is possible.
  */
-function pollerCmd(agentId: string): string {
-  return `bash ${shq(POLLER)} --agent ${shq(agentId)}`;
+function pollerCmd(
+  agentId: string,
+  opts: { room?: string; mentionsOnly?: boolean } = {},
+): string {
+  let cmd = `bash ${shq(POLLER)} --agent ${shq(agentId)}`;
+  if (opts.room !== undefined) cmd += ` --room ${shq(opts.room)}`;
+  if (opts.mentionsOnly) cmd += ` --mentions-only`;
+  return cmd;
 }
 const POLLER_CMD = `${pollerCmd("<your_agent_id>")} [--mentions-only]`;
 
@@ -53,7 +59,7 @@ To wait for activity without busy-looping tool calls, run this poller as a BACKG
 
   ${POLLER_CMD}
 
-Prefer the poller_cmd string join_room returns: it is this command pre-quoted for your exact agent id (hand-substituting an id containing quote characters breaks the shell quoting). Default scope is ALL rooms you are present in; --room <id|name> scopes to one. catch_up first so your markers are the baseline; your own posts never wake it; --mentions-only fires only on messages directed at you. Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override; requires --room). Exit codes: 0 updates, 124 timeout, 2 error. cursor:'private' note: the poller reads IDENTITY-level markers (the MAX across twin sessions); a lagging private session should use --room with --since = its own last_read_seq from whoami.`;
+Prefer the poller_cmd string join_room returns, or call the wait_for_messages tool: both hand back this command pre-quoted for your exact agent id (hand-substituting an id containing quote characters breaks the shell quoting). The poller is a background SCRIPT, not a blocking tool: run the command as a background task. Default scope is ALL rooms you are present in; --room <id|name> scopes to one. catch_up first so your markers are the baseline; your own posts never wake it; --mentions-only fires only on messages directed at you. Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override; requires --room). Exit codes: 0 updates, 124 timeout, 2 error. cursor:'private' note: the poller reads IDENTITY-level markers (the MAX across twin sessions); a lagging private session should use --room with --since = its own last_read_seq from whoami.`;
 
 // One stdio server process serves one agent. We remember its identity and
 // active room for the session so the agent need not repeat them on every call.
@@ -884,6 +890,82 @@ server.registerTool(
           after_id ?? 0,
         ),
       );
+    } catch (e) {
+      return fail(asMessage(e));
+    }
+  },
+);
+
+server.registerTool(
+  "wait_for_messages",
+  {
+    title: "Wait for new messages (background poller)",
+    description:
+      "Get the exact shell command to WATCH for new messages without " +
+      "busy-looping tool calls. IMPORTANT: this tool does NOT block or wait " +
+      "itself; it RETURNS a `command` (a background poller script) for you to " +
+      "run. Launch that `command` as a BACKGROUND shell task: it exits 0 the " +
+      "moment a new message arrives (that exit is your signal to catch_up), " +
+      "124 if it times out with nothing new, 2 on error. Needs an identity " +
+      "(join_room first). Watches EVERY room you are present in unless `room` " +
+      "scopes it to one. Set mentions_only to fire only on messages that " +
+      "mention you or reply to you. (join_room also returns this same command " +
+      "as poller_cmd.)",
+    inputSchema: z
+      .object({
+        room: z
+          .string()
+          .min(1)
+          .optional()
+          .describe(
+            "Scope the watch to one room (id or name); default watches every " +
+              "room you are present in",
+          ),
+        mentions_only: z
+          .boolean()
+          .optional()
+          .describe("Fire only when a message mentions you or replies to you"),
+      })
+      .strict(),
+  },
+  async ({ room, mentions_only }) => {
+    try {
+      touchSession();
+      if (session.agentId === null) {
+        return fail(
+          "join a room first with join_room to establish your identity, then call this again",
+        );
+      }
+      // Resolve the room to its id so the emitted --room is unambiguous (and
+      // fail early if it does not exist, rather than hand back a command that
+      // errors when run).
+      let roomArg: string | undefined;
+      if (room !== undefined) {
+        const target = store.resolveRoom(room);
+        if (!target) {
+          return fail(
+            `no room "${room}". Use list_rooms to see options, or omit room to watch all rooms you are in.`,
+          );
+        }
+        roomArg = String(target.id);
+      }
+      const command = pollerCmd(session.agentId, {
+        room: roomArg,
+        mentionsOnly: mentions_only,
+      });
+      return ok({
+        command,
+        run_as: "background shell task (do not wait for it inline)",
+        how_to:
+          "Run `command` in the background. It exits 0 when there is something " +
+          "new (then call catch_up to read it), 124 if it times out with " +
+          "nothing new, 2 on error. Re-launch it after each hit to keep watching.",
+        exit_codes: {
+          "0": "new messages -> catch_up",
+          "124": "timed out, nothing new",
+          "2": "error",
+        },
+      });
     } catch (e) {
       return fail(asMessage(e));
     }
