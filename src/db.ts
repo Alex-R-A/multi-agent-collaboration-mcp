@@ -96,6 +96,11 @@ const STUB_ALLOWANCE = 500;
  *  block retention forever). Live sessions refresh on every join/touch. */
 const SESSION_GC_AGE = "-7 days";
 
+/** Serialized-size budget for a metadata listing's row ARRAY, leaving room for
+ *  the response envelope (total, truncated/size_trimmed flags) so the WHOLE
+ *  response stays under DEFAULT_MAX_BYTES, not just the array. */
+const LIST_ROW_BUDGET = DEFAULT_MAX_BYTES - 500;
+
 /**
  * Slice s to at most `end` UTF-16 code units, backing off one unit when the
  * cut would split a surrogate pair: a lone surrogate is not valid Unicode,
@@ -146,14 +151,26 @@ function assertStorable(value: string | null, field: string): void {
  * one row, but control-heavy metadata serializes ~6x, so 200 rows could still
  * blow past any client output cap; this caps the response itself. Keeps at
  * least one row so a page is never empty.
+ *
+ * Linear: each row is serialized ONCE and its size accumulated (brackets +
+ * per-element comma charged like boundByBytes), instead of re-serializing the
+ * whole shrinking array on every pop -- the quadratic version took ~1.3s to
+ * trim 1000 control-heavy rooms.
  */
 function fitRows<T>(rows: T[], budget: number): { rows: T[]; sizeTrimmed: boolean } {
-  if (rows.length === 0 || JSON.stringify(rows).length <= budget) {
-    return { rows, sizeTrimmed: false };
+  const kept: T[] = [];
+  let used = 2; // the array's own brackets
+  let sizeTrimmed = false;
+  for (const r of rows) {
+    const size = JSON.stringify(r).length + (kept.length > 0 ? 1 : 0);
+    if (kept.length > 0 && used + size > budget) {
+      sizeTrimmed = true;
+      break; // rows are appended in order, so the rest are droppable/pageable
+    }
+    kept.push(r);
+    used += size;
   }
-  const kept = rows.slice();
-  while (kept.length > 1 && JSON.stringify(kept).length > budget) kept.pop();
-  return { rows: kept, sizeTrimmed: true };
+  return { rows: kept, sizeTrimmed };
 }
 
 export type RoomRow = {
@@ -252,6 +269,10 @@ type RawMessage = {
    *  NULL only for rows written by an old build during a mixed-version window
    *  before this process's startup backfill ran; fall back to body.length. */
   body_len: number | null;
+  /** Full body length in CODEPOINTS (length(body)); the reported `length`
+   *  field's unit, consistent with get_message. Present on every fetched row.
+   *  Absent (undefined) only on synthetic rows the code builds in-memory. */
+  body_cp?: number;
   mentions: string | null;
   reply_to_seq: number | null;
   reply_from: string | null;
@@ -261,6 +282,16 @@ type RawMessage = {
   supersedes_seq: number | null;
   superseded_by: number | null;
 };
+
+/** Full body length in CODEPOINTS, the unit the reported `length` field uses
+ *  everywhere. Prefers the fetched-row codepoint count; for a synthetic row
+ *  built in code (no body_cp), the number of codepoints in the body in hand. */
+function codepointLen(r: RawMessage): number {
+  if (r.body_cp !== undefined) return r.body_cp;
+  let n = 0;
+  for (const _ of r.body) n++;
+  return n;
+}
 
 /**
  * Full body length, tolerant of a wrong or missing body_len. The MAX of the
@@ -288,8 +319,15 @@ function fullLen(r: RawMessage): number {
 // flags and `length` fields stay exact for capped rows.
 function messageCols(bodyCap: number): string {
   const cap = Math.max(1, Math.floor(bodyCap));
+  // body_cp = length(g.body) is the full CODEPOINT count (a memory-safe
+  // scalar, never the body itself). The reported `length` field uses it so a
+  // message's length is the SAME character count everywhere -- get_message
+  // (which pages in codepoints) and the bulk reads used to disagree by the
+  // astral factor (an emoji is 1 codepoint but 2 UTF-16 units). NUL is
+  // rejected/sanitized, so length() is exact.
   return `g.seq, g.agent_id, a.type AS from_type, a.role AS from_role,
           g.format, substr(g.body, 1, ${cap}) AS body, g.body_len,
+          length(g.body) AS body_cp,
           g.mentions, g.reply_to_seq,
           datetime(g.created_at, 'localtime') AS created_local,
           CAST(strftime('%s', g.created_at) AS INTEGER) AS created_unix,
@@ -444,7 +482,41 @@ export class ChatStore {
       -- fullLen() falls back to the exact fetched body.length, and the next
       -- new-build startup backfills it precisely.
       DROP TRIGGER IF EXISTS messages_body_len_ai;
+
+      -- Reject an embedded NUL at the DATABASE level: SQLite's substr()/length()
+      -- stop at U+0000, so a NUL body reads back truncated with the marker
+      -- advancing past the lost tail. New builds already reject it in JS
+      -- (assertStorable), but an OLD build writing during a rolling upgrade
+      -- would not -- this trigger fires for its inserts too and aborts them,
+      -- closing that window. (A SQL trigger cannot SANITIZE the value: replace()
+      -- is itself NUL-terminated. Existing NUL rows are healed in JS below.)
+      CREATE TRIGGER IF NOT EXISTS messages_reject_nul BEFORE INSERT ON messages
+      WHEN instr(NEW.body, char(0)) > 0 BEGIN
+        SELECT RAISE(ABORT, 'message body contains a NUL character (U+0000), which SQLite cannot store without silently truncating');
+      END;
     `);
+    // Heal existing rows that already hold a NUL (written by a pre-guard build):
+    // a plain SELECT is NOT NUL-terminated, so the full body is recoverable;
+    // replace each NUL with U+FFFD so substr()/length() readers see it whole,
+    // and clear body_len so the backfill below re-stamps the corrected length.
+    // instr(body, char(0)) detects them; these rows are exotic, so loading them
+    // one at a time is fine.
+    {
+      const nulRows = this.db
+        .prepare("SELECT id, body FROM messages WHERE instr(body, char(0)) > 0")
+        .all() as { id: number; body: string }[];
+      if (nulRows.length > 0) {
+        const fix = this.db.prepare(
+          "UPDATE messages SET body = ?, body_len = NULL WHERE id = ?",
+        );
+        const tx = this.db.transaction(() => {
+          for (const r of nulRows) {
+            fix.run(r.body.split("\u0000").join("�"), r.id);
+          }
+        });
+        tx();
+      }
+    }
     // Backfill body_len for rows that predate the column. Exact UTF-16 length
     // must be measured in JS, so we LOAD the body -- but only for rows small
     // enough to be safe (length() is a cheap codepoint gate, an upper bound on
@@ -689,7 +761,7 @@ export class ChatStore {
         ...(pinned_cut ? { pinned_truncated: true } : {}),
       };
     });
-    const { rows: rooms, sizeTrimmed } = fitRows(mapped, DEFAULT_MAX_BYTES);
+    const { rows: rooms, sizeTrimmed } = fitRows(mapped, LIST_ROW_BUDGET);
     return { rooms, total, ...(sizeTrimmed ? { size_trimmed: true } : {}) };
   }
 
@@ -701,6 +773,17 @@ export class ChatStore {
         "SELECT COUNT(*) AS c FROM memberships WHERE room_id = ? AND left_at IS NULL",
       )
       .get(roomId) as { c: number };
+    return c;
+  }
+
+  /** How many rooms an identity is currently present in (for wait_for_messages
+   *  to refuse a doomed all-rooms watch when the agent is in none). */
+  presentRoomCount(agentId: string): number {
+    const { c } = this.db
+      .prepare(
+        "SELECT COUNT(*) AS c FROM memberships WHERE agent_id = ? AND left_at IS NULL",
+      )
+      .get(agentId) as { c: number };
     return c;
   }
 
@@ -1031,7 +1114,7 @@ export class ChatStore {
           r.idle_seconds <= threshold,
       };
     });
-    const { rows: agents, sizeTrimmed } = fitRows(mapped, DEFAULT_MAX_BYTES);
+    const { rows: agents, sizeTrimmed } = fitRows(mapped, LIST_ROW_BUDGET);
     return { agents, total, ...(sizeTrimmed ? { size_trimmed: true } : {}) };
   }
 
@@ -1158,6 +1241,9 @@ export class ChatStore {
   }
 
   private rowToMessage(r: RawMessage, previewChars?: number): MessageRow {
+    // The CUT decision is in UTF-16 units (safeCut cuts code units, and
+    // previewChars is a UTF-16 budget); the reported `length` is in CODEPOINTS
+    // (the character count, consistent with get_message).
     const total = fullLen(r);
     const truncate = previewChars !== undefined && total > previewChars;
     // A truncated body is returned as a raw (possibly partial) string even for
@@ -1188,7 +1274,7 @@ export class ChatStore {
             },
       at: r.created_local,
       unix: r.created_unix,
-      ...(truncate ? { truncated: true, length: total } : {}),
+      ...(truncate ? { truncated: true, length: codepointLen(r) } : {}),
       ...(r.supersedes_seq !== null && r.supersedes_seq !== undefined
         ? { supersedes: r.supersedes_seq }
         : {}),
@@ -1248,7 +1334,7 @@ export class ChatStore {
       const stub = head as MessageRow & { room_name?: string };
       stub.content = "";
       stub.truncated = true;
-      stub.length = fullLen(r);
+      stub.length = codepointLen(r); // codepoints, consistent with get_message
       stub.reply_to = null;
       stub.to = null;
       stub.oversized = true;
@@ -1286,7 +1372,7 @@ export class ChatStore {
    * many-tiny-message pages. Draining/breaking the iterator closes it before
    * the caller runs further queries in the same transaction.
    */
-  private fetchBounded<T extends { body: string }>(
+  private fetchBounded<T extends { body: string; mentions?: string | null }>(
     stmt: Database.Statement,
     params: unknown[],
     maxBytes: number,
@@ -1297,7 +1383,12 @@ export class ChatStore {
     let res = it.next();
     while (!res.done) {
       rows.push(res.value);
-      used += res.value.body ? res.value.body.length : 0;
+      // Charge body AND mentions: an empty-body row can still carry a huge
+      // mentions list, so counting body alone let 500 empty-body/max-mention
+      // rows materialize ~10 MB to return one stub.
+      used +=
+        (res.value.body ? res.value.body.length : 0) +
+        (res.value.mentions ? res.value.mentions.length : 0);
       res = it.next();
       if (used >= maxBytes) {
         // Grab ONE more row past the budget (if any) as a SENTINEL, then stop:
@@ -2283,7 +2374,7 @@ export class ChatStore {
         const { note_cut, ...rest } = r;
         return { ...rest, ...(note_cut ? { note_truncated: true } : {}) };
       });
-      const { rows: claims, sizeTrimmed } = fitRows(mapped, DEFAULT_MAX_BYTES);
+      const { rows: claims, sizeTrimmed } = fitRows(mapped, LIST_ROW_BUDGET);
       return { claims, total, ...(sizeTrimmed ? { size_trimmed: true } : {}) };
     });
     return tx.immediate();

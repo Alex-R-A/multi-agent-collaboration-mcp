@@ -121,12 +121,13 @@ function getDb() {
   return db;
 }
 
-// This runs on the sidebar's 6-second refresh, so it must stay small: pinned
-// and description are capped to previews in SQL (the sidebar only needs a
-// glimpse; opening a room fetches the full intro), and the row count is
-// bounded. Unbounded, hundreds of rooms with 10k pinned intros made a
-// multi-megabyte response every 6 seconds.
-const ROOM_PREVIEW_CHARS = 2000;
+// The sidebar's 6-second refresh: it shows name/activity/counts only, so this
+// carries NO pinned and only a SHORT description snippet (for the filter box).
+// The full pinned/description are fetched by /api/room when a room is opened.
+// Dropping the pinned from this list is what keeps 1000 rooms with 10k intros
+// from producing a ~24 MB response every 6 seconds. `total` reports the true
+// room count; only the most-recently-active ROOMS_MAX are listed.
+const ROOM_DESC_SNIPPET = 200;
 const ROOMS_MAX = 1000;
 function listRooms() {
   const d = getDb();
@@ -134,20 +135,30 @@ function listRooms() {
   const rooms = d
     .prepare(
       `SELECT r.id, r.name,
-              substr(r.description, 1, ${ROOM_PREVIEW_CHARS}) AS description,
-              substr(r.pinned, 1, ${ROOM_PREVIEW_CHARS}) AS pinned,
-              CASE WHEN length(r.pinned) > ${ROOM_PREVIEW_CHARS} THEN 1 ELSE NULL END AS pinned_truncated,
+              substr(r.description, 1, ${ROOM_DESC_SNIPPET}) AS description,
               (SELECT COUNT(*) FROM memberships m WHERE m.room_id = r.id AND m.left_at IS NULL) AS members,
               (SELECT COUNT(*) FROM messages g WHERE g.room_id = r.id) AS messages,
               (SELECT MAX(created_at) FROM messages g WHERE g.room_id = r.id) AS last_activity
        FROM rooms r ORDER BY last_activity DESC, r.id DESC LIMIT ${ROOMS_MAX}`,
     )
     .all();
-  // When there are more than ROOMS_MAX rooms, keep the most-recently-ACTIVE
-  // ones (ordering by id kept the OLDEST, hiding the newest rooms a user is
-  // most likely to want; the client re-sorts by activity anyway).
-  for (const r of rooms) if (r.pinned_truncated == null) delete r.pinned_truncated;
-  return rooms;
+  const { c: total } = d.prepare("SELECT COUNT(*) AS c FROM rooms").get();
+  return { rooms, total };
+}
+
+// Full detail for ONE room (name, description, and the WHOLE pinned intro),
+// fetched when a room is opened -- the sidebar list omits the pinned. Returns
+// null when the room does not exist, which also lets the client CONFIRM a
+// deletion instead of wrongly inferring it from a room's absence in the
+// capped /api/rooms list.
+function getRoomDetail(roomId) {
+  const d = getDb();
+  if (!d) return null;
+  return (
+    d
+      .prepare("SELECT id, name, description, pinned FROM rooms WHERE id = ?")
+      .get(roomId) ?? null
+  );
 }
 
 // Message columns for the JSON endpoints. Bodies are capped in SQL (substr
@@ -701,13 +712,24 @@ const server = createServer(async (req, res) => {
       return;
     }
     if (url.pathname === "/api/rooms") {
-      const rooms = listRooms();
-      if (rooms === null)
+      const result = listRooms();
+      if (result === null)
         return sendJson(res, 200, {
           rooms: [],
+          total: 0,
           error: dbUnavailableError(),
         });
-      return sendJson(res, 200, { rooms });
+      return sendJson(res, 200, { rooms: result.rooms, total: result.total });
+    }
+    if (url.pathname === "/api/room") {
+      // Full detail for one room (name, description, WHOLE pinned), fetched on
+      // open; also lets the client confirm a room really is deleted.
+      const roomId = Number(url.searchParams.get("id"));
+      if (!Number.isInteger(roomId) || roomId <= 0)
+        return sendJson(res, 400, { error: "id must be a positive integer" });
+      const d = getDb();
+      if (!d) return sendJson(res, 200, { room: null, error: dbUnavailableError() });
+      return sendJson(res, 200, { room: getRoomDetail(roomId) });
     }
     if (url.pathname === "/api/messages") {
       const roomId = Number(url.searchParams.get("room"));

@@ -1425,10 +1425,17 @@
           return {};
         }
       }
+      // Returns false when the write fails (e.g. QuotaExceededError): the
+      // caller can then surface an error instead of leaving the server joined
+      // while the UI silently believes it is not (the local map is how the
+      // client knows it is joined).
       function saveJoined(map) {
         try {
           localStorage.setItem(JOINED_KEY, JSON.stringify(map));
-        } catch {}
+          return true;
+        } catch {
+          return false;
+        }
       }
       function joinedHere() {
         return (
@@ -1692,6 +1699,34 @@
         el.rooms.scrollTop = scroll;
       }
 
+      // Confirm a room really is deleted (not just displaced from the capped
+      // /api/rooms list) before tearing down its view. Only acts if the room
+      // is STILL the open one when the check returns.
+      async function confirmRoomGone(room) {
+        const epoch = state.roomEpoch;
+        let gone = false;
+        try {
+          const data = await fetchJson(`/api/room?id=${room.id}`);
+          gone = data.room === null && !data.error;
+        } catch {
+          return; // server unreachable: keep the room, retry next refresh
+        }
+        if (!gone || !sameView(room, epoch)) return;
+        state.current = null;
+        state.searchMode = false;
+        el.streamWrap.hidden = true;
+        el.roomHead.hidden = true;
+        el.pinned.hidden = true;
+        el.deleteConfirm.hidden = true;
+        renderComposer();
+        updateTitle();
+        showPlaceholder(
+          "This room was deleted.",
+          `"${room.name}" no longer exists; pick another room on the left.`,
+          true,
+        );
+      }
+
       async function loadRooms() {
         if (state.loadingRooms) return;
         state.loadingRooms = true;
@@ -1705,27 +1740,21 @@
           if (state.current) {
             const cur = state.rooms.find((r) => r.id === state.current.id);
             if (cur) {
-              state.current = cur;
+              // Carry the full pinned/description (from /api/room) across the
+              // refresh: the list version has only a short description snippet
+              // and no pinned, so replacing wholesale would blank the header.
+              const pinned = state.current.pinned;
+              const fullDesc = state.current.description;
+              state.current = { ...cur, pinned, description: fullDesc ?? cur.description };
               state.seen[cur.id] = cur.last_activity;
               saveSeen();
               renderRoomHead();
             } else {
-              // The open room was deleted by another process. Stop polling a
-              // ghost and say so instead of failing on the next post.
-              const gone = state.current.name;
-              state.current = null;
-              state.searchMode = false;
-              el.streamWrap.hidden = true;
-              el.roomHead.hidden = true;
-              el.pinned.hidden = true;
-              el.deleteConfirm.hidden = true;
-              renderComposer();
-              updateTitle();
-              showPlaceholder(
-                "This room was deleted.",
-                `"${gone}" no longer exists; pick another room on the left.`,
-                true,
-              );
+              // The open room is ABSENT from the (capped, most-recently-active)
+              // list. That does NOT prove deletion -- 1000+ newer rooms could
+              // have displaced it. Confirm with /api/room before tearing down,
+              // so a still-existing open room is never falsely reported gone.
+              confirmRoomGone(state.current);
             }
           } else if (
             state.rooms.length &&
@@ -1886,16 +1915,25 @@
         // match (and page toward) the NEW room's unrelated seq numbers.
         const room = state.current;
         const epoch = state.roomEpoch;
-        for (let i = 0; i < 20; i++) {
+        // Bounded by NO-PROGRESS (with a generous safety cap), not a fixed 20
+        // pages: a deep reply-jump toward seq 1 in a large room used to stop
+        // hundreds of messages short. loadOlder returning false with the older
+        // button still shown means the fetch lock was momentarily busy, so
+        // retry a few times before giving up.
+        let backStalls = 0;
+        for (let i = 0; i < 2000; i++) {
           if (!sameView(room, epoch)) return;
           if (el.msgs.querySelector(`[data-seq="${seq}"]`)) break;
           const first = state.msgs[0];
           if (!first || first.seq <= 1 || first.seq <= seq) break;
           const changed = await loadOlder();
-          if (!changed) {
-            if (el.older.hidden) break; // history exhausted or room switched
-            await sleep(150); // fetch lock was busy; retry
+          if (changed) {
+            backStalls = 0;
+            continue;
           }
+          if (el.older.hidden) break; // history exhausted or room switched
+          if (++backStalls > 8) break; // lock stayed busy; give up gracefully
+          await sleep(150);
         }
         // Forward: the target can be NEWER than the rendered tail (a search
         // hit posted while search mode paused the stream). The exitSearch
@@ -2333,7 +2371,10 @@
         el.searchInfo.textContent = data.failed
           ? "Search failed: " + data.failed
           : data.matches.length
-            ? `${data.matches.length} match(es) for "${q}", best first. Click one to view it in the stream.`
+            ? `${data.matches.length} match(es) for "${q}", best first. Click one to view it in the stream.` +
+              (data.trimmed
+                ? " (more matches exist but were omitted to bound the response size; narrow your query.)"
+                : "")
             : `No matches for "${q}".`;
         for (const m of data.matches || []) el.results.append(renderResult(m));
         el.stream.scrollTop = 0;
@@ -2431,7 +2472,7 @@
           // the cross-tab membership lock: its localStorage read-modify-write
           // steps are only merge-safe against writes that happen strictly
           // before or after, not interleaved between read and save.
-          const { j, prevIdentity } = await withMembershipLock(async () => {
+          const { j, prevIdentity, saved } = await withMembershipLock(async () => {
           const prevIdentity = identity();
           // Join FIRST: the server validates the new name, and an invalid
           // rename must not have already torn down the old memberships.
@@ -2476,7 +2517,7 @@
             if (freshMap[rid] === storedName) delete freshMap[rid];
           }
           freshMap[String(room.id)] = name;
-          saveJoined(freshMap);
+          const saved = saveJoined(freshMap);
           // Re-adopting a previously-ghosted (room, name): the mapping above
           // makes that pair live again, so drop any stale ledger entry for it
           // before the next sweep can leave the room we just joined.
@@ -2485,11 +2526,19 @@
             (x) => !(x.room === room.id && x.name === name),
           );
           if (keptGhosts.length !== ledgerNow.length) saveGhosts(keptGhosts);
-          return { j, prevIdentity };
+          return { j, prevIdentity, saved };
           });
           // Fire-and-forget AFTER the lock releases: retryGhosts takes the
           // same (non-reentrant) lock, so awaiting it here would deadlock.
           retryGhosts();
+          // Local storage write failed (e.g. quota): the server join committed
+          // but the client cannot record it, so joinedHere() will read false
+          // and the composer would silently show "not joined". Surface it
+          // instead of leaving the user confused.
+          if (!saved) {
+            el.joinError.textContent =
+              "joined on the server, but this browser could not save it locally (storage full?); free space and rejoin";
+          }
           // The composer reflects the GLOBAL identity for whatever room is
           // shown now; re-render it even after a room switch so a stale
           // successful rename cannot leave it showing the old identity.
@@ -2806,6 +2855,20 @@
         document.body.classList.remove("show-rooms");
         loadNew(true);
         fetchMarker();
+        fetchRoomDetail(room, state.roomEpoch); // full pinned/description
+      }
+
+      // The sidebar list carries only a short description snippet and NO pinned
+      // (keeping /api/rooms small); fetch the full intro when a room is opened
+      // and merge it onto the live room object so the header shows all of it.
+      async function fetchRoomDetail(room, epoch) {
+        try {
+          const data = await fetchJson(`/api/room?id=${room.id}`);
+          if (!sameView(room, epoch) || !data.room) return;
+          state.current.description = data.room.description;
+          state.current.pinned = data.room.pinned;
+          renderRoomHead();
+        } catch {}
       }
 
       // ---- wiring ------------------------------------------------------------

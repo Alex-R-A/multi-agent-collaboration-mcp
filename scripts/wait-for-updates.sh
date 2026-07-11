@@ -65,21 +65,30 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-# Digits only AND at most 9 of them: a value past ~2 billion overflows bash's
-# signed-64-bit arithmetic and WRAPS (e.g. a huge --timeout became 0, i.e.
-# "never time out"), so cap the magnitude before any (( )) touches it. 9 digits
-# (< 1e9 seconds ~= 31 years) is far more than any real interval/timeout.
-if ! [[ "$interval" =~ ^[0-9]{1,9}$ ]]; then
-  echo "wait-for-updates: --interval must be a positive integer under 1000000000" >&2; exit 2
+# Accept any run of digits (leading zeros included, e.g. "0000000001"), then
+# force base 10 and range-check the VALUE, not the digit count: bash treats a
+# leading zero as octal (so "08" would blow up the first (( )) ), and a value
+# past ~9.2e18 overflows signed-64-bit arithmetic and WRAPS (a huge --timeout
+# became 0 = "never time out"). Normalizing first lets a zero-padded small
+# value through while still rejecting a genuinely huge one.
+if ! [[ "$interval" =~ ^[0-9]+$ ]]; then
+  echo "wait-for-updates: --interval must be a positive integer" >&2; exit 2
 fi
-if ! [[ "$timeout" =~ ^[0-9]{1,9}$ ]]; then
-  echo "wait-for-updates: --timeout must be a non-negative integer under 1000000000" >&2; exit 2
+if ! [[ "$timeout" =~ ^[0-9]+$ ]]; then
+  echo "wait-for-updates: --timeout must be a non-negative integer" >&2; exit 2
 fi
-# Force base 10 BEFORE any arithmetic: bash treats a leading zero as octal,
-# so a validated-but-unnormalized "08" blew up the first (( )) with
-# "value too great for base" and the wrong exit code.
+# 10# forces base 10; a leading-zero value is safe. Cap magnitude at 1e9 (~31
+# years) -- far more than any real interval/timeout, and well under the wrap
+# threshold. Strip to at most 10 significant digits before (( )) so an absurdly
+# long string cannot itself overflow the conversion.
+if [[ ${#interval} -gt 10 || ${#timeout} -gt 10 ]]; then
+  echo "wait-for-updates: --interval/--timeout too large (max 1000000000)" >&2; exit 2
+fi
 interval=$((10#$interval))
 timeout=$((10#$timeout))
+if [[ "$interval" -gt 1000000000 || "$timeout" -gt 1000000000 ]]; then
+  echo "wait-for-updates: --interval/--timeout too large (max 1000000000)" >&2; exit 2
+fi
 if [[ "$interval" -lt 1 ]]; then
   echo "wait-for-updates: --interval must be a positive integer" >&2; exit 2
 fi

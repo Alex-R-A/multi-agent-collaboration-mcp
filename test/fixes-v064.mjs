@@ -156,7 +156,9 @@ const check = (n, c, x) => {
   // Preview cut lands mid-pair without the backoff (5 units).
   const prev = s.readHistory(r, 1, 2, 5).messages[0];
   check("preview never ends in a lone surrogate", !loneHigh(String(prev.content)), prev.content);
-  check("preview still flagged truncated with full length", prev.truncated === true && prev.length === 200, prev);
+  // length is now in CODEPOINTS (characters), consistent with get_message: a
+  // 100-emoji body is 100 characters (was reported as 200 UTF-16 units).
+  check("preview still flagged truncated with full length", prev.truncated === true && prev.length === 100, prev);
 
   // Offset walk with an odd page size: every page well-formed, reassembly exact.
   let walked = "";

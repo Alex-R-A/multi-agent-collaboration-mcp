@@ -953,25 +953,39 @@ server.registerTool(
   async ({ room, mentions_only }) => {
     try {
       touchSession();
-      if (session.agentId === null) {
+      const agentId = session.agentId;
+      if (agentId === null) {
         return fail(
           "join a room first with join_room to establish your identity, then call this again",
         );
       }
-      // Resolve the room to its id so the emitted --room is unambiguous (and
-      // fail early if it does not exist, rather than hand back a command that
-      // errors when run).
       let roomArg: string | undefined;
       if (room !== undefined) {
+        // Resolve to an id AND verify present membership: the poller exits 2
+        // for an agent that is not a member, so handing back a command that
+        // watches a room you never joined (or already left) would produce a
+        // command that just errors. Fail here with the real remedy instead.
         const target = store.resolveRoom(room);
         if (!target) {
           return fail(
             `no room "${room}". Use list_rooms to see options, or omit room to watch all rooms you are in.`,
           );
         }
+        const m = store.getMembership(target.id, agentId);
+        if (!m || m.left_at !== null) {
+          return fail(
+            `you are not a present member of room "${target.name}"; join_room it first, then call wait_for_messages`,
+          );
+        }
         roomArg = String(target.id);
+      } else if (store.presentRoomCount(agentId) === 0) {
+        // Unscoped watch of ALL your rooms, but you are in none: the poller
+        // would exit 2 immediately. Say so rather than emit a doomed command.
+        return fail(
+          "you are not present in any room, so there is nothing to watch; join_room first, or pass a room you have joined",
+        );
       }
-      const command = pollerCmd(session.agentId, {
+      const command = pollerCmd(agentId, {
         room: roomArg,
         mentionsOnly: mentions_only,
       });
@@ -979,11 +993,16 @@ server.registerTool(
         command,
         run_as: "background shell task (do not wait for it inline)",
         how_to:
-          "Run `command` in the background. It exits 0 when there is something " +
-          "new (then call catch_up to read it), 124 if it times out with " +
-          "nothing new, 2 on error. Re-launch it after each hit to keep watching.",
+          "Run `command` in the background. It exits 0 when something new " +
+          "arrives, 124 on timeout with nothing new, 2 on error; re-launch it " +
+          "after each hit to keep watching. On exit 0, an unscoped watch does " +
+          "NOT tell you WHICH room fired: use my_mentions (the cross-room " +
+          "inbox) or catch_up in each joined room -- a plain catch_up only " +
+          "reads your ACTIVE room, which may not be the one that woke the " +
+          "poller. A --room-scoped watch fires only for that room, so catch_up " +
+          "there directly.",
         exit_codes: {
-          "0": "new messages -> catch_up",
+          "0": "new messages -> my_mentions or catch_up the right room",
           "124": "timed out, nothing new",
           "2": "error",
         },
