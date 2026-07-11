@@ -1871,16 +1871,21 @@ export class ChatStore {
 
       // Cap by_room to a third of the budget, most directed rooms first, so
       // the response as a whole honors maxBytes.
-      const byRoom = [...allRooms].sort(
+      let byRoom = [...allRooms].sort(
         (a, b) =>
           b.directed - a.directed || b.unread - a.unread || a.room_id - b.room_id,
       );
-      let by_room_truncated = false;
       const roomBudget = Math.floor(maxBytes / 3);
-      while (byRoom.length > 1 && JSON.stringify(byRoom).length > roomBudget) {
-        byRoom.pop();
-        by_room_truncated = true;
-      }
+      // Trim off the end (least-directed rooms) with the LINEAR fitRows, not a
+      // re-serialize-the-whole-array-per-pop loop: an agent present in hundreds
+      // of rooms that all have unread otherwise paid an O(n^2) trim. fitRows
+      // charges the array brackets + a comma per element, so its cut point is
+      // identical to JSON.stringify(byRoom).length <= roomBudget (the old
+      // predicate), and it always keeps at least one row -- so the single-entry
+      // name-halving below still handles a lone oversized room.
+      const trimmed = fitRows(byRoom, roomBudget);
+      byRoom = trimmed.rows;
+      let by_room_truncated = trimmed.sizeTrimmed;
       // A single long-named room can still overflow a small budget: halve
       // the display name until the MEASURED serialized size fits (a fixed
       // code-unit cut under-counts JSON escaping, so a control-heavy name
