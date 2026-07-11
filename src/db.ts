@@ -1029,9 +1029,24 @@ export class ChatStore {
    * calls) still counts as present. Residual: if the last un-left session
    * CRASHES without leaving, the identity lingers present until the 7-day
    * session GC reaps its row -- a strictly milder error than evicting a live
-   * session, and a rejoin fixes it immediately. Shared-cursor sessions have no
-   * session row, so shared multi-session leave stays identity-level (documented:
-   * the multi-session pattern is cursor:'private').
+   * session, and a rejoin fixes it immediately.
+   *
+   * KNOWN LIMITATION (mixed cursor modes under ONE identity). The twin check
+   * below sees only session_markers rows, and ONLY private sessions create
+   * those; a shared session -- and the web viewer, which never creates one --
+   * is invisible to it. So under a single agent_id running BOTH a shared and a
+   * private session:
+   *   - a private session's leave marks the IDENTITY left even while a live
+   *     shared twin remains, evicting that twin (its poller reads
+   *     memberships.left_at and exits 2), and
+   *   - a shared session's leave NO-OPS (returns false, memberships unchanged)
+   *     while a private twin is present.
+   * The supported multi-session pattern is all-PRIVATE, under which the twin
+   * check sees every session and both symptoms vanish; MIXING modes, or reusing
+   * an active agent's id in the web viewer, is the unsupported corner. Left
+   * unfixed in the store BY DESIGN: a real fix needs presence tracked
+   * independently of cursor mode (a new table + API change), judged out of
+   * proportion to a bug only this narrow mix can trigger.
    */
   leaveRoom(
     roomId: number,

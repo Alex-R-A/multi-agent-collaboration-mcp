@@ -461,7 +461,9 @@ server.registerTool(
             "the backlog. 'private': this session keeps its own read " +
             "position. Omitted: keeps this session's current mode for the " +
             "room (shared on first join); only an explicit 'shared' discards " +
-            "an existing private cursor.",
+            "an existing private cursor. Run ALL sessions of one identity in " +
+            "the SAME mode: mixing shared and private under one agent_id can " +
+            "make a later leave evict a live twin or silently no-op.",
         ),
     }).strict(),
   },
