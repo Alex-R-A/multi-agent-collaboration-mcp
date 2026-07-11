@@ -179,11 +179,15 @@ try {
     process.exit(hasUpdates ? 0 : 1);
   }
 
-  let room = /^\d+$/.test(args.room)
-    ? (db.prepare("SELECT id FROM rooms WHERE id = ?").get(Number(args.room)) as
-        | { id: number }
-        | undefined)
-    : undefined;
+  // Number.isSafeInteger gate: a numeric ref past 2^53 rounds to a different
+  // integer, so a huge --room could watch a neighbouring room's id. Only try
+  // the id lookup for exactly-representable integers; else fall to name lookup.
+  let room =
+    /^\d+$/.test(args.room) && Number.isSafeInteger(Number(args.room))
+      ? (db.prepare("SELECT id FROM rooms WHERE id = ?").get(Number(args.room)) as
+          | { id: number }
+          | undefined)
+      : undefined;
   if (!room) {
     room = db.prepare("SELECT id FROM rooms WHERE name = ?").get(args.room) as
       | { id: number }

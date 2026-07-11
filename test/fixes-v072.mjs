@@ -148,7 +148,7 @@ const throws = (fn, re) => {
   await call("join_room", { room: "joined-room", agent_id: "u" });
   // Scoping to a room the identity never joined -> refuse.
   const notJoined = await call("wait_for_messages", { room: "other-room" });
-  check("wait_for_messages refuses a room you never joined", notJoined.isErr && /not a present member/.test(notJoined.data.error), notJoined);
+  check("wait_for_messages refuses a room you never joined", notJoined.isErr && /never joined/.test(notJoined.data.error), notJoined);
   // The joined room works.
   const ok = await call("wait_for_messages", {});
   check("wait_for_messages returns a command for a joined identity", typeof ok.data.command === "string" && ok.data.command.includes("--agent 'u'"), ok.data);

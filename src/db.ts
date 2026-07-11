@@ -449,19 +449,10 @@ export class ChatStore {
     this.ensureColumn("messages", "supersedes_seq", "INTEGER");
     this.ensureColumn("messages", "reply_to_agent", "TEXT");
     this.ensureColumn("messages", "body_len", "INTEGER");
-    // Backfill the denormalized reply author for rows written by older builds
-    // whose parent still exists. Rows whose parent was already pruned stay
-    // NULL (their direction is unrecoverable) and are re-examined harmlessly.
-    this.db.exec(`
-      UPDATE messages SET reply_to_agent =
-        (SELECT p.agent_id FROM messages p
-          WHERE p.room_id = messages.room_id AND p.seq = messages.reply_to_seq)
-      WHERE reply_to_seq IS NOT NULL AND reply_to_agent IS NULL
-    `);
     // DB-level enforcement for MIXED-VERSION windows: a still-running old
     // build inserts without these columns, and if the reply's parent is
     // pruned before any new-build process restarts, the startup backfill
-    // above can never recover the author -- the reply is silently
+    // below can never recover the author -- the reply is silently
     // undirected forever. Triggers live in the database file, so they fire
     // for the old build's inserts too. New builds stamp both columns
     // explicitly, so the WHEN clauses skip their rows.
@@ -495,26 +486,47 @@ export class ChatStore {
         SELECT RAISE(ABORT, 'message body contains a NUL character (U+0000), which SQLite cannot store without silently truncating');
       END;
     `);
+    // Backfill the denormalized reply author AFTER the old-writer trigger above
+    // exists, closing a rolling-upgrade gap: with the backfill running FIRST, an
+    // old build inserting a reply in the window between the two steps hit
+    // neither (backfill already passed, trigger not yet created), and if the
+    // parent was pruned before any restart the author was unrecoverable and
+    // my_mentions missed the reply forever. Now a reply inserted before the
+    // trigger is caught here; one inserted after is stamped by the trigger.
+    // Rows whose parent is already gone stay NULL (unrecoverable) and are
+    // re-examined harmlessly.
+    this.db.exec(`
+      UPDATE messages SET reply_to_agent =
+        (SELECT p.agent_id FROM messages p
+          WHERE p.room_id = messages.room_id AND p.seq = messages.reply_to_seq)
+      WHERE reply_to_seq IS NOT NULL AND reply_to_agent IS NULL
+    `);
     // Heal existing rows that already hold a NUL (written by a pre-guard build):
     // a plain SELECT is NOT NUL-terminated, so the full body is recoverable;
     // replace each NUL with U+FFFD so substr()/length() readers see it whole,
     // and clear body_len so the backfill below re-stamps the corrected length.
-    // instr(body, char(0)) detects them; these rows are exotic, so loading them
-    // one at a time is fine.
+    // Cursored ONE ROW AT A TIME (not .all(), which materialized every
+    // malformed body at once and could OOM the process at startup on many/large
+    // NUL bodies), via a regex replace (not split/join, which builds a giant
+    // array on an all-NUL body). instr() detects them; healing a row clears its
+    // NUL, so the predicate never revisits it and the id cursor moves strictly
+    // forward. (Scan still runs each startup; a user_version gate to skip it on
+    // already-healed files is a proposed follow-up, not bundled into this fix.)
     {
-      const nulRows = this.db
-        .prepare("SELECT id, body FROM messages WHERE instr(body, char(0)) > 0")
-        .all() as { id: number; body: string }[];
-      if (nulRows.length > 0) {
-        const fix = this.db.prepare(
-          "UPDATE messages SET body = ?, body_len = NULL WHERE id = ?",
-        );
-        const tx = this.db.transaction(() => {
-          for (const r of nulRows) {
-            fix.run(r.body.split("\u0000").join("�"), r.id);
-          }
-        });
-        tx();
+      const nextNul = this.db.prepare(
+        "SELECT id, body FROM messages WHERE instr(body, char(0)) > 0 AND id > ? ORDER BY id LIMIT 1",
+      );
+      const fix = this.db.prepare(
+        "UPDATE messages SET body = ?, body_len = NULL WHERE id = ?",
+      );
+      let cursor = 0;
+      for (;;) {
+        const row = nextNul.get(cursor) as
+          | { id: number; body: string }
+          | undefined;
+        if (!row) break;
+        fix.run(row.body.replace(/\u0000/g, "\ufffd"), row.id);
+        cursor = row.id;
       }
     }
     // Backfill body_len for rows that predate the column. Exact UTF-16 length
@@ -567,6 +579,12 @@ export class ChatStore {
         updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
         PRIMARY KEY (room_id, agent_id, session_id)
       );
+      -- touch()/touchSessionMarkers refresh a session's rows by session_id
+      -- ALONE (a process-unique nonce, keyed independently of room/agent). The
+      -- PK starts with room_id, so that predicate had no usable index and did a
+      -- full session_markers scan on every liveness touch; this covers it.
+      CREATE INDEX IF NOT EXISTS idx_session_markers_session
+        ON session_markers(session_id);
 
       -- Advisory single-winner work claims with TTL. Purely advisory: nothing
       -- fences the claimed resource itself; expiry frees claims from crashed
@@ -603,15 +621,17 @@ export class ChatStore {
     // count mismatch also repairs databases already damaged by that window.
     // The index row count MUST come from the messages_fts_docsize shadow
     // table: with external content, COUNT(*) on the virtual table itself
-    // reads the content table and always matches. (Triggers exist by this
-    // point, so concurrent inserts move both counts together and cannot fake
-    // consistency.)
-    const { c: msgCount } = this.db
-      .prepare("SELECT COUNT(*) AS c FROM messages")
-      .get() as { c: number };
-    const { c: ftsCount } = this.db
-      .prepare("SELECT COUNT(*) AS c FROM messages_fts_docsize")
-      .get() as { c: number };
+    // reads the content table and always matches. BOTH counts are read in ONE
+    // statement (a single consistent snapshot): two separate SELECTs could
+    // straddle a concurrent insert -- messages counted pre-insert, fts counted
+    // post-trigger -- making an already-inconsistent {2,1} file read as {2,2}
+    // and skip the rebuild it actually needed.
+    const { msgCount, ftsCount } = this.db
+      .prepare(
+        `SELECT (SELECT COUNT(*) FROM messages) AS msgCount,
+                (SELECT COUNT(*) FROM messages_fts_docsize) AS ftsCount`,
+      )
+      .get() as { msgCount: number; ftsCount: number };
     if (ftsCount !== msgCount) {
       this.db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
     }
@@ -789,11 +809,18 @@ export class ChatStore {
 
   /** Resolve a room reference that may be a numeric id or a name. */
   resolveRoom(ref: string): RoomRow | undefined {
+    // Number.isSafeInteger gate: a 16+ digit numeric ref past 2^53 rounds to a
+    // DIFFERENT integer, so Number("9007199254740993") could resolve to the
+    // room at 9007199254740992. Skip the id lookup for such refs (fall through
+    // to the exact-name lookup) rather than select a neighbour by rounding.
     if (/^\d+$/.test(ref)) {
-      const byId = this.db
-        .prepare("SELECT * FROM rooms WHERE id = ?")
-        .get(Number(ref)) as RoomRow | undefined;
-      if (byId) return byId;
+      const n = Number(ref);
+      if (Number.isSafeInteger(n)) {
+        const byId = this.db
+          .prepare("SELECT * FROM rooms WHERE id = ?")
+          .get(n) as RoomRow | undefined;
+        if (byId) return byId;
+      }
     }
     return this.db.prepare("SELECT * FROM rooms WHERE name = ?").get(ref) as
       | RoomRow
@@ -1376,11 +1403,14 @@ export class ChatStore {
     stmt: Database.Statement,
     params: unknown[],
     maxBytes: number,
-  ): T[] {
+  ): { rows: T[]; exhausted: boolean } {
     const rows: T[] = [];
     let used = 0;
     const it = stmt.iterate(...params) as IterableIterator<T>;
     let res = it.next();
+    // exhausted = the query was fully drained (rows holds EVERY matching row).
+    // false = we stopped on the raw-byte budget with more rows behind us.
+    let exhausted = true;
     while (!res.done) {
       rows.push(res.value);
       // Charge body AND mentions: an empty-body row can still carry a huge
@@ -1391,17 +1421,24 @@ export class ChatStore {
         (res.value.mentions ? res.value.mentions.length : 0);
       res = it.next();
       if (used >= maxBytes) {
-        // Grab ONE more row past the budget (if any) as a SENTINEL, then stop:
-        // boundByBytes decides byte_limited from whether rows remain after the
-        // ones it keeps, so cutting off at exactly the budget would hide that
-        // more exist (a lone oversized head would report byte_limited:false
-        // with 99 messages still behind it). Peak memory stays ~2x maxBytes.
-        if (!res.done) rows.push(res.value);
+        // Grab ONE more row past the budget (if any) as a SENTINEL, then stop.
+        // The sentinel lets boundByBytes see that more rows remain. But the
+        // raw-size stop assumes serialized >= raw, which BREAKS when preview_chars
+        // or a compact JSON reparse shrinks rows below their raw size: then
+        // boundByBytes can fit EVERY fetched row (sentinel included) and report
+        // byte_limited:false while rows were left unfetched. `exhausted:false`
+        // records the query was not drained, so callers (get_thread, search)
+        // that lack a secondary "more" signal can still flag it. Peak memory
+        // stays ~2x maxBytes.
+        if (!res.done) {
+          rows.push(res.value);
+          exhausted = false;
+        }
         if (it.return) it.return();
         break;
       }
     }
-    return rows;
+    return { rows, exhausted };
   }
 
   /**
@@ -1651,7 +1688,7 @@ export class ChatStore {
     // ~budget raw body plus a sentinel. When it stops by SIZE, replies_capped
     // may under-report (byte_limited then carries "more replies exist"); when
     // replies are small it fetches the full cap+1 and reports capping exactly.
-    const rows = this.fetchBounded<RawMessage & { depth: number }>(
+    const { rows, exhausted } = this.fetchBounded<RawMessage & { depth: number }>(
       this.db.prepare(
         `WITH RECURSIVE descendants(seq, depth, path) AS (
            SELECT g.seq, 1, printf('%010d', g.seq)
@@ -1694,6 +1731,12 @@ export class ChatStore {
         }),
       ));
     }
+    // If fetchBounded stopped on the raw-byte budget (exhausted:false), replies
+    // were left unfetched even when boundByBytes fit everything it got (a
+    // preview_chars cut shrank them all): flag byte_limited so the omission is
+    // never silent. get_thread has no reply-offset param; the recourse is
+    // get_thread on a reply seq, which byte_limited signals is needed.
+    byteLimited = byteLimited || !exhausted;
     return {
       message,
       parent,
@@ -1745,7 +1788,7 @@ export class ChatStore {
       const cursor = this.getCursor(roomId, agentId, sessionId);
       if (!cursor) throw new Error("not a member of this room");
       const from = cursor.last_read_seq;
-      const rows = this.fetchBounded<RawMessage>(
+      const { rows, exhausted } = this.fetchBounded<RawMessage>(
         this.db.prepare(
           `SELECT ${messageCols(maxBytes)} FROM ${MESSAGE_FROM}
            WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
@@ -1773,7 +1816,10 @@ export class ChatStore {
         new_last_read_seq: lastSeq,
         remaining: this.unreadCount(roomId, lastSeq, agentId),
         advanced: lastSeq > from,
-        ...(byteLimited ? { byte_limited: true } : {}),
+        // !exhausted: fetchBounded stopped on the raw budget with rows behind
+        // it that a preview/JSON shrink could otherwise hide. `remaining` is the
+        // authoritative "more unread" count here, but keep byte_limited honest.
+        ...(byteLimited || !exhausted ? { byte_limited: true } : {}),
       };
     });
     return tx.immediate();
@@ -1824,7 +1870,7 @@ export class ChatStore {
     // both shared and private cursors.
     const sessionKey = sessionId ?? "";
     const tx = this.db.transaction(() => {
-      const rows = this.fetchBounded<
+      const { rows, exhausted } = this.fetchBounded<
         RawMessage & { gid: number; room_id: number; room_name: string }
       >(
         this.db.prepare(
@@ -1934,7 +1980,11 @@ export class ChatStore {
         next_after_id,
         by_room: byRoom,
         ...(by_room_truncated ? { by_room_truncated: true } : {}),
-        ...(byteLimited ? { byte_limited: true } : {}),
+        // !exhausted: fetchBounded left directed rows unfetched (a preview/JSON
+        // shrink could otherwise let boundByBytes fit all it got and hide them).
+        // next_after_id has still advanced, so paging with after_id delivers
+        // them; byte_limited now flags that paging is needed.
+        ...(byteLimited || !exhausted ? { byte_limited: true } : {}),
       };
     });
     return tx.deferred();
@@ -1963,7 +2013,7 @@ export class ChatStore {
       params.push(beforeSeq);
     }
     const where = conds.join(" AND ");
-    const rows = this.fetchBounded<RawMessage>(
+    const { rows, exhausted } = this.fetchBounded<RawMessage>(
       this.db.prepare(
         `SELECT ${messageCols(maxBytes)} FROM ${MESSAGE_FROM}
          WHERE ${where} ORDER BY g.seq DESC LIMIT ?`,
@@ -1995,7 +2045,11 @@ export class ChatStore {
       messages,
       oldest_seq: oldest,
       has_more,
-      ...(byteLimited ? { byte_limited: true } : {}),
+      // !exhausted: fetchBounded stopped on the raw budget with older rows
+      // unfetched (a preview/JSON shrink could otherwise hide them). has_more is
+      // the authoritative "older exist" signal (page via before_seq); keep
+      // byte_limited honest too.
+      ...(byteLimited || !exhausted ? { byte_limited: true } : {}),
     };
   }
 
@@ -2053,7 +2107,7 @@ export class ChatStore {
     // more exist, so the extra row is the definitive "there is a next page"
     // probe (a page of exactly `limit` matches used to emit a false
     // next_offset that returned nothing).
-    const rows = this.fetchBounded<RawMessage>(
+    const { rows, exhausted } = this.fetchBounded<RawMessage>(
       this.db.prepare(
         `SELECT ${messageCols(DEFAULT_MAX_BYTES)}
          FROM messages_fts f
@@ -2074,9 +2128,13 @@ export class ChatStore {
       DEFAULT_MAX_BYTES - SEARCH_ENVELOPE,
       (r, pc) => this.rowToMessage(r, pc),
     );
-    // More remain if the byte bound cut the page, or a genuine extra match
-    // exists beyond `limit`.
-    const more = byteLimited || (hasExtra && messages.length === limit);
+    // More remain if the byte bound cut the page, a genuine extra match exists
+    // beyond `limit`, OR fetchBounded stopped on the raw byte budget with
+    // matches unfetched (!exhausted) -- the last case is invisible to
+    // byteLimited when a compact JSON reparse shrinks matches below their raw
+    // size, which silently dropped rows with no next_offset before.
+    const more =
+      byteLimited || !exhausted || (hasExtra && messages.length === limit);
     return {
       matches: messages,
       ...(byteLimited ? { byte_limited: true } : {}),

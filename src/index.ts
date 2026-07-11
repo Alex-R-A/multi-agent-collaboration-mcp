@@ -413,6 +413,14 @@ server.registerTool(
         .refine((s) => !/[\u0000-\u001f\u007f]/.test(s), {
           message: "control characters are not allowed in agent ids",
         })
+        // Reject an empty/whitespace-only id when PROVIDED: the handler trims
+        // and treats a blank as "omitted" (keep/generate identity), so passing
+        // "   " silently did something other than set that id. Omit the field
+        // to get that behaviour deliberately; a blank string is an error.
+        .refine((s) => s.trim().length > 0, {
+          message:
+            "agent_id cannot be empty or whitespace-only; omit it to keep or auto-assign an identity",
+        })
         .optional()
         .describe(
           "Your stable identity/nickname. Omit to keep the session identity " +
@@ -961,10 +969,14 @@ server.registerTool(
       }
       let roomArg: string | undefined;
       if (room !== undefined) {
-        // Resolve to an id AND verify present membership: the poller exits 2
-        // for an agent that is not a member, so handing back a command that
-        // watches a room you never joined (or already left) would produce a
-        // command that just errors. Fail here with the real remedy instead.
+        // Resolve to an id and require only that a membership row EXISTS -- not
+        // that it is still present. A scoped --room probe (check.ts) baselines
+        // off the room's preserved read marker regardless of left_at, and the
+        // poller contract deliberately supports watching a room after
+        // soft-leaving it ("naming the room is the intent to watch it").
+        // Rejecting soft-left here contradicted that and blocked a valid watch.
+        // A never-joined room has no marker to baseline from, so that still
+        // fails with the real remedy.
         const target = store.resolveRoom(room);
         if (!target) {
           return fail(
@@ -972,9 +984,9 @@ server.registerTool(
           );
         }
         const m = store.getMembership(target.id, agentId);
-        if (!m || m.left_at !== null) {
+        if (!m) {
           return fail(
-            `you are not a present member of room "${target.name}"; join_room it first, then call wait_for_messages`,
+            `you have never joined room "${target.name}", so there is no read position to watch from; join_room it first, then call wait_for_messages`,
           );
         }
         roomArg = String(target.id);
@@ -999,8 +1011,9 @@ server.registerTool(
           "NOT tell you WHICH room fired: use my_mentions (the cross-room " +
           "inbox) or catch_up in each joined room -- a plain catch_up only " +
           "reads your ACTIVE room, which may not be the one that woke the " +
-          "poller. A --room-scoped watch fires only for that room, so catch_up " +
-          "there directly.",
+          "poller. A --room-scoped watch fires only for that room, but a plain " +
+          "catch_up still reads your ACTIVE room, so join_room the watched room " +
+          "first (or use my_mentions) to read what woke it.",
         exit_codes: {
           "0": "new messages -> my_mentions or catch_up the right room",
           "124": "timed out, nothing new",

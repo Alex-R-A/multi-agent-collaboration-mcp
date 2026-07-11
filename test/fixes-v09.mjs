@@ -1,0 +1,169 @@
+// Regression tests for the NINTH-round fixes, each reproducing an issue an
+// external reviewer confirmed against v0.7.2:
+//   1  bulk reads silently omitted rows when preview_chars / a compact JSON
+//      reparse shrank them below their raw size: get_thread and search now flag
+//      byte_limited / next_offset via fetchBounded's `exhausted` signal.
+//   3  the NUL heal is cursored one row at a time (not .all()); many NUL rows
+//      all heal.
+//   8b wait_for_messages allows a SCOPED watch on a soft-left room (the poller
+//      supports it), while still refusing a never-joined room.
+//   13 resolveRoom skips the id lookup for a numeric ref past 2^53 (would round
+//      to a neighbour) and falls through to the exact-name lookup.
+//   14 the poller accepts a heavily zero-padded small value ("00000000001").
+//   15 a whitespace-only agent_id is rejected, not silently treated as omitted.
+import { ChatStore } from "../dist/db.js";
+import Database from "better-sqlite3";
+import { spawn, spawnSync } from "node:child_process";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, dirname } from "node:path";
+import { fileURLToPath } from "node:url";
+
+const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
+let failures = 0;
+const check = (n, c, x) => {
+  console.log(`${c ? "PASS" : "FAIL"}  ${n}${c ? "" : "  >> " + JSON.stringify(x)}`);
+  if (!c) failures++;
+};
+const NUL = String.fromCharCode(0);
+
+// --- 1: get_thread + search flag omission after a shrink ----------------------
+{
+  const dir = mkdtempSync(join(tmpdir(), "v09-omit-"));
+  const s = new ChatStore(join(dir, "t.db"));
+  const r = s.createRoom("r", null, null).id;
+  s.upsertAgent("a", null, null, null); s.joinRoom(r, "a");
+  // 10 large replies; preview_chars shrinks them so boundByBytes would fit all
+  // it fetched -- but fetchBounded stopped on the raw budget with rows behind.
+  const root = s.postMessage(r, "a", "root", "text", null, null).seq;
+  for (let i = 0; i < 10; i++) s.postMessage(r, "a", "R" + i + ".".repeat(50000), "text", null, root);
+  const th = s.getThread(r, root, 3, 10);
+  check(
+    "get_thread flags byte_limited when a preview cut hides replies",
+    th.replies.length < 10 && th.byte_limited === true,
+    { replies: th.replies.length, byte_limited: th.byte_limited },
+  );
+  // 10 whitespace-heavy JSON matches: reparse compacts them below raw size.
+  const gap = " ".repeat(60000);
+  for (let i = 0; i < 10; i++) {
+    s.postMessage(r, "a", '["needle",' + gap + '"v' + i + '"]', "json", null, null);
+  }
+  const sr = s.searchMessages(r, "needle", 20, 0);
+  check(
+    "search emits next_offset when a JSON reparse hides matches",
+    sr.matches.length < 10 && typeof sr.next_offset === "number",
+    { matches: sr.matches.length, next_offset: sr.next_offset },
+  );
+  // Paging with the emitted next_offset actually reaches the rest (no loss).
+  const seen = new Set();
+  let off = 0, guard = 0;
+  for (;;) {
+    if (++guard > 100) break;
+    const p = s.searchMessages(r, "needle", 20, off);
+    for (const m of p.matches) seen.add(m.seq);
+    if (p.next_offset === undefined) break;
+    off = p.next_offset;
+  }
+  check("paging by next_offset delivers all 10 JSON matches", seen.size === 10, seen.size);
+  s.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- 3: many NUL rows all heal (cursored, not .all()) -------------------------
+{
+  const dir = mkdtempSync(join(tmpdir(), "v09-heal-"));
+  const DB = join(dir, "t.db");
+  { const s = new ChatStore(DB); s.createRoom("r", null, null); s.upsertAgent("a", null, null, null); s.joinRoom(1, "a"); s.close(); }
+  {
+    const raw = new Database(DB);
+    raw.pragma("foreign_keys = ON");
+    raw.exec("DROP TRIGGER IF EXISTS messages_reject_nul");
+    const ins = raw.prepare("INSERT INTO messages (room_id,seq,agent_id,format,body) VALUES (1,?,'a','text',?)");
+    for (let i = 1; i <= 25; i++) ins.run(i, "a" + i + NUL + "b" + i);
+    raw.close();
+  }
+  const s = new ChatStore(DB); // migrate heal runs
+  let allHealed = true;
+  for (let i = 1; i <= 25; i++) {
+    const gm = s.getMessage(1, i, 0, 1000);
+    if (gm.content !== "a" + i + "�" + "b" + i) allHealed = false;
+  }
+  const leftover = new Database(DB).prepare("SELECT COUNT(*) c FROM messages WHERE instr(body, char(0)) > 0").get().c;
+  check("all 25 NUL rows healed (cursored heal, no .all())", allHealed && leftover === 0, { allHealed, leftover });
+  s.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- 13: resolveRoom skips an unsafe-integer id ref ---------------------------
+{
+  const s = new ChatStore(":memory:");
+  const r = s.createRoom("real-room", null, null);
+  check("resolveRoom finds a normal id", s.resolveRoom(String(r.id))?.id === r.id, null);
+  // 2^53+1 rounds to 2^53 in JS; must NOT resolve to any room by rounding.
+  check(
+    "resolveRoom rejects an id past 2^53 (no rounded neighbour)",
+    s.resolveRoom("9007199254740993") === undefined,
+    null,
+  );
+  s.close();
+}
+
+// --- 8b + 15: MCP client (soft-left scoped watch; whitespace agent_id) --------
+{
+  const dir = mkdtempSync(join(tmpdir(), "v09-mcp-"));
+  const DB = join(dir, "t.db");
+  { const s = new ChatStore(DB); s.createRoom("watch-me", null, null); s.close(); }
+  const child = spawn("node", [join(ROOT, "dist", "index.js")], { env: { ...process.env, AGENT_CHAT_DB: DB }, stdio: ["pipe", "pipe", "ignore"] });
+  const R = new Map();
+  let buf = "";
+  child.stdout.on("data", (d) => { buf += d; let i; while ((i = buf.indexOf("\n")) >= 0) { const l = buf.slice(0, i); buf = buf.slice(i + 1); if (!l.trim()) continue; try { const m = JSON.parse(l); if (m.id !== undefined) R.set(m.id, m); } catch {} } });
+  const s = (o) => child.stdin.write(JSON.stringify(o) + "\n");
+  const w = (id) => new Promise((res) => { const t = setInterval(() => { if (R.has(id)) { clearInterval(t); res(R.get(id)); } }, 15); });
+  let id = 1;
+  const call = async (name, args) => {
+    const i = ++id;
+    s({ jsonrpc: "2.0", id: i, method: "tools/call", params: { name, arguments: args } });
+    const r = await w(i);
+    const isErr = r.result && r.result.isError;
+    return { isErr, data: (() => { try { return JSON.parse(r.result.content[0].text); } catch { return { error: r.result.content[0].text }; } })() };
+  };
+  s({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "0" } } });
+  await w(1);
+  s({ jsonrpc: "2.0", method: "notifications/initialized" });
+
+  // #15: whitespace-only agent_id is rejected (not silently treated as omitted).
+  const ws = await call("join_room", { room: "watch-me", agent_id: "   " });
+  check("whitespace-only agent_id is rejected", ws.isErr && /whitespace|empty/.test(JSON.stringify(ws.data)), ws);
+
+  // Join normally, then SOFT-LEAVE, then a scoped wait_for_messages must succeed.
+  await call("join_room", { room: "watch-me", agent_id: "u" });
+  await call("leave_room", {});
+  const softLeft = await call("wait_for_messages", { room: "watch-me" });
+  check(
+    "wait_for_messages allows a scoped watch on a soft-left room",
+    !softLeft.isErr && typeof softLeft.data.command === "string",
+    softLeft,
+  );
+  // But a never-joined room is still refused.
+  const never = await call("wait_for_messages", { room: "nope-never" });
+  check("wait_for_messages still refuses a never-existent room", never.isErr, never);
+  child.kill();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- 14: poller accepts an 11-digit zero-padded value -------------------------
+{
+  const dir = mkdtempSync(join(tmpdir(), "v09-poll-"));
+  const DB = join(dir, "t.db");
+  { const s = new ChatStore(DB); s.createRoom("r", null, null); s.upsertAgent("w", null, null, null); s.joinRoom(1, "w"); s.close(); }
+  const POLLER = join(ROOT, "scripts", "wait-for-updates.sh");
+  const run = (a) => spawnSync("bash", [POLLER, ...a], { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20000 });
+  const padded = run(["--agent", "w", "--interval", "00000000001", "--timeout", "1"]);
+  check("poller accepts an 11-digit zero-padded value (times out cleanly)", padded.status === 124, { status: padded.status, stderr: padded.stderr });
+  const huge = run(["--agent", "w", "--interval", "99999999999", "--timeout", "1"]);
+  check("poller still rejects a genuinely huge value", huge.status === 2 && /too large/.test(huge.stderr), { status: huge.status });
+  rmSync(dir, { recursive: true, force: true });
+}
+
+console.log(`\n${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"}`);
+process.exit(failures === 0 ? 0 : 1);

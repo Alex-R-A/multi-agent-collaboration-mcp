@@ -43,6 +43,7 @@
 # asynchronously-launched shell and will not stop it. SIGINT (exit 130) works
 # only for a foreground poller.
 set -euo pipefail
+shopt -s extglob   # +(0) leading-zero stripping in the numeric guards below
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CHECK="$SCRIPT_DIR/../dist/check.js"
@@ -77,15 +78,19 @@ fi
 if ! [[ "$timeout" =~ ^[0-9]+$ ]]; then
   echo "wait-for-updates: --timeout must be a non-negative integer" >&2; exit 2
 fi
-# 10# forces base 10; a leading-zero value is safe. Cap magnitude at 1e9 (~31
-# years) -- far more than any real interval/timeout, and well under the wrap
-# threshold. Strip to at most 10 significant digits before (( )) so an absurdly
-# long string cannot itself overflow the conversion.
-if [[ ${#interval} -gt 10 || ${#timeout} -gt 10 ]]; then
+# Strip leading zeros BEFORE the magnitude check so the cap is on SIGNIFICANT
+# digits, not raw length: "00000000001" (11 chars, value 1) must be accepted,
+# not rejected as "too large" for being 11 characters. +(0) removes the leading
+# zero run; an all-zero string collapses to "" and defaults to "0". Convert from
+# the STRIPPED value so an absurdly long padded string cannot itself overflow
+# (( )). Cap magnitude at 1e9 (~31 years), well under the 64-bit wrap threshold.
+istrip="${interval##+(0)}"; istrip="${istrip:-0}"
+tstrip="${timeout##+(0)}";  tstrip="${tstrip:-0}"
+if [[ ${#istrip} -gt 10 || ${#tstrip} -gt 10 ]]; then
   echo "wait-for-updates: --interval/--timeout too large (max 1000000000)" >&2; exit 2
 fi
-interval=$((10#$interval))
-timeout=$((10#$timeout))
+interval=$((10#$istrip))
+timeout=$((10#$tstrip))
 if [[ "$interval" -gt 1000000000 || "$timeout" -gt 1000000000 ]]; then
   echo "wait-for-updates: --interval/--timeout too large (max 1000000000)" >&2; exit 2
 fi
