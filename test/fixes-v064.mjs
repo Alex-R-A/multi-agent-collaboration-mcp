@@ -246,7 +246,7 @@ const check = (n, c, x) => {
   s.upsertAgent("plain", null, "rate x50zy", null);
   s.joinRoom(r, "pct");
   s.joinRoom(r, "plain");
-  const hits = s.listAgents(r, 5, "50%");
+  const { agents: hits } = s.listAgents(r, 5, "50%");
   check(
     "agent filter treats % as a literal, not a wildcard",
     hits.length === 1 && hits[0].id === "pct",

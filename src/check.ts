@@ -66,6 +66,12 @@ function parseArgs(argv: string[]): Args {
       // Digits only: Number() would also admit "0x10" and "1e3".
       if (!/^\d+$/.test(v)) fail("--since must be a non-negative integer");
       out.since = Number(v);
+      // Beyond 2^53 the Number is silently rounded and the comparison runs
+      // against a DIFFERENT baseline than the caller passed; no real seq gets
+      // anywhere near this, so reject rather than guess.
+      if (!Number.isSafeInteger(out.since)) {
+        fail("--since is too large to represent exactly");
+      }
     } else if (a === "--db") {
       out.db = take(a);
     } else {

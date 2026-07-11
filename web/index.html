@@ -1143,7 +1143,7 @@
           <div class="tagline">live coordination log</div>
         </div>
         <div class="filter-wrap">
-          <input id="filter" type="search" placeholder="Filter rooms" autocomplete="off" />
+          <input id="filter" type="search" placeholder="Filter rooms" aria-label="Filter rooms" autocomplete="off" />
         </div>
         <nav id="rooms" aria-label="Rooms"></nav>
       </aside>
@@ -1164,6 +1164,7 @@
               id="search"
               type="search"
               placeholder="Search room"
+              aria-label="Search room messages"
               autocomplete="off"
               spellcheck="false"
               title="Full-text search (FTS5 syntax: AND by default, OR, NOT, quoted phrases, prefix*)"
@@ -1203,6 +1204,7 @@
               <input
                 id="join-name"
                 placeholder="Your name"
+                aria-label="Your name"
                 maxlength="200"
                 autocomplete="off"
                 spellcheck="false"
@@ -1219,6 +1221,7 @@
                 <textarea
                   id="compose-text"
                   rows="1"
+                  aria-label="Message text"
                   placeholder="Message the room. Enter sends, Shift+Enter breaks, @name tags an agent"
                 ></textarea>
                 <button id="send" class="btn-accent">Send</button>
@@ -1308,6 +1311,24 @@
       const JOINED_KEY = "agent-chat.joined";
       const GHOST_KEY = "agent-chat.ghosts";
 
+      // Cross-tab serialization for EVERY membership mutation (identity,
+      // joined map, ghost ledger, and the server calls they mirror). These
+      // are read-modify-write sequences over shared localStorage: two tabs
+      // joining different rooms both read the map, then the second save
+      // erased the first tab's join; concurrent renames left the stored
+      // identity and room mapping naming different names; and a ghost
+      // sweep's in-flight leave could evict a membership another tab had
+      // just re-adopted. Web Locks serialize the whole sequence (awaited
+      // server calls included) across same-origin tabs. localhost is a
+      // secure context, so navigator.locks exists everywhere this runs; the
+      // fallback keeps a degraded single-tab-correct behavior just in case.
+      function withMembershipLock(fn) {
+        if (navigator.locks && navigator.locks.request) {
+          return navigator.locks.request("agent-chat.membership", fn);
+        }
+        return Promise.resolve().then(fn);
+      }
+
       // Memberships whose soft-leave failed (e.g. server briefly down during
       // a rename): tracked so later joins can retry the leave instead of the
       // ghost becoming permanently unaddressable.
@@ -1337,33 +1358,38 @@
         if (ghostRetryActive) return; // overlapping sweeps would race the ledger
         ghostRetryActive = true;
         try {
-          for (const g of loadGhosts()) {
-            // A ghost whose (room, name) is the CURRENT mapping again is not
-            // stale: the user re-adopted the name and rejoined, and leaving
-            // now would evict that live membership seconds after it was
-            // created. Purge the entry instead of retrying it.
-            if (loadJoined()[String(g.room)] === g.name) {
+          // The membership lock is held ACROSS each leave's round trip: the
+          // stale-check below is only race-free if no other tab can re-adopt
+          // the (room, name) while the leave is in flight.
+          await withMembershipLock(async () => {
+            for (const g of loadGhosts()) {
+              // A ghost whose (room, name) is the CURRENT mapping again is not
+              // stale: the user re-adopted the name and rejoined, and leaving
+              // now would evict that live membership seconds after it was
+              // created. Purge the entry instead of retrying it.
+              if (loadJoined()[String(g.room)] === g.name) {
+                saveGhosts(
+                  loadGhosts().filter(
+                    (x) => !(x.room === g.room && x.name === g.name),
+                  ),
+                );
+                continue;
+              }
+              try {
+                await postJson("/api/leave", { room: g.room, name: g.name });
+              } catch {
+                continue; // still unreachable; keep the entry for the next sweep
+              }
+              // Remove exactly this entry from the CURRENT ledger: a wholesale
+              // save of a pre-loop snapshot would erase entries recorded while
+              // these retries were in flight.
               saveGhosts(
                 loadGhosts().filter(
                   (x) => !(x.room === g.room && x.name === g.name),
                 ),
               );
-              continue;
             }
-            try {
-              await postJson("/api/leave", { room: g.room, name: g.name });
-            } catch {
-              continue; // still unreachable; keep the entry for the next sweep
-            }
-            // Remove exactly this entry from the CURRENT ledger: a wholesale
-            // save of a pre-loop snapshot would erase entries recorded while
-            // these retries were in flight.
-            saveGhosts(
-              loadGhosts().filter(
-                (x) => !(x.room === g.room && x.name === g.name),
-              ),
-            );
-          }
+          });
         } finally {
           ghostRetryActive = false;
         }
@@ -1526,6 +1552,10 @@
         const me = identity();
         if (!me || m.from === me) return false;
         if (Array.isArray(m.mentions) && m.mentions.includes(me)) return true;
+        // The stored reply author decides (it survives parent pruning and
+        // needs no parent row loaded); the in-memory parent lookup remains
+        // as a fallback for rows written before the column existed.
+        if (m.reply_to_agent) return m.reply_to_agent === me;
         if (m.reply_to_seq) {
           const parent = state.msgs.find((x) => x.seq === m.reply_to_seq);
           if (parent && parent.from === me) return true;
@@ -1807,12 +1837,21 @@
           // rendered text is not mistaken for the whole message.
           const note = document.createElement("div");
           note.className = "trunc-note";
+          // body_length is exact (same UTF-16 unit as body.length) when the
+          // row carries a stamped length; rows from old builds fall back to
+          // a codepoint count, which can undershoot the shown length for
+          // astral-heavy text. Guard against emitting an impossible
+          // "showing X of fewer-than-X" notice in that case.
+          const shown = m.body.length;
+          const total = Number(m.body_length);
           note.textContent =
-            "[showing the first " +
-            m.body.length.toLocaleString() +
-            " of " +
-            Number(m.body_length).toLocaleString() +
-            " characters]";
+            total > shown
+              ? "[showing the first " +
+                shown.toLocaleString() +
+                " of " +
+                total.toLocaleString() +
+                " characters]"
+              : "[truncated: the full message is longer than shown]";
           wrap.append(note);
         }
         container.append(wrap);
@@ -1838,6 +1877,19 @@
             if (el.older.hidden) break; // history exhausted or room switched
             await sleep(150); // fetch lock was busy; retry
           }
+        }
+        // Forward: the target can be NEWER than the rendered tail (a search
+        // hit posted while search mode paused the stream). The exitSearch
+        // refresh runs un-awaited, so page the tail in here and wait for it;
+        // the backward-only walk just returned without scrolling.
+        for (let i = 0; i < 20; i++) {
+          if (!sameView(room, epoch)) return;
+          if (el.msgs.querySelector(`[data-seq="${seq}"]`)) break;
+          const last = state.msgs[state.msgs.length - 1];
+          if (!last || last.seq >= seq) break;
+          const before = state.msgs.length;
+          await loadNew(false);
+          if (state.msgs.length === before) await sleep(150); // busy; retry
         }
         if (!sameView(room, epoch)) return;
         const target = el.msgs.querySelector(`[data-seq="${seq}"]`);
@@ -2080,8 +2132,10 @@
             el.msgs.textContent = "";
             appendMsgs(rows, false);
             // Fewer rows than the fetch limit = the room's ENTIRE history is
-            // rendered; anything below the window's floor was pruned.
-            if (rows.length < PAGE) state.noOlderHistory = true;
+            // rendered; anything below the window's floor was pruned. A page
+            // the server cut short for SIZE (trimmed) proves nothing about
+            // history and must not disable the gap guard.
+            if (rows.length < PAGE && !data.trimmed) state.noOlderHistory = true;
             updateOlderButton();
             computeGap();
             if (rows.length === 0) {
@@ -2331,8 +2385,13 @@
         }
         el.joinBtn.disabled = true;
         const epoch = state.roomEpoch;
-        const prevIdentity = identity();
         try {
+          // The whole join/rename sequence (server calls INCLUDED) runs under
+          // the cross-tab membership lock: its localStorage read-modify-write
+          // steps are only merge-safe against writes that happen strictly
+          // before or after, not interleaved between read and save.
+          const { j, prevIdentity } = await withMembershipLock(async () => {
+          const prevIdentity = identity();
           // Join FIRST: the server validates the new name, and an invalid
           // rename must not have already torn down the old memberships.
           const j = await postJson("/api/join", { room: room.id, name });
@@ -2370,8 +2429,7 @@
           }
           // Same merge discipline for the joined map: re-read it and delete
           // only the entries we actually left AND that still hold the value
-          // we left under; a wholesale save of the pre-loop snapshot would
-          // erase a join another tab recorded during the awaits above.
+          // we left under (defense in depth under the lock).
           const freshMap = loadJoined();
           for (const [rid, storedName] of removed) {
             if (freshMap[rid] === storedName) delete freshMap[rid];
@@ -2380,17 +2438,25 @@
           saveJoined(freshMap);
           // Re-adopting a previously-ghosted (room, name): the mapping above
           // makes that pair live again, so drop any stale ledger entry for it
-          // before the sweep below can leave the room we just joined.
+          // before the next sweep can leave the room we just joined.
           const ledgerNow = loadGhosts();
           const keptGhosts = ledgerNow.filter(
             (x) => !(x.room === room.id && x.name === name),
           );
           if (keptGhosts.length !== ledgerNow.length) saveGhosts(keptGhosts);
+          return { j, prevIdentity };
+          });
+          // Fire-and-forget AFTER the lock releases: retryGhosts takes the
+          // same (non-reentrant) lock, so awaiting it here would deadlock.
           retryGhosts();
           // The composer reflects the GLOBAL identity for whatever room is
           // shown now; re-render it even after a room switch so a stale
           // successful rename cannot leave it showing the old identity.
           renderComposer();
+          // A rename invalidates identity-derived DECORATION on already-
+          // rendered rows ("you" badges, directed-at-me styling); rebuild
+          // whatever stream is currently shown from its cached rows.
+          if (prevIdentity !== name && !state.searchMode) rebuildStream();
           // A delayed response must not mutate another visit's marker/UI --
           // but a RENAME was global, so the room shown now still carries the
           // old identity's marker state: reset it and re-baseline (fetchMarker
@@ -2429,18 +2495,21 @@
         const name = identity();
         if (!room || !name) return;
         try {
-          await postJson("/api/leave", { room: room.id, name });
+          // Same lock as join/rename: the leave plus its map update must not
+          // interleave with another tab's read-modify-write.
+          await withMembershipLock(async () => {
+            await postJson("/api/leave", { room: room.id, name });
+            // Drop the mapping only while it still records THIS leave's
+            // identity: a rename in another tab must not lose its mapping.
+            const joined = loadJoined();
+            if (joined[String(room.id)] === name) {
+              delete joined[String(room.id)];
+              saveJoined(joined);
+            }
+          });
         } catch (e) {
           if (sameView(room, epoch)) el.composeError.textContent = e.message;
           return;
-        }
-        // Drop the mapping only while it still records THIS leave's identity:
-        // a stale completion arriving after a rename must not delete the
-        // newer name's still-live membership mapping.
-        const joined = loadJoined();
-        if (joined[String(room.id)] === name) {
-          delete joined[String(room.id)];
-          saveJoined(joined);
         }
         // Composer/reply belong to whatever room is shown NOW.
         if (!sameView(room, epoch)) return;
@@ -2615,10 +2684,12 @@
         }
         el.deleteYes.disabled = false;
         // Forget every local trace of the deleted room regardless of where
-        // the user is now.
-        const joined = loadJoined();
-        delete joined[String(room.id)];
-        saveJoined(joined);
+        // the user is now (map edit under the cross-tab lock).
+        await withMembershipLock(() => {
+          const joined = loadJoined();
+          delete joined[String(room.id)];
+          saveJoined(joined);
+        });
         delete state.seen[room.id];
         saveSeen();
         delete state.drafts[room.id];
@@ -2810,6 +2881,9 @@
         state.gap = false;
         renderComposer();
         if (state.current) {
+          // Rendered rows carry identity-derived decoration ("you" badges,
+          // directed styling); a cross-tab rename stales them in place.
+          if (e.key === IDENT_KEY && !state.searchMode) rebuildStream();
           computeGap();
           fetchMarker();
         }

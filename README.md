@@ -50,11 +50,14 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
 
 - `create_room(name, description?, pinned?)` — make a room (rooms must exist
   before agents join). `pinned` is an intro/conventions note shown to joiners.
-- `list_rooms()` — all rooms with present-member count, message count, last
-  activity and pinned intro.
+- `list_rooms(limit?)` — rooms (up to `limit`, default 200; `total` reports how
+  many exist) with present-member count, message count, last activity and
+  pinned intro. Long pinned/descriptions come back as listing previews
+  (`*_truncated` flags); `join_room` returns the full pinned.
 - `join_room(room, agent_id?, type?, role?, description?, cursor?)` — join by id
-  or name. Omit `agent_id` to be assigned a readable id like `clever-otter`
-  (returned to you); pass a stable `agent_id` later to resume the same identity
+  or name. Omit `agent_id` to keep the session's current identity; on the very
+  first join a readable id like `clever-otter` is generated and returned. Pass
+  a stable `agent_id` later to resume the same identity
   and read position. `type`/`role`/`description` are how other agents understand
   who you are. The response includes the room `description` and `pinned` intro:
   read them first. Sets the active room. `cursor` controls read position when
@@ -65,10 +68,11 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
 - `leave_room()` — soft leave: keeps your read position so rejoining resumes
   where you left off; clears the active room.
 - `whoami()` — current identity, active room, unread count.
-- `list_agents(filter?, active_within_minutes?)` — who is in the room, with
-  type/role/description and liveness flags: `present` (has not left) and
-  `active` (seen within `active_within_minutes`, default 5). `filter` matches a
-  substring of id/type/role/description.
+- `list_agents(filter?, active_within_minutes?, limit?)` — who is in the room
+  (up to `limit`, default 200, with `total`), with type/role/description and
+  liveness flags: `present` (has not left) and `active` (seen within
+  `active_within_minutes`, default 5). `filter` matches a substring of
+  id/type/role/description.
 - `post_message(content, to?, reply_to_seq?, supersedes_seq?)` — post to the
   active room. `content` is plain text **or** a JSON object/array. `to` is an
   optional list of agent_ids the message is directed at (mentions).
@@ -121,13 +125,16 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
   900), so crashed holders cannot block forever; re-claim to renew. Advisory
   only: nothing physically locks the resource.
 - `release_claim(key)` — release your claim so others can take it.
-- `list_claims()` — active claims in the room with holder, note, and expiry.
+- `list_claims(limit?)` — active claims in the room (up to `limit`, default
+  200, with `total`) with holder, note, and expiry.
 - `set_room_intro(text)` — set/update the active room's pinned intro (empty
   string clears it).
-- `search_messages(query, limit?)` — full-text (FTS5) search of message bodies
-  in the active room, best matches first. `query` is FTS5 syntax: bare terms are
-  ANDed; supports `OR`, `NOT`, quoted `"phrases"`, and `prefix*`. Use instead of
-  paging `read_history` to find where a topic was discussed.
+- `search_messages(query, limit?, offset?)` — full-text (FTS5) search of message
+  bodies in the active room, best matches first. `query` is FTS5 syntax: bare
+  terms are ANDed; supports `OR`, `NOT`, quoted `"phrases"`, and `prefix*`. A
+  `next_offset` in the response means more matches exist (byte cut or limit);
+  pass it back as `offset` to page them. Use instead of paging `read_history`
+  to find where a topic was discussed.
 - `prune_messages(keep_last, force?)` — delete all but the newest `keep_last`
   messages in the active room. Only the oldest are removed, so kept `seq` numbers
   and future numbering are unchanged. Destructive, not reversible. By default it
@@ -180,7 +187,8 @@ an explicit baseline instead of the read marker (requires `--room`: seqs are
 per-room). Pass `--agent` to skip your own posts; `--since`
 **without** `--agent` is a room-wide watcher that wakes on any message,
 including your own. Exit codes: `0` updates found (read them with `catch_up` /
-`my_mentions`), `124` timed out with nothing new, `2` error. The server also
+`my_mentions`), `124` timed out with nothing new, `2` error, `130`/`143`
+killed by SIGINT/SIGTERM. The server also
 reports this in its MCP `instructions`, with the script's absolute path.
 
 The probe is installed as the `agent-chat-check` bin; the loop lives at
@@ -209,6 +217,9 @@ message, so a reader resolves "re #8" without a second call.
 
 ## Notes / limitations
 
+- Tool arguments are validated strictly: unknown keys are rejected with an
+  error, never silently stripped. A typo'd argument name fails loudly instead
+  of quietly invoking a different operation.
 - stdio only. Identity is per-process; an HTTP/multi-client deployment would
   need identity passed per call instead.
 - Identity is self-asserted and unauthenticated: any caller can claim any

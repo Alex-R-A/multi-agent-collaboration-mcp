@@ -31,10 +31,14 @@
 # (soft-left rooms are muted) and fails fast with exit 2 if the agent is
 # present in none (a typo'd id should surface immediately, not burn the
 # timeout). An explicit --room watch keeps working after leaving that room:
-# naming the room is the intent to watch it.
+# naming the room is the intent to watch it. The timeout is a FLOOR: one
+# final probe runs at the deadline and may still report updates, so the
+# worst-case overshoot is <1s plus one probe. The probe's busy_timeout bounds
+# SQLite LOCK waits only, not query execution or a stalled filesystem; a
+# wedged probe wedges the poller (accepted: kill the process).
 #
 # Exit codes: 0 updates found (status JSON printed to stdout), 124 timed out,
-# 2 error.
+# 2 error, 130/143 killed (SIGINT/SIGTERM).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -58,11 +62,19 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if ! [[ "$interval" =~ ^[0-9]+$ ]] || [[ "$interval" -lt 1 ]]; then
+if ! [[ "$interval" =~ ^[0-9]+$ ]]; then
   echo "wait-for-updates: --interval must be a positive integer" >&2; exit 2
 fi
 if ! [[ "$timeout" =~ ^[0-9]+$ ]]; then
   echo "wait-for-updates: --timeout must be a non-negative integer" >&2; exit 2
+fi
+# Force base 10 BEFORE any arithmetic: bash treats a leading zero as octal,
+# so a validated-but-unnormalized "08" blew up the first (( )) with
+# "value too great for base" and the wrong exit code.
+interval=$((10#$interval))
+timeout=$((10#$timeout))
+if [[ "$interval" -lt 1 ]]; then
+  echo "wait-for-updates: --interval must be a positive integer" >&2; exit 2
 fi
 
 # No passthrough flags means neither --agent nor --room. Guard explicitly:
@@ -75,6 +87,25 @@ if [[ ! -f "$CHECK" ]]; then
   echo "wait-for-updates: $CHECK not found; run 'npm run build' first" >&2
   exit 2
 fi
+
+# Interruptible sleep that dies WITH us: a foreground `sleep` survives the
+# shell being SIGTERMed (reparented, naps out its full interval); running it
+# in the background and killing it from the trap ends both immediately.
+SLEEP_PID=""
+on_signal() {
+  local code=$1
+  [[ -n "$SLEEP_PID" ]] && kill "$SLEEP_PID" 2>/dev/null
+  exit "$code"
+}
+trap 'on_signal 130' INT
+trap 'on_signal 143' TERM
+nap() {
+  sleep "$1" &
+  SLEEP_PID=$!
+  # `wait` returns >128 when interrupted by a trapped signal; the trap exits.
+  wait "$SLEEP_PID" 2>/dev/null || true
+  SLEEP_PID=""
+}
 
 start=$(date +%s)
 while true; do
@@ -119,8 +150,8 @@ while true; do
     # (the top-of-loop check exits once the deadline has passed).
     remaining=$(( timeout - elapsed ))
     if (( remaining < 1 )); then remaining=1; fi
-    sleep "$(( interval < remaining ? interval : remaining ))"
+    nap "$(( interval < remaining ? interval : remaining ))"
   else
-    sleep "$interval"
+    nap "$interval"
   fi
 done

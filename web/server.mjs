@@ -21,12 +21,22 @@ import Database from "better-sqlite3";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // PORT=0 is meaningful (bind an ephemeral port; used by tests), so a falsy
-// check must not swallow it.
+// check must not swallow it. An explicitly SET but invalid value is a user
+// error and must fail loudly: silently defaulting served the viewer on a
+// port the operator does not expect, and out-of-range values crashed
+// listen() with a stack trace instead of a diagnosis.
 const rawPort = process.env.AGENT_CHAT_VIEWER_PORT;
-const PORT =
-  rawPort !== undefined && rawPort.trim() !== "" && Number.isFinite(Number(rawPort))
-    ? Number(rawPort)
-    : 8787;
+let PORT = 8787;
+if (rawPort !== undefined && rawPort.trim() !== "") {
+  const p = Number(rawPort.trim());
+  if (!Number.isInteger(p) || p < 0 || p > 65535) {
+    console.error(
+      `agent-chat viewer: AGENT_CHAT_VIEWER_PORT must be an integer 0-65535, got "${rawPort}"`,
+    );
+    process.exit(1);
+  }
+  PORT = p;
+}
 
 // Same resolution the server uses (kept in sync deliberately, not imported, so
 // the viewer needs no build output and never runs migrations against the file).
@@ -42,6 +52,47 @@ function resolveDbPath() {
   return join(homedir(), ".agent-chat-mcp", "chat.db");
 }
 const DB_PATH = resolveDbPath();
+if (DB_PATH === ":memory:") {
+  // An in-memory database is process-private: this viewer would open its own
+  // fresh empty one, silently unrelated to whatever wrote the sentinel.
+  console.error(
+    "agent-chat viewer: cannot attach to a :memory: database (it is private " +
+      "to the process that opened it)",
+  );
+  process.exit(1);
+}
+
+// Structures this viewer's queries depend on. The viewer never migrates the
+// shared file (that is the MCP server's job); on an older-schema database its
+// queries used to fail as a mix of opaque 400/500s, so check ONCE per open
+// attempt and report the real remedy instead.
+function schemaGaps(d) {
+  const gaps = [];
+  const col = (t, c) =>
+    !!d
+      .prepare(`SELECT 1 FROM pragma_table_info('${t}') WHERE name = '${c}'`)
+      .get();
+  const table = (t) =>
+    !!d
+      .prepare("SELECT 1 FROM sqlite_master WHERE type IN ('table','trigger') AND name = ?")
+      .get(t);
+  for (const t of ["rooms", "agents", "memberships", "messages", "session_markers", "claims"]) {
+    if (!table(t)) gaps.push(`table ${t}`);
+  }
+  if (gaps.length) return gaps; // column checks would all fail anyway
+  for (const [t, c] of [
+    ["rooms", "pinned"],
+    ["memberships", "left_at"],
+    ["messages", "supersedes_seq"],
+    ["messages", "reply_to_agent"],
+    ["messages", "body_len"],
+  ]) {
+    if (!col(t, c)) gaps.push(`${t}.${c}`);
+  }
+  if (!table("messages_fts")) gaps.push("table messages_fts");
+  return gaps;
+}
+let schemaError = null; // sticky reason string when the file is too old
 
 // Open lazily so the server still starts (and says why it is empty) when no
 // agent has created the database yet. Opened writable but pinned query_only: a
@@ -51,9 +102,22 @@ let db = null;
 function getDb() {
   if (db) return db;
   if (!existsSync(DB_PATH)) return null;
-  db = new Database(DB_PATH, { fileMustExist: true });
-  db.pragma("busy_timeout = 5000");
-  db.pragma("query_only = ON");
+  const candidate = new Database(DB_PATH, { fileMustExist: true });
+  candidate.pragma("busy_timeout = 5000");
+  candidate.pragma("query_only = ON");
+  const gaps = schemaGaps(candidate);
+  if (gaps.length) {
+    // Re-checked on every request (cheap PRAGMAs, no cached handle): an MCP
+    // server may migrate the file at any moment, after which the viewer
+    // starts working without a restart.
+    candidate.close();
+    schemaError =
+      `database schema predates this viewer (missing ${gaps.join(", ")}); ` +
+      "start the current agent-chat MCP server once to migrate it";
+    return null;
+  }
+  schemaError = null;
+  db = candidate;
   return db;
 }
 
@@ -71,52 +135,88 @@ function listRooms() {
     .all();
 }
 
+// Message columns for the JSON endpoints. Bodies are capped in SQL (substr
+// is codepoint-aware, no surrogate splitting): agents can legally post up to
+// SQLITE_MAX_LENGTH, and one such message must not balloon a page into
+// gigabytes. The full length rides along (body_len when stamped: exact UTF-16,
+// the same unit as the JS-side shown length) so the client can label the cut.
+// reply_to_agent lets the client style replies-to-me without needing the
+// parent row loaded.
+const MAX_BODY_CHARS = 100_000; // matches the agents' per-page read budget
+
+const MSG_COLS = `g.seq, g.agent_id AS "from", a.role, a.type,
+              substr(g.body, 1, ${MAX_BODY_CHARS}) AS body,
+              CASE WHEN length(g.body) > ${MAX_BODY_CHARS}
+                   THEN COALESCE(g.body_len, length(g.body)) ELSE NULL END AS body_length,
+              g.format,
+              g.mentions, g.reply_to_seq, g.reply_to_agent, g.supersedes_seq,
+              g.created_at AS at,
+              (SELECT s.seq FROM messages s
+                WHERE s.room_id = g.room_id AND s.supersedes_seq = g.seq
+                ORDER BY s.seq DESC LIMIT 1) AS superseded_by`;
+
+// Aggregate BODY budget per response: the per-row cap alone let a 400-row
+// page of legal 100k bodies serialize to ~40 MB. Collection stops (with at
+// least one row, so paging always progresses) once the running body total
+// passes this; `trimmed` tells the client the page is short for size, NOT
+// because history ran out.
+const PAGE_BODY_BUDGET = 2_000_000;
+
+// Pull rows off a better-sqlite3 iterator until the body budget is spent.
+function takeBudgeted(iter) {
+  const rows = [];
+  let used = 0;
+  let trimmed = false;
+  for (const r of iter) {
+    if (rows.length > 0 && used + r.body.length > PAGE_BODY_BUDGET) {
+      trimmed = true;
+      break;
+    }
+    used += r.body.length;
+    rows.push(r);
+  }
+  return { rows, trimmed };
+}
+
 function listMessages(roomId, afterSeq, beforeSeq, limit) {
   const d = getDb();
   if (!d) return null;
-  // Bodies are capped in SQL (substr is codepoint-aware, no surrogate
-  // splitting): agents can legally post up to SQLITE_MAX_LENGTH, and one
-  // such message must not balloon a 400-row page into gigabytes. The full
-  // length rides along so the client can label the cut.
-  const cols = `g.seq, g.agent_id AS "from", a.role, a.type,
-                substr(g.body, 1, ${MAX_BODY_CHARS}) AS body,
-                CASE WHEN length(g.body) > ${MAX_BODY_CHARS}
-                     THEN length(g.body) ELSE NULL END AS body_length,
-                g.format,
-                g.mentions, g.reply_to_seq, g.supersedes_seq, g.created_at AS at,
-                (SELECT s.seq FROM messages s
-                  WHERE s.room_id = g.room_id AND s.supersedes_seq = g.seq
-                  ORDER BY s.seq DESC LIMIT 1) AS superseded_by`;
   const src = `messages g LEFT JOIN agents a ON a.id = g.agent_id`;
-  let rows;
+  let taken;
   if (afterSeq > 0) {
     // Incremental tail: only messages newer than what the client already has.
-    rows = d
-      .prepare(
-        `SELECT ${cols} FROM ${src}
-         WHERE g.room_id = ? AND g.seq > ? ORDER BY g.seq ASC LIMIT ?`,
-      )
-      .all(roomId, afterSeq, limit);
+    taken = takeBudgeted(
+      d
+        .prepare(
+          `SELECT ${MSG_COLS} FROM ${src}
+           WHERE g.room_id = ? AND g.seq > ? ORDER BY g.seq ASC LIMIT ?`,
+        )
+        .iterate(roomId, afterSeq, limit),
+    );
   } else if (beforeSeq > 0) {
     // History paging: the `limit` messages just older than what is shown.
-    rows = d
-      .prepare(
-        `SELECT ${cols} FROM ${src}
-         WHERE g.room_id = ? AND g.seq < ? ORDER BY g.seq DESC LIMIT ?`,
-      )
-      .all(roomId, beforeSeq, limit)
-      .reverse();
+    taken = takeBudgeted(
+      d
+        .prepare(
+          `SELECT ${MSG_COLS} FROM ${src}
+           WHERE g.room_id = ? AND g.seq < ? ORDER BY g.seq DESC LIMIT ?`,
+        )
+        .iterate(roomId, beforeSeq, limit),
+    );
+    taken.rows.reverse();
   } else {
     // Initial load: newest `limit`, returned oldest-first for top-to-bottom reading.
-    rows = d
-      .prepare(
-        `SELECT ${cols} FROM ${src}
-         WHERE g.room_id = ? ORDER BY g.seq DESC LIMIT ?`,
-      )
-      .all(roomId, limit)
-      .reverse();
+    taken = takeBudgeted(
+      d
+        .prepare(
+          `SELECT ${MSG_COLS} FROM ${src}
+           WHERE g.room_id = ? ORDER BY g.seq DESC LIMIT ?`,
+        )
+        .iterate(roomId, limit),
+    );
+    taken.rows.reverse();
   }
-  for (const r of rows) {
+  for (const r of taken.rows) {
     if (r.mentions) {
       try {
         r.mentions = JSON.parse(r.mentions);
@@ -126,7 +226,7 @@ function listMessages(roomId, afterSeq, beforeSeq, limit) {
     }
     finishBodyCap(r);
   }
-  return rows;
+  return taken;
 }
 
 // Expose the SQL-side body cap as a flag the client can render. The decision
@@ -141,25 +241,26 @@ function finishBodyCap(r) {
 }
 
 // Writable handle for participation endpoints only. Kept separate from the
-// query_only read handle so a bug in a read path can never write.
+// query_only read handle so a bug in a read path can never write. The schema
+// preflight in getDb() has already gated this: the write paths can assume
+// every current column exists.
 let wdb = null;
-let wdbHasReplyAgent = false;
 function getWriteDb() {
   if (wdb) return wdb;
-  if (!existsSync(DB_PATH)) return null;
+  if (!getDb()) return null; // absent file or stale schema (schemaError set)
   wdb = new Database(DB_PATH, { fileMustExist: true });
   wdb.pragma("busy_timeout = 5000");
-  // The viewer never migrates the shared file; only stamp the denormalized
-  // reply author when a current MCP server has already added the column.
-  wdbHasReplyAgent = !!wdb
-    .prepare(
-      "SELECT 1 FROM pragma_table_info('messages') WHERE name = 'reply_to_agent'",
-    )
-    .get();
   return wdb;
 }
 
-const MAX_BODY_CHARS = 100_000; // matches the agents' per-page read budget
+/** Why the database is unusable right now (message for a 503). */
+function dbUnavailableError() {
+  return (
+    schemaError ??
+    `No database at ${DB_PATH}. Start an agent-chat MCP server first.`
+  );
+}
+
 const NAME_RE = /^[\w][\w.-]{0,199}$/; // sane self-asserted ids, no whitespace
 
 // Cap in BYTES. Sized so a maximal legal post (MAX_BODY_CHARS UTF-16 units,
@@ -234,16 +335,6 @@ function joinRoom(d, roomId, name) {
 }
 
 function postMessage(d, roomId, name, body, replyToSeq, mentions) {
-  // The column check is cached from open time; if an MCP server migrated the
-  // shared file AFTER this viewer started, pick the column up now instead of
-  // writing NULL reply authors until a viewer restart.
-  if (!wdbHasReplyAgent) {
-    wdbHasReplyAgent = !!d
-      .prepare(
-        "SELECT 1 FROM pragma_table_info('messages') WHERE name = 'reply_to_agent'",
-      )
-      .get();
-  }
   const mentionsJson =
     mentions && mentions.length > 0 ? JSON.stringify(mentions) : null;
   // Same shape as ChatStore.postMessage: validate membership and the reply
@@ -271,17 +362,12 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
         "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM messages WHERE room_id = ?",
       )
       .get(roomId);
-    if (wdbHasReplyAgent) {
-      d.prepare(
-        `INSERT INTO messages (room_id, seq, agent_id, format, body, mentions, reply_to_seq, reply_to_agent)
-         VALUES (?, ?, ?, 'text', ?, ?, ?, ?)`,
-      ).run(roomId, next, name, body, mentionsJson, replyToSeq, replyToAgent);
-    } else {
-      d.prepare(
-        `INSERT INTO messages (room_id, seq, agent_id, format, body, mentions, reply_to_seq)
-         VALUES (?, ?, ?, 'text', ?, ?, ?)`,
-      ).run(roomId, next, name, body, mentionsJson, replyToSeq);
-    }
+    // body_len is the exact UTF-16 length (same stamp ChatStore.postMessage
+    // writes); the schema preflight guarantees both columns exist.
+    d.prepare(
+      `INSERT INTO messages (room_id, seq, agent_id, format, body, body_len, mentions, reply_to_seq, reply_to_agent)
+       VALUES (?, ?, ?, 'text', ?, ?, ?, ?, ?)`,
+    ).run(roomId, next, name, body, body.length, mentionsJson, replyToSeq, replyToAgent);
     d.prepare(
       "UPDATE memberships SET last_seen = datetime('now') WHERE room_id = ? AND agent_id = ?",
     ).run(roomId, name);
@@ -387,25 +473,19 @@ function parseMentions(body) {
 function searchMessages(roomId, q, limit) {
   const d = getDb();
   if (!d) return null;
-  const rows = d
-    .prepare(
-      `SELECT g.seq, g.agent_id AS "from", a.role, a.type,
-              substr(g.body, 1, ${MAX_BODY_CHARS}) AS body,
-              CASE WHEN length(g.body) > ${MAX_BODY_CHARS}
-                   THEN length(g.body) ELSE NULL END AS body_length,
-              g.format,
-              g.mentions, g.reply_to_seq, g.supersedes_seq, g.created_at AS at,
-              (SELECT s.seq FROM messages s
-                WHERE s.room_id = g.room_id AND s.supersedes_seq = g.seq
-                ORDER BY s.seq DESC LIMIT 1) AS superseded_by
-       FROM messages_fts f
-       JOIN messages g ON g.id = f.rowid
-       LEFT JOIN agents a ON a.id = g.agent_id
-       WHERE f.body MATCH ? AND g.room_id = ?
-       ORDER BY rank LIMIT ?`,
-    )
-    .all(q, roomId, limit);
-  for (const r of rows) {
+  const taken = takeBudgeted(
+    d
+      .prepare(
+        `SELECT ${MSG_COLS}
+         FROM messages_fts f
+         JOIN messages g ON g.id = f.rowid
+         LEFT JOIN agents a ON a.id = g.agent_id
+         WHERE f.body MATCH ? AND g.room_id = ?
+         ORDER BY rank LIMIT ?`,
+      )
+      .iterate(q, roomId, limit),
+  );
+  for (const r of taken.rows) {
     if (r.mentions) {
       try {
         r.mentions = JSON.parse(r.mentions);
@@ -415,7 +495,7 @@ function searchMessages(roomId, q, limit) {
     }
     finishBodyCap(r);
   }
-  return rows;
+  return taken;
 }
 
 function sendJson(res, status, payload) {
@@ -428,28 +508,22 @@ function sendJson(res, status, payload) {
 
 async function handlePost(url, req, res) {
   // A foreign web page can fire no-preflight POSTs at localhost from the
-  // operator's browser; reject any non-local Origin. Requests without an
-  // Origin header (curl, scripts) stay allowed: local processes can already
-  // write the database file directly, so this is browser-context hygiene,
-  // not authentication.
+  // operator's browser; require the request's own EXACT origin (scheme +
+  // host + port). Hostname-only checking let any other localhost-bound
+  // process's page (a dev server on another port) write here. Requests
+  // without an Origin header (curl, scripts) stay allowed: local processes
+  // can already write the database file directly, so this is browser-context
+  // hygiene, not authentication. The Host header was allowlisted upstream.
   const origin = req.headers.origin;
-  if (origin) {
-    let local = false;
-    try {
-      // WHATWG URL keeps the brackets on an IPv6 literal, so "[::1]" is the
-      // form that actually occurs.
-      const h = new URL(origin).hostname;
-      local = h === "127.0.0.1" || h === "localhost" || h === "[::1]";
-    } catch {}
-    if (!local) {
-      return sendJson(res, 403, { error: "cross-origin writes are not allowed" });
-    }
+  if (
+    origin &&
+    origin.toLowerCase() !== `http://${(req.headers.host || "").toLowerCase()}`
+  ) {
+    return sendJson(res, 403, { error: "cross-origin writes are not allowed" });
   }
   const d = getWriteDb();
   if (!d) {
-    return sendJson(res, 503, {
-      error: `No database at ${DB_PATH}. Start an agent-chat MCP server first.`,
-    });
+    return sendJson(res, 503, { error: dbUnavailableError() });
   }
   let payload;
   try {
@@ -577,7 +651,13 @@ const server = createServer(async (req, res) => {
       // Read BEFORE writeHead: a read failure after headers are sent would
       // make the catch's second writeHead throw and crash the process.
       const html = readFileSync(join(HERE, "index.html"));
-      res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+      res.writeHead(200, {
+        "Content-Type": "text/html; charset=utf-8",
+        // The page carries destructive controls (room deletion); refuse to
+        // render inside any frame so a hostile page cannot clickjack them.
+        "X-Frame-Options": "DENY",
+        "Content-Security-Policy": "frame-ancestors 'none'",
+      });
       res.end(html);
       return;
     }
@@ -586,7 +666,7 @@ const server = createServer(async (req, res) => {
       if (rooms === null)
         return sendJson(res, 200, {
           rooms: [],
-          error: `No database at ${DB_PATH}. Start an agent-chat MCP server first.`,
+          error: dbUnavailableError(),
         });
       return sendJson(res, 200, { rooms });
     }
@@ -602,13 +682,18 @@ const server = createServer(async (req, res) => {
         1,
         Math.min(Math.floor(Number(url.searchParams.get("limit"))) || 200, 1000),
       );
-      const messages = listMessages(roomId, after, before, limit);
-      if (messages === null)
+      const result = listMessages(roomId, after, before, limit);
+      if (result === null)
         return sendJson(res, 200, {
           messages: [],
-          error: `No database at ${DB_PATH}.`,
+          error: dbUnavailableError(),
         });
-      return sendJson(res, 200, { messages });
+      return sendJson(res, 200, {
+        messages: result.rows,
+        // Short page because of the SIZE budget, not exhausted history; the
+        // client must not conclude "no more messages" from it.
+        ...(result.trimmed ? { trimmed: true } : {}),
+      });
     }
     if (url.pathname === "/api/me") {
       // Membership state for a (room, name): lets the client learn its read
@@ -640,13 +725,17 @@ const server = createServer(async (req, res) => {
         Math.min(Math.floor(Number(url.searchParams.get("limit"))) || 30, 100),
       );
       try {
-        const matches = searchMessages(roomId, q, limit);
-        if (matches === null)
+        const result = searchMessages(roomId, q, limit);
+        if (result === null)
           return sendJson(res, 200, {
             matches: [],
-            error: `No database at ${DB_PATH}.`,
+            error: dbUnavailableError(),
           });
-        return sendJson(res, 200, { matches, q });
+        return sendJson(res, 200, {
+          matches: result.rows,
+          q,
+          ...(result.trimmed ? { trimmed: true } : {}),
+        });
       } catch (e) {
         // Most commonly an FTS5 syntax error in q; a 400 the UI can display.
         return sendJson(res, 400, { error: String((e && e.message) || e) });

@@ -60,24 +60,35 @@ Prefer the poller_cmd string join_room returns: it is this command pre-quoted fo
 const session: {
   agentId: string | null;
   roomId: number | null;
-  // Cursor mode is PER ROOM, not global: a session can hold a private cursor
-  // in room A while working room B shared. A single boolean here previously
-  // let the LAST join's mode leak into every room's inbox baseline.
-  privateRooms: Set<number>;
+  // Cursor mode is PER (ROOM, IDENTITY), not per room: a session can switch
+  // identities, and a room-only key let identity B's shared join silently
+  // clear identity A's private mode -- A's next omitted-cursor rejoin then
+  // deleted A's private cursor row and jumped it to the identity marker,
+  // making its unread backlog unrecoverable.
+  privateRooms: Set<string>;
 } = {
   agentId: null,
   roomId: null,
   privateRooms: new Set(),
 };
 
+/** Key for the per-(room, identity) private-cursor mode set. \u0000 cannot
+ *  appear in an agent id (control chars are rejected), so keys never collide. */
+function privKey(roomId: number, agentId: string): string {
+  return `${roomId}\u0000${agentId}`;
+}
+
 // Distinguishes this process's private read cursor (join_room cursor:'private')
 // from other sessions running under the same agent_id.
 const SESSION_NONCE = randomUUID();
 
 /** The session-cursor key for ACTIVE-room store calls: the nonce when the
- *  active room was joined with a private cursor, else null. */
+ *  active room was joined with a private cursor UNDER THE CURRENT IDENTITY,
+ *  else null. */
 function cursorId(): string | null {
-  return session.roomId !== null && session.privateRooms.has(session.roomId)
+  return session.roomId !== null &&
+    session.agentId !== null &&
+    session.privateRooms.has(privKey(session.roomId, session.agentId))
     ? SESSION_NONCE
     : null;
 }
@@ -201,6 +212,13 @@ const server = new McpServer(
   { instructions: INSTRUCTIONS },
 );
 
+// Every inputSchema below is z.object(...).strict(): UNKNOWN keys are
+// rejected, not silently stripped. Stripping turned typos into different
+// operations -- mark_read({sequence:0}) marked the whole backlog read,
+// post_message({too:[...]}) posted without its recipients. The SDK passes
+// Zod schema instances through to its own validator, so strictness reaches
+// the wire (and additionalProperties:false reaches the advertised schema).
+
 server.registerTool(
   "server_info",
   {
@@ -211,7 +229,7 @@ server.registerTool(
       "started; reconnect the MCP to load it (stdio servers do not " +
       "hot-reload); `latest_commit`/`latest_built_at` name it. `commit` gets " +
       "a -dirty suffix for uncommitted builds.",
-    inputSchema: {},
+    inputSchema: z.object({}).strict(),
   },
   async () => {
     try {
@@ -241,7 +259,7 @@ server.registerTool(
       "epoch SECONDS), `at` (local 'YYYY-MM-DD HH:MM:SS'), `timezone` (IANA " +
       "name). `unix` matches each message's `unix`, so now.unix - " +
       "message.unix = the message's age in seconds.",
-    inputSchema: {},
+    inputSchema: z.object({}).strict(),
   },
   async () => {
     try {
@@ -268,7 +286,7 @@ server.registerTool(
       "for the TOPIC (kebab-case, e.g. 'auth-refactor-review'), never for " +
       "participants or generic labels: list_rooms names are how agents find " +
       "rooms. `pinned` is an intro shown to every joiner. Returns the room id.",
-    inputSchema: {
+    inputSchema: z.object({
       name: z
         .string()
         .min(1)
@@ -287,7 +305,7 @@ server.registerTool(
         .max(10_000)
         .optional()
         .describe("Pinned intro/conventions shown to joiners"),
-    },
+    }).strict(),
   },
   async ({ name, description, pinned }) => {
     try {
@@ -323,14 +341,31 @@ server.registerTool(
   {
     title: "List rooms",
     description:
-      "List all chat rooms with present-member count, message count, last " +
-      "activity and pinned intro.",
-    inputSchema: {},
+      "List chat rooms (oldest first, up to `limit`; `total` reports how many " +
+      "exist) with present-member count, message count, last activity and " +
+      "pinned intro. Long pinned/descriptions are listing previews " +
+      "(*_truncated flags); join_room returns the full pinned.",
+    inputSchema: z
+      .object({
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .max(1000)
+          .optional()
+          .describe("Max rooms to return (default 200)"),
+      })
+      .strict(),
   },
-  async () => {
+  async ({ limit }) => {
     try {
       touchSession();
-      return ok({ rooms: store.listRooms() });
+      const { rooms, total } = store.listRooms(limit ?? 200);
+      return ok({
+        rooms,
+        total,
+        ...(total > rooms.length ? { truncated: true } : {}),
+      });
     } catch (e) {
       return fail(asMessage(e));
     }
@@ -343,8 +378,9 @@ server.registerTool(
     title: "Join room",
     description:
       "Join a room (id or name) under an identity; sets it active for the " +
-      "session. Omit agent_id to get a generated readable id (returned; reuse " +
-      "it later to resume the same identity and read position). " +
+      "session. Omit agent_id to keep the session's current identity (on the " +
+      "FIRST join a generated readable id is assigned and returned; reuse it " +
+      "later to resume the same identity and read position). " +
       "type/role/description tell other agents who you are. Read the returned " +
       "`pinned` intro. `server_stale:true` = this server runs outdated code; " +
       "tell the user to reconnect the MCP. `cursor` (for several sessions " +
@@ -352,7 +388,7 @@ server.registerTool(
       "concurrent sessions SPLIT the backlog (work-queue style); 'private' = " +
       "this session keeps its own cursor (starting from the shared marker) " +
       "and sees the full stream independently.",
-    inputSchema: {
+    inputSchema: z.object({
       room: z.string().min(1).describe("Room id or name to join"),
       agent_id: z
         .string()
@@ -362,7 +398,8 @@ server.registerTool(
         })
         .optional()
         .describe(
-          "Your stable identity/nickname. Omit to be assigned a readable id.",
+          "Your stable identity/nickname. Omit to keep the session identity " +
+            "(first join: a readable id is generated and returned).",
         ),
       type: z
         .string()
@@ -389,7 +426,7 @@ server.registerTool(
             "room (shared on first join); only an explicit 'shared' discards " +
             "an existing private cursor.",
         ),
-    },
+    }).strict(),
   },
   async ({ room, agent_id, type, role, description, cursor }) => {
     try {
@@ -404,6 +441,13 @@ server.registerTool(
       if (agent_id && agent_id.trim().length > 0) {
         id = agent_id.trim();
         store.upsertAgent(id, type ?? null, role ?? null, description ?? null);
+      } else if (session.agentId !== null) {
+        // STICKY identity: a session that already established who it is
+        // keeps that identity on later joins. Generating a fresh id here
+        // forked the session into a second identity whose twin kept its own
+        // markers and memberships -- silent state the caller never asked for.
+        id = session.agentId;
+        store.upsertAgent(id, type ?? null, role ?? null, description ?? null);
       } else {
         // Generated ids are claimed atomically inside assignReadableId, so no
         // separate upsert here (it would risk clobbering a racing assigner).
@@ -412,20 +456,21 @@ server.registerTool(
       // Session state mutates only AFTER the join succeeds: flipping cursor
       // mode first would leave a failed join having silently changed the mode
       // for the still-active previous room.
-      // Cursor mode is STICKY per room: an omitted `cursor` keeps this
-      // session's existing mode. Treating omission as an explicit 'shared'
-      // used to DELETE the session's private cursor on any rejoin (a role
-      // refresh, a reconnect), silently jumping the session to the identity
-      // marker -- messages it never received became unrecoverable. Only an
-      // explicit 'shared' downgrades.
+      // Cursor mode is STICKY per (room, identity): an omitted `cursor` keeps
+      // this session's existing mode FOR THIS IDENTITY. Treating omission as
+      // an explicit 'shared' used to DELETE the session's private cursor on
+      // any rejoin, and a room-only key let ANOTHER identity's shared join
+      // clear this identity's mode with the same silent-loss outcome. Only an
+      // explicit 'shared' downgrades, and only for the identity that joins.
+      const key = privKey(target.id, id);
       const priv =
         cursor === "private" ||
-        (cursor === undefined && session.privateRooms.has(target.id));
+        (cursor === undefined && session.privateRooms.has(key));
       store.joinRoom(target.id, id, priv ? SESSION_NONCE : null);
       if (priv) {
-        session.privateRooms.add(target.id);
+        session.privateRooms.add(key);
       } else {
-        session.privateRooms.delete(target.id);
+        session.privateRooms.delete(key);
         // Mode switch hygiene: drop any leftover private row so my_mentions'
         // per-room COALESCE stops using a baseline this session abandoned.
         // (Reached on explicit 'shared', or on omitted-cursor joins where the
@@ -452,7 +497,7 @@ server.registerTool(
         cursor: priv ? "private" : "shared",
         last_read_seq: cur.last_read_seq,
         unread: store.unreadCount(target.id, cur.last_read_seq, id),
-        members: store.listAgents(target.id, 5).filter((a) => a.present).length,
+        members: store.presentCount(target.id),
         // Ready-to-run background poller invocation, shell-quoted for THIS
         // id (see the server instructions for its options and semantics).
         poller_cmd: pollerCmd(id),
@@ -475,7 +520,7 @@ server.registerTool(
       "Soft-leave the active room: your read position is kept, rejoining " +
       "resumes it. Clears the active room; your identity is kept (my_mentions " +
       "and later joins still work).",
-    inputSchema: {},
+    inputSchema: z.object({}).strict(),
   },
   async () => {
     try {
@@ -499,7 +544,7 @@ server.registerTool(
   {
     title: "Who am I",
     description: "Report the current session identity, active room and unread count.",
-    inputSchema: {},
+    inputSchema: z.object({}).strict(),
   },
   async () => {
     try {
@@ -527,7 +572,10 @@ server.registerTool(
         agent_id: session.agentId,
         room_id: session.roomId,
         room_name: roomRow?.name ?? null,
-        cursor: session.privateRooms.has(session.roomId) ? "private" : "shared",
+        cursor:
+          session.privateRooms.has(privKey(session.roomId, session.agentId))
+            ? "private"
+            : "shared",
         last_read_seq: cur?.last_read_seq ?? 0,
         unread: store.unreadCount(
           session.roomId,
@@ -546,10 +594,12 @@ server.registerTool(
   {
     title: "List agents in room",
     description:
-      "List agents in the active room: type/role/description, `last_read_seq` " +
-      "(read receipt: compare to a message seq), `last_seen`, `idle_seconds`, " +
-      "`present` (has not left), `active` (seen within active_within_minutes).",
-    inputSchema: {
+      "List agents in the active room (up to `limit`, `total` rides along): " +
+      "type/role/description, `last_read_seq` (read receipt: compare to a " +
+      "message seq), `last_seen`, `idle_seconds`, `present` (has not left), " +
+      "`active` (seen within active_within_minutes). Long descriptions are " +
+      "listing previews (description_truncated).",
+    inputSchema: z.object({
       filter: z
         .string()
         .optional()
@@ -560,14 +610,29 @@ server.registerTool(
         .max(1440)
         .optional()
         .describe("Window for the `active` flag (default 5 minutes)"),
-    },
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .max(1000)
+        .optional()
+        .describe("Max agents to return (default 200)"),
+    }).strict(),
   },
-  async ({ filter, active_within_minutes }) => {
+  async ({ filter, active_within_minutes, limit }) => {
     try {
       touchSession();
       const { roomId } = requireActive();
+      const { agents, total } = store.listAgents(
+        roomId,
+        active_within_minutes ?? 5,
+        filter,
+        limit ?? 200,
+      );
       return ok({
-        agents: store.listAgents(roomId, active_within_minutes ?? 5, filter),
+        agents,
+        total,
+        ...(total > agents.length ? { truncated: true } : {}),
       });
     } catch (e) {
       return fail(asMessage(e));
@@ -590,7 +655,7 @@ server.registerTool(
       "catch_up, contradicting messages may have landed while you wrote. " +
       "`supersedes_seq` marks YOUR OWN earlier message as corrected (readers " +
       "see `superseded_by` on it) instead of leaving both versions standing.",
-    inputSchema: {
+    inputSchema: z.object({
       content: z
         .union([z.string(), z.record(z.any()), z.array(z.any())])
         .describe("Message body: a string, or a JSON object/array"),
@@ -622,7 +687,7 @@ server.registerTool(
           "seq of YOUR OWN earlier message that this message supersedes " +
             "(correction/retraction)",
         ),
-    },
+    }).strict(),
   },
   async ({ content, to, reply_to_seq, supersedes_seq }) => {
     try {
@@ -679,7 +744,7 @@ server.registerTool(
       "read_history/search_messages to see them). This is THE room sync and it " +
       "is unfiltered by design; to find what is directed at you across every " +
       "room, use my_mentions (a cross-room inbox that never moves markers).",
-    inputSchema: {
+    inputSchema: z.object({
       limit: z
         .number()
         .int()
@@ -716,7 +781,7 @@ server.registerTool(
         .number()
         .optional()
         .describe("REMOVED in v0.6.0; my_mentions pages with after_id."),
-    },
+    }).strict(),
   },
   async ({ limit, preview_chars, max_bytes, mentions_me, after_seq }) => {
     try {
@@ -763,7 +828,7 @@ server.registerTool(
       "every room with ANY unread from others: `directed` (aimed at you) and " +
       "`unread` (total, broadcasts included); an EMPTY inbox with nonzero " +
       "by_room unread means rooms still have traffic to sync, not silence.",
-    inputSchema: {
+    inputSchema: z.object({
       limit: z
         .number()
         .int()
@@ -796,7 +861,7 @@ server.registerTool(
           "Paging cursor: the prior response's next_after_id. Paging state " +
             "only; moves no read marker.",
         ),
-    },
+    }).strict(),
   },
   async ({ limit, preview_chars, max_bytes, after_id }) => {
     try {
@@ -835,7 +900,7 @@ server.registerTool(
       "prior call's oldest_seq. Oldest-first; replies carry a `reply_to` " +
       "preview. For unread directed messages use my_mentions; to find a " +
       "topic use search_messages.",
-    inputSchema: {
+    inputSchema: z.object({
       limit: z
         .number()
         .int()
@@ -873,7 +938,7 @@ server.registerTool(
           "Serialized-size budget per page (default 100000); " +
             "byte_limited:true = trimmed, continue with before_seq.",
         ),
-    },
+    }).strict(),
   },
   async ({ limit, before_seq, mentions_me, preview_chars, max_bytes }) => {
     try {
@@ -904,14 +969,14 @@ server.registerTool(
       "`seq` to jump to the latest (skip the backlog); a lower `seq` " +
       "re-exposes messages to catch_up. Nothing is deleted; read_history " +
       "still sees everything. Returns previous/new marker and the latest seq.",
-    inputSchema: {
+    inputSchema: z.object({
       seq: z
         .number()
         .int()
         .nonnegative()
         .optional()
         .describe("Marker target; omit to jump to the latest message"),
-    },
+    }).strict(),
   },
   async ({ seq }) => {
     try {
@@ -930,11 +995,12 @@ server.registerTool(
     title: "Get one message",
     description:
       "Fetch one message by seq (e.g. to resolve 'see message 8'). Bodies " +
-      "return up to `max_chars` per call; longer ones arrive sliced with " +
-      "`length` and `offset`. truncated:true = more remains BEYOND the slice: " +
-      "call again with offset = offset + returned chars until truncated is " +
-      "false. A sliced json body is a raw partial string.",
-    inputSchema: {
+      "return up to `max_chars` per call (escape-heavy bodies return fewer: " +
+      "the SERIALIZED slice honors max_chars too); longer ones arrive sliced " +
+      "with `length` and `offset`. truncated:true = more remains BEYOND the " +
+      "slice: call again with offset = offset + returned chars until " +
+      "truncated is false. A sliced json body is a raw partial string.",
+    inputSchema: z.object({
       seq: z.number().int().positive().describe("Message number to fetch"),
       offset: z
         .number()
@@ -949,7 +1015,7 @@ server.registerTool(
         .max(400_000)
         .optional()
         .describe("Max body characters to return (default 100000)"),
-    },
+    }).strict(),
   },
   async ({ seq, offset, max_chars }) => {
     try {
@@ -974,7 +1040,7 @@ server.registerTool(
       "default 3; `replies_capped` flags the internal cap). One shared byte " +
       "budget covers message + parent + replies, so oversized bodies arrive " +
       "truncated:true with length; page full text via get_message.",
-    inputSchema: {
+    inputSchema: z.object({
       seq: z.number().int().positive().describe("Message number to expand"),
       max_depth: z
         .number()
@@ -989,7 +1055,7 @@ server.registerTool(
         .positive()
         .optional()
         .describe("Truncate reply bodies to this many characters"),
-    },
+    }).strict(),
   },
   async ({ seq, max_depth, preview_chars }) => {
     try {
@@ -1011,12 +1077,12 @@ server.registerTool(
     description:
       "Set or update the pinned intro/conventions for the active room. Pass an " +
       "empty string to clear it. Joiners see this in join_room.",
-    inputSchema: {
+    inputSchema: z.object({
       text: z
         .string()
         .max(10_000)
         .describe("Pinned intro text (empty string clears it)"),
-    },
+    }).strict(),
   },
   async ({ text }) => {
     try {
@@ -1039,8 +1105,10 @@ server.registerTool(
       "Full-text search of message bodies in the active room, best matches " +
       "first. `query` is FTS5 syntax: bare terms are ANDed; supports OR, NOT, " +
       'quoted "phrases", and prefix* . Use this instead of paging read_history ' +
-      "to find where a topic was discussed.",
-    inputSchema: {
+      "to find where a topic was discussed. `next_offset` present = more " +
+      "matches exist (a byte cut or the limit); pass it back as `offset` to " +
+      "page the rest.",
+    inputSchema: z.object({
       query: z.string().min(1).describe("FTS5 search query"),
       limit: z
         .number()
@@ -1049,13 +1117,19 @@ server.registerTool(
         .max(100)
         .optional()
         .describe("Max results (default 20)"),
-    },
+      offset: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("Skip this many best matches (prior page's next_offset)"),
+    }).strict(),
   },
-  async ({ query, limit }) => {
+  async ({ query, limit, offset }) => {
     try {
       touchSession();
       const { roomId } = requireActive();
-      return ok(store.searchMessages(roomId, query, limit ?? 20));
+      return ok(store.searchMessages(roomId, query, limit ?? 20, offset ?? 0));
     } catch (e) {
       return fail(asMessage(e));
     }
@@ -1074,7 +1148,7 @@ server.registerTool(
       "holder. Claims expire after ttl_seconds (default 900); re-claim your " +
       "own key to renew. Advisory only: nothing is physically locked, " +
       "cooperating agents must check. Ownership is per agent_id.",
-    inputSchema: {
+    inputSchema: z.object({
       key: z
         .string()
         .min(1)
@@ -1092,7 +1166,7 @@ server.registerTool(
         .max(2000)
         .optional()
         .describe("What you are doing with it (shown to other agents)"),
-    },
+    }).strict(),
   },
   async ({ key, ttl_seconds, note }) => {
     try {
@@ -1114,9 +1188,9 @@ server.registerTool(
     description:
       "Release a claim you hold so others can take it. Expired claims can be " +
       "released by anyone; an active claim only by its holder.",
-    inputSchema: {
+    inputSchema: z.object({
       key: z.string().min(1).max(500).describe("Resource name to release"),
-    },
+    }).strict(),
   },
   async ({ key }) => {
     try {
@@ -1134,16 +1208,32 @@ server.registerTool(
   {
     title: "List claims",
     description:
-      "List active (unexpired) claims in the active room: key, holder, note, " +
-      "and seconds until expiry. Check before starting work that overlaps " +
-      "someone's claim.",
-    inputSchema: {},
+      "List active (unexpired) claims in the active room (up to `limit`, " +
+      "`total` rides along): key, holder, note (listing preview, " +
+      "note_truncated flags a cut), and seconds until expiry. Check before " +
+      "starting work that overlaps someone's claim.",
+    inputSchema: z
+      .object({
+        limit: z
+          .number()
+          .int()
+          .positive()
+          .max(1000)
+          .optional()
+          .describe("Max claims to return (default 200)"),
+      })
+      .strict(),
   },
-  async () => {
+  async ({ limit }) => {
     try {
       touchSession();
       const { roomId } = requireActive();
-      return ok({ claims: store.listClaims(roomId) });
+      const { claims, total } = store.listClaims(roomId, limit ?? 200);
+      return ok({
+        claims,
+        total,
+        ...(total > claims.length ? { truncated: true } : {}),
+      });
     } catch (e) {
       return fail(asMessage(e));
     }
@@ -1161,7 +1251,7 @@ server.registerTool(
       "would_delete_unread/min_read_seq) if any non-author member has not " +
       "read a doomed message yet, including members that left and lagging " +
       "private session cursors; force=true prunes anyway.",
-    inputSchema: {
+    inputSchema: z.object({
       keep_last: z
         .number()
         .int()
@@ -1173,7 +1263,7 @@ server.registerTool(
         .describe(
           "Delete even messages a member (present or left) has not read yet",
         ),
-    },
+    }).strict(),
   },
   async ({ keep_last, force }) => {
     try {
@@ -1198,12 +1288,12 @@ server.registerTool(
       "(messages, memberships, read positions, claims). Requires " +
       "confirm=true. Destructive, not reversible, unauthenticated: any caller " +
       "can delete any room. Returns the removed counts.",
-    inputSchema: {
+    inputSchema: z.object({
       room: z.string().min(1).describe("Room id or name to delete"),
       confirm: z
         .boolean()
         .describe("Must be true; a guard against accidental deletion"),
-    },
+    }).strict(),
   },
   async ({ room, confirm }) => {
     try {
@@ -1214,7 +1304,11 @@ server.registerTool(
         return fail(`pass confirm:true to delete room ${target.id} ("${target.name}")`);
       }
       const result = store.deleteRoom(target.id);
-      session.privateRooms.delete(target.id);
+      // Drop every identity's private-mode entry for the dead room.
+      // (Deleting the current element during Set iteration is well-defined.)
+      for (const k of session.privateRooms) {
+        if (k.startsWith(`${target.id}\u0000`)) session.privateRooms.delete(k);
+      }
       if (session.roomId === target.id) {
         session.roomId = null; // identity survives; only the room is gone
       }

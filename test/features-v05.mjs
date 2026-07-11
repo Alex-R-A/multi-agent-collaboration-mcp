@@ -116,7 +116,7 @@ const rel2 = s.releaseClaim(room, "file:src/db.ts", "alice");
 check(rel2.released === true, "holder releases");
 const c4 = s.claimResource(room, "file:src/db.ts", "bob", 900, null);
 check(c4.granted === true, "released key claimable by another agent");
-const list = s.listClaims(room);
+const { claims: list } = s.listClaims(room);
 check(list.length === 1 && list[0].holder === "bob" && list[0].expires_in_seconds > 0, "list_claims shows active holder");
 
 // expiry: a 1-second claim frees itself
