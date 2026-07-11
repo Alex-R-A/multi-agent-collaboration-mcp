@@ -1345,11 +1345,12 @@ server.registerTool(
   {
     title: "List claims",
     description:
-      "List active (unexpired) claims in the active room (up to `limit` from " +
-      "`offset`, `total` rides along): key, holder, note (listing preview, " +
+      "List active (unexpired) claims in the active room (up to `limit`, " +
+      "`total` active count rides along): key, holder, note (listing preview, " +
       "note_truncated flags a cut), and seconds until expiry. Check before " +
-      "starting work that overlaps someone's claim. `truncated:true` = more " +
-      "rows exist; page with offset.",
+      "starting work that overlaps someone's claim. `next_key` present = more " +
+      "rows exist; page by passing it back as `after_key` (keyset paging, so a " +
+      "claim expiring between pages cannot make you skip a live one).",
     inputSchema: z
       .object({
         limit: z
@@ -1359,30 +1360,30 @@ server.registerTool(
           .max(1000)
           .optional()
           .describe("Max claims to return (default 200)"),
-        offset: z
-          .number()
-          .int()
-          .nonnegative()
+        after_key: z
+          .string()
+          .max(500)
           .optional()
-          .describe("Skip this many claims (paging; default 0)"),
+          .describe(
+            "Keyset paging cursor: the prior page's next_key. Returns claims " +
+              "whose key sorts after it.",
+          ),
       })
       .strict(),
   },
-  async ({ limit, offset }) => {
+  async ({ limit, after_key }) => {
     try {
       touchSession();
       const { roomId } = requireActive();
-      const off = offset ?? 0;
-      const { claims, total, size_trimmed } = store.listClaims(
+      const { claims, total, next_key, size_trimmed } = store.listClaims(
         roomId,
         limit ?? 200,
-        off,
+        after_key ?? "",
       );
-      const more = off + claims.length < total || !!size_trimmed;
       return ok({
         claims,
         total,
-        ...(more ? { truncated: true } : {}),
+        ...(next_key !== undefined ? { next_key, truncated: true } : {}),
         ...(size_trimmed ? { size_trimmed: true } : {}),
       });
     } catch (e) {

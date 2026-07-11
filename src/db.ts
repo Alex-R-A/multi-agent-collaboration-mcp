@@ -2387,13 +2387,17 @@ export class ChatStore {
     return tx.immediate();
   }
 
-  /** Active (unexpired) claims in a room, at most `limit` from `offset` (total
-   *  rides along); notes are cut to listing previews and the whole response is
-   *  trimmed to a serialized-size budget. Expired rows pruned in passing. */
+  /** Active (unexpired) claims in a room, KEYSET-paged by key: pass the prior
+   *  page's `next_key` back as `afterKey` for the next page. Keyset, NOT OFFSET,
+   *  because a claim expiring (and being pruned) between pages shifts every
+   *  OFFSET after it and skips a still-live claim; `key > afterKey` is immune to
+   *  that (keys are unique per room and are the sort key). Notes are cut to
+   *  listing previews and the whole response is trimmed to a serialized-size
+   *  budget. Expired rows are pruned in passing; `total` is the active count. */
   listClaims(
     roomId: number,
     limit = 200,
-    offset = 0,
+    afterKey = "",
   ): {
     claims: {
       key: string;
@@ -2404,15 +2408,20 @@ export class ChatStore {
       expires_in_seconds: number;
     }[];
     total: number;
+    next_key?: string;
     size_trimmed?: boolean;
   } {
     const PREVIEW = 300;
+    const lim = Math.max(1, Math.floor(limit));
     const tx = this.db.transaction(() => {
       this.db
         .prepare(
           "DELETE FROM claims WHERE room_id = ? AND expires_at <= datetime('now')",
         )
         .run(roomId);
+      // Fetch one MORE than asked to detect a further page without a tail COUNT.
+      // key > afterKey is the keyset cursor; afterKey need not still exist (a
+      // plain string comparison), so a since-expired cursor key is harmless.
       const rows = this.db
         .prepare(
           `SELECT key, agent_id AS holder,
@@ -2420,9 +2429,9 @@ export class ChatStore {
                   CASE WHEN length(note) > ${PREVIEW} THEN 1 ELSE 0 END AS note_cut,
                   expires_at,
                   (strftime('%s', expires_at) - strftime('%s', 'now')) AS expires_in_seconds
-           FROM claims WHERE room_id = ? ORDER BY key LIMIT ? OFFSET ?`,
+           FROM claims WHERE room_id = ? AND key > ? ORDER BY key LIMIT ?`,
         )
-        .all(roomId, Math.max(1, Math.floor(limit)), Math.max(0, Math.floor(offset))) as {
+        .all(roomId, afterKey, lim + 1) as {
         key: string;
         holder: string;
         note: string | null;
@@ -2433,12 +2442,25 @@ export class ChatStore {
       const { c: total } = this.db
         .prepare("SELECT COUNT(*) AS c FROM claims WHERE room_id = ?")
         .get(roomId) as { c: number };
-      const mapped = rows.map((r) => {
+      const hasMore = rows.length > lim;
+      const page = hasMore ? rows.slice(0, lim) : rows;
+      const mapped = page.map((r) => {
         const { note_cut, ...rest } = r;
         return { ...rest, ...(note_cut ? { note_truncated: true } : {}) };
       });
       const { rows: claims, sizeTrimmed } = fitRows(mapped, LIST_ROW_BUDGET);
-      return { claims, total, ...(sizeTrimmed ? { size_trimmed: true } : {}) };
+      // More remain if the byte budget cut the page OR a further row existed
+      // beyond `limit`. next_key is the LAST RETURNED claim's key -- the keyset
+      // cursor for the next page; omitted once the page is exhausted.
+      const more = sizeTrimmed || (hasMore && claims.length === page.length);
+      const next_key =
+        more && claims.length > 0 ? claims[claims.length - 1].key : undefined;
+      return {
+        claims,
+        total,
+        ...(next_key !== undefined ? { next_key } : {}),
+        ...(sizeTrimmed ? { size_trimmed: true } : {}),
+      };
     });
     return tx.immediate();
   }

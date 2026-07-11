@@ -165,5 +165,36 @@ const NUL = String.fromCharCode(0);
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- 7: claim listing keyset-pages; a claim expiring mid-page skips nothing ---
+{
+  const dir = mkdtempSync(join(tmpdir(), "v09-claims-"));
+  const DB = join(dir, "t.db");
+  const s = new ChatStore(DB);
+  const r = s.createRoom("claims", null, null).id;
+  s.upsertAgent("a", null, null, null); s.joinRoom(r, "a");
+  for (const k of ["k-a", "k-b", "k-c", "k-d"]) s.claimResource(r, k, "a", 900, null);
+  const p1 = s.listClaims(r, 2, "");
+  check(
+    "claims page 1: first two by key, next_key set",
+    p1.claims.map((c) => c.key).join(",") === "k-a,k-b" && p1.next_key === "k-b",
+    { keys: p1.claims.map((c) => c.key), next_key: p1.next_key },
+  );
+  // Expire the FIRST claim between pages. Under the old DELETE-then-OFFSET, page
+  // 2 at offset 2 would shift over the now-3-row set and skip the live k-c.
+  {
+    const raw = new Database(DB);
+    raw.prepare("UPDATE claims SET expires_at = datetime('now','-10 seconds') WHERE key = 'k-a'").run();
+    raw.close();
+  }
+  const p2 = s.listClaims(r, 2, p1.next_key);
+  check(
+    "claims page 2 (keyset) returns k-c,k-d after k-a expired -- live claim not skipped",
+    p2.claims.map((c) => c.key).join(",") === "k-c,k-d",
+    p2.claims.map((c) => c.key),
+  );
+  s.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+
 console.log(`\n${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"}`);
 process.exit(failures === 0 ? 0 : 1);
