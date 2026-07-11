@@ -116,6 +116,26 @@ function safeCut(s: string, end: number): string {
 }
 
 /**
+ * Slice s to its first `n` CODEPOINTS (characters), the unit get_message and the
+ * reported `length` field use. preview_chars is a codepoint budget, so cutting
+ * in codepoints keeps preview length and reported length in the same unit (an
+ * emoji counts once, not twice). Iterating by codepoint never splits a surrogate
+ * pair, and it stops after n codepoints, so cost is O(n) not O(|s|) -- safe on a
+ * body up to the fetch cap.
+ */
+function cutToCodepoints(s: string, n: number): string {
+  if (n <= 0) return "";
+  let count = 0;
+  let units = 0;
+  for (const ch of s) {
+    if (count >= n) break;
+    units += ch.length;
+    count++;
+  }
+  return units >= s.length ? s : s.slice(0, units);
+}
+
+/**
  * Reject text SQLite cannot round-trip losslessly, at WRITE time, so a read
  * never silently loses data:
  *  - U+0000 (NUL): SQLite's string functions are C NUL-terminated, so
@@ -293,19 +313,6 @@ function codepointLen(r: RawMessage): number {
   return n;
 }
 
-/**
- * Full body length, tolerant of a wrong or missing body_len. The MAX of the
- * stored length and what we actually fetched: body.length is an exact lower
- * bound (we hold those characters), so a stale-low body_len (an old build's
- * codepoint count for astral text, or a lone-surrogate renormalization skew)
- * can never make us UNDER-report below the characters in hand. When the whole
- * body was fetched, body.length is exact and wins; only a genuinely capped
- * fetch of a huge body leans on the stored body_len.
- */
-function fullLen(r: RawMessage): number {
-  return Math.max(r.body_len ?? 0, r.body.length);
-}
-
 // A message row joined to its author and (for reply previews) its parent.
 // superseded_by resolves ONE hop (the latest direct superseder); readers follow
 // chains by looking at that message's own superseded_by.
@@ -466,12 +473,13 @@ export class ChatStore {
       END;
 
       -- The former messages_body_len_ai trigger stamped length(NEW.body), which
-      -- counts CODEPOINTS. For astral text that under-counts vs the UTF-16 unit
-      -- paging uses, and the value was never repaired (the JS backfill only
-      -- visits NULLs), so a mixed-version astral insert reported a permanently
-      -- wrong length. Dropped: an old build's insert now leaves body_len NULL,
-      -- fullLen() falls back to the exact fetched body.length, and the next
-      -- new-build startup backfills it precisely.
+      -- counts CODEPOINTS. For astral text that under-counts vs the UTF-16
+      -- body_len the web viewer reports, and the value was never repaired (the
+      -- JS backfill only visits NULLs), so a mixed-version astral insert
+      -- reported a permanently wrong length. Dropped: an old build's insert now
+      -- leaves body_len NULL, the web viewer falls back to length(body), and the
+      -- next new-build startup backfills the exact UTF-16 value. (MCP reads no
+      -- longer use body_len at all -- they report length(body) codepoints.)
       DROP TRIGGER IF EXISTS messages_body_len_ai;
 
       -- Reject an embedded NUL at the DATABASE level: SQLite's substr()/length()
@@ -529,13 +537,14 @@ export class ChatStore {
         cursor = row.id;
       }
     }
-    // Backfill body_len for rows that predate the column. Exact UTF-16 length
-    // must be measured in JS, so we LOAD the body -- but only for rows small
-    // enough to be safe (length() is a cheap codepoint gate, an upper bound on
-    // UTF-16 units is 2x that, so <= BACKFILL_MAX_CHARS codepoints is at most
-    // ~2x that many UTF-16 units held at once). Giant legacy rows are stamped
-    // with the memory-safe codepoint count via SQL (a low-but-nonzero bound;
-    // fullLen()'s max() lifts it to the fetched length when more is in hand).
+    // Backfill body_len (the exact UTF-16 length the WEB viewer reports) for
+    // rows that predate the column. It must be measured in JS, so we LOAD the
+    // body -- but only for rows small enough to be safe (length() is a cheap
+    // codepoint gate, an upper bound on UTF-16 units is 2x that, so <=
+    // BACKFILL_MAX_CHARS codepoints is at most ~2x that many UTF-16 units held
+    // at once). Giant legacy rows are stamped with the memory-safe codepoint
+    // count via SQL (a low-but-nonzero bound; the web viewer's COALESCE still
+    // shows a length and its total>shown guard tolerates the codepoint skew).
     // Cursored by id so the whole sweep is one table pass, one body resident.
     {
       const BACKFILL_MAX_CHARS = 1_000_000;
@@ -600,6 +609,15 @@ export class ChatStore {
       );
     `);
 
+    // Heal legacy embedded NULs in metadata columns too (message bodies are
+    // healed above, with their body_len reset). Listing SQL uses substr(), which
+    // stops at the first NUL, so a legacy NUL silently truncated the shown
+    // value. Runs after every table exists; new writes are already rejected.
+    this.healNulColumn("rooms", "description");
+    this.healNulColumn("rooms", "pinned");
+    this.healNulColumn("agents", "description");
+    this.healNulColumn("claims", "note");
+
     // Full-text search over message bodies. External-content FTS5 mirrors
     // messages.body keyed by messages.id; triggers keep it in sync.
     this.db.exec(`
@@ -651,6 +669,33 @@ export class ChatStore {
         const msg = e instanceof Error ? e.message : String(e);
         if (!/duplicate column name/i.test(msg)) throw e;
       }
+    }
+  }
+
+  /**
+   * Heal legacy embedded NULs in a bounded TEXT metadata column (room
+   * description/pinned, agent description, claim note): replace U+0000 with
+   * U+FFFD so a listing's substr()/length() reads the value whole instead of
+   * truncating at the NUL. Cursored by rowid one row at a time (these columns
+   * cap at <=10k and NUL rows are exotic); a plain SELECT is not NUL-terminated,
+   * so the value is recoverable. `table`/`col` are fixed internal identifiers,
+   * never caller input. Healing clears the NUL, so the predicate never revisits
+   * a row and the rowid cursor moves strictly forward.
+   */
+  private healNulColumn(table: string, col: string): void {
+    const next = this.db.prepare(
+      `SELECT rowid AS rid, ${col} AS v FROM ${table}
+       WHERE instr(${col}, char(0)) > 0 AND rowid > ? ORDER BY rowid LIMIT 1`,
+    );
+    const fix = this.db.prepare(
+      `UPDATE ${table} SET ${col} = ? WHERE rowid = ?`,
+    );
+    let cursor = 0;
+    for (;;) {
+      const row = next.get(cursor) as { rid: number; v: string } | undefined;
+      if (!row) break;
+      fix.run(row.v.replace(/\u0000/g, "\ufffd"), row.rid);
+      cursor = row.rid;
     }
   }
 
@@ -1268,18 +1313,20 @@ export class ChatStore {
   }
 
   private rowToMessage(r: RawMessage, previewChars?: number): MessageRow {
-    // The CUT decision is in UTF-16 units (safeCut cuts code units, and
-    // previewChars is a UTF-16 budget); the reported `length` is in CODEPOINTS
-    // (the character count, consistent with get_message).
-    const total = fullLen(r);
-    const truncate = previewChars !== undefined && total > previewChars;
+    // Both the CUT and the reported `length` are in CODEPOINTS now, so
+    // preview_chars means the same unit as get_message's max_chars and as the
+    // reported length (an emoji counts once). Deciding on codepointLen (the full
+    // codepoint count) rather than a UTF-16 length keeps the threshold in the
+    // same unit as the cut.
+    const truncate =
+      previewChars !== undefined && codepointLen(r) > previewChars;
     // A truncated body is returned as a raw (possibly partial) string even for
     // json: a sliced JSON string does not parse, so the caller must fetch the
     // full body with get_message. `truncated`/`length` signal exactly that.
     // A body larger than the fetch cap arrives here already cut; it can never
     // fit the byte budget anyway, so shrinkToFit re-flags it downstream.
     const content = truncate
-      ? safeCut(r.body, previewChars)
+      ? cutToCodepoints(r.body, previewChars)
       : r.format === "json"
         ? safeParse(r.body)
         : r.body;
@@ -2482,5 +2529,8 @@ function safeParse(s: string): unknown {
 function makePreview(s: string | null): string {
   if (!s) return "";
   const flat = s.replace(/\s+/g, " ").trim();
-  return flat.length > 100 ? safeCut(flat, 100) + "..." : flat;
+  // Codepoint-based cut/threshold (parity with preview_chars) so an emoji-heavy
+  // reply preview is not cut at half its visible length. flat is at most ~101
+  // codepoints (from a 101-codepoint reply_preview), so the spread is cheap.
+  return [...flat].length > 100 ? cutToCodepoints(flat, 100) + "..." : flat;
 }

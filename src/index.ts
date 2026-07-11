@@ -38,10 +38,17 @@ function shq(s: string): string {
  */
 function pollerCmd(
   agentId: string,
-  opts: { room?: string; mentionsOnly?: boolean } = {},
+  opts: { room?: string; mentionsOnly?: boolean; since?: number } = {},
 ): string {
   let cmd = `bash ${shq(POLLER)} --agent ${shq(agentId)}`;
   if (opts.room !== undefined) cmd += ` --room ${shq(opts.room)}`;
+  // --since baselines the watch off an explicit seq instead of the identity
+  // marker; it requires --room (seqs are per-room), so only emit it alongside
+  // a scoped watch. Used for a private-cursor session whose own position is
+  // BEHIND the identity marker (see wait_for_messages).
+  if (opts.since !== undefined && opts.room !== undefined) {
+    cmd += ` --since ${shq(String(opts.since))}`;
+  }
   if (opts.mentionsOnly) cmd += ` --mentions-only`;
   return cmd;
 }
@@ -968,6 +975,7 @@ server.registerTool(
         );
       }
       let roomArg: string | undefined;
+      let sinceArg: number | undefined;
       if (room !== undefined) {
         // Resolve to an id and require only that a membership row EXISTS -- not
         // that it is still present. A scoped --room probe (check.ts) baselines
@@ -990,6 +998,16 @@ server.registerTool(
           );
         }
         roomArg = String(target.id);
+        // If THIS session holds a PRIVATE cursor in the scoped room, baseline
+        // the poller off that cursor via --since. The poller only knows the
+        // IDENTITY marker (the MAX across twin sessions); when a twin advanced
+        // it past this session's private position, a plain identity-level watch
+        // would see nothing new and time out while this session's own catch_up
+        // still has unread. --since requires --room, which we have here.
+        if (session.privateRooms.has(privKey(target.id, agentId))) {
+          const cur = store.getCursor(target.id, agentId, SESSION_NONCE);
+          if (cur) sinceArg = cur.last_read_seq;
+        }
       } else if (store.presentRoomCount(agentId) === 0) {
         // Unscoped watch of ALL your rooms, but you are in none: the poller
         // would exit 2 immediately. Say so rather than emit a doomed command.
@@ -1000,6 +1018,7 @@ server.registerTool(
       const command = pollerCmd(agentId, {
         room: roomArg,
         mentionsOnly: mentions_only,
+        since: sinceArg,
       });
       return ok({
         command,

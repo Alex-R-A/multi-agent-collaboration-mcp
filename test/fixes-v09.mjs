@@ -147,6 +147,16 @@ const NUL = String.fromCharCode(0);
   // But a never-joined room is still refused.
   const never = await call("wait_for_messages", { room: "nope-never" });
   check("wait_for_messages still refuses a never-existent room", never.isErr, never);
+
+  // #5: a scoped watch on a PRIVATE-cursor room emits --since (this session's
+  // own position) so the poller does not fall back to the identity marker a
+  // twin may have advanced; a shared-cursor room omits it.
+  await call("join_room", { room: "watch-me", agent_id: "p", cursor: "private" });
+  const priv = await call("wait_for_messages", { room: "watch-me" });
+  check("private scoped watch emits --since", !priv.isErr && /--since /.test(priv.data.command || ""), priv.data.command);
+  await call("join_room", { room: "watch-me", agent_id: "p", cursor: "shared" });
+  const shared = await call("wait_for_messages", { room: "watch-me" });
+  check("shared scoped watch omits --since", !shared.isErr && !/--since /.test(shared.data.command || ""), shared.data.command);
   child.kill();
   rmSync(dir, { recursive: true, force: true });
 }
@@ -192,6 +202,57 @@ const NUL = String.fromCharCode(0);
     p2.claims.map((c) => c.key).join(",") === "k-c,k-d",
     p2.claims.map((c) => c.key),
   );
+  s.close();
+  rmSync(dir, { recursive: true, force: true });
+}
+
+// --- 9: preview_chars cuts in CODEPOINTS (parity with get_message) -----------
+{
+  const s = new ChatStore(":memory:");
+  const r = s.createRoom("r", null, null).id;
+  s.upsertAgent("a", null, null, null); s.joinRoom(r, "a");
+  s.postMessage(r, "a", "\u{1F600}".repeat(75), "text", null, null); // 75 emoji = 75 cp, 150 UTF-16
+  const p50 = s.readHistory(r, 10, undefined, 50).messages[0];
+  check(
+    "preview_chars:50 keeps 50 codepoints (emoji), not 25 UTF-16 halves",
+    [...p50.content].length === 50 && p50.truncated === true && p50.length === 75,
+    { cp: [...p50.content].length, truncated: p50.truncated, length: p50.length },
+  );
+  const p100 = s.readHistory(r, 10, undefined, 100).messages[0];
+  check(
+    "preview_chars:100 returns all 75 emoji, not truncated",
+    [...p100.content].length === 75 && !p100.truncated,
+    { cp: [...p100.content].length, truncated: p100.truncated },
+  );
+  s.close();
+}
+
+// --- 10: legacy metadata NULs are healed (not just message bodies) -----------
+{
+  const dir = mkdtempSync(join(tmpdir(), "v09-meta-"));
+  const DB = join(dir, "t.db");
+  {
+    const s = new ChatStore(DB);
+    s.createRoom("r", "desc", null);
+    s.upsertAgent("a", null, null, "adesc");
+    s.joinRoom(1, "a");
+    s.claimResource(1, "k", "a", 900, "cnote");
+    s.close();
+  }
+  {
+    const raw = new Database(DB);
+    raw.prepare("UPDATE rooms SET description = 'x'||char(0)||'y' WHERE id=1").run();
+    raw.prepare("UPDATE agents SET description = 'a'||char(0)||'b' WHERE id='a'").run();
+    raw.prepare("UPDATE claims SET note = 'n'||char(0)||'m' WHERE room_id=1 AND key='k'").run();
+    raw.close();
+  }
+  const s = new ChatStore(DB); // migrate heals metadata columns
+  const room = s.listRooms(10, 0).rooms[0];
+  const agent = s.listAgents(1, 5).agents.find((a) => a.id === "a");
+  const claim = s.listClaims(1).claims[0];
+  check("room description NUL healed (listing substr reads it whole)", room.description === "x�y", room.description);
+  check("agent description NUL healed", agent && agent.description === "a�b", agent && agent.description);
+  check("claim note NUL healed", claim && claim.note === "n�m", claim && claim.note);
   s.close();
   rmSync(dir, { recursive: true, force: true });
 }
