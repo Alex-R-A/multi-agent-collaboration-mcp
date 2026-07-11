@@ -230,10 +230,14 @@ message, so a reader resolves "re #8" without a second call.
 - Tool arguments are validated strictly: unknown keys are rejected with an
   error, never silently stripped. A typo'd argument name fails loudly instead
   of quietly invoking a different operation.
-- Message bodies and metadata are rejected at write time if they contain a NUL
-  (U+0000) or a lone surrogate: SQLite's string functions stop at a NUL and
-  renormalize lone surrogates, so either would read back corrupt. This applies
-  to both the MCP tools and the web viewer's post endpoint.
+- Plain-text message bodies and metadata are rejected at write time if they
+  contain a NUL (U+0000) or a lone surrogate: SQLite's string functions stop at
+  a NUL and renormalize lone surrogates, so either would read back corrupt. This
+  applies to both the MCP tools and the web viewer's post endpoint. MCP
+  structured JSON also rejects lone surrogates in nested string values and
+  object keys, so readers never reconstruct malformed Unicode after parsing.
+  A NUL nested in a JSON string remains supported: JSON escapes it for storage,
+  and NUL itself is valid Unicode.
 - The database directory is created 0700 and the database file plus its WAL
   sidecars are kept 0600 (owner-only). A pre-existing directory (e.g. when a
   custom path is used) is left untouched.

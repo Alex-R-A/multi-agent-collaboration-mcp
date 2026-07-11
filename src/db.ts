@@ -2,6 +2,7 @@ import Database from "better-sqlite3";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
+import { assertWellFormedUtf16 } from "./unicode.js";
 
 /**
  * Resolve the shared database file. All agents on a machine talk through one
@@ -148,11 +149,6 @@ function cutToCodepoints(s: string, n: number): string {
  * Failing loud at write is the only safe option: stripping mutates the
  * caller's content, and there is no faithful storage for these.
  */
-// A high surrogate not immediately followed by a low, or a low not preceded by
-// a high: either is an unpaired (lone) surrogate. A native regex is far faster
-// than a per-char JS loop on a large body (a body can be ~1 GB).
-const LONE_SURROGATE =
-  /[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/;
 function assertStorable(value: string | null, field: string): void {
   if (value === null) return;
   if (value.indexOf("\u0000") !== -1) {
@@ -160,9 +156,7 @@ function assertStorable(value: string | null, field: string): void {
       `${field} contains a NUL character (U+0000), which SQLite cannot store without silently truncating; remove it`,
     );
   }
-  if (LONE_SURROGATE.test(value)) {
-    throw new Error(`${field} contains a lone surrogate (malformed UTF-16); fix the encoding`);
-  }
+  assertWellFormedUtf16(value, field);
 }
 
 /**

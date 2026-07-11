@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import { z } from "zod";
 import { ChatStore, SQLITE_MAX_LENGTH } from "./db.js";
+import { stringifyWellFormedJson } from "./unicode.js";
 
 const store = new ChatStore();
 
@@ -704,7 +705,10 @@ server.registerTool(
     inputSchema: z.object({
       content: z
         .union([z.string(), z.record(z.any()), z.array(z.any())])
-        .describe("Message body: a string, or a JSON object/array"),
+        .describe(
+          "Message body: a string, or a JSON object/array. Strings and " +
+            "object keys must be well-formed Unicode (no lone surrogates).",
+        ),
       to: z
         .array(
           z
@@ -740,7 +744,12 @@ server.registerTool(
       touchSession();
       const { agentId, roomId } = requireActive();
       const isText = typeof content === "string";
-      const body = isText ? (content as string) : JSON.stringify(content);
+      // Validate structured strings DURING serialization, before JSON.stringify
+      // escapes lone surrogates to harmless-looking ASCII. The store validates
+      // the serialized body too, but cannot recover this semantic distinction.
+      const body = isText
+        ? (content as string)
+        : stringifyWellFormedJson(content, "message content");
       if (Buffer.byteLength(body, "utf8") > SQLITE_MAX_LENGTH) {
         return fail(
           `message body exceeds the SQLite maximum of ${SQLITE_MAX_LENGTH} bytes`,

@@ -7,6 +7,8 @@
 //      all heal.
 //   8b wait_for_messages allows a SCOPED watch on a soft-left room (the poller
 //      supports it), while still refusing a never-joined room.
+//   11 structured JSON rejects lone surrogates in nested strings and keys
+//      before JSON.stringify can hide them as ASCII escapes.
 //   13 resolveRoom skips the id lookup for a numeric ref past 2^53 (would round
 //      to a neighbour) and falls through to the exact-name lookup.
 //   14 the poller accepts a heavily zero-padded small value ("00000000001").
@@ -108,7 +110,7 @@ const NUL = String.fromCharCode(0);
   s.close();
 }
 
-// --- 8b + 15: MCP client (soft-left scoped watch; whitespace agent_id) --------
+// --- 5 + 8b + 11 + 15: MCP client integration -------------------------------
 {
   const dir = mkdtempSync(join(tmpdir(), "v09-mcp-"));
   const DB = join(dir, "t.db");
@@ -157,6 +159,70 @@ const NUL = String.fromCharCode(0);
   await call("join_room", { room: "watch-me", agent_id: "p", cursor: "shared" });
   const shared = await call("wait_for_messages", { room: "watch-me" });
   check("shared scoped watch omits --since", !shared.isErr && !/--since /.test(shared.data.command || ""), shared.data.command);
+
+  // #11: JSON.stringify normally turns a semantic lone surrogate into the
+  // ASCII escape "\\ud800", so the storage-level string guard cannot see it.
+  // Reject malformed strings and object keys before encoding instead.
+  const malformedJson = [
+    ["a nested high surrogate", { outer: { inner: ["ok", "x\ud800y"] } }],
+    ["a nested low surrogate", [{ outer: ["ok", { inner: "x\udc00y" }] }]],
+    ["a lone surrogate in an object key", { ["key\ud800"]: "value" }],
+    ["surrogate halves split across values", ["\ud83d", "\ude00"]],
+  ];
+  for (const [name, content] of malformedJson) {
+    const bad = await call("post_message", { content });
+    check(
+      `structured JSON rejects ${name}`,
+      bad.isErr && /lone surrogate|malformed UTF-16/.test(JSON.stringify(bad.data)),
+      bad,
+    );
+  }
+  const badText = await call("post_message", { content: "x\ud800y" });
+  check("text and structured JSON share the lone-surrogate policy", badText.isErr, badText);
+  const empty = await call("read_history", { limit: 10 });
+  check("rejected malformed content inserted no messages", empty.data.messages.length === 0, empty.data);
+
+  // A real surrogate pair is valid, while the six literal characters
+  // backslash-u-d-8-0-0 are ordinary ASCII. Nested NUL is valid Unicode and is
+  // safely escaped in the serialized database body, so it remains supported.
+  const goodKeys = ["pair-\ud83d\ude00", "literal-\\ud800", "nul-\u0000"];
+  const goodContent = {
+    nested: [{ emoji: "\ud83d\ude00" }],
+    literal: "\\ud800",
+    nul: "a\u0000b",
+    keys: Object.fromEntries(goodKeys.map((key, i) => [key, i])),
+  };
+  const good = await call("post_message", { content: goodContent });
+  const badTextNul = await call("post_message", { content: "a\u0000b" });
+  check(
+    "plain-text NUL is rejected while a nested JSON NUL remains supported",
+    badTextNul.isErr && /NUL/.test(JSON.stringify(badTextNul.data)),
+    badTextNul,
+  );
+  const goodTextContent = "pair-\ud83d\ude00 literal-\\ud800";
+  const goodText = await call("post_message", { content: goodTextContent });
+  const goodHistory = await call("read_history", { limit: 10 });
+  const jsonMessage = goodHistory.data.messages.find((m) => m.seq === 1);
+  const textMessage = goodHistory.data.messages.find((m) => m.seq === 2);
+  check(
+    "valid pairs, literal backslash-u, nested NUL, and valid keys round-trip",
+    !good.isErr &&
+      good.data.seq === 1 &&
+      jsonMessage?.format === "json" &&
+      jsonMessage.content?.nested?.[0]?.emoji === "\ud83d\ude00" &&
+      jsonMessage.content?.literal === "\\ud800" &&
+      jsonMessage.content?.nul === "a\u0000b" &&
+      Object.keys(jsonMessage.content?.keys ?? {}).join("|") === goodKeys.join("|"),
+    { good, history: goodHistory.data },
+  );
+  check(
+    "valid-pair and literal-backslash text still round-trip",
+    !goodText.isErr &&
+      goodText.data.seq === 2 &&
+      textMessage?.format === "text" &&
+      textMessage.content === goodTextContent,
+    { goodText, textMessage },
+  );
   child.kill();
   rmSync(dir, { recursive: true, force: true });
 }
