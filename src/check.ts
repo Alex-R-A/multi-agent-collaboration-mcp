@@ -32,29 +32,42 @@ function fail(msg: string): never {
 
 function parseArgs(argv: string[]): Args {
   const out: Args = { mentionsOnly: false };
-  // Read the value following a flag, failing if it is missing (e.g. a trailing
-  // `--db` would otherwise silently leave the value undefined).
-  const value = (i: number, flag: string): string => {
-    const v = argv[i + 1];
-    if (v === undefined) fail(`${flag} requires a value`);
-    return v;
-  };
   for (let i = 0; i < argv.length; i++) {
-    const a = argv[i];
+    // Accept both `--flag value` and `--flag=value` (the wrapper script
+    // accepts the = form for its own flags, so the probe must not reject it).
+    let a = argv[i];
+    let inline: string | undefined;
+    if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      if (eq !== -1) {
+        inline = a.slice(eq + 1);
+        a = a.slice(0, eq);
+      }
+    }
+    // Read a flag's value, rejecting missing AND empty/whitespace values: an
+    // unset shell variable (`--since "$SEQ"`) used to sail through as
+    // Number("") === 0, silently rebasing the watch to seq 0, and
+    // `--agent ''` became an identity-less watch that wakes on your own posts.
+    const take = (flag: string): string => {
+      const v = inline !== undefined ? inline : argv[++i];
+      if (v === undefined) fail(`${flag} requires a value`);
+      if (v.trim().length === 0) fail(`${flag} requires a non-empty value`);
+      return v;
+    };
     if (a === "--mentions-only") {
+      if (inline !== undefined) fail("--mentions-only takes no value");
       out.mentionsOnly = true;
     } else if (a === "--room") {
-      out.room = value(i, a);
-      i++;
+      out.room = take(a);
     } else if (a === "--agent") {
-      out.agent = value(i, a);
-      i++;
+      out.agent = take(a);
     } else if (a === "--since") {
-      out.since = Number(value(i, a));
-      i++;
+      const v = take(a).trim();
+      // Digits only: Number() would also admit "0x10" and "1e3".
+      if (!/^\d+$/.test(v)) fail("--since must be a non-negative integer");
+      out.since = Number(v);
     } else if (a === "--db") {
-      out.db = value(i, a);
-      i++;
+      out.db = take(a);
     } else {
       fail(`unknown argument: ${a}`);
     }

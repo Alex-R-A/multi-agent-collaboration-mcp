@@ -47,8 +47,14 @@ const size = (o) => JSON.stringify(o).length;
       if (seen.has(m.seq)) dups++;
       seen.add(m.seq);
     }
-    if (!page.byte_limited) break;
-    if (pages > 10) break;
+    if (!page.byte_limited) {
+      check("dense catch_up final page reports remaining 0", page.remaining === 0, page);
+      break;
+    }
+    if (pages > 10) {
+      check("dense catch_up paging terminates", false, pages);
+      break;
+    }
   }
   check("catch_up paging repeats no seq", dups === 0, dups);
   check("catch_up paging delivered all 55 packed messages", seen.size === 55, seen.size);
@@ -81,7 +87,10 @@ const size = (o) => JSON.stringify(o).length;
     for (const m of page.messages) seen.add(m.seq);
     if (page.next_after_id === after) break;
     after = page.next_after_id;
-    if (pages > 10) break;
+    if (pages > 10) {
+      check("dense my_mentions paging terminates", false, pages);
+      break;
+    }
   }
   check("my_mentions paging delivered all 110 entries", seen.size === 110, seen.size);
   s.close();
@@ -117,20 +126,44 @@ const size = (o) => JSON.stringify(o).length;
   s.postMessage(room, sender, "\u0001".repeat(400), "text", ["a"], null);
 
   const MAX = 1000;
+  // DELIVERY assertions alongside the size assertions: a bound achieved by
+  // silently dropping the control-heavy row passed the size checks alone
+  // (mutation-proven by the test audit). Exactly one directed message
+  // exists; it must arrive as an oversized stub, not vanish.
   let after = 0;
+  const inboxGot = [];
   for (let i = 0; i < 5; i++) {
     const page = s.myMentions("a", 50, undefined, MAX, null, after);
     check(`ctl-heavy my_mentions page ${i + 1} <= 1000`, size(page) <= MAX, size(page));
+    for (const m of page.messages) inboxGot.push(m);
     if (page.next_after_id === after) break;
     after = page.next_after_id;
   }
+  check("ctl-heavy inbox delivered its one entry", inboxGot.length === 1, inboxGot.length);
+  check(
+    "ctl-heavy inbox entry is an honest stub (oversized, empty body, real length)",
+    inboxGot.length === 1 &&
+      inboxGot[0].oversized === true &&
+      inboxGot[0].content === "" &&
+      inboxGot[0].length === 400,
+    inboxGot[0],
+  );
+  const caughtUp = [];
   for (let i = 0; i < 5; i++) {
     const page = s.catchUp(room, "a", 50, undefined, MAX);
     check(`ctl-heavy catch_up page ${i + 1} <= 1000`, size(page) <= MAX, size(page));
+    for (const m of page.messages) caughtUp.push(m);
     if (!page.byte_limited) break;
   }
+  check("ctl-heavy catch_up delivered the message", caughtUp.length === 1, caughtUp.length);
+  check(
+    "ctl-heavy catch_up row is an honest stub",
+    caughtUp.length === 1 && caughtUp[0].oversized === true && caughtUp[0].truncated === true,
+    caughtUp[0],
+  );
   const h = s.readHistory(room, 50, undefined, undefined, MAX);
   check("ctl-heavy read_history <= 1000", size(h) <= MAX, size(h));
+  check("ctl-heavy read_history delivered the message", h.messages.length === 1, h.messages.length);
   s.close();
 }
 

@@ -2,7 +2,6 @@
 // delivered rows), sliceable get_message, post-time crossing report,
 // supersede annotation, advisory claims, and private session cursors.
 // Plus v0.5.1 regression tests for the Fable/Opus review findings.
-import assert from "node:assert";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -37,22 +36,29 @@ for (let guard = 0; guard < 10; guard++) {
   const r = s.catchUp(room, "alice", 50, undefined, 5000);
   if (r.byte_limited) byteLimitedPages++;
   for (const m of r.messages) seen.push(m.seq);
+  check(r.messages.length > 0, `page ${guard}: non-empty while remaining`, r);
   check(
-    r.new_last_read_seq === (r.messages.at(-1)?.seq ?? r.new_last_read_seq),
+    r.messages.length > 0 && r.new_last_read_seq === r.messages.at(-1).seq,
     `page ${guard}: marker == last delivered seq`,
   );
-  if (r.remaining === 0) break;
+  if (r.remaining === 0) {
+    check(r.byte_limited === undefined, "final page reports byte_limited falsy", r);
+    break;
+  }
 }
 check(byteLimitedPages >= 1, "byte budget forced multiple pages");
-assert.deepStrictEqual(seen, [1, 2, 3, 4, 5]);
-check(true, "drained 5 msgs in order, no loss, no overlap");
+check(seen.join(",") === "1,2,3,4,5", "drained 5 msgs in order, no loss, no overlap", seen);
 
 // --- head message alone exceeds the budget: truncated, never an empty page -
 s.postMessage(room, "bob", "y".repeat(20_000), "text", null, null); // seq 6
 const big = s.catchUp(room, "alice", 50, undefined, 5000);
 check(big.messages.length === 1 && big.messages[0].seq === 6, "oversized head still delivered");
 check(big.messages[0].truncated === true && big.messages[0].length === 20_000, "oversized head truncated with full length");
-check(big.new_last_read_seq === 6 && big.byte_limited === true, "marker advanced past oversized head; byte_limited set");
+check(
+  big.new_last_read_seq === 6 && big.remaining === 0 && big.byte_limited === undefined,
+  "marker advanced past oversized head; byte_limited truthfully absent (nothing left to page)",
+  big,
+);
 
 // --- sliceable get_message --------------------------------------------------
 const g1 = s.getMessage(room, 6, 0, 8000);
@@ -208,7 +214,11 @@ s.close();
   v.markRead(r, "twin", 3, "S1"); // re-lag S1 (catchUp above advanced it)
   const pr = v.pruneMessages(r, 5, false);
   check(pr.refused === true, "prune refuses while a private session lags");
-  check(pr.min_read_seq === 0 || pr.min_read_seq === 3, "min_read_seq spans session cursors");
+  check(
+    pr.min_read_seq === 3,
+    "min_read_seq names the BLOCKING session cursor exactly (author-only lag exempt)",
+    pr,
+  );
   const forced = v.pruneMessages(r, 5, true);
   check(forced.deleted > 0, "force still prunes");
   v.close();

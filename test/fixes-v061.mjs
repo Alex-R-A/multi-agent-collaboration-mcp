@@ -131,13 +131,25 @@ const check = (n, c, x) => {
     const id = s.createRoom("room-" + String(i).padStart(2, "0") + "-" + "x".repeat(80), null, null).id;
     s.joinRoom(id, "hero");
     s.joinRoom(id, "noise");
-    s.postMessage(id, "noise", "broadcast noise", "text", null, null);
+    // DIRECTED, one per room: an earlier version posted only broadcasts, so
+    // the "pre-truncation" assertion below was === 0 and could not tell a
+    // pre-truncation count from a post-truncation one (mutation-proven).
+    s.postMessage(id, "noise", "ping @hero", "text", ["hero"], null);
   }
   const inbox = s.myMentions("hero", 50, undefined, 2000);
   const size = JSON.stringify(inbox).length;
   check(`whole inbox response respects max_bytes (${size} <= 2000)`, size <= 2000, size);
   check("by_room truncation is flagged", inbox.by_room_truncated === true, inbox);
-  check("total_directed still counts every room (pre-truncation)", inbox.total_directed === 0, inbox.total_directed);
+  check(
+    "total_directed counts every room PRE-truncation",
+    inbox.total_directed === 30,
+    inbox.total_directed,
+  );
+  check(
+    "truncated by_room keeps fewer rooms than total_directed spans",
+    inbox.by_room.length < 30 && inbox.by_room.length > 0,
+    inbox.by_room.length,
+  );
   s.close();
 }
 
@@ -182,6 +194,7 @@ const check = (n, c, x) => {
   const size = JSON.stringify(inbox).length;
   check(`max_bytes=1000 is a hard bound (${size} <= 1000)`, size <= 1000, size);
   check("byte_limited flagged when trimmed", inbox.byte_limited === true, inbox.byte_limited);
+  s.close();
 }
 
 // --- envelope-dominated messages: HARD byte bound on the whole response -----
@@ -234,23 +247,38 @@ const check = (n, c, x) => {
   s.postMessage(r, bigSender, "plain body from a long-metadata sender", "text", null, null);
 
   let pages = 0;
+  const delivered = [];
   for (;;) {
     const p = s.catchUp(r, "a", 50, undefined, 1000);
     const sz = JSON.stringify(p).length;
     check(`repro catch_up page ${++pages} hard-bounded (${sz} <= 1000)`, sz <= 1000, sz);
-    if (p.remaining === 0) break;
+    for (const m of p.messages) delivered.push(m.seq);
+    if (p.remaining === 0) {
+      check("repro final catch_up page not byte_limited", p.byte_limited === undefined, p);
+      break;
+    }
     if (pages > 10) {
       check("catch_up paging terminates", false, pages);
       break;
     }
   }
+  // DELIVERY, not just page size: a bound that drops rows to stay small
+  // passed the size checks above while silently losing messages
+  // (mutation-proven by the test audit).
+  check(
+    "repro catch_up delivered every message exactly once",
+    delivered.join(",") === "1,2,3",
+    delivered,
+  );
   s.markRead(r, "a", 0);
   let afterId = 0;
   let ipages = 0;
+  const inboxSeqs = [];
   for (;;) {
     const p = s.myMentions("a", 50, undefined, 1000, null, afterId);
     const sz = JSON.stringify(p).length;
     check(`repro inbox page ${++ipages} hard-bounded (${sz} <= 1000)`, sz <= 1000, sz);
+    for (const m of p.messages) inboxSeqs.push(m.seq);
     if (p.messages.length === 0) break;
     afterId = p.next_after_id;
     if (ipages > 10) {
@@ -258,6 +286,11 @@ const check = (n, c, x) => {
       break;
     }
   }
+  check(
+    "repro inbox delivered both directed messages exactly once",
+    inboxSeqs.join(",") === "1,2",
+    inboxSeqs,
+  );
   s.close();
 }
 

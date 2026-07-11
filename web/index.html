@@ -702,6 +702,12 @@
       .expand:hover {
         text-decoration: underline;
       }
+      .trunc-note {
+        margin-top: 4px;
+        font-size: 10.5px;
+        letter-spacing: 0.06em;
+        color: var(--text-dim);
+      }
 
       pre.json {
         margin: 4px 0 0;
@@ -1278,6 +1284,12 @@
         // monotonic marker over unfetched messages would silently erase their
         // my_mentions entries without them ever being rendered.
         marker: -1,
+        // True once we know no older history exists below the rendered
+        // window (an exhausted older-page, or an initial load smaller than
+        // PAGE): a marker gap below that floor points at PRUNED messages,
+        // which can never be fetched, so it must not suspend read-marking
+        // forever.
+        noOlderHistory: false,
         // Which identity `marker`/`lastReadSent` were established for: /api/read
         // posts are refused when the live identity no longer matches (another
         // tab renaming would otherwise graft the old identity's marker onto
@@ -1300,8 +1312,17 @@
       // a rename): tracked so later joins can retry the leave instead of the
       // ghost becoming permanently unaddressable.
       function loadGhosts() {
+        // Type-check, not just parse-check: valid-but-wrong-typed JSON (a
+        // bare number, an object) written by devtools or version skew would
+        // otherwise throw deep inside consumers as an unhandled rejection.
         try {
-          return JSON.parse(localStorage.getItem(GHOST_KEY)) || [];
+          const v = JSON.parse(localStorage.getItem(GHOST_KEY));
+          return Array.isArray(v)
+            ? v.filter(
+                (g) =>
+                  g && typeof g.room === "number" && typeof g.name === "string",
+              )
+            : [];
         } catch {
           return [];
         }
@@ -1317,6 +1338,18 @@
         ghostRetryActive = true;
         try {
           for (const g of loadGhosts()) {
+            // A ghost whose (room, name) is the CURRENT mapping again is not
+            // stale: the user re-adopted the name and rejoined, and leaving
+            // now would evict that live membership seconds after it was
+            // created. Purge the entry instead of retrying it.
+            if (loadJoined()[String(g.room)] === g.name) {
+              saveGhosts(
+                loadGhosts().filter(
+                  (x) => !(x.room === g.room && x.name === g.name),
+                ),
+              );
+              continue;
+            }
             try {
               await postJson("/api/leave", { room: g.room, name: g.name });
             } catch {
@@ -1341,7 +1374,8 @@
       }
       function loadJoined() {
         try {
-          return JSON.parse(localStorage.getItem(JOINED_KEY)) || {};
+          const v = JSON.parse(localStorage.getItem(JOINED_KEY));
+          return v && typeof v === "object" && !Array.isArray(v) ? v : {};
         } catch {
           return {};
         }
@@ -1387,7 +1421,8 @@
 
       function loadSeen() {
         try {
-          return JSON.parse(localStorage.getItem(SEEN_KEY)) || {};
+          const v = JSON.parse(localStorage.getItem(SEEN_KEY));
+          return v && typeof v === "object" && !Array.isArray(v) ? v : {};
         } catch {
           return {};
         }
@@ -1452,7 +1487,10 @@
 
       function flat(s, n) {
         const f = String(s).replace(/\s+/g, " ").trim();
-        return f.length > n ? f.slice(0, n) + "..." : f;
+        if (f.length <= n) return f;
+        // Back off a cut that would split a surrogate pair (renders U+FFFD).
+        const c = f.charCodeAt(n - 1);
+        return f.slice(0, c >= 0xd800 && c <= 0xdbff ? n - 1 : n) + "...";
       }
 
       function label(m) {
@@ -1764,6 +1802,19 @@
           });
           wrap.append(btn);
         }
+        if (m.body_truncated) {
+          // The server caps very large bodies per page; label the cut so the
+          // rendered text is not mistaken for the whole message.
+          const note = document.createElement("div");
+          note.className = "trunc-note";
+          note.textContent =
+            "[showing the first " +
+            m.body.length.toLocaleString() +
+            " of " +
+            Number(m.body_length).toLocaleString() +
+            " characters]";
+          wrap.append(note);
+        }
         container.append(wrap);
       }
 
@@ -1772,7 +1823,13 @@
       // Scroll a message into view, paging older history in (bounded) when the
       // target is not loaded yet. Retries briefly when the fetch lock is busy.
       async function jumpToSeq(seq) {
+        // Guarded like every other multi-await flow: this loop spans seconds
+        // on deep history, and after a room switch the live selectors would
+        // match (and page toward) the NEW room's unrelated seq numbers.
+        const room = state.current;
+        const epoch = state.roomEpoch;
         for (let i = 0; i < 20; i++) {
+          if (!sameView(room, epoch)) return;
           if (el.msgs.querySelector(`[data-seq="${seq}"]`)) break;
           const first = state.msgs[0];
           if (!first || first.seq <= 1 || first.seq <= seq) break;
@@ -1782,6 +1839,7 @@
             await sleep(150); // fetch lock was busy; retry
           }
         }
+        if (!sameView(room, epoch)) return;
         const target = el.msgs.querySelector(`[data-seq="${seq}"]`);
         if (!target) return;
         target.scrollIntoView({ block: "center" });
@@ -1999,7 +2057,15 @@
             `/api/messages?room=${room.id}&after=${initial ? 0 : last}&limit=${PAGE}`,
           );
           noteOk();
-          if (!sameView(room, epoch) || data.error || !data.messages) {
+          // Re-check searchMode at COMPLETION: a search entered while this
+          // fetch was in flight hid the stream, and appending + scrolling +
+          // marking against the hidden layout claims unseen messages read.
+          if (
+            !sameView(room, epoch) ||
+            state.searchMode ||
+            data.error ||
+            !data.messages
+          ) {
             // A discarded INITIAL load for the room still shown (epoch bumped
             // by a rename) must re-arm, or the stream stays empty till a
             // failure path happens to set pendingInitial.
@@ -2013,6 +2079,9 @@
             state.msgs = [];
             el.msgs.textContent = "";
             appendMsgs(rows, false);
+            // Fewer rows than the fetch limit = the room's ENTIRE history is
+            // rendered; anything below the window's floor was pruned.
+            if (rows.length < PAGE) state.noOlderHistory = true;
             updateOlderButton();
             computeGap();
             if (rows.length === 0) {
@@ -2069,7 +2138,10 @@
             changed = true;
           }
           updateOlderButton();
-          if (!data.messages.length) el.older.hidden = true;
+          if (!data.messages.length) {
+            el.older.hidden = true;
+            state.noOlderHistory = true; // floor reached: the rest was pruned
+          }
           const hadGap = state.gap;
           computeGap();
           if (hadGap && !state.gap) maybeMarkRead(); // gap closed by paging
@@ -2162,6 +2234,9 @@
         state.searchMode = true;
         el.msgs.hidden = true;
         el.older.hidden = true;
+        // A gapped room otherwise leaves a stray "Mark all as read" button
+        // floating above the results, marking from within search.
+        el.markall.hidden = true;
         hidePlaceholder();
         el.searchBar.hidden = false;
         el.results.hidden = false;
@@ -2186,6 +2261,7 @@
         el.results.textContent = "";
         el.msgs.hidden = false;
         updateOlderButton();
+        computeGap(); // restore the markall button hidden by enterSearch
         if (!wasSearching) return;
         loadNew(false); // catch up on the tail that was paused during search
         if (scrollToBottom) {
@@ -2242,6 +2318,10 @@
       }
 
       async function joinCurrent() {
+        // The Enter key in the name field bypasses the button's disabled
+        // state; gate on it here so two rename loops can never interleave
+        // over the shared localStorage maps.
+        if (el.joinBtn.disabled) return;
         const room = state.current;
         const name = el.joinName.value.trim().replace(/^@/, "");
         if (!room || !name) {
@@ -2266,6 +2346,7 @@
           // old name, which the map overwrite below would otherwise orphan.
           const joinedMap = loadJoined();
           const newGhosts = [];
+          const removed = [];
           for (const [rid, storedName] of Object.entries(joinedMap)) {
             if (!storedName || storedName === name) continue;
             try {
@@ -2273,7 +2354,7 @@
             } catch {
               newGhosts.push({ room: Number(rid), name: storedName });
             }
-            delete joinedMap[rid];
+            removed.push([rid, storedName]);
           }
           // Merge the new failures into the CURRENT ledger at save time: a
           // snapshot-wholesale save would erase entries another tab (or a
@@ -2287,8 +2368,24 @@
             }
             saveGhosts(ledger);
           }
-          joinedMap[String(room.id)] = name;
-          saveJoined(joinedMap);
+          // Same merge discipline for the joined map: re-read it and delete
+          // only the entries we actually left AND that still hold the value
+          // we left under; a wholesale save of the pre-loop snapshot would
+          // erase a join another tab recorded during the awaits above.
+          const freshMap = loadJoined();
+          for (const [rid, storedName] of removed) {
+            if (freshMap[rid] === storedName) delete freshMap[rid];
+          }
+          freshMap[String(room.id)] = name;
+          saveJoined(freshMap);
+          // Re-adopting a previously-ghosted (room, name): the mapping above
+          // makes that pair live again, so drop any stale ledger entry for it
+          // before the sweep below can leave the room we just joined.
+          const ledgerNow = loadGhosts();
+          const keptGhosts = ledgerNow.filter(
+            (x) => !(x.room === room.id && x.name === name),
+          );
+          if (keptGhosts.length !== ledgerNow.length) saveGhosts(keptGhosts);
           retryGhosts();
           // The composer reflects the GLOBAL identity for whatever room is
           // shown now; re-render it even after a room switch so a stale
@@ -2400,11 +2497,15 @@
       // keeps prune's unread-refusal from wedging on a joined-but-idle human.
       function computeGap() {
         const first = state.msgs[0];
+        // noOlderHistory: a gap below a floor that paging proved empty points
+        // at pruned (unfetchable) messages; suspending marking for them would
+        // wedge a fresh join to a pruned room forever.
         state.gap =
           joinedHere() &&
           !!first &&
           state.marker >= 0 &&
-          first.seq > state.marker + 1;
+          first.seq > state.marker + 1 &&
+          !state.noOlderHistory;
         el.markall.hidden = !state.gap;
         el.older.classList.toggle("gapped", state.gap);
         el.older.textContent = state.gap
@@ -2429,7 +2530,15 @@
           // listener usually catches that, but its event delivery is async,
           // so re-check before baselining the wrong identity's marker.
           if (identity() !== name) return;
-          state.marker = me.joined ? me.last_read_seq : -1;
+          // Never LOWER a marker a same-epoch same-identity writer (join,
+          // markall) advanced while this response was in flight: the server
+          // marker is monotonic, so the max is the truth; a stale value
+          // would resurrect a cleared gap and suspend auto-marking.
+          state.marker = me.joined
+            ? state.markerIdent === name && state.marker >= 0
+              ? Math.max(state.marker, me.last_read_seq)
+              : me.last_read_seq
+            : -1;
           state.markerIdent = name;
           computeGap();
           maybeMarkRead();
@@ -2441,6 +2550,11 @@
         const epoch = state.roomEpoch;
         const name = identity();
         if (!room || !name || !joinedHere()) return;
+        // Search mode hides the live stream: follow/scroll state describes
+        // the RESULTS layout, and the stream tail was never on screen, so
+        // marking it read here would claim unseen messages (monotonically,
+        // unrecoverably) as read.
+        if (state.searchMode) return;
         // The marker baseline must belong to THIS identity: after another
         // tab renames, marker/gap state still describes the old name until
         // fetchMarker re-baselines; posting meanwhile would graft the old
@@ -2546,6 +2660,7 @@
         state.marker = -1;
         state.markerIdent = null;
         state.gap = false;
+        state.noOlderHistory = false;
         state.roomEpoch += 1;
         try {
           localStorage.setItem(ROOM_KEY, JSON.stringify({ id: room.id }));
@@ -2579,6 +2694,11 @@
       // ---- wiring ------------------------------------------------------------
 
       el.stream.addEventListener("scroll", () => {
+        // Search results share this scroll container with the (hidden) live
+        // stream: recomputing follow against the results layout flipped it
+        // true at the results' bottom, zeroed the new-count, and marked the
+        // never-displayed stream tail as read.
+        if (state.searchMode) return;
         const was = state.follow;
         state.follow = nearBottom();
         if (state.follow && state.newCount > 0) {

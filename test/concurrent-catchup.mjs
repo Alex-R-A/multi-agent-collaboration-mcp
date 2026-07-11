@@ -36,12 +36,15 @@ if (process.argv[2] === "worker") {
   const seqs = [];
   for (;;) {
     let r;
+    // Bounded retries: unbounded, a lock-leak regression turns this suite
+    // into an infinite CI hang instead of a failure.
+    let attempts = 0;
     for (;;) {
       try {
         r = store.catchUp(ROOM, AGENT, LIMIT);
         break;
       } catch (e) {
-        if (isBusy(e)) continue; // lock contention: retry the same call
+        if (isBusy(e) && ++attempts < 2000) continue; // lock contention: retry
         throw e;
       }
     }

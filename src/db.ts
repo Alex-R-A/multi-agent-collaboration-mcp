@@ -90,6 +90,20 @@ const THREAD_ENVELOPE =
  *  legal row as a stub (fixed fields ~430 worst case); budgets floor here. */
 const STUB_ALLOWANCE = 500;
 
+/**
+ * Slice s to at most `end` UTF-16 code units, backing off one unit when the
+ * cut would split a surrogate pair: a lone surrogate is not valid Unicode,
+ * renders as U+FFFD, and non-JS clients (Python most commonly) can crash
+ * re-encoding it. Applies to every preview/shrink cut; get_message offset
+ * walks keep their own boundary logic (the caller's offset is a contract).
+ */
+function safeCut(s: string, end: number): string {
+  if (end <= 0) return "";
+  if (end >= s.length) return s;
+  const c = s.charCodeAt(end - 1);
+  return s.slice(0, c >= 0xd800 && c <= 0xdbff ? end - 1 : end);
+}
+
 export type RoomRow = {
   id: number;
   name: string;
@@ -333,9 +347,6 @@ export class ChatStore {
 
     // Full-text search over message bodies. External-content FTS5 mirrors
     // messages.body keyed by messages.id; triggers keep it in sync.
-    const ftsExisted = !!this.db
-      .prepare("SELECT 1 FROM sqlite_master WHERE name = 'messages_fts'")
-      .get();
     this.db.exec(`
       CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts
         USING fts5(body, content='messages', content_rowid='id');
@@ -348,14 +359,24 @@ export class ChatStore {
           VALUES ('delete', old.id, old.body);
       END;
     `);
-    if (!ftsExisted) {
-      const { c } = this.db
-        .prepare("SELECT COUNT(*) AS c FROM messages")
-        .get() as { c: number };
-      if (c > 0) {
-        // Backfill rows that existed before FTS was added.
-        this.db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
-      }
+    // Backfill decision by INDEX CONSISTENCY, not table existence: a process
+    // dying between the CREATE above and the rebuild below used to leave a
+    // database where every later start saw the table and skipped the rebuild
+    // forever -- all pre-FTS messages permanently invisible to search. A row
+    // count mismatch also repairs databases already damaged by that window.
+    // The index row count MUST come from the messages_fts_docsize shadow
+    // table: with external content, COUNT(*) on the virtual table itself
+    // reads the content table and always matches. (Triggers exist by this
+    // point, so concurrent inserts move both counts together and cannot fake
+    // consistency.)
+    const { c: msgCount } = this.db
+      .prepare("SELECT COUNT(*) AS c FROM messages")
+      .get() as { c: number };
+    const { c: ftsCount } = this.db
+      .prepare("SELECT COUNT(*) AS c FROM messages_fts_docsize")
+      .get() as { c: number };
+    if (ftsCount !== msgCount) {
+      this.db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
     }
   }
 
@@ -511,6 +532,11 @@ export class ChatStore {
    * identity left off; an existing session row keeps its position.
    */
   joinRoom(roomId: number, agentId: string, sessionId: string | null = null): void {
+    // One IMMEDIATE transaction: this was the file's only multi-statement
+    // read-then-write path running autocommitted, where a cross-process
+    // deleteRoom interleaving between statements surfaced as an opaque
+    // NOT NULL/FK constraint error instead of a clean failure.
+    const tx = this.db.transaction(() => {
     this.db
       .prepare(
         "INSERT OR IGNORE INTO memberships (room_id, agent_id) VALUES (?, ?)",
@@ -543,6 +569,8 @@ export class ChatStore {
         )
         .run(roomId);
     }
+    });
+    tx.immediate();
   }
 
   /**
@@ -697,11 +725,13 @@ export class ChatStore {
       left_at: string | null;
     })[];
     if (filter && filter.trim().length > 0) {
-      const like = `%${filter.trim()}%`;
+      // Literal-substring semantics: escape LIKE wildcards so a filter of
+      // "50%" matches those three characters, not everything.
+      const like = `%${filter.trim().replace(/[\\%_]/g, "\\$&")}%`;
       rows = this.db
         .prepare(
-          `${base} AND (IFNULL(a.role,'') LIKE ? OR IFNULL(a.type,'') LIKE ?
-                        OR IFNULL(a.description,'') LIKE ? OR a.id LIKE ?)
+          `${base} AND (IFNULL(a.role,'') LIKE ? ESCAPE '\\' OR IFNULL(a.type,'') LIKE ? ESCAPE '\\'
+                        OR IFNULL(a.description,'') LIKE ? ESCAPE '\\' OR a.id LIKE ? ESCAPE '\\')
            ORDER BY m.joined_at`,
         )
         .all(roomId, like, like, like, like) as typeof rows;
@@ -843,7 +873,7 @@ export class ChatStore {
     // json: a sliced JSON string does not parse, so the caller must fetch the
     // full body with get_message. `truncated`/`length` signal exactly that.
     const content = truncate
-      ? r.body.slice(0, previewChars)
+      ? safeCut(r.body, previewChars)
       : r.format === "json"
         ? safeParse(r.body)
         : r.body;
@@ -930,7 +960,7 @@ export class ChatStore {
       stub.to = null;
       stub.oversized = true;
       sz = JSON.stringify(head).length;
-      const half = (s: string) => s.slice(0, Math.floor(s.length / 2));
+      const half = (s: string) => safeCut(s, Math.floor(s.length / 2));
       while (
         sz > budget &&
         ((stub.from_role?.length ?? 0) > 0 ||
@@ -975,9 +1005,10 @@ export class ChatStore {
       if (out.length === 0 && used + size > maxBytes) {
         // The head must fit alone: an advancing catch_up commits its marker
         // before the client sees the page, so an over-budget page a client
-        // rejects means silent message loss.
+        // rejects means silent message loss. byte_limited stays truthful:
+        // a lone shrunk row with no rows behind it leaves nothing to page.
         out.push(this.shrinkToFit(r, previewChars, maxBytes - 2, map));
-        return { messages: out, byteLimited: true };
+        return { messages: out, byteLimited: rows.length > 1 };
       }
       if (used + size > maxBytes && out.length > 0) {
         return { messages: out, byteLimited: true };
@@ -1002,7 +1033,14 @@ export class ChatStore {
   ): MessageRow | undefined {
     const r = this.getRawMessage(roomId, seq);
     if (!r) return undefined;
-    const end = Math.min(offset + maxChars, r.body.length);
+    let end = Math.min(offset + maxChars, r.body.length);
+    // Back off a cut that would split a surrogate pair, but never below one
+    // unit past offset: a pager stepping by content.length stays exact (the
+    // next page picks up the deferred unit), and an empty page would stall it.
+    if (end < r.body.length && end - offset > 1) {
+      const c = r.body.charCodeAt(end - 1);
+      if (c >= 0xd800 && c <= 0xdbff) end -= 1;
+    }
     const partial = offset > 0 || end < r.body.length;
     if (!partial) return this.rowToMessage(r);
     // Build the envelope without parsing the (possibly huge) body.
@@ -1292,9 +1330,10 @@ export class ChatStore {
    * by_room lists EVERY present room with any unread from others (most
    * directed first), reporting both `directed` and total `unread` (broadcasts
    * included): an empty inbox with nonzero unread means rooms have traffic to
-   * sync, not silence. by_room shares the byte budget (capped to half, worst
-   * rooms dropped with by_room_truncated:true) so many chatty rooms cannot
-   * bury the entries themselves. Rows and counts read one DEFERRED snapshot.
+   * sync, not silence. by_room shares the byte budget (capped to a third,
+   * worst rooms dropped with by_room_truncated:true) so many chatty rooms
+   * cannot bury the entries themselves. Rows and counts read one DEFERRED
+   * snapshot.
    */
   myMentions(
     agentId: string,
@@ -1360,8 +1399,8 @@ export class ChatStore {
       }[];
       const total_directed = allRooms.reduce((a, r) => a + r.directed, 0);
 
-      // Cap by_room to half the budget, most directed rooms first, so the
-      // response as a whole honors maxBytes.
+      // Cap by_room to a third of the budget, most directed rooms first, so
+      // the response as a whole honors maxBytes.
       const byRoom = [...allRooms].sort(
         (a, b) =>
           b.directed - a.directed || b.unread - a.unread || a.room_id - b.room_id,
@@ -1384,7 +1423,7 @@ export class ChatStore {
         ) {
           entry = {
             ...entry,
-            name: entry.name.slice(0, Math.floor(entry.name.length / 2)),
+            name: safeCut(entry.name, Math.floor(entry.name.length / 2)),
           };
         }
         byRoom[0] = entry;
@@ -1556,6 +1595,10 @@ export class ChatStore {
     would_delete_unread?: number;
     min_read_seq?: number;
   } {
+    // Keep at least the newest message: keepLast=0 would hit OFFSET -1
+    // (clamped to 0 by SQLite, silently keeping one row anyway), and deleting
+    // ALL rows would reset MAX(seq), breaking the monotonic-seq invariant.
+    keepLast = Math.max(1, Math.floor(keepLast));
     const tx = this.db.transaction(() => {
       const { c: total } = this.db
         .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = ?")
@@ -1591,15 +1634,29 @@ export class ChatStore {
           )
           .get(roomId, cutoff.seq) as { u: number };
         if (u > 0) {
+          // min over markers that actually BLOCK the prune (same predicate
+          // as the refusal count): a min over all markers pointed callers at
+          // harmless laggards, most commonly the doomed messages' own author,
+          // whom the refusal itself exempts.
           const { m } = this.db
             .prepare(
               `SELECT MIN(m) AS m FROM (
-                 SELECT MIN(last_read_seq) AS m FROM memberships WHERE room_id = ?
+                 SELECT mm.last_read_seq AS m FROM memberships mm
+                  WHERE mm.room_id = ? AND EXISTS (
+                    SELECT 1 FROM messages g WHERE g.room_id = mm.room_id
+                      AND g.seq < ? AND g.seq > mm.last_read_seq
+                      AND g.agent_id != mm.agent_id)
                  UNION ALL
-                 SELECT MIN(last_read_seq) FROM session_markers WHERE room_id = ?
+                 SELECT sm.last_read_seq FROM session_markers sm
+                  WHERE sm.room_id = ? AND EXISTS (
+                    SELECT 1 FROM messages g WHERE g.room_id = sm.room_id
+                      AND g.seq < ? AND g.seq > sm.last_read_seq
+                      AND g.agent_id != sm.agent_id)
                )`,
             )
-            .get(roomId, roomId) as { m: number | null };
+            .get(roomId, cutoff.seq, roomId, cutoff.seq) as {
+            m: number | null;
+          };
           return {
             deleted: 0,
             kept: total,
@@ -1797,5 +1854,5 @@ function safeParse(s: string): unknown {
 function makePreview(s: string | null): string {
   if (!s) return "";
   const flat = s.replace(/\s+/g, " ").trim();
-  return flat.length > 100 ? flat.slice(0, 100) + "..." : flat;
+  return flat.length > 100 ? safeCut(flat, 100) + "..." : flat;
 }

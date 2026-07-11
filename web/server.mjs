@@ -74,7 +74,15 @@ function listRooms() {
 function listMessages(roomId, afterSeq, beforeSeq, limit) {
   const d = getDb();
   if (!d) return null;
-  const cols = `g.seq, g.agent_id AS "from", a.role, a.type, g.body, g.format,
+  // Bodies are capped in SQL (substr is codepoint-aware, no surrogate
+  // splitting): agents can legally post up to SQLITE_MAX_LENGTH, and one
+  // such message must not balloon a 400-row page into gigabytes. The full
+  // length rides along so the client can label the cut.
+  const cols = `g.seq, g.agent_id AS "from", a.role, a.type,
+                substr(g.body, 1, ${MAX_BODY_CHARS}) AS body,
+                CASE WHEN length(g.body) > ${MAX_BODY_CHARS}
+                     THEN length(g.body) ELSE NULL END AS body_length,
+                g.format,
                 g.mentions, g.reply_to_seq, g.supersedes_seq, g.created_at AS at,
                 (SELECT s.seq FROM messages s
                   WHERE s.room_id = g.room_id AND s.supersedes_seq = g.seq
@@ -116,8 +124,20 @@ function listMessages(roomId, afterSeq, beforeSeq, limit) {
         r.mentions = null;
       }
     }
+    finishBodyCap(r);
   }
   return rows;
+}
+
+// Expose the SQL-side body cap as a flag the client can render. The decision
+// is made in SQL (both sides in codepoints); body_length is non-NULL exactly
+// when the body was cut, and carries the full character count.
+function finishBodyCap(r) {
+  if (r.body_length != null) {
+    r.body_truncated = true;
+  } else {
+    delete r.body_length;
+  }
 }
 
 // Writable handle for participation endpoints only. Kept separate from the
@@ -142,15 +162,22 @@ function getWriteDb() {
 const MAX_BODY_CHARS = 100_000; // matches the agents' per-page read budget
 const NAME_RE = /^[\w][\w.-]{0,199}$/; // sane self-asserted ids, no whitespace
 
-function readBody(req, cap = 400_000) {
+// Cap in BYTES. Sized so a maximal legal post (MAX_BODY_CHARS UTF-16 units,
+// worst case ~3 UTF-8 bytes per unit, plus JSON envelope) still fits.
+function readBody(req, cap = 700_000) {
   return new Promise((resolve, reject) => {
     let size = 0;
     const chunks = [];
     req.on("data", (c) => {
       size += c.length;
       if (size > cap) {
-        reject(new Error("request body too large"));
-        req.destroy();
+        // Pause, never destroy here: destroying tears down the socket the
+        // RESPONSE shares, so the 413 the handler sends would never reach
+        // the client (it saw a bare connection reset instead).
+        req.pause();
+        const err = new Error("request body too large");
+        err.tooLarge = true;
+        reject(err);
         return;
       }
       chunks.push(c);
@@ -170,6 +197,10 @@ function membership(d, roomId, name) {
 
 // { error } results become 400s; { status: ... } results become 200s.
 function joinRoom(d, roomId, name) {
+  // One IMMEDIATE transaction: with the room-exists check outside it, a
+  // concurrent agent delete_room between statements surfaced as an uncaught
+  // FK throw (a 500) and left a stray agents row behind.
+  const tx = d.transaction(() => {
   const room = d.prepare("SELECT id FROM rooms WHERE id = ?").get(roomId);
   if (!room) return { error: `no room ${roomId}` };
   // Never overwrite an existing agent's type/role: identity is self-asserted,
@@ -194,13 +225,15 @@ function joinRoom(d, roomId, name) {
     room_id: roomId,
     last_read_seq: m.last_read_seq,
   };
+  });
+  try {
+    return tx.immediate();
+  } catch (e) {
+    return { error: String((e && e.message) || e) };
+  }
 }
 
 function postMessage(d, roomId, name, body, replyToSeq, mentions) {
-  const m = membership(d, roomId, name);
-  if (!m || m.left_at !== null) {
-    return { error: "join the room first (POST /api/join)" };
-  }
   // The column check is cached from open time; if an MCP server migrated the
   // shared file AFTER this viewer started, pick the column up now instead of
   // writing NULL reply authors until a viewer restart.
@@ -213,11 +246,16 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
   }
   const mentionsJson =
     mentions && mentions.length > 0 ? JSON.stringify(mentions) : null;
-  // Same shape as ChatStore.postMessage: validate the reply target and
-  // allocate the next per-room seq inside one IMMEDIATE transaction, so a
-  // concurrent agent writer cannot take the same seq and the reply reference
-  // cannot dangle against a racing prune.
+  // Same shape as ChatStore.postMessage: validate membership and the reply
+  // target and allocate the next per-room seq inside one IMMEDIATE
+  // transaction, so a concurrent agent writer cannot take the same seq, the
+  // reply reference cannot dangle against a racing prune, and a concurrent
+  // delete_room yields this clean error instead of a raw FK failure.
   const tx = d.transaction(() => {
+    const m = membership(d, roomId, name);
+    if (!m || m.left_at !== null) {
+      throw new Error("join the room first (POST /api/join)");
+    }
     let replyToAgent = null;
     if (replyToSeq !== null) {
       const parent = d
@@ -257,29 +295,39 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
 }
 
 function markRead(d, roomId, name, seq) {
-  const m = membership(d, roomId, name);
-  if (!m) return { error: "join the room first (POST /api/join)" };
-  // Clamp to the room's latest seq (parity with the MCP server's mark_read):
-  // the monotonic max() below makes an unclamped over-large value permanent,
-  // wedging the marker above every future message.
-  const { latest } = d
-    .prepare(
-      "SELECT COALESCE(MAX(seq), 0) AS latest FROM messages WHERE room_id = ?",
-    )
-    .get(roomId);
-  const eff = Math.min(seq, latest);
-  // Monotonic, mirroring the identity-marker semantics agents rely on for
-  // read receipts and prune refusal.
-  d.prepare(
-    `UPDATE memberships SET last_read_seq = max(last_read_seq, ?), last_seen = datetime('now')
-     WHERE room_id = ? AND agent_id = ?`,
-  ).run(eff, roomId, name);
-  const row = d
-    .prepare(
-      "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
-    )
-    .get(roomId, name);
-  return { last_read_seq: row.last_read_seq };
+  // One IMMEDIATE transaction (read-then-write), so a concurrent room
+  // deletion cannot vanish the membership row between statements.
+  const tx = d.transaction(() => {
+    const m = membership(d, roomId, name);
+    if (!m) return { error: "join the room first (POST /api/join)" };
+    // Clamp to the room's latest seq (parity with the MCP server's mark_read):
+    // the monotonic max() below makes an unclamped over-large value permanent,
+    // wedging the marker above every future message.
+    const { latest } = d
+      .prepare(
+        "SELECT COALESCE(MAX(seq), 0) AS latest FROM messages WHERE room_id = ?",
+      )
+      .get(roomId);
+    const eff = Math.min(seq, latest);
+    // Monotonic BY DESIGN for the web viewer, unlike MCP mark_read (which
+    // supports deliberate rewind): the browser auto-marks from async
+    // completions, so a delayed stale write must never regress the marker.
+    d.prepare(
+      `UPDATE memberships SET last_read_seq = max(last_read_seq, ?), last_seen = datetime('now')
+       WHERE room_id = ? AND agent_id = ?`,
+    ).run(eff, roomId, name);
+    const row = d
+      .prepare(
+        "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
+      )
+      .get(roomId, name);
+    return { last_read_seq: row ? row.last_read_seq : eff };
+  });
+  try {
+    return tx.immediate();
+  } catch (e) {
+    return { error: String((e && e.message) || e) };
+  }
 }
 
 // Full room deletion, mirroring ChatStore.deleteRoom: messages first (so the
@@ -322,9 +370,13 @@ function leaveRoom(d, roomId, name) {
 // "ask @bob." tags bob, not "bob.".
 function parseMentions(body) {
   const out = [];
-  for (const m of body.matchAll(/@([\w][\w.-]{0,199})/g)) {
+  // Capture up to 201 chars, strip trailing punctuation, THEN length-check:
+  // capping the regex at 200 made a 201-char id silently tag its first-200
+  // prefix, a nonexistent identity.
+  for (const m of body.matchAll(/@([\w][\w.-]{0,200})/g)) {
     const id = m[1].replace(/[.-]+$/, "");
-    if (id && !out.includes(id)) out.push(id);
+    if (!id || id.length > 200 || out.includes(id)) continue;
+    out.push(id);
     if (out.length >= 100) break;
   }
   return out;
@@ -337,7 +389,11 @@ function searchMessages(roomId, q, limit) {
   if (!d) return null;
   const rows = d
     .prepare(
-      `SELECT g.seq, g.agent_id AS "from", a.role, a.type, g.body, g.format,
+      `SELECT g.seq, g.agent_id AS "from", a.role, a.type,
+              substr(g.body, 1, ${MAX_BODY_CHARS}) AS body,
+              CASE WHEN length(g.body) > ${MAX_BODY_CHARS}
+                   THEN length(g.body) ELSE NULL END AS body_length,
+              g.format,
               g.mentions, g.reply_to_seq, g.supersedes_seq, g.created_at AS at,
               (SELECT s.seq FROM messages s
                 WHERE s.room_id = g.room_id AND s.supersedes_seq = g.seq
@@ -357,6 +413,7 @@ function searchMessages(roomId, q, limit) {
         r.mentions = null;
       }
     }
+    finishBodyCap(r);
   }
   return rows;
 }
@@ -379,8 +436,10 @@ async function handlePost(url, req, res) {
   if (origin) {
     let local = false;
     try {
+      // WHATWG URL keeps the brackets on an IPv6 literal, so "[::1]" is the
+      // form that actually occurs.
       const h = new URL(origin).hostname;
-      local = h === "127.0.0.1" || h === "localhost" || h === "[::1]" || h === "::1";
+      local = h === "127.0.0.1" || h === "localhost" || h === "[::1]";
     } catch {}
     if (!local) {
       return sendJson(res, 403, { error: "cross-origin writes are not allowed" });
@@ -396,12 +455,26 @@ async function handlePost(url, req, res) {
   try {
     payload = JSON.parse(await readBody(req));
   } catch (e) {
-    return sendJson(res, 400, { error: String((e && e.message) || e) });
+    const tooLarge = !!(e && e.tooLarge);
+    res.writeHead(tooLarge ? 413 : 400, {
+      "Content-Type": "application/json; charset=utf-8",
+      "Cache-Control": "no-store",
+      Connection: "close",
+    });
+    res.end(JSON.stringify({ error: String((e && e.message) || e) }));
+    // Drop the half-received request only after the response has flushed.
+    res.on("finish", () => req.destroy());
+    return;
   }
   if (payload === null || typeof payload !== "object" || Array.isArray(payload)) {
     return sendJson(res, 400, { error: "request body must be a JSON object" });
   }
-  const roomId = Number(payload.room);
+  // Require a real JSON number: Number() coercion accepted true/[1]/"1"
+  // (all of which coerce to a usable integer) despite the error text below.
+  const roomId =
+    typeof payload.room === "number" && Number.isInteger(payload.room)
+      ? payload.room
+      : NaN;
   if (!Number.isInteger(roomId) || roomId <= 0) {
     return sendJson(res, 400, { error: "room must be a positive integer id" });
   }
@@ -436,7 +509,10 @@ async function handlePost(url, req, res) {
     return sendJson(res, 200, leaveRoom(d, roomId, name));
   }
   if (url.pathname === "/api/read") {
-    const seq = Number(payload.seq);
+    const seq =
+      typeof payload.seq === "number" && Number.isInteger(payload.seq)
+        ? payload.seq
+        : NaN;
     if (!Number.isInteger(seq) || seq < 0) {
       return sendJson(res, 400, { error: "seq must be a non-negative integer" });
     }
@@ -453,7 +529,11 @@ async function handlePost(url, req, res) {
     }
     let replyTo = null;
     if (payload.reply_to_seq !== undefined && payload.reply_to_seq !== null) {
-      replyTo = Number(payload.reply_to_seq);
+      replyTo =
+        typeof payload.reply_to_seq === "number" &&
+        Number.isInteger(payload.reply_to_seq)
+          ? payload.reply_to_seq
+          : NaN;
       if (!Number.isInteger(replyTo) || replyTo <= 0) {
         return sendJson(res, 400, {
           error: "reply_to_seq must be a positive integer",
@@ -468,6 +548,19 @@ async function handlePost(url, req, res) {
 }
 
 const server = createServer(async (req, res) => {
+  // DNS-rebinding hygiene on EVERY request (reads included): a hostile page
+  // whose hostname rebinds to 127.0.0.1 issues requests the browser treats
+  // as same-origin, exfiltrating chat content via the GET endpoints. The
+  // Host header still carries the page's own hostname through a rebind, so
+  // requiring a local one closes that door. Same class as the Origin gate
+  // on writes: browser-context hygiene, not authentication.
+  const rawHost = (req.headers.host || "").toLowerCase();
+  const hostname = rawHost.startsWith("[")
+    ? rawHost.slice(0, rawHost.indexOf("]") + 1)
+    : rawHost.split(":")[0];
+  if (hostname !== "127.0.0.1" && hostname !== "localhost" && hostname !== "[::1]") {
+    return sendJson(res, 403, { error: "unrecognized Host header" });
+  }
   let url;
   try {
     url = new URL(req.url, `http://${req.headers.host}`);
@@ -501,11 +594,13 @@ const server = createServer(async (req, res) => {
       const roomId = Number(url.searchParams.get("room"));
       if (!Number.isInteger(roomId) || roomId <= 0)
         return sendJson(res, 400, { error: "room must be a positive integer" });
-      const after = Number(url.searchParams.get("after")) || 0;
-      const before = Number(url.searchParams.get("before")) || 0;
+      // floor everything bound to SQL integer slots: a float LIMIT is a
+      // "datatype mismatch" 500 out of SQLite.
+      const after = Math.floor(Number(url.searchParams.get("after"))) || 0;
+      const before = Math.floor(Number(url.searchParams.get("before"))) || 0;
       const limit = Math.max(
         1,
-        Math.min(Number(url.searchParams.get("limit")) || 200, 1000),
+        Math.min(Math.floor(Number(url.searchParams.get("limit"))) || 200, 1000),
       );
       const messages = listMessages(roomId, after, before, limit);
       if (messages === null)
@@ -542,7 +637,7 @@ const server = createServer(async (req, res) => {
       if (!q) return sendJson(res, 400, { error: "q is required" });
       const limit = Math.max(
         1,
-        Math.min(Number(url.searchParams.get("limit")) || 30, 100),
+        Math.min(Math.floor(Number(url.searchParams.get("limit"))) || 30, 100),
       );
       try {
         const matches = searchMessages(roomId, q, limit);

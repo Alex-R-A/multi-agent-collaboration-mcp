@@ -2,6 +2,7 @@
 // join/post/read/leave, mention parsing, reply validation, join gating,
 // and interop (an agent's catch_up sees a web-posted message as directed).
 import { spawn } from "node:child_process";
+import { request as httpRequest } from "node:http";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -239,6 +240,69 @@ try {
     check("messages/memberships/markers/claims/room all cascaded", Object.values(remains).every((v) => v === 0), remains);
     const missing = await post("/api/delete-room", { room: rid, confirm: true });
     check("deleting a missing room is a 400", missing.status === 400, missing);
+  }
+
+  // input validation hardening (self-review round)
+  {
+    const floaty = await fetch(base + "/api/messages?room=1&limit=1.5");
+    check("float limit is handled, not a 500", floaty.status === 200, floaty.status);
+    const coerced = await post("/api/join", { room: true, name: "coerce" });
+    check("room:true is rejected (no Number() coercion)", coerced.status === 400, coerced);
+    const nullSeq = await post("/api/read", { room: 1, name: "alex", seq: null });
+    check("seq:null is rejected", nullSeq.status === 400, nullSeq);
+    const big = await fetch(base + "/api/post", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ room: 1, name: "alex", body: "a".repeat(800_000) }),
+    });
+    const bigBody = await big.json().catch(() => null);
+    check(
+      "oversized body gets a READABLE 413, not a connection reset",
+      big.status === 413 && bigBody && /too large/.test(bigBody.error),
+      { status: big.status, body: bigBody },
+    );
+    const alive = await fetch(base + "/api/rooms");
+    check("server alive after the 413", alive.status === 200, alive.status);
+    // Host allowlist (DNS-rebinding hygiene) via a raw request: fetch()
+    // refuses to override the Host header.
+    const evilHost = await new Promise((resolve) => {
+      const req = httpRequest(
+        { host: "127.0.0.1", port, path: "/api/rooms", headers: { Host: "evil.example.com" } },
+        (r) => resolve(r.statusCode),
+      );
+      req.on("error", () => resolve(-1));
+      req.end();
+    });
+    check("foreign Host header is rejected on reads", evilHost === 403, evilHost);
+    // Body cap: a >100k body arrives cut with an honest flag.
+    {
+      const s = new ChatStore(DB);
+      s.postMessage(1, "bot", "capped " + "y".repeat(150_000), "text", null, null);
+      s.close();
+      const r = await fetch(base + "/api/messages?room=1");
+      const data = await r.json();
+      const m = data.messages.find((x) => x.body.startsWith("capped"));
+      check(
+        "big bodies are capped per page with truncation metadata",
+        m && m.body.length === 100_000 && m.body_truncated === true && m.body_length === 150_007,
+        m && { len: m.body.length, flag: m.body_truncated, total: m.body_length },
+      );
+      const small = data.messages.find((x) => x.seq === 1);
+      check("small bodies carry no cap bookkeeping", small && small.body_length === undefined && small.body_truncated === undefined, small);
+    }
+    // 201-char mention runs are skipped, not mistagged as their 200-prefix.
+    {
+      const long = "b".repeat(201);
+      await post("/api/post", { room: 1, name: "alex", body: `hi @${long} and @carol.` });
+      const r = await fetch(base + "/api/messages?room=1");
+      const data = await r.json();
+      const m = data.messages[data.messages.length - 1];
+      check(
+        "201-char mention skipped; trailing-dot mention still tags",
+        JSON.stringify(m.mentions) === '["carol"]',
+        m.mentions,
+      );
+    }
   }
 } finally {
   child.kill();

@@ -26,7 +26,12 @@
 #   --interval <sec>     poll interval (default 5)
 #   --timeout <sec>      give up after this many seconds of no updates
 #                        (default 1200 = 20 minutes; 0 = never)
-#   --db <path>          db file (default $AGENT_CHAT_DB or ~/.agent-chat-mcp/chat.db)
+#
+# Scope notes: the all-rooms watch covers rooms the agent is PRESENT in
+# (soft-left rooms are muted) and fails fast with exit 2 if the agent is
+# present in none (a typo'd id should surface immediately, not burn the
+# timeout). An explicit --room watch keeps working after leaving that room:
+# naming the room is the intent to watch it.
 #
 # Exit codes: 0 updates found (status JSON printed to stdout), 124 timed out,
 # 2 error.
@@ -90,11 +95,18 @@ while true; do
     exit 0
   else
     rc=$?
-    # Only rc==1 means "no updates yet". Anything else (probe error 2, or the
-    # node process itself dying: 127/137/139/...) must surface, not be mistaken
-    # for a quiet room.
-    if [[ $rc -ne 1 ]]; then
-      echo "wait-for-updates: probe exited $rc" >&2
+    # Only rc==1 WITH a status line means "no updates yet". Anything else
+    # (probe error 2, or the node process dying: 127/137/139/...) must
+    # surface, not be mistaken for a quiet room. The -z guard closes the
+    # nastiest gap: node itself exits 1 on a module-load failure (missing
+    # node_modules, ABI mismatch, partial build), and a genuine quiet probe
+    # always prints exactly one JSON line, while a crashed one prints nothing.
+    if [[ $rc -ne 1 || -z "$out" ]]; then
+      if [[ -z "$out" ]]; then
+        echo "wait-for-updates: probe exited $rc with no status line (crashed?)" >&2
+      else
+        echo "wait-for-updates: probe exited $rc" >&2
+      fi
       exit 2
     fi
     # fall through to sleep

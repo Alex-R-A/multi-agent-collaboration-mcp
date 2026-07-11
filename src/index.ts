@@ -134,12 +134,18 @@ function touchSession(): void {
   // Always pass the nonce (not cursorId()): the ACTIVE room may be shared
   // while this session holds private cursors in other rooms, and those rows
   // must stay refreshed against the 7-day GC too.
-  if (session.roomId !== null) {
-    store.touch(session.roomId, session.agentId, SESSION_NONCE);
-  } else {
-    // Identity without an active room (post-leave my_mentions polling):
-    // still shield this session's cursors from the GC.
-    store.touchSessionMarkers(session.agentId, SESSION_NONCE);
+  try {
+    if (session.roomId !== null) {
+      store.touch(session.roomId, session.agentId, SESSION_NONCE);
+    } else {
+      // Identity without an active room (post-leave my_mentions polling):
+      // still shield this session's cursors from the GC.
+      store.touchSessionMarkers(session.agentId, SESSION_NONCE);
+    }
+  } catch {
+    // Liveness is best-effort: a briefly-locked database must not fail the
+    // tool call this touch piggybacks on (pure reads included). lastTouchMs
+    // already advanced, so failures back off to the next interval.
   }
 }
 
@@ -377,9 +383,11 @@ server.registerTool(
         .enum(["shared", "private"])
         .optional()
         .describe(
-          "'shared' (default): one read marker per identity, concurrent " +
-            "sessions split the backlog. 'private': this session keeps its own " +
-            "read position.",
+          "'shared': one read marker per identity, concurrent sessions split " +
+            "the backlog. 'private': this session keeps its own read " +
+            "position. Omitted: keeps this session's current mode for the " +
+            "room (shared on first join); only an explicit 'shared' discards " +
+            "an existing private cursor.",
         ),
     },
   },
@@ -404,7 +412,15 @@ server.registerTool(
       // Session state mutates only AFTER the join succeeds: flipping cursor
       // mode first would leave a failed join having silently changed the mode
       // for the still-active previous room.
-      const priv = cursor === "private";
+      // Cursor mode is STICKY per room: an omitted `cursor` keeps this
+      // session's existing mode. Treating omission as an explicit 'shared'
+      // used to DELETE the session's private cursor on any rejoin (a role
+      // refresh, a reconnect), silently jumping the session to the identity
+      // marker -- messages it never received became unrecoverable. Only an
+      // explicit 'shared' downgrades.
+      const priv =
+        cursor === "private" ||
+        (cursor === undefined && session.privateRooms.has(target.id));
       store.joinRoom(target.id, id, priv ? SESSION_NONCE : null);
       if (priv) {
         session.privateRooms.add(target.id);
@@ -412,11 +428,21 @@ server.registerTool(
         session.privateRooms.delete(target.id);
         // Mode switch hygiene: drop any leftover private row so my_mentions'
         // per-room COALESCE stops using a baseline this session abandoned.
+        // (Reached on explicit 'shared', or on omitted-cursor joins where the
+        // session held no private mode -- a no-op there.)
         store.clearSessionCursor(target.id, id, SESSION_NONCE);
       }
       session.agentId = id;
       session.roomId = target.id;
-      const cur = store.getCursor(target.id, id, cursorId())!;
+      const cur = store.getCursor(target.id, id, cursorId());
+      if (!cur) {
+        // The room was deleted by another process between our join and this
+        // read; same recovery contract as requireActive.
+        session.roomId = null;
+        return fail(
+          `room "${target.name}" was deleted while joining; rejoin with join_room`,
+        );
+      }
       return ok({
         agent_id: id,
         room_id: target.id,
