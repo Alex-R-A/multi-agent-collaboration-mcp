@@ -270,8 +270,9 @@ if (process.platform !== "win32") {
 }
 
 // --- 4b: list_agents pagination is stable under same-second joins -------------
-// joined_at is second-resolution; the a.id tie-break gives a total order so
-// offset paging never skips or duplicates same-second joiners.
+// joined_at is second-resolution; the composite (joined_at, a.id) keyset gives
+// a total order so paging never skips or duplicates same-second joiners, even
+// with a concurrent join between pages.
 {
   const s = new ChatStore(":memory:");
   const r = s.createRoom("many", null, null).id;
@@ -281,17 +282,20 @@ if (process.platform !== "win32") {
     s.joinRoom(r, id); // all within the same wall-clock second
   }
   const seen = [];
-  let off = 0;
+  let after;
   for (let p = 0; p < 20; p++) {
-    const { agents, total } = s.listAgents(r, 5, undefined, 3, off);
+    const { agents, next_after } = s.listAgents(r, 5, undefined, 3, after);
     for (const a of agents) seen.push(a.id);
-    off += agents.length;
-    if (off >= total || agents.length === 0) break;
+    // A concurrent same-second join on page 2 would shift an OFFSET; keyset is
+    // immune. Insert one mid-traversal to prove it.
+    if (p === 1) { s.upsertAgent("agent-zz", null, null, null); s.joinRoom(r, "agent-zz"); }
+    if (next_after === undefined || agents.length === 0) break;
+    after = next_after;
   }
   const uniq = new Set(seen);
   check(
-    "list_agents offset paging covers every same-second joiner exactly once",
-    seen.length === 12 && uniq.size === 12,
+    "list_agents keyset paging covers every same-second joiner exactly once",
+    seen.length === uniq.size && uniq.size >= 12 && ids.every((id) => uniq.has(id)),
     { count: seen.length, unique: uniq.size },
   );
   s.close();

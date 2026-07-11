@@ -640,8 +640,9 @@ server.registerTool(
       "rides along): type/role/description, `last_read_seq` (read receipt: " +
       "compare to a message seq), `last_seen`, `idle_seconds`, `present` (has " +
       "not left), `active` (seen within active_within_minutes). Long " +
-      "descriptions are listing previews (description_truncated). " +
-      "`truncated:true` = more rows exist; page with offset.",
+      "descriptions are listing previews (description_truncated). `next_after` " +
+      "present = more rows exist; page by passing it back as `after` (keyset " +
+      "paging, so a concurrent join cannot make you skip or duplicate an agent).",
     inputSchema: z.object({
       filter: z
         .string()
@@ -660,31 +661,28 @@ server.registerTool(
         .max(1000)
         .optional()
         .describe("Max agents to return (default 200)"),
-      offset: z
-        .number()
-        .int()
-        .nonnegative()
+      after: z
+        .object({ joined_at: z.string(), id: z.string() })
+        .strict()
         .optional()
-        .describe("Skip this many agents (paging; default 0)"),
+        .describe("Keyset paging cursor: the prior page's next_after."),
     }).strict(),
   },
-  async ({ filter, active_within_minutes, limit, offset }) => {
+  async ({ filter, active_within_minutes, limit, after }) => {
     try {
       touchSession();
       const { roomId } = requireActive();
-      const off = offset ?? 0;
-      const { agents, total, size_trimmed } = store.listAgents(
+      const { agents, total, next_after, size_trimmed } = store.listAgents(
         roomId,
         active_within_minutes ?? 5,
         filter,
         limit ?? 200,
-        off,
+        after,
       );
-      const more = off + agents.length < total || !!size_trimmed;
       return ok({
         agents,
         total,
-        ...(more ? { truncated: true } : {}),
+        ...(next_after ? { next_after, truncated: true } : {}),
         ...(size_trimmed ? { size_trimmed: true } : {}),
       });
     } catch (e) {
@@ -710,7 +708,20 @@ server.registerTool(
       "see `superseded_by` on it) instead of leaving both versions standing.",
     inputSchema: z.object({
       content: z
-        .union([z.string(), z.record(z.any()), z.array(z.any())])
+        .union([
+          z.string(),
+          z.array(z.any()),
+          // z.custom passthrough, NOT z.record: z.record rebuilds the object by
+          // assignment, and assigning key "__proto__" sets the prototype rather
+          // than an own property, so a top-level "__proto__" key was silently
+          // dropped before storage. Passthrough keeps the raw parsed object
+          // (JSON.parse already made "__proto__" a safe own key -- no prototype
+          // pollution), so it round-trips like any other key.
+          z.custom<Record<string, unknown>>(
+            (v) => typeof v === "object" && v !== null && !Array.isArray(v),
+            { message: "content must be a string, JSON object, or JSON array" },
+          ),
+        ])
         .describe(
           "Message body: a string, or a JSON object/array. Strings and " +
             "object keys must be well-formed Unicode (no lone surrogates).",

@@ -2,7 +2,7 @@ import Database from "better-sqlite3";
 import { chmodSync, existsSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
-import { assertWellFormedUtf16 } from "./unicode.js";
+import { assertWellFormedUtf16, assertWellFormedJsonValue } from "./unicode.js";
 
 /**
  * Resolve the shared database file. All agents on a machine talk through one
@@ -25,6 +25,12 @@ function resolveDbPath(): string {
 
 /** SQLite's default maximum string/blob byte length (SQLITE_MAX_LENGTH). */
 export const SQLITE_MAX_LENGTH = 1_000_000_000;
+
+/** Above this body length the store's json well-formedness re-validation is
+ *  skipped: parsing a ~GB body into memory to walk it would defeat the
+ *  memory-bounded read design, and such a caller owns validation (the MCP
+ *  handler validates pre-serialization, independent of size). */
+const JSON_VALIDATE_MAX_CHARS = 1_000_000;
 
 /**
  * Default serialized-size budget for bulk message reads (catch_up,
@@ -503,6 +509,19 @@ export class ChatStore {
           WHERE p.room_id = messages.room_id AND p.seq = messages.reply_to_seq)
       WHERE reply_to_seq IS NOT NULL AND reply_to_agent IS NULL
     `);
+    // The message-body NUL scan below runs ONLY until this file is marked
+    // migrated via PRAGMA user_version. It reads EVERY body to evaluate
+    // instr(body, char(0)) -- costly on a large corpus (a 1 GB body is read
+    // every startup) and pointless once done: the reject trigger blocks any new
+    // NUL row, so a migrated file cannot acquire one. The gate is set at the END
+    // of migrate(), so a crash mid-scan just re-runs. Everything else
+    // (schema/index/trigger creation, the cheap body_len backfill and small
+    // metadata heals) stays ungated.
+    const SCHEMA_VERSION = 1;
+    const needsHeal =
+      (this.db.pragma("user_version", { simple: true }) as number) <
+      SCHEMA_VERSION;
+
     // Heal existing rows that already hold a NUL (written by a pre-guard build):
     // a plain SELECT is NOT NUL-terminated, so the full body is recoverable;
     // replace each NUL with U+FFFD so substr()/length() readers see it whole,
@@ -512,9 +531,8 @@ export class ChatStore {
     // NUL bodies), via a regex replace (not split/join, which builds a giant
     // array on an all-NUL body). instr() detects them; healing a row clears its
     // NUL, so the predicate never revisits it and the id cursor moves strictly
-    // forward. (Scan still runs each startup; a user_version gate to skip it on
-    // already-healed files is a proposed follow-up, not bundled into this fix.)
-    {
+    // forward.
+    if (needsHeal) {
       const nextNul = this.db.prepare(
         "SELECT id, body FROM messages WHERE instr(body, char(0)) > 0 AND id > ? ORDER BY id LIMIT 1",
       );
@@ -540,6 +558,10 @@ export class ChatStore {
     // count via SQL (a low-but-nonzero bound; the web viewer's COALESCE still
     // shows a length and its total>shown guard tolerates the codepoint skew).
     // Cursored by id so the whole sweep is one table pass, one body resident.
+    // NOT gated: on a migrated file this reads NO bodies -- body_len IS NULL
+    // short-circuits before length(body), and new inserts always stamp body_len
+    // -- so it stays cheap while still backfilling a rolling-upgrade old-build
+    // row that landed a NULL body_len after this file was marked migrated.
     {
       const BACKFILL_MAX_CHARS = 1_000_000;
       this.db
@@ -616,6 +638,8 @@ export class ChatStore {
     // healed above, with their body_len reset). Listing SQL uses substr(), which
     // stops at the first NUL, so a legacy NUL silently truncated the shown
     // value. Runs after every table exists; new writes are already rejected.
+    // NOT gated: metadata columns are small (<=10k) so these scans are cheap,
+    // and unlike the message-body NUL scan they never read a 1 GB body.
     this.healNulColumn("rooms", "description");
     this.healNulColumn("rooms", "pinned");
     this.healNulColumn("agents", "description");
@@ -656,6 +680,12 @@ export class ChatStore {
     if (ftsCount !== msgCount) {
       this.db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
     }
+
+    // Mark this file migrated so the message-body NUL scan above is skipped on
+    // future startups (one-time work; the reject trigger keeps new rows clean).
+    // Set LAST, only after the scan ran, so a crash mid-scan leaves user_version
+    // unchanged and it re-runs.
+    if (needsHeal) this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
   }
 
   private ensureColumn(table: string, column: string, type: string): void {
@@ -808,27 +838,36 @@ export class ChatStore {
   ): { rooms: RoomSummary[]; total: number; next_id?: number; size_trimmed?: boolean } {
     const PREVIEW = 300;
     const lim = Math.max(1, Math.floor(limit));
-    // Fetch one MORE than asked to detect a further page without a tail COUNT.
-    const rows = this.db
-      .prepare(
-        `SELECT r.id, r.name,
-                substr(r.description, 1, ${PREVIEW}) AS description,
-                CASE WHEN length(r.description) > ${PREVIEW} THEN 1 ELSE 0 END AS description_cut,
-                substr(r.pinned, 1, ${PREVIEW}) AS pinned,
-                CASE WHEN length(r.pinned) > ${PREVIEW} THEN 1 ELSE 0 END AS pinned_cut,
-                r.created_at,
-                (SELECT COUNT(*) FROM memberships m WHERE m.room_id = r.id AND m.left_at IS NULL) AS members,
-                (SELECT COUNT(*) FROM messages g WHERE g.room_id = r.id) AS messages,
-                (SELECT MAX(created_at) FROM messages g WHERE g.room_id = r.id) AS last_activity
-         FROM rooms r WHERE r.id > ? ORDER BY r.id LIMIT ?`,
-      )
-      .all(Math.max(0, Math.floor(afterId)), lim + 1) as (RoomSummary & {
-      description_cut: number;
-      pinned_cut: number;
-    })[];
-    const { c: total } = this.db
-      .prepare("SELECT COUNT(*) AS c FROM rooms")
-      .get() as { c: number };
+    // Rows and total in ONE deferred snapshot: read as separate statements, a
+    // concurrent create_room/delete_room BETWEEN them yields an internally
+    // contradictory page (e.g. total:4 with no next_id, so the keyset pager
+    // stops and misses the now-live room). Fetch one MORE than asked to detect
+    // a further page without a tail COUNT.
+    const { rows, total } = this.db
+      .transaction(() => {
+        const rows = this.db
+          .prepare(
+            `SELECT r.id, r.name,
+                    substr(r.description, 1, ${PREVIEW}) AS description,
+                    CASE WHEN length(r.description) > ${PREVIEW} THEN 1 ELSE 0 END AS description_cut,
+                    substr(r.pinned, 1, ${PREVIEW}) AS pinned,
+                    CASE WHEN length(r.pinned) > ${PREVIEW} THEN 1 ELSE 0 END AS pinned_cut,
+                    r.created_at,
+                    (SELECT COUNT(*) FROM memberships m WHERE m.room_id = r.id AND m.left_at IS NULL) AS members,
+                    (SELECT COUNT(*) FROM messages g WHERE g.room_id = r.id) AS messages,
+                    (SELECT MAX(created_at) FROM messages g WHERE g.room_id = r.id) AS last_activity
+             FROM rooms r WHERE r.id > ? ORDER BY r.id LIMIT ?`,
+          )
+          .all(Math.max(0, Math.floor(afterId)), lim + 1) as (RoomSummary & {
+          description_cut: number;
+          pinned_cut: number;
+        })[];
+        const { c: total } = this.db
+          .prepare("SELECT COUNT(*) AS c FROM rooms")
+          .get() as { c: number };
+        return { rows, total };
+      })
+      .deferred();
     const hasMore = rows.length > lim;
     const page = hasMore ? rows.slice(0, lim) : rows;
     const mapped = page.map((r) => {
@@ -1211,8 +1250,13 @@ export class ChatStore {
     activeWithinMinutes: number,
     filter?: string,
     limit = 200,
-    offset = 0,
-  ): { agents: AgentRow[]; total: number; size_trimmed?: boolean } {
+    after?: { joined_at: string; id: string },
+  ): {
+    agents: AgentRow[];
+    total: number;
+    next_after?: { joined_at: string; id: string };
+    size_trimmed?: boolean;
+  } {
     const PREVIEW = 300;
     const cols = `SELECT a.id, a.type, a.role,
                          substr(a.description, 1, ${PREVIEW}) AS description,
@@ -1221,43 +1265,55 @@ export class ChatStore {
                          m.last_read_seq, m.last_seen, m.left_at,
                          (strftime('%s','now') - strftime('%s', m.last_seen)) AS idle_seconds
                   FROM memberships m JOIN agents a ON a.id = m.agent_id
-                  WHERE m.room_id = ?`;
+                  WHERE m.room_id = @room`;
     const count = `SELECT COUNT(*) AS c
                    FROM memberships m JOIN agents a ON a.id = m.agent_id
-                   WHERE m.room_id = ?`;
+                   WHERE m.room_id = @room`;
     const lim = Math.max(1, Math.floor(limit));
-    const off = Math.max(0, Math.floor(offset));
     type Row = Omit<AgentRow, "present" | "active"> & {
       left_at: string | null;
       description_cut: number;
     };
-    let rows: Row[];
-    let total: number;
+    // Base params (room + optional filter) go to BOTH the row and count queries;
+    // row-only params (keyset cursor, limit) are added separately so each
+    // prepared statement is handed EXACTLY the named parameters it references.
+    const base: Record<string, unknown> = { room: roomId };
+    let cond = "";
     if (filter && filter.trim().length > 0) {
       // Literal-substring semantics: escape LIKE wildcards so a filter of
       // "50%" matches those three characters, not everything.
-      const like = `%${filter.trim().replace(/[\\%_]/g, "\\$&")}%`;
-      const cond = ` AND (IFNULL(a.role,'') LIKE ? ESCAPE '\\' OR IFNULL(a.type,'') LIKE ? ESCAPE '\\'
-                        OR IFNULL(a.description,'') LIKE ? ESCAPE '\\' OR a.id LIKE ? ESCAPE '\\')`;
-      rows = this.db
-        .prepare(`${cols}${cond} ORDER BY m.joined_at, a.id LIMIT ? OFFSET ?`)
-        .all(roomId, like, like, like, like, lim, off) as Row[];
-      total = (
-        this.db.prepare(`${count}${cond}`).get(roomId, like, like, like, like) as {
-          c: number;
-        }
-      ).c;
-    } else {
-      rows = this.db
-        // a.id tie-break: joined_at is second-resolution and non-unique, so
-        // without it same-second joiners have no total order and offset paging
-        // could skip or duplicate them.
-        .prepare(`${cols} ORDER BY m.joined_at, a.id LIMIT ? OFFSET ?`)
-        .all(roomId, lim, off) as Row[];
-      total = (this.db.prepare(count).get(roomId) as { c: number }).c;
+      base.like = `%${filter.trim().replace(/[\\%_]/g, "\\$&")}%`;
+      cond = ` AND (IFNULL(a.role,'') LIKE @like ESCAPE '\\' OR IFNULL(a.type,'') LIKE @like ESCAPE '\\'
+                  OR IFNULL(a.description,'') LIKE @like ESCAPE '\\' OR a.id LIKE @like ESCAPE '\\')`;
     }
+    // Composite KEYSET (matches ORDER BY m.joined_at, a.id), NOT OFFSET: a
+    // concurrent same-second join shifts every OFFSET after it, skipping or
+    // duplicating a row across pages. joined_at is second-resolution and
+    // non-unique, so a.id (unique) is the tie-break and part of the cursor.
+    let keyset = "";
+    const rowParams: Record<string, unknown> = { ...base, lim: lim + 1 };
+    if (after) {
+      keyset = ` AND (m.joined_at > @aj OR (m.joined_at = @aj AND a.id > @ai))`;
+      rowParams.aj = after.joined_at;
+      rowParams.ai = after.id;
+    }
+    // Rows and count in ONE deferred snapshot so total cannot disagree with the
+    // page (parity with listRooms). Fetch one MORE than asked to detect a page.
+    const { rows, total } = this.db
+      .transaction(() => {
+        const rows = this.db
+          .prepare(`${cols}${cond}${keyset} ORDER BY m.joined_at, a.id LIMIT @lim`)
+          .all(rowParams) as Row[];
+        const total = (
+          this.db.prepare(`${count}${cond}`).get(base) as { c: number }
+        ).c;
+        return { rows, total };
+      })
+      .deferred();
+    const hasMore = rows.length > lim;
+    const page = hasMore ? rows.slice(0, lim) : rows;
     const threshold = activeWithinMinutes * 60;
-    const mapped = rows.map((r) => {
+    const mapped = page.map((r) => {
       const { left_at, description_cut, ...rest } = r;
       return {
         ...rest,
@@ -1270,7 +1326,18 @@ export class ChatStore {
       };
     });
     const { rows: agents, sizeTrimmed } = fitRows(mapped, LIST_ROW_BUDGET);
-    return { agents, total, ...(sizeTrimmed ? { size_trimmed: true } : {}) };
+    // next_after is the last RETURNED agent's (joined_at, id) keyset cursor;
+    // omitted once the listing is exhausted.
+    const more = sizeTrimmed || (hasMore && agents.length === page.length);
+    const last = agents.length > 0 ? agents[agents.length - 1] : undefined;
+    const next_after =
+      more && last ? { joined_at: last.joined_at, id: last.id } : undefined;
+    return {
+      agents,
+      total,
+      ...(next_after ? { next_after } : {}),
+      ...(sizeTrimmed ? { size_trimmed: true } : {}),
+    };
   }
 
   // --- messages ----------------------------------------------------------
@@ -1305,6 +1372,20 @@ export class ChatStore {
     // would advance the marker past the lost tail. mentions are agent ids
     // (already control-char-validated upstream) but guard defensively.
     assertStorable(body, "message body");
+    // Defense in depth for DIRECT store callers (the MCP handler already
+    // validated pre-serialization): a json body can hide a nested lone
+    // surrogate as an ASCII \uXXXX escape that assertStorable's raw-string check
+    // misses, and JSON.parse reconstructs it on read. Validate the parsed
+    // content -- bounded, so a pathological ~GB body is not parsed into memory.
+    if (format === "json" && body.length <= JSON_VALIDATE_MAX_CHARS) {
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(body);
+      } catch {
+        parsed = undefined; // not valid json; stored as-is, read back as a string
+      }
+      if (parsed !== undefined) assertWellFormedJsonValue(parsed, "message body");
+    }
     if (mentions) for (const m of mentions) assertStorable(m, "mention id");
     const mentionsJson =
       mentions && mentions.length > 0 ? JSON.stringify(mentions) : null;
@@ -1552,17 +1633,20 @@ export class ChatStore {
       res = it.next();
       if (used >= maxBytes) {
         // Grab ONE more row past the budget (if any) as a SENTINEL, then stop.
-        // The sentinel lets boundByBytes see that more rows remain. But the
+        // The sentinel lets boundByBytes see that more rows remain. The
         // raw-size stop assumes serialized >= raw, which BREAKS when preview_chars
         // or a compact JSON reparse shrinks rows below their raw size: then
-        // boundByBytes can fit EVERY fetched row (sentinel included) and report
-        // byte_limited:false while rows were left unfetched. `exhausted:false`
-        // records the query was not drained, so callers (get_thread, search)
-        // that lack a secondary "more" signal can still flag it. Peak memory
-        // stays ~2x maxBytes.
+        // boundByBytes can fit EVERY fetched row (sentinel included), so
+        // `exhausted:false` is the callers' only "more" signal in that case.
+        // But the sentinel may itself be the LAST matching row, in which case
+        // nothing remains and exhausted must stay TRUE -- else a shrink that
+        // fits the sentinel emits a false "more remain" (a spurious empty next
+        // page). PEEK one further row to decide, discarding it (paging resumes
+        // from the last RETURNED row, so the peek is re-fetched, never skipped).
+        // Peak memory stays ~2x maxBytes.
         if (!res.done) {
           rows.push(res.value);
-          exhausted = false;
+          exhausted = it.next().done === true;
         }
         if (it.return) it.return();
         break;

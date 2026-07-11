@@ -82,6 +82,9 @@ const NUL = String.fromCharCode(0);
     raw.exec("DROP TRIGGER IF EXISTS messages_reject_nul");
     const ins = raw.prepare("INSERT INTO messages (room_id,seq,agent_id,format,body) VALUES (1,?,'a','text',?)");
     for (let i = 1; i <= 25; i++) ins.run(i, "a" + i + NUL + "b" + i);
+    // A build old enough to write NULs predates the migration marker, so clear
+    // user_version: the body NUL scan is now gated on it and must re-run here.
+    raw.pragma("user_version = 0");
     raw.close();
   }
   const s = new ChatStore(DB); // migrate heal runs

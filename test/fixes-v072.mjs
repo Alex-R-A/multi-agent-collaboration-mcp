@@ -43,6 +43,10 @@ const throws = (fn, re) => {
     const raw = new Database(DB);
     raw.exec("DROP TRIGGER IF EXISTS messages_reject_nul");
     raw.prepare("INSERT INTO messages (room_id,seq,agent_id,format,body) VALUES (1,1,'b','text',?)").run("abc" + NUL + "def");
+    // A build old enough to write a NUL predates the migration marker too, so
+    // clear user_version: the current build must then re-run the one-time heal
+    // (the scan is now gated on user_version to avoid re-reading every body).
+    raw.pragma("user_version = 0");
     raw.close();
   }
   // Reopen with the current build: the migration heals the existing NUL row.

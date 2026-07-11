@@ -15,6 +15,32 @@ export function assertWellFormedUtf16(value: string, field: string): void {
 }
 
 /**
+ * Reject a lone surrogate in any string value or object key anywhere in a
+ * PARSED JSON value. Used at the store boundary for direct callers of
+ * postMessage(format:"json"): their already-serialized body hides a nested lone
+ * surrogate as an ASCII "\\uXXXX" escape that a raw-string check cannot see, and
+ * JSON.parse reconstructs it for readers. The MCP handler validates earlier and
+ * more cheaply via stringifyWellFormedJson (pre-escape, single pass); this is
+ * the defense-in-depth walk for everyone else.
+ */
+export function assertWellFormedJsonValue(value: unknown, field: string): void {
+  if (typeof value === "string") {
+    assertWellFormedUtf16(value, `${field} string`);
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const v of value) assertWellFormedJsonValue(v, field);
+    return;
+  }
+  if (value !== null && typeof value === "object") {
+    for (const k of Object.keys(value)) {
+      assertWellFormedUtf16(k, `${field} object key`);
+      assertWellFormedJsonValue((value as Record<string, unknown>)[k], field);
+    }
+  }
+}
+
+/**
  * Serialize structured content while rejecting lone surrogates in every JSON
  * string value and object key. A plain JSON.stringify would escape a lone
  * surrogate to ASCII (for example, "\\ud800"), hiding it from the storage
