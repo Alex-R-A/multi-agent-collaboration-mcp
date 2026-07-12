@@ -2373,7 +2373,7 @@
           : data.matches.length
             ? `${data.matches.length} match(es) for "${q}", best first. Click one to view it in the stream.` +
               (data.trimmed
-                ? " (more matches exist but were omitted to bound the response size; narrow your query.)"
+                ? " (more matches exist beyond those shown; narrow your query.)"
                 : "")
             : `No matches for "${q}".`;
         for (const m of data.matches || []) el.results.append(renderResult(m));

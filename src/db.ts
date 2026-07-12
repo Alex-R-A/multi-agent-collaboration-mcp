@@ -1245,8 +1245,8 @@ export class ChatStore {
   /**
    * Mark an active agent alive. Also clears the ACTIVE room's left_at (an
    * actively-acting session re-asserts identity presence there). With
-   * presenceId, refresh this session's live presence and cursor rows in EVERY
-   * room against the 7-day GC.
+   * presenceId, refresh this session's cursor rows (every identity) and the
+   * current identity's live presence rows in EVERY room against the 7-day GC.
    */
   touch(roomId: number, agentId: string, presenceId: string | null = null): void {
     this.db
@@ -1269,24 +1269,31 @@ export class ChatStore {
              updated_at = datetime('now'), left_at = NULL`,
         )
         .run(roomId, agentId, presenceId);
-      this.touchSessionAlive(presenceId);
+      this.touchSessionAlive(presenceId, agentId);
     }
   }
 
   /**
    * Shield a live session's cursor AND presence rows from the 7-day GC in EVERY
    * room (keyed by the process nonce, so it also covers rooms the session is not
-   * currently active in). Only LIVE presence rows are refreshed -- a room the
-   * session explicitly left keeps its left_at and ages out. Used for the
-   * no-active-room case (post-leave my_mentions polling) and by touch().
+   * currently active in). CURSOR rows are refreshed nonce-wide, for every
+   * identity the session has ever held (see touchSessionMarkers for why).
+   * PRESENCE rows are refreshed only for the CURRENT identity: a session that
+   * switched identity no longer acts as the old one, so the old identity's
+   * presence must age out via the GC and read as left -- a nonce-wide refresh
+   * kept it `present` for the life of the process with no way to leave it. The
+   * old identity's preserved cursor row means a later rejoin under that id
+   * resumes its exact read position. Only LIVE presence rows are refreshed -- a
+   * room the session explicitly left keeps its left_at and ages out. Used for
+   * the no-active-room case (post-leave my_mentions polling) and by touch().
    */
-  touchSessionAlive(sessionId: string): void {
+  touchSessionAlive(sessionId: string, agentId: string): void {
     this.touchSessionMarkers("", sessionId);
     this.db
       .prepare(
-        "UPDATE session_presence SET updated_at = datetime('now') WHERE session_id = ? AND left_at IS NULL",
+        "UPDATE session_presence SET updated_at = datetime('now') WHERE session_id = ? AND agent_id = ? AND left_at IS NULL",
       )
-      .run(sessionId);
+      .run(sessionId, agentId);
   }
 
   getMembership(

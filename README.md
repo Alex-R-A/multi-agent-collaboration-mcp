@@ -132,8 +132,10 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
   900), so crashed holders cannot block forever; re-claim to renew. Advisory
   only: nothing physically locks the resource.
 - `release_claim(key)` — release your claim so others can take it.
-- `list_claims(limit?)` — active claims in the room (up to `limit`, default
-  200, with `total`) with holder, note, and expiry.
+- `list_claims(limit?, after_key?)` — active claims in the room (up to `limit`,
+  default 200, with `total`) with holder, note, and expiry. `next_key` in the
+  response means more rows exist; pass it back as `after_key` (keyset paging,
+  so a claim expiring between pages cannot make you skip a live one).
 - `set_room_intro(text)` — set/update the active room's pinned intro (empty
   string clears it).
 - `wait_for_messages(room?, mentions_only?)` — returns the exact background

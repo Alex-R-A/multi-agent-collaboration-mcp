@@ -176,7 +176,7 @@ function touchSession(): void {
     } else {
       // Identity without an active room (post-leave my_mentions polling):
       // still shield this session's cursors AND live presence rows from the GC.
-      store.touchSessionAlive(SESSION_NONCE);
+      store.touchSessionAlive(SESSION_NONCE, session.agentId);
     }
   } catch {
     // Liveness is best-effort: a briefly-locked database must not fail the
@@ -1574,9 +1574,17 @@ function assignReadableId(
     const id = i < 12 ? base : `${base}-${randomUUID().slice(0, 4)}`;
     if (store.tryCreateAgent(id, type, role, description)) return id;
   }
-  const id = `agent-${randomUUID().slice(0, 8)}`;
-  store.tryCreateAgent(id, type, role, description);
-  return id;
+  // Last resort: keep drawing until an id is actually CLAIMED. Returning an
+  // unclaimed id here silently adopted an EXISTING identity (shared read
+  // markers and claims); ids are self-asserted, so a collision is improbable
+  // but not impossible.
+  for (let i = 0; i < 30; i++) {
+    const id = `agent-${randomUUID().slice(0, 8)}`;
+    if (store.tryCreateAgent(id, type, role, description)) return id;
+  }
+  throw new Error(
+    "could not allocate a generated agent id; pass an explicit agent_id",
+  );
 }
 
 function dedupe(xs: string[]): string[] {

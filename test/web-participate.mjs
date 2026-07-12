@@ -312,6 +312,75 @@ try {
       );
     }
   }
+
+  // web joins register a presence row, so a web participant sharing a name
+  // with MCP sessions is never evicted by the presence recompute (v0.8.3)
+  {
+    const s = new ChatStore(DB);
+    const rid = s.createRoom("shared-name", null, null).id;
+    s.close();
+    const wj = await post("/api/join", { room: rid, name: "pat" });
+    // An MCP session joins and leaves under the SAME name; the recompute must
+    // see the web participant's live presence row and keep the membership.
+    const s2 = new ChatStore(DB);
+    s2.joinRoom(rid, "pat", null, "MCPNONCE");
+    s2.leaveRoom(rid, "pat", "MCPNONCE");
+    const m = s2.getMembership(rid, "pat");
+    s2.close();
+    check(
+      "MCP twin leave does not evict the web participant",
+      wj.status === 200 && m.left_at === null,
+      m,
+    );
+    const still = await post("/api/post", { room: rid, name: "pat", body: "still here" });
+    check("web participant can still post after the twin left", still.status === 200, still);
+    // The inverse: a web leave with a live MCP twin must not evict the twin.
+    const s3 = new ChatStore(DB);
+    s3.joinRoom(rid, "pat", null, "MCPNONCE2");
+    s3.close();
+    const wl = await post("/api/leave", { room: rid, name: "pat" });
+    const s4 = new ChatStore(DB);
+    const m2 = s4.getMembership(rid, "pat");
+    s4.close();
+    check(
+      "web leave with a live MCP twin keeps the identity present",
+      wl.status === 200 && wl.data.left === true && m2.left_at === null,
+      { wl: wl.data, m2 },
+    );
+    // With no live sessions anywhere, a web leave marks the membership left.
+    const s5 = new ChatStore(DB);
+    s5.leaveRoom(rid, "pat", "MCPNONCE2");
+    s5.close();
+    const rejoinW = await post("/api/join", { room: rid, name: "pat" });
+    const wl2 = await post("/api/leave", { room: rid, name: "pat" });
+    const s6 = new ChatStore(DB);
+    const m3 = s6.getMembership(rid, "pat");
+    s6.close();
+    check(
+      "web leave with no live twins marks the membership left",
+      rejoinW.status === 200 && wl2.data.left === true && m3.left_at !== null,
+      { wl2: wl2.data, m3 },
+    );
+  }
+
+  // search: a page of exactly `limit` matches signals more exist (v0.8.3)
+  {
+    for (let i = 0; i < 4; i++) {
+      await post("/api/post", { room: 1, name: "alex", body: "needleword " + i });
+    }
+    const cut = await (await fetch(`${base}/api/search?room=1&q=needleword&limit=3`)).json();
+    check(
+      "search limit cut carries the trimmed flag",
+      cut.matches.length === 3 && cut.trimmed === true,
+      { n: cut.matches.length, trimmed: cut.trimmed },
+    );
+    const all = await (await fetch(`${base}/api/search?room=1&q=needleword&limit=50`)).json();
+    check(
+      "a complete search page carries no trimmed flag",
+      all.matches.length === 4 && all.trimmed === undefined,
+      { n: all.matches.length, trimmed: all.trimmed },
+    );
+  }
 } finally {
   child.kill();
   rmSync(dir, { recursive: true, force: true });

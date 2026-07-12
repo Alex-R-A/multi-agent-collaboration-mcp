@@ -310,6 +310,17 @@ function dbUnavailableError() {
 
 const NAME_RE = /^[\w][\w.-]{0,199}$/; // sane self-asserted ids, no whitespace
 
+// session_presence id for a web participant. Derived from the name (the
+// browser has no process nonce, and all tabs share the localStorage identity
+// anyway); the "web:" prefix cannot collide with the MCP servers' UUID nonces.
+// Web joins MUST register presence: recomputeMembershipPresence treats an
+// identity with ANY presence rows as session-managed, so a web join without a
+// row was evicted (memberships.left_at set) as soon as an MCP session of the
+// same name left or aged out of the GC window.
+function webSession(name) {
+  return "web:" + name;
+}
+
 // Return a human reason if `s` holds text SQLite cannot round-trip (an
 // embedded NUL -- substr/length truncate at it -- or a lone surrogate), else
 // "". Mirrors the store's assertStorable so a web post is rejected the same way
@@ -375,6 +386,13 @@ function joinRoom(d, roomId, name) {
   d.prepare(
     "UPDATE memberships SET left_at = NULL, last_seen = datetime('now') WHERE room_id = ? AND agent_id = ?",
   ).run(roomId, name);
+  // Register/refresh this web participant's presence row (see webSession).
+  d.prepare(
+    `INSERT INTO session_presence (room_id, agent_id, session_id)
+     VALUES (?, ?, ?)
+     ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
+       updated_at = datetime('now'), left_at = NULL`,
+  ).run(roomId, name, webSession(name));
   const m = d
     .prepare(
       "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
@@ -431,6 +449,14 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
     d.prepare(
       "UPDATE memberships SET last_seen = datetime('now') WHERE room_id = ? AND agent_id = ?",
     ).run(roomId, name);
+    // Posting is active participation: re-assert this web session's presence
+    // (recreating a row the 7-day GC reaped), matching the MCP store's touch().
+    d.prepare(
+      `INSERT INTO session_presence (room_id, agent_id, session_id)
+       VALUES (?, ?, ?)
+       ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
+         updated_at = datetime('now'), left_at = NULL`,
+    ).run(roomId, name, webSession(name));
     return next;
   });
   try {
@@ -462,6 +488,13 @@ function markRead(d, roomId, name, seq) {
       `UPDATE memberships SET last_read_seq = max(last_read_seq, ?), last_seen = datetime('now')
        WHERE room_id = ? AND agent_id = ?`,
     ).run(eff, roomId, name);
+    // Keep a live web session's presence row fresh against the 7-day GC.
+    // REFRESH only (no upsert): the browser auto-marks read, and that must
+    // not resurrect a presence row for a room the participant left.
+    d.prepare(
+      `UPDATE session_presence SET updated_at = datetime('now')
+       WHERE room_id = ? AND agent_id = ? AND session_id = ? AND left_at IS NULL`,
+    ).run(roomId, name, webSession(name));
     const row = d
       .prepare(
         "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
@@ -501,14 +534,45 @@ function deleteRoomFull(d, roomId) {
   return tx.immediate();
 }
 
+// Session-aware leave, mirroring ChatStore.leaveRoom: mark THIS web session's
+// presence row left, then recompute the identity flag from the surviving live
+// rows -- present iff any session (web or MCP) is still live. Unconditionally
+// setting memberships.left_at evicted a live MCP twin running under the same
+// name. The '-7 days' liveness window matches the store's SESSION_GC_AGE.
 function leaveRoom(d, roomId, name) {
-  const info = d
-    .prepare(
-      `UPDATE memberships SET left_at = datetime('now'), last_seen = datetime('now')
-       WHERE room_id = ? AND agent_id = ? AND left_at IS NULL`,
-    )
-    .run(roomId, name);
-  return { left: info.changes > 0, room_id: roomId };
+  const tx = d.transaction(() => {
+    const s = d
+      .prepare(
+        `UPDATE session_presence SET left_at = datetime('now')
+         WHERE room_id = ? AND agent_id = ? AND session_id = ? AND left_at IS NULL`,
+      )
+      .run(roomId, name, webSession(name));
+    const live = d
+      .prepare(
+        `SELECT 1 FROM session_presence
+         WHERE room_id = ? AND agent_id = ? AND left_at IS NULL
+           AND updated_at >= datetime('now', '-7 days') LIMIT 1`,
+      )
+      .get(roomId, name);
+    // `left` matches the store's semantics: true iff THIS session went
+    // present -> left (or, with no presence rows at all, the identity did).
+    let left = s.changes > 0;
+    if (!live) {
+      const info = d
+        .prepare(
+          `UPDATE memberships SET left_at = datetime('now'), last_seen = datetime('now')
+           WHERE room_id = ? AND agent_id = ? AND left_at IS NULL`,
+        )
+        .run(roomId, name);
+      left = left || info.changes > 0;
+    }
+    return { left, room_id: roomId };
+  });
+  try {
+    return tx.immediate();
+  } catch (e) {
+    return { error: String((e && e.message) || e) };
+  }
 }
 
 // Mentions are parsed server-side from @tokens so every client gets the same
@@ -535,6 +599,9 @@ function searchMessages(roomId, q, limit) {
   const d = getDb();
   if (!d) return null;
   // rank, g.id: total, stable order so a size-trimmed page is deterministic.
+  // Fetch one MORE than asked (parity with the MCP search): a page of exactly
+  // `limit` matches otherwise carried no "more exist" signal at all -- the
+  // trimmed flag only fired on a byte cut.
   const taken = takeBudgeted(
     d
       .prepare(
@@ -545,8 +612,12 @@ function searchMessages(roomId, q, limit) {
          WHERE f.body MATCH ? AND g.room_id = ?
          ORDER BY rank, g.id LIMIT ?`,
       )
-      .iterate(q, roomId, limit),
+      .iterate(q, roomId, limit + 1),
   );
+  if (taken.rows.length > limit) {
+    taken.rows.length = limit;
+    taken.trimmed = true;
+  }
   // Rows already finalized inside takeBudgeted.
   return taken;
 }
@@ -633,7 +704,8 @@ async function handlePost(url, req, res) {
     return sendJson(res, r.error ? 400 : 200, r);
   }
   if (url.pathname === "/api/leave") {
-    return sendJson(res, 200, leaveRoom(d, roomId, name));
+    const r = leaveRoom(d, roomId, name);
+    return sendJson(res, r.error ? 400 : 200, r);
   }
   if (url.pathname === "/api/read") {
     const seq =
