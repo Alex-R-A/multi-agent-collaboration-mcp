@@ -681,12 +681,12 @@ if (process.platform !== "win32") {
     body: JSON.stringify({ room: roomId, name: "author", seq: 1 }),
   });
   check("a DIFFERENT localhost port's Origin is rejected", foreign.status === 403, foreign.status);
-  const самe = await fetch(`${base}/api/read`, {
+  const same = await fetch(`${base}/api/read`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Origin: base },
     body: JSON.stringify({ room: roomId, name: "author", seq: 1 }),
   });
-  check("the viewer's own exact origin is accepted", самe.status === 200, самe.status);
+  check("the viewer's own exact origin is accepted", same.status === 200, same.status);
 
   web.kill();
   rmSync(dir, { recursive: true, force: true });

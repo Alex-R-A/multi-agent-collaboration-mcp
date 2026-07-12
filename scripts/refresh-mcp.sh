@@ -68,17 +68,85 @@ else
   skipped=$((skipped + 1))
 fi
 
-# agy 1.x does not expose MCP add/remove commands. Gemini CLI owns the Gemini
-# MCP configuration, so refresh that registration directly and label it for
-# both names used by the local workflow.
-if command -v gemini >/dev/null 2>&1; then
-  remove_registration "Gemini/agy" \
-    gemini mcp remove --scope user "$MCP_NAME"
-  add_registration "Gemini/agy" \
-    gemini mcp add --scope user --transport stdio \
-      "$MCP_NAME" "$NODE_BIN" -- "$SERVER_PATH"
+# Antigravity (agy) has no MCP-management CLI. It discovers global servers in
+# ~/.gemini/config/mcp_config.json, which is separate from Gemini CLI's user
+# settings. Update that JSON atomically and preserve every unrelated field and
+# server. AGENT_CHAT_AGY_CONFIG provides an isolated path for tests.
+if command -v agy >/dev/null 2>&1; then
+  if [[ -n "${AGENT_CHAT_AGY_CONFIG:-}" ]]; then
+    AGY_CONFIG="$AGENT_CHAT_AGY_CONFIG"
+  elif [[ -n "${HOME:-}" ]]; then
+    AGY_CONFIG="$HOME/.gemini/config/mcp_config.json"
+  else
+    AGY_CONFIG=""
+  fi
+  if [[ -z "$AGY_CONFIG" ]]; then
+    echo "[Antigravity/agy] failed: HOME is unset; set AGENT_CHAT_AGY_CONFIG" >&2
+    failed=$((failed + 1))
+  elif [[ "$AGY_CONFIG" != /* ]]; then
+    echo "[Antigravity/agy] failed: config path must be absolute: $AGY_CONFIG" >&2
+    failed=$((failed + 1))
+  else
+    echo "[Antigravity/agy] refreshing '$MCP_NAME' in $AGY_CONFIG"
+    if "$NODE_BIN" - "$AGY_CONFIG" "$MCP_NAME" "$NODE_BIN" "$SERVER_PATH" <<'NODE'
+const fs = require("node:fs");
+const pathModule = require("node:path");
+
+const [requestedPath, name, command, serverPath] = process.argv.slice(2);
+const exists = fs.existsSync(requestedPath);
+const configPath =
+  exists && fs.lstatSync(requestedPath).isSymbolicLink()
+    ? fs.realpathSync(requestedPath)
+    : requestedPath;
+
+let config = {};
+if (exists) {
+  const source = fs.readFileSync(configPath, "utf8");
+  config = source.trim().length === 0 ? {} : JSON.parse(source);
+}
+if (config === null || typeof config !== "object" || Array.isArray(config)) {
+  throw new Error(`${configPath} must contain a JSON object`);
+}
+if (config.mcpServers === undefined) config.mcpServers = {};
+if (
+  config.mcpServers === null ||
+  typeof config.mcpServers !== "object" ||
+  Array.isArray(config.mcpServers)
+) {
+  throw new Error(`${configPath}: mcpServers must be a JSON object`);
+}
+
+// Explicit remove + add semantics, committed as one atomic file replacement.
+delete config.mcpServers[name];
+config.mcpServers[name] = { command, args: [serverPath] };
+
+const dir = pathModule.dirname(configPath);
+fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+const mode = exists ? fs.statSync(configPath).mode & 0o777 : 0o600;
+const tempPath = `${configPath}.tmp-${process.pid}-${Date.now()}`;
+try {
+  fs.writeFileSync(tempPath, `${JSON.stringify(config, null, 2)}\n`, {
+    encoding: "utf8",
+    mode,
+  });
+  fs.chmodSync(tempPath, mode);
+  fs.renameSync(tempPath, configPath);
+} catch (error) {
+  try {
+    fs.unlinkSync(tempPath);
+  } catch {}
+  throw error;
+}
+NODE
+    then
+      refreshed=$((refreshed + 1))
+    else
+      echo "[Antigravity/agy] failed to refresh '$MCP_NAME'" >&2
+      failed=$((failed + 1))
+    fi
+  fi
 else
-  echo "[Gemini/agy] skipped: 'gemini' is not installed (agy has no compatible MCP subcommand)" >&2
+  echo "[Antigravity/agy] skipped: 'agy' is not installed" >&2
   skipped=$((skipped + 1))
 fi
 
