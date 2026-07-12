@@ -55,9 +55,11 @@ function pollerCmd(
   if (opts.since !== undefined && opts.room !== undefined) {
     cmd += ` --since ${shq(String(opts.since))}`;
   }
-  // --session makes an ALL-ROOMS watch session-aware (excludes rooms this
-  // session soft-left, matching my_mentions); it only affects the unscoped
-  // path, so emit it just there.
+  // --session makes an ALL-ROOMS watch session-aware: rooms this session
+  // soft-left are excluded (matching my_mentions) and each room baselines
+  // off this session's OWN private cursor where one exists (matching this
+  // session's catch_up). It only affects the unscoped path, so emit it just
+  // there.
   if (opts.session !== undefined && opts.room === undefined) {
     cmd += ` --session ${shq(opts.session)}`;
   }
@@ -78,7 +80,7 @@ To wait for activity without busy-looping tool calls, run this poller as a BACKG
 
   ${POLLER_CMD}
 
-Prefer the poller_cmd string join_room returns, or call the wait_for_messages tool: both hand back this command pre-quoted for your exact agent id (hand-substituting an id containing quote characters breaks the shell quoting). The poller is a background SCRIPT, not a blocking tool: run the command as a background task. Default scope is ALL rooms you are present in; --room <id|name> scopes to one. catch_up first so your markers are the baseline; your own posts never wake it; --mentions-only fires only on messages directed at you. Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override; requires --room). Exit codes: 0 updates, 124 timeout, 2 error. cursor:'private' note: the poller reads IDENTITY-level markers (the MAX across twin sessions); a lagging private session should use --room with --since = its own last_read_seq from whoami.`;
+Prefer the poller_cmd string join_room returns, or call the wait_for_messages tool: both hand back this command pre-quoted for your exact agent id (hand-substituting an id containing quote characters breaks the shell quoting). The poller is a background SCRIPT, not a blocking tool: run the command as a background task. Default scope is ALL rooms you are present in; --room <id|name> scopes to one. catch_up first so your markers are the baseline; your own posts never wake it; --mentions-only fires only on messages directed at you. Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override; requires --room). Exit codes: 0 updates, 124 timeout, 2 error. cursor:'private' note: the command handed back carries --session, so the all-rooms watch baselines off THIS session's own cursors; a hand-built probe without --session sees only identity-level markers (the MAX across twin sessions), which can hide a lagging private session's backlog (--room with --since is the manual fallback).`;
 
 // One stdio server process serves one agent. We remember its identity and
 // active room for the session so the agent need not repeat them on every call.
@@ -719,21 +721,27 @@ server.registerTool(
       "`supersedes_seq` marks YOUR OWN earlier message as corrected (readers " +
       "see `superseded_by` on it) instead of leaving both versions standing.",
     inputSchema: z.object({
+      // ONE bare z.custom for all three shapes, deliberately:
+      // - NOT z.record / z.object().passthrough(): both rebuild the object by
+      //   assignment, and assigning key "__proto__" sets the prototype rather
+      //   than an own property, so a top-level "__proto__" key was silently
+      //   dropped before storage. z.custom passes the raw parsed value through
+      //   (JSON.parse already made "__proto__" a safe own key -- no prototype
+      //   pollution), so it round-trips like any other key.
+      // - NOT a union with string/array arms: a z.custom arm is DROPPED from
+      //   the generated JSON Schema, so tools/list advertised content as only
+      //   string|array and schema-validating clients rejected every object
+      //   body client-side. A bare z.custom generates an unconstrained schema,
+      //   which admits objects; the description carries the contract and this
+      //   validator enforces it at runtime.
       content: z
-        .union([
-          z.string(),
-          z.array(z.any()),
-          // z.custom passthrough, NOT z.record: z.record rebuilds the object by
-          // assignment, and assigning key "__proto__" sets the prototype rather
-          // than an own property, so a top-level "__proto__" key was silently
-          // dropped before storage. Passthrough keeps the raw parsed object
-          // (JSON.parse already made "__proto__" a safe own key -- no prototype
-          // pollution), so it round-trips like any other key.
-          z.custom<Record<string, unknown>>(
-            (v) => typeof v === "object" && v !== null && !Array.isArray(v),
-            { message: "content must be a string, JSON object, or JSON array" },
-          ),
-        ])
+        .custom<string | unknown[] | Record<string, unknown>>(
+          (v) =>
+            typeof v === "string" ||
+            Array.isArray(v) ||
+            (typeof v === "object" && v !== null),
+          { message: "content must be a string, JSON object, or JSON array" },
+        )
         .describe(
           "Message body: a string, or a JSON object/array. Strings and " +
             "object keys must be well-formed Unicode (no lone surrogates).",

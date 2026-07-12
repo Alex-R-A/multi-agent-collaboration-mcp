@@ -111,7 +111,9 @@ const throws = (fn, re) => {
 // --- 5b: list response (array + envelope) stays under the budget --------------
 {
   const s = new ChatStore(":memory:");
-  const heavy = "d".repeat(3000);
+  // 2000 = the store's description cap (v0.8.4); still far past the 300-char
+  // listing preview, so the budget math is exercised identically.
+  const heavy = "d".repeat(2000);
   for (let i = 0; i < 80; i++) s.createRoom("room-" + i, heavy, null);
   const { rooms } = s.listRooms(200, 0);
   // The store returns just the array; the whole MCP result adds total/flags.

@@ -367,6 +367,26 @@ function membership(d, roomId, name) {
     .get(roomId, name);
 }
 
+// A web session is joined only when the identity's membership is present AND
+// THIS web session's presence row exists and is live. Deliberately NO
+// fallback for a missing row: treating "no web row" as joined would let any
+// MCP-joined identity post or mark read through the web API without ever
+// joining here, and a left web session could act again the moment an MCP
+// twin held the membership present (advancing the monotonic read marker over
+// unseen messages, or resurrecting the left presence). Web participation
+// from before presence rows existed (pre-v0.8.4) fails this check once and
+// is fixed by rejoining. Gates /api/post, /api/read, and /api/me.
+function webJoined(d, roomId, name) {
+  const m = membership(d, roomId, name);
+  if (!m || m.left_at !== null) return false;
+  const row = d
+    .prepare(
+      "SELECT left_at FROM session_presence WHERE room_id = ? AND agent_id = ? AND session_id = ?",
+    )
+    .get(roomId, name, webSession(name));
+  return !!row && row.left_at === null;
+}
+
 // { error } results become 400s; { status: ... } results become 200s.
 function joinRoom(d, roomId, name) {
   // One IMMEDIATE transaction: with the room-exists check outside it, a
@@ -421,8 +441,7 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
   // reply reference cannot dangle against a racing prune, and a concurrent
   // delete_room yields this clean error instead of a raw FK failure.
   const tx = d.transaction(() => {
-    const m = membership(d, roomId, name);
-    if (!m || m.left_at !== null) {
+    if (!webJoined(d, roomId, name)) {
       throw new Error("join the room first (POST /api/join)");
     }
     let replyToAgent = null;
@@ -470,8 +489,12 @@ function markRead(d, roomId, name, seq) {
   // One IMMEDIATE transaction (read-then-write), so a concurrent room
   // deletion cannot vanish the membership row between statements.
   const tx = d.transaction(() => {
-    const m = membership(d, roomId, name);
-    if (!m) return { error: "join the room first (POST /api/join)" };
+    // Gate on the live WEB session, not bare membership: a read landing after
+    // this web session left (a stale tab, an in-flight auto-mark) advanced
+    // the monotonic durable marker over messages nobody had seen.
+    if (!webJoined(d, roomId, name)) {
+      return { error: "join the room first (POST /api/join)" };
+    }
     // Clamp to the room's latest seq (parity with the MCP server's mark_read):
     // the monotonic max() below makes an unclamped over-large value permanent,
     // wedging the marker above every future message.
@@ -855,7 +878,10 @@ const server = createServer(async (req, res) => {
         )
         .get(roomId, name);
       return sendJson(res, 200, {
-        joined: !!m && m.left_at === null,
+        // Same gate as post/read: joined means THIS web session, so the
+        // client never believes it can act on the strength of an MCP twin's
+        // membership.
+        joined: webJoined(d, roomId, name),
         last_read_seq: m ? m.last_read_seq : 0,
       });
     }

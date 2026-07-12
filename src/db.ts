@@ -168,6 +168,21 @@ function assertStorable(value: string | null, field: string): void {
 }
 
 /**
+ * Enforce the MCP layer's metadata length caps in the store too (character =
+ * UTF-16 units, the same unit zod's .max counts): the listing byte budgets
+ * assume them. fitRows always keeps at least one row (paging must progress)
+ * and LIST_ROW_BUDGET's cursor reserve assumes a claim key <= 500 chars, so a
+ * direct store caller (web viewer, tests) writing a 120k-char key shipped an
+ * over-budget listing no MCP input could ever produce. Message BODIES are
+ * exempt: they are data, capped by SQLITE_MAX_LENGTH and shrunk at read time.
+ */
+function assertMaxLen(value: string | null, field: string, max: number): void {
+  if (value !== null && value.length > max) {
+    throw new Error(`${field} exceeds ${max} characters`);
+  }
+}
+
+/**
  * Trim a metadata listing to a serialized-size budget, dropping WHOLE rows off
  * the end (still reachable via offset paging). The per-row preview caps bound
  * one row, but control-heavy metadata serializes ~6x, so 200 rows could still
@@ -398,7 +413,26 @@ export class ChatStore {
         chmodSync(path, 0o600);
       } catch {}
     }
-    this.db.pragma("journal_mode = WAL");
+    // Converting a legacy rollback-journal file to WAL needs an exclusive
+    // lock, and SQLite can return SQLITE_BUSY here WITHOUT consulting the
+    // busy handler (better-sqlite3's default 5s timeout does not cover this
+    // path), so two fresh processes racing to convert the same legacy file
+    // intermittently crashed on startup (reproduced ~1 in 24 synchronized
+    // opens). Retry with a short synchronous backoff: the loser of the race
+    // finds the file already in WAL and succeeds immediately. A no-op on
+    // already-WAL files, i.e. every startup after the first.
+    for (let attempt = 1; ; attempt++) {
+      try {
+        this.db.pragma("journal_mode = WAL");
+        break;
+      } catch (e) {
+        if (attempt >= 20 || (e as { code?: string }).code !== "SQLITE_BUSY") {
+          throw e;
+        }
+        // Synchronous sleep (constructor context); ~4.75s worst-case total.
+        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25 * attempt);
+      }
+    }
     this.db.pragma("busy_timeout = 5000");
     this.db.pragma("foreign_keys = ON");
     this.migrate();
@@ -760,8 +794,11 @@ export class ChatStore {
     pinned: string | null,
   ): RoomRow {
     assertStorable(name, "room name");
+    assertMaxLen(name, "room name", 200);
     assertStorable(description, "room description");
+    assertMaxLen(description, "room description", 2000);
     assertStorable(pinned, "room pinned intro");
+    assertMaxLen(pinned, "room pinned intro", 10_000);
     const info = this.db
       .prepare("INSERT INTO rooms (name, description, pinned) VALUES (?, ?, ?)")
       .run(name, description, pinned);
@@ -772,6 +809,7 @@ export class ChatStore {
 
   setPinned(roomId: number, pinned: string | null): void {
     assertStorable(pinned, "room pinned intro");
+    assertMaxLen(pinned, "room pinned intro", 10_000);
     const info = this.db
       .prepare("UPDATE rooms SET pinned = ? WHERE id = ?")
       .run(pinned, roomId);
@@ -964,9 +1002,13 @@ export class ChatStore {
     description: string | null,
   ): void {
     assertStorable(id, "agent id");
+    assertMaxLen(id, "agent id", 200);
     assertStorable(type, "agent type");
+    assertMaxLen(type, "agent type", 100);
     assertStorable(role, "agent role");
+    assertMaxLen(role, "agent role", 200);
     assertStorable(description, "agent description");
+    assertMaxLen(description, "agent description", 2000);
     this.db
       .prepare(
         `INSERT INTO agents (id, type, role, description)
@@ -992,9 +1034,13 @@ export class ChatStore {
     description: string | null,
   ): boolean {
     assertStorable(id, "agent id");
+    assertMaxLen(id, "agent id", 200);
     assertStorable(type, "agent type");
+    assertMaxLen(type, "agent type", 100);
     assertStorable(role, "agent role");
+    assertMaxLen(role, "agent role", 200);
     assertStorable(description, "agent description");
+    assertMaxLen(description, "agent description", 2000);
     const info = this.db
       .prepare(
         `INSERT INTO agents (id, type, role, description)
@@ -1246,31 +1292,50 @@ export class ChatStore {
    * Mark an active agent alive. Also clears the ACTIVE room's left_at (an
    * actively-acting session re-asserts identity presence there). With
    * presenceId, refresh this session's cursor rows (every identity) and the
-   * current identity's live presence rows in EVERY room against the 7-day GC.
+   * current identity's presence rows in EVERY room against the 7-day GC, and
+   * reconcile the active room's presence.
+   *
+   * One IMMEDIATE transaction: these statements ran as separate autocommits,
+   * and another process's GC interleaving between the membership update and
+   * the presence upsert could recompute from the half-applied state, leaving
+   * a live presence row beside a left membership (an active session hidden
+   * from inboxes and pollers) until the next touch.
+   *
+   * The GC runs here too: join/leave/prune alone never reconciled a crashed
+   * twin in a stable room, so it could read present:true indefinitely. touch
+   * covers exactly the rooms whose agents anyone can list (list_agents reads
+   * the caller's ACTIVE room). Reconciliation stays OPPORTUNISTIC overall: a
+   * room no live session joins/leaves/prunes/touches keeps stale presence
+   * until the next such operation inside it.
    */
   touch(roomId: number, agentId: string, presenceId: string | null = null): void {
-    this.db
-      .prepare(
-        "UPDATE memberships SET last_seen = datetime('now'), left_at = NULL WHERE room_id = ? AND agent_id = ?",
-      )
-      .run(roomId, agentId);
-    if (presenceId !== null) {
-      // Re-assert this session's presence in the ACTIVE room (recreating a row
-      // the 7-day GC reaped while the process stayed alive but idle), so a NULL
-      // memberships.left_at is always backed by a live presence row and a later
-      // leave or crash reconciles correctly. The active room is never one the
-      // session soft-left (leave clears the session's active room), so this
-      // cannot resurrect a left room's presence.
+    const tx = this.db.transaction(() => {
       this.db
         .prepare(
-          `INSERT INTO session_presence (room_id, agent_id, session_id)
-           VALUES (?, ?, ?)
-           ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
-             updated_at = datetime('now'), left_at = NULL`,
+          "UPDATE memberships SET last_seen = datetime('now'), left_at = NULL WHERE room_id = ? AND agent_id = ?",
         )
-        .run(roomId, agentId, presenceId);
-      this.touchSessionAlive(presenceId, agentId);
-    }
+        .run(roomId, agentId);
+      if (presenceId !== null) {
+        // Re-assert this session's presence in the ACTIVE room (recreating a
+        // row the 7-day GC reaped while the process stayed alive but idle), so
+        // a NULL memberships.left_at is always backed by a live presence row
+        // and a later leave or crash reconciles correctly. The active room is
+        // never one the session soft-left (leave clears the session's active
+        // room), so this cannot resurrect a left room's presence. Upsert FIRST
+        // so the GC below never reaps the toucher itself.
+        this.db
+          .prepare(
+            `INSERT INTO session_presence (room_id, agent_id, session_id)
+             VALUES (?, ?, ?)
+             ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
+               updated_at = datetime('now'), left_at = NULL`,
+          )
+          .run(roomId, agentId, presenceId);
+        this.gcSessionPresence(roomId);
+        this.touchSessionAlive(presenceId, agentId);
+      }
+    });
+    tx.immediate();
   }
 
   /**
@@ -1283,15 +1348,18 @@ export class ChatStore {
    * presence must age out via the GC and read as left -- a nonce-wide refresh
    * kept it `present` for the life of the process with no way to leave it. The
    * old identity's preserved cursor row means a later rejoin under that id
-   * resumes its exact read position. Only LIVE presence rows are refreshed -- a
-   * room the session explicitly left keeps its left_at and ages out. Used for
-   * the no-active-room case (post-leave my_mentions polling) and by touch().
+   * resumes its exact read position. LEFT rows (leave tombstones) are refreshed
+   * too -- the GC reaps by updated_at alone, so a live session's my_mentions
+   * muting otherwise silently expired at the GC age while the session kept
+   * polling; left_at itself is never cleared here, and a dead session's
+   * tombstones still age out. Used for the no-active-room case (post-leave
+   * my_mentions polling) and by touch().
    */
   touchSessionAlive(sessionId: string, agentId: string): void {
     this.touchSessionMarkers("", sessionId);
     this.db
       .prepare(
-        "UPDATE session_presence SET updated_at = datetime('now') WHERE session_id = ? AND agent_id = ? AND left_at IS NULL",
+        "UPDATE session_presence SET updated_at = datetime('now') WHERE session_id = ? AND agent_id = ?",
       )
       .run(sessionId, agentId);
   }
@@ -1514,7 +1582,12 @@ export class ChatStore {
       }
       if (parsed !== undefined) assertWellFormedJsonValue(parsed, "message body");
     }
-    if (mentions) for (const m of mentions) assertStorable(m, "mention id");
+    if (mentions) {
+      for (const m of mentions) {
+        assertStorable(m, "mention id");
+        assertMaxLen(m, "mention id", 200);
+      }
+    }
     const mentionsJson =
       mentions && mentions.length > 0 ? JSON.stringify(mentions) : null;
     const tx = this.db.transaction(() => {
@@ -2685,7 +2758,9 @@ export class ChatStore {
         expires_in_seconds: number;
       } {
     assertStorable(key, "claim key");
+    assertMaxLen(key, "claim key", 500);
     assertStorable(note, "claim note");
+    assertMaxLen(note, "claim note", 2000);
     const tx = this.db.transaction(() => {
       // Same deleted-room window as postMessage: fail cleanly, not with a
       // raw FK error from the claims INSERT.

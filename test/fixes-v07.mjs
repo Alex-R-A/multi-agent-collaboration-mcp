@@ -666,6 +666,15 @@ if (process.platform !== "win32") {
     Object.fromEntries(html.headers),
   );
 
+  // The same-origin probe below must reach the marker write to get a 200:
+  // since v0.8.4 the web API requires a live WEB presence row (an MCP-style
+  // membership is not enough), so join "author" through the web API first.
+  const wjoin = await fetch(`${base}/api/join`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ room: roomId, name: "author" }),
+  });
+  check("web join for the origin probes succeeds", wjoin.status === 200, wjoin.status);
   const foreign = await fetch(`${base}/api/read`, {
     method: "POST",
     headers: { "Content-Type": "application/json", Origin: "http://localhost:9999" },

@@ -18,11 +18,14 @@
 #                        (requires --room: seqs are per-room). Without --agent
 #                        this is a room-wide watcher: it has no identity, so it
 #                        wakes on ANY message, including yours.
-#                        Private-cursor sessions (join_room cursor:'private')
-#                        should pass --room with --since = their own
-#                        last_read_seq from whoami: markers are identity-level
-#                        (the MAX across twin sessions), which can hide a
-#                        lagging session's backlog.
+#   --session <nonce>    the server session nonce (poller_cmd bakes it in):
+#                        makes the all-rooms watch session-aware -- rooms that
+#                        session soft-left are muted, and each room baselines
+#                        off that session's own private cursor where one
+#                        exists. Without it, markers are identity-level (the
+#                        MAX across twin sessions), which can hide a lagging
+#                        private session's backlog; --room with --since = its
+#                        own last_read_seq from whoami is the manual fallback.
 #   --interval <sec>     poll interval (default 5)
 #   --timeout <sec>      give up after this many seconds of no updates
 #                        (default 1200 = 20 minutes; 0 = never)

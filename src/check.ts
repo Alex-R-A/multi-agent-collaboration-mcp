@@ -7,10 +7,13 @@
 // Exit 0 = updates exist, 1 = none yet, 2 = error. Prints a JSON status line.
 // Used by scripts/wait-for-updates.sh to poll without touching read markers.
 //
-// The --agent baseline is the IDENTITY-level marker (memberships.last_read_seq,
-// the MAX across that identity's sessions); per-session private cursors are
-// keyed by a process-internal nonce this probe cannot see. A private-cursor
-// session lagging its twin should pass --since with its own last_read_seq.
+// The bare --agent baseline is the IDENTITY-level marker
+// (memberships.last_read_seq, the MAX across that identity's sessions), which
+// can hide a lagging private session's backlog. --session (the process nonce
+// the server bakes into poller_cmd) fixes that for the all-rooms watch: each
+// room then baselines off that session's OWN private cursor where one exists.
+// The manual fallback remains --room with --since = the session's own
+// last_read_seq.
 import Database from "better-sqlite3";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
@@ -76,11 +79,15 @@ function parseArgs(argv: string[]): Args {
     } else if (a === "--db") {
       out.db = take(a);
     } else if (a === "--session") {
-      // A process nonce that makes the ALL-ROOMS watch session-aware: rooms the
-      // owning session soft-left (a session_presence row with left_at set) are
-      // excluded, matching my_mentions, so a left session is not woken for a
-      // room its inbox hides. Only meaningful with the all-rooms (no --room)
-      // path; ignored otherwise.
+      // A process nonce that makes the ALL-ROOMS watch session-aware, twice
+      // over: rooms the owning session soft-left (a session_presence row with
+      // left_at set) are excluded, matching my_mentions, and each room
+      // baselines off that session's OWN private cursor where one exists
+      // (session_markers is keyed by the same nonce). Without the cursor
+      // baseline a private session whose twin read ahead was never woken: the
+      // identity marker is the MAX across sessions, so its own unread was
+      // invisible here while its catch_up still had messages. Only meaningful
+      // with the all-rooms (no --room) path; ignored otherwise.
       out.session = take(a);
     } else {
       fail(`unknown argument: ${a}`);
@@ -140,9 +147,18 @@ try {
     if (!agent) fail("--agent is required when watching all rooms");
     const counts = db
       .transaction(() => {
-        // Session-aware: exclude rooms this session soft-left (parity with
-        // my_mentions), only when --session is given.
+        // Session-aware, only when --session is given: exclude rooms this
+        // session soft-left (parity with my_mentions), and baseline each room
+        // off this session's OWN private cursor where one exists (COALESCE to
+        // the identity marker; parity with the session's catch_up).
         const sess = args.session;
+        const smJoin = sess
+          ? ` LEFT JOIN session_markers sm ON sm.room_id = mb.room_id
+                  AND sm.agent_id = mb.agent_id AND sm.session_id = ?`
+          : "";
+        const baseline = sess
+          ? "COALESCE(sm.last_read_seq, mb.last_read_seq)"
+          : "mb.last_read_seq";
         const sessClause = sess
           ? ` AND NOT EXISTS (SELECT 1 FROM session_presence sp
                WHERE sp.room_id = mb.room_id AND sp.agent_id = mb.agent_id
@@ -163,21 +179,21 @@ try {
           .prepare(
             `SELECT COUNT(*) AS c FROM messages g
              JOIN memberships mb ON mb.room_id = g.room_id
-                  AND mb.agent_id = ? AND mb.left_at IS NULL
-             WHERE g.seq > mb.last_read_seq AND g.agent_id != ?${sessClause}`,
+                  AND mb.agent_id = ? AND mb.left_at IS NULL${smJoin}
+             WHERE g.seq > ${baseline} AND g.agent_id != ?${sessClause}`,
           )
-          .get(...(sess ? [agent, agent, sess] : [agent, agent])) as { c: number };
+          .get(...(sess ? [agent, sess, agent, sess] : [agent, agent])) as { c: number };
         const { c: unreadMentions } = db
           .prepare(
             `SELECT COUNT(*) AS c FROM messages g
              JOIN memberships mb ON mb.room_id = g.room_id
-                  AND mb.agent_id = ? AND mb.left_at IS NULL
-             WHERE g.seq > mb.last_read_seq AND g.agent_id != ?
+                  AND mb.agent_id = ? AND mb.left_at IS NULL${smJoin}
+             WHERE g.seq > ${baseline} AND g.agent_id != ?
                AND ${directedAt("g")}${sessClause}`,
           )
           .get(
             ...(sess
-              ? [agent, agent, agent, agent, sess]
+              ? [agent, sess, agent, agent, agent, sess]
               : [agent, agent, agent, agent]),
           ) as { c: number };
         return { rooms, unread, unreadMentions };

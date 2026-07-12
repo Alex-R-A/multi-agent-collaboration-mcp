@@ -381,6 +381,52 @@ try {
       { n: all.matches.length, trimmed: all.trimmed },
     );
   }
+
+  // web gating requires a LIVE web presence row (v0.8.4): an MCP-only
+  // identity cannot act through the web API without a web join, and a left
+  // web session cannot post or advance the durable read marker even while an
+  // MCP twin keeps the membership present.
+  {
+    const s = new ChatStore(DB);
+    const rid = s.createRoom("gating", null, null).id;
+    s.joinRoom(rid, "bot"); // MCP-style membership, no web presence row
+    s.close();
+    const meBot = await (await fetch(`${base}/api/me?room=${rid}&name=bot`)).json();
+    const postBot = await post("/api/post", { room: rid, name: "bot", body: "via web" });
+    const readBot = await post("/api/read", { room: rid, name: "bot", seq: 1 });
+    check("MCP-only identity is not web-joined", meBot.joined === false, meBot);
+    check("MCP-only identity cannot post via the web API", postBot.status === 400, postBot);
+    check("MCP-only identity cannot mark read via the web API", readBot.status === 400, readBot);
+
+    await post("/api/join", { room: rid, name: "meg" });
+    const s2 = new ChatStore(DB);
+    s2.joinRoom(rid, "meg", null, "TWIN"); // live MCP twin, same name
+    s2.postMessage(rid, "bot", "unseen", "text", null, null);
+    s2.close();
+    await post("/api/leave", { room: rid, name: "meg" });
+    const meMeg = await (await fetch(`${base}/api/me?room=${rid}&name=meg`)).json();
+    const postMeg = await post("/api/post", { room: rid, name: "meg", body: "after leave" });
+    const readMeg = await post("/api/read", { room: rid, name: "meg", seq: 99 });
+    const s3 = new ChatStore(DB);
+    const megRow = s3.getMembership(rid, "meg");
+    s3.close();
+    check(
+      "left web session reports not joined despite a live MCP twin",
+      meMeg.joined === false,
+      meMeg,
+    );
+    check(
+      "left web session cannot post (no presence resurrection)",
+      postMeg.status === 400,
+      postMeg,
+    );
+    check(
+      "left web session cannot advance the durable marker",
+      readMeg.status === 400 && megRow.last_read_seq === 0,
+      { status: readMeg.status, marker: megRow.last_read_seq },
+    );
+    check("the MCP twin is still present after the web leave", megRow.left_at === null, megRow);
+  }
 } finally {
   child.kill();
   rmSync(dir, { recursive: true, force: true });

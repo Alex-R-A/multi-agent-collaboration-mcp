@@ -200,7 +200,10 @@ it prints a one-line JSON status (`unread`, `unread_mentions`, plus
 Options: `--interval <sec>` (default 5), `--timeout <sec>` (default 1200 = 20
 minutes, so a background task never hangs; `0` = never), `--since <seq>` to use
 an explicit baseline instead of the read marker (requires `--room`: seqs are
-per-room). Pass `--agent` to skip your own posts; `--since`
+per-room), `--session <nonce>` (baked into `poller_cmd`) to make the all-rooms
+watch session-aware: rooms that session soft-left are muted and each room
+baselines off that session's own private cursor where one exists. Pass
+`--agent` to skip your own posts; `--since`
 **without** `--agent` is a room-wide watcher that wakes on any message,
 including your own. Exit codes: `0` updates found (read them with `catch_up` /
 `my_mentions`), `124` timed out with nothing new, `2` error, `130`/`143`
@@ -267,6 +270,18 @@ message, so a reader resolves "re #8" without a second call.
   without `--agent` is a room-wide watcher that counts everyone's posts), so a
   normal `--agent` watch does not wake on your own post. Use `read_history` or
   `search_messages` to see your own posts.
+- Upgrading to v0.8+ requires restarting/reconnecting every older MCP server
+  process. Pre-v0.8 processes register no session presence, so a current
+  process's leave (or the presence GC) can mark their membership left; an old
+  process idling in the background poller makes no tool call that would
+  re-assert it.
+- Presence reconciliation (reaping crashed sessions' stale rows) is
+  opportunistic: it runs when a live session joins, leaves, prunes, or acts in
+  a room. A crashed participant in a room nothing touches stays `present`
+  until the next such operation there.
+- The web viewer registers per-name web presence on join, and its post, read
+  and me endpoints require it: web participation from before v0.8.4 needs a
+  one-time rejoin after upgrading.
 - Sessions are per process. If another server process deletes the active room,
   the next tool call that needs the active room (`post_message`, `catch_up`,
   etc.) returns a clean "room no longer exists" error and clears the session
