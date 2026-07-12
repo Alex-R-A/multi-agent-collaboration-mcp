@@ -71,6 +71,25 @@ const check = (n, c, x) => {
   rmSync(dir, { recursive: true, force: true });
 }
 
+// --- #4-reaped: a leave AFTER this session's presence row was GC-reaped must
+//     NOT evict a live twin (the no-row fallback reconciles, never blind-leaves)
+{
+  const dir = mkdtempSync(join(tmpdir(), "v08-reap-"));
+  const DB = join(dir, "t.db");
+  { const s = new ChatStore(DB); s.createRoom("room", null, null); s.upsertAgent("a", null, null, null);
+    s.joinRoom(1, "a", "A", "A"); s.joinRoom(1, "a", "B", "B"); s.close(); }
+  { const raw = new Database(DB);
+    raw.prepare("UPDATE session_presence SET updated_at=datetime('now','-8 days') WHERE session_id='A'").run();
+    raw.close(); }
+  { const s = new ChatStore(DB); s.upsertAgent("z", null, null, null); s.joinRoom(1, "z", null, "Z"); // GC reaps A's aged row
+    s.leaveRoom(1, "a", "A"); // A leaves, but its presence row is gone
+    check("#4-reaped: leave after GC-reap does NOT evict the live twin B",
+      s.getMembership(1, "a").left_at === null && s.presentRoomCount("a") === 1,
+      { left_at: s.getMembership(1, "a").left_at, present: s.presentRoomCount("a") });
+    s.close(); }
+  rmSync(dir, { recursive: true, force: true });
+}
+
 // --- #2: my_mentions is session-aware -- a left session mutes its room --------
 {
   const s = new ChatStore(":memory:");

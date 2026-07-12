@@ -1182,7 +1182,21 @@ export class ChatStore {
           this.recomputeMembershipPresence(roomId, agentId);
           return s.changes > 0; // true iff this session went present -> left
         }
-        // No presence row for this session: fall through to identity-level.
+        // No presence row for THIS session -- e.g. the 7-day GC reaped it while
+        // the process stayed alive (idle, no touch). If the identity still has
+        // OTHER presence rows (a live twin), reconcile from them rather than
+        // blindly evicting via the identity-level leave below (which would defeat
+        // the redesign's no-twin-eviction guarantee). Only an identity with NO
+        // presence rows at all (web viewer, tests, pre-redesign) takes that path.
+        const any = this.db
+          .prepare(
+            "SELECT 1 FROM session_presence WHERE room_id = ? AND agent_id = ? LIMIT 1",
+          )
+          .get(roomId, agentId);
+        if (any) {
+          this.recomputeMembershipPresence(roomId, agentId);
+          return false;
+        }
       }
       const info = this.db
         .prepare(
@@ -1227,7 +1241,23 @@ export class ChatStore {
         "UPDATE memberships SET last_seen = datetime('now'), left_at = NULL WHERE room_id = ? AND agent_id = ?",
       )
       .run(roomId, agentId);
-    if (presenceId !== null) this.touchSessionAlive(presenceId);
+    if (presenceId !== null) {
+      // Re-assert this session's presence in the ACTIVE room (recreating a row
+      // the 7-day GC reaped while the process stayed alive but idle), so a NULL
+      // memberships.left_at is always backed by a live presence row and a later
+      // leave or crash reconciles correctly. The active room is never one the
+      // session soft-left (leave clears the session's active room), so this
+      // cannot resurrect a left room's presence.
+      this.db
+        .prepare(
+          `INSERT INTO session_presence (room_id, agent_id, session_id)
+           VALUES (?, ?, ?)
+           ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
+             updated_at = datetime('now'), left_at = NULL`,
+        )
+        .run(roomId, agentId, presenceId);
+      this.touchSessionAlive(presenceId);
+    }
   }
 
   /**
