@@ -22,6 +22,7 @@ type Args = {
   agent?: string;
   since?: number;
   db?: string;
+  session?: string;
   mentionsOnly: boolean;
 };
 
@@ -74,6 +75,13 @@ function parseArgs(argv: string[]): Args {
       }
     } else if (a === "--db") {
       out.db = take(a);
+    } else if (a === "--session") {
+      // A process nonce that makes the ALL-ROOMS watch session-aware: rooms the
+      // owning session soft-left (a session_presence row with left_at set) are
+      // excluded, matching my_mentions, so a left session is not woken for a
+      // room its inbox hides. Only meaningful with the all-rooms (no --room)
+      // path; ignored otherwise.
+      out.session = take(a);
     } else {
       fail(`unknown argument: ${a}`);
     }
@@ -132,6 +140,19 @@ try {
     if (!agent) fail("--agent is required when watching all rooms");
     const counts = db
       .transaction(() => {
+        // Session-aware: exclude rooms this session soft-left (parity with
+        // my_mentions), only when --session is given.
+        const sess = args.session;
+        const sessClause = sess
+          ? ` AND NOT EXISTS (SELECT 1 FROM session_presence sp
+               WHERE sp.room_id = mb.room_id AND sp.agent_id = mb.agent_id
+                 AND sp.session_id = ? AND sp.left_at IS NOT NULL)`
+          : "";
+        // Rooms count stays IDENTITY-level: it only distinguishes a doomed
+        // watch (identity in no room -> fail) from a live one. A session that
+        // left all its rooms while a twin keeps the identity present is NOT
+        // doomed -- its session-filtered unread below is simply 0 (exit 1, no
+        // updates), never an error.
         const { n: rooms } = db
           .prepare(
             "SELECT COUNT(*) AS n FROM memberships WHERE agent_id = ? AND left_at IS NULL",
@@ -143,18 +164,22 @@ try {
             `SELECT COUNT(*) AS c FROM messages g
              JOIN memberships mb ON mb.room_id = g.room_id
                   AND mb.agent_id = ? AND mb.left_at IS NULL
-             WHERE g.seq > mb.last_read_seq AND g.agent_id != ?`,
+             WHERE g.seq > mb.last_read_seq AND g.agent_id != ?${sessClause}`,
           )
-          .get(agent, agent) as { c: number };
+          .get(...(sess ? [agent, agent, sess] : [agent, agent])) as { c: number };
         const { c: unreadMentions } = db
           .prepare(
             `SELECT COUNT(*) AS c FROM messages g
              JOIN memberships mb ON mb.room_id = g.room_id
                   AND mb.agent_id = ? AND mb.left_at IS NULL
              WHERE g.seq > mb.last_read_seq AND g.agent_id != ?
-               AND ${directedAt("g")}`,
+               AND ${directedAt("g")}${sessClause}`,
           )
-          .get(agent, agent, agent, agent) as { c: number };
+          .get(
+            ...(sess
+              ? [agent, agent, agent, agent, sess]
+              : [agent, agent, agent, agent]),
+          ) as { c: number };
         return { rooms, unread, unreadMentions };
       })
       .deferred();

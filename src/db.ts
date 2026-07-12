@@ -104,9 +104,11 @@ const STUB_ALLOWANCE = 500;
 const SESSION_GC_AGE = "-7 days";
 
 /** Serialized-size budget for a metadata listing's row ARRAY, leaving room for
- *  the response envelope (total, truncated/size_trimmed flags) so the WHOLE
- *  response stays under DEFAULT_MAX_BYTES, not just the array. */
-const LIST_ROW_BUDGET = DEFAULT_MAX_BYTES - 500;
+ *  the response envelope (total, truncated/size_trimmed flags) AND the keyset
+ *  paging cursor, so the WHOLE response stays under DEFAULT_MAX_BYTES. The
+ *  reserve covers a worst-case cursor: list_claims' next_key is a claim key up
+ *  to 500 chars, which JSON-escaping can inflate ~6x on control-heavy input. */
+const LIST_ROW_BUDGET = DEFAULT_MAX_BYTES - 4000;
 
 /**
  * Slice s to at most `end` UTF-16 code units, backing off one unit when the
@@ -1048,7 +1050,12 @@ export class ChatStore {
    * unmanaged (no-rows) identity -- THEN delete the left/expired rows.
    */
   private gcSessionPresence(roomId: number): void {
-    const dead = `left_at IS NOT NULL OR updated_at < datetime('now', ?)`;
+    // Reap ONLY expired rows (not left-but-fresh ones): a left row must survive
+    // its 7-day window because my_mentions reads it to keep muting the room for
+    // the session that left -- deleting it on the next unrelated join would
+    // silently un-mute. Recompute ignores left rows either way (they are not
+    // "live"), so keeping them does not affect identity presence.
+    const dead = `updated_at < datetime('now', ?)`;
     const affected = this.db
       .prepare(
         `SELECT DISTINCT agent_id FROM session_presence WHERE room_id = ? AND (${dead})`,
@@ -1165,6 +1172,12 @@ export class ChatStore {
     presenceId: string | null = null,
   ): boolean {
     const tx = this.db.transaction(() => {
+      // Reconcile stale presence in this room on the way out: broadens the GC
+      // beyond join, so a crashed twin's aged row is reaped (and its identity
+      // recomputed) whenever anyone leaves, not only on the next join. The
+      // active leaver's own row was refreshed on its last join/touch, so it is
+      // not expired and is not reaped here.
+      this.gcSessionPresence(roomId);
       if (presenceId !== null) {
         const row = this.db
           .prepare(
@@ -1357,18 +1370,18 @@ export class ChatStore {
     activeWithinMinutes: number,
     filter?: string,
     limit = 200,
-    after?: { joined_at: string; id: string },
+    after?: number,
   ): {
     agents: AgentRow[];
     total: number;
-    next_after?: { joined_at: string; id: string };
+    next_after?: number;
     size_trimmed?: boolean;
   } {
     const PREVIEW = 300;
     const cols = `SELECT a.id, a.type, a.role,
                          substr(a.description, 1, ${PREVIEW}) AS description,
                          CASE WHEN length(a.description) > ${PREVIEW} THEN 1 ELSE 0 END AS description_cut,
-                         m.joined_at,
+                         m.joined_at, m.rowid AS _rid,
                          m.last_read_seq, m.last_seen, m.left_at,
                          (strftime('%s','now') - strftime('%s', m.last_seen)) AS idle_seconds
                   FROM memberships m JOIN agents a ON a.id = m.agent_id
@@ -1380,6 +1393,7 @@ export class ChatStore {
     type Row = Omit<AgentRow, "present" | "active"> & {
       left_at: string | null;
       description_cut: number;
+      _rid: number;
     };
     // Base params (room + optional filter) go to BOTH the row and count queries;
     // row-only params (keyset cursor, limit) are added separately so each
@@ -1393,23 +1407,23 @@ export class ChatStore {
       cond = ` AND (IFNULL(a.role,'') LIKE @like ESCAPE '\\' OR IFNULL(a.type,'') LIKE @like ESCAPE '\\'
                   OR IFNULL(a.description,'') LIKE @like ESCAPE '\\' OR a.id LIKE @like ESCAPE '\\')`;
     }
-    // Composite KEYSET (matches ORDER BY m.joined_at, a.id), NOT OFFSET: a
-    // concurrent same-second join shifts every OFFSET after it, skipping or
-    // duplicating a row across pages. joined_at is second-resolution and
-    // non-unique, so a.id (unique) is the tie-break and part of the cursor.
+    // KEYSET on the MONOTONIC membership rowid (NOT (joined_at, id)): rowid is
+    // assigned on insert and only grows, so a concurrent join is ALWAYS after
+    // any prior cursor -- unlike a caller-chosen id, where a same-second joiner
+    // whose id sorts below the cursor was skipped. rowid is stable across
+    // rejoins (INSERT OR IGNORE keeps the row); rows come back in join order.
     let keyset = "";
     const rowParams: Record<string, unknown> = { ...base, lim: lim + 1 };
-    if (after) {
-      keyset = ` AND (m.joined_at > @aj OR (m.joined_at = @aj AND a.id > @ai))`;
-      rowParams.aj = after.joined_at;
-      rowParams.ai = after.id;
+    if (after !== undefined && Number.isFinite(after)) {
+      keyset = ` AND m.rowid > @after`;
+      rowParams.after = Math.floor(after);
     }
     // Rows and count in ONE deferred snapshot so total cannot disagree with the
     // page (parity with listRooms). Fetch one MORE than asked to detect a page.
     const { rows, total } = this.db
       .transaction(() => {
         const rows = this.db
-          .prepare(`${cols}${cond}${keyset} ORDER BY m.joined_at, a.id LIMIT @lim`)
+          .prepare(`${cols}${cond}${keyset} ORDER BY m.rowid LIMIT @lim`)
           .all(rowParams) as Row[];
         const total = (
           this.db.prepare(`${count}${cond}`).get(base) as { c: number }
@@ -1421,7 +1435,8 @@ export class ChatStore {
     const page = hasMore ? rows.slice(0, lim) : rows;
     const threshold = activeWithinMinutes * 60;
     const mapped = page.map((r) => {
-      const { left_at, description_cut, ...rest } = r;
+      const { left_at, description_cut, _rid, ...rest } = r;
+      void _rid;
       return {
         ...rest,
         ...(description_cut ? { description_truncated: true } : {}),
@@ -1433,16 +1448,15 @@ export class ChatStore {
       };
     });
     const { rows: agents, sizeTrimmed } = fitRows(mapped, LIST_ROW_BUDGET);
-    // next_after is the last RETURNED agent's (joined_at, id) keyset cursor;
-    // omitted once the listing is exhausted.
+    // next_after is the last RETURNED agent's membership rowid (monotonic
+    // keyset cursor); omitted once the listing is exhausted.
     const more = sizeTrimmed || (hasMore && agents.length === page.length);
-    const last = agents.length > 0 ? agents[agents.length - 1] : undefined;
     const next_after =
-      more && last ? { joined_at: last.joined_at, id: last.id } : undefined;
+      more && agents.length > 0 ? page[agents.length - 1]._rid : undefined;
     return {
       agents,
       total,
-      ...(next_after ? { next_after } : {}),
+      ...(next_after !== undefined ? { next_after } : {}),
       ...(sizeTrimmed ? { size_trimmed: true } : {}),
     };
   }
@@ -2531,6 +2545,9 @@ export class ChatStore {
           "DELETE FROM session_markers WHERE room_id = ? AND updated_at < datetime('now', ?)",
         )
         .run(roomId, SESSION_GC_AGE);
+      // Reconcile presence too (reap crashed sessions' aged rows, recompute
+      // memberships.left_at) so a prune also refreshes who is present.
+      this.gcSessionPresence(roomId);
       const { c: total } = this.db
         .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = ?")
         .get(roomId) as { c: number };

@@ -39,7 +39,12 @@ function shq(s: string): string {
  */
 function pollerCmd(
   agentId: string,
-  opts: { room?: string; mentionsOnly?: boolean; since?: number } = {},
+  opts: {
+    room?: string;
+    mentionsOnly?: boolean;
+    since?: number;
+    session?: string;
+  } = {},
 ): string {
   let cmd = `bash ${shq(POLLER)} --agent ${shq(agentId)}`;
   if (opts.room !== undefined) cmd += ` --room ${shq(opts.room)}`;
@@ -49,6 +54,12 @@ function pollerCmd(
   // BEHIND the identity marker (see wait_for_messages).
   if (opts.since !== undefined && opts.room !== undefined) {
     cmd += ` --since ${shq(String(opts.since))}`;
+  }
+  // --session makes an ALL-ROOMS watch session-aware (excludes rooms this
+  // session soft-left, matching my_mentions); it only affects the unscoped
+  // path, so emit it just there.
+  if (opts.session !== undefined && opts.room === undefined) {
+    cmd += ` --session ${shq(opts.session)}`;
   }
   if (opts.mentionsOnly) cmd += ` --mentions-only`;
   return cmd;
@@ -418,7 +429,7 @@ server.registerTool(
       "this session keeps its own cursor (starting from the shared marker) " +
       "and sees the full stream independently.",
     inputSchema: z.object({
-      room: z.string().min(1).describe("Room id or name to join"),
+      room: z.string().min(1).max(500).describe("Room id or name to join"),
       agent_id: z
         .string()
         .max(200)
@@ -461,9 +472,7 @@ server.registerTool(
             "the backlog. 'private': this session keeps its own read " +
             "position. Omitted: keeps this session's current mode for the " +
             "room (shared on first join); only an explicit 'shared' discards " +
-            "an existing private cursor. Run ALL sessions of one identity in " +
-            "the SAME mode: mixing shared and private under one agent_id can " +
-            "make a later leave evict a live twin or silently no-op.",
+            "an existing private cursor.",
         ),
     }).strict(),
   },
@@ -539,7 +548,7 @@ server.registerTool(
         members: store.presentCount(target.id),
         // Ready-to-run background poller invocation, shell-quoted for THIS
         // id (see the server instructions for its options and semantics).
-        poller_cmd: pollerCmd(id),
+        poller_cmd: pollerCmd(id, { session: SESSION_NONCE }),
         // Surface staleness at the session-start checkpoint, where it is seen
         // once without per-call noise. True => this server is running old code;
         // reconnect the MCP. See server_info for the latest commit.
@@ -637,16 +646,17 @@ server.registerTool(
   {
     title: "List agents in room",
     description:
-      "List agents in the active room (up to `limit` from `offset`, `total` " +
-      "rides along): type/role/description, `last_read_seq` (read receipt: " +
-      "compare to a message seq), `last_seen`, `idle_seconds`, `present` (has " +
-      "not left), `active` (seen within active_within_minutes). Long " +
-      "descriptions are listing previews (description_truncated). `next_after` " +
-      "present = more rows exist; page by passing it back as `after` (keyset " +
-      "paging, so a concurrent join cannot make you skip or duplicate an agent).",
+      "List agents in the active room (up to `limit`; `total` rides along): " +
+      "type/role/description, `last_read_seq` (read receipt: compare to a " +
+      "message seq), `last_seen`, `idle_seconds`, `present` (has not left), " +
+      "`active` (seen within active_within_minutes). Long descriptions are " +
+      "listing previews (description_truncated). `next_after` present = more " +
+      "rows exist; page by passing it back as `after` (keyset paging, so a " +
+      "concurrent join cannot make you skip or duplicate an agent).",
     inputSchema: z.object({
       filter: z
         .string()
+        .max(500)
         .optional()
         .describe("Substring to match against id/type/role/description"),
       active_within_minutes: z
@@ -663,8 +673,9 @@ server.registerTool(
         .optional()
         .describe("Max agents to return (default 200)"),
       after: z
-        .object({ joined_at: z.string(), id: z.string() })
-        .strict()
+        .number()
+        .int()
+        .positive()
         .optional()
         .describe("Keyset paging cursor: the prior page's next_after."),
     }).strict(),
@@ -683,7 +694,7 @@ server.registerTool(
       return ok({
         agents,
         total,
-        ...(next_after ? { next_after, truncated: true } : {}),
+        ...(next_after !== undefined ? { next_after, truncated: true } : {}),
         ...(size_trimmed ? { size_trimmed: true } : {}),
       });
     } catch (e) {
@@ -983,6 +994,7 @@ server.registerTool(
         room: z
           .string()
           .min(1)
+          .max(500)
           .optional()
           .describe(
             "Scope the watch to one room (id or name); default watches every " +
@@ -1049,6 +1061,7 @@ server.registerTool(
         room: roomArg,
         mentionsOnly: mentions_only,
         since: sinceArg,
+        session: SESSION_NONCE,
       });
       return ok({
         command,
@@ -1303,7 +1316,7 @@ server.registerTool(
       "matches exist (a byte cut or the limit); pass it back as `offset` to " +
       "page the rest.",
     inputSchema: z.object({
-      query: z.string().min(1).describe("FTS5 search query"),
+      query: z.string().min(1).max(1000).describe("FTS5 search query"),
       limit: z
         .number()
         .int()
@@ -1498,7 +1511,7 @@ server.registerTool(
       "confirm=true. Destructive, not reversible, unauthenticated: any caller " +
       "can delete any room. Returns the removed counts.",
     inputSchema: z.object({
-      room: z.string().min(1).describe("Room id or name to delete"),
+      room: z.string().min(1).max(500).describe("Room id or name to delete"),
       confirm: z
         .boolean()
         .describe("Must be true; a guard against accidental deletion"),

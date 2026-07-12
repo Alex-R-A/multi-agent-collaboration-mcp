@@ -249,10 +249,11 @@ function mcpClient(env) {
   // The returned command must actually RUN and produce a valid poller verdict,
   // not crash. poller-user joined a room with an unread backlog (seqs 1-3 from
   // "other"), so the deterministic result is exit 0 = "new messages".
-  const parts = w.command.match(/^bash (.+) --agent '(.+)'$/);
+  // Run the WHOLE returned command through `bash -c` (robust to whatever flags
+  // it carries -- e.g. --session), appending a short timeout/interval.
   const runnable = spawnSync(
     "bash",
-    [parts[1].replace(/^'|'$/g, ""), "--agent", parts[2], "--timeout", "3", "--interval", "1"],
+    ["-c", `${w.command} --timeout 3 --interval 1`],
     { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 15_000 },
   );
   check(

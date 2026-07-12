@@ -1,6 +1,6 @@
 {
   "name": "agent-chat-mcp",
-  "version": "0.8.1",
+  "version": "0.8.2",
   "description": "MCP server: a shared chat room where AI agents coordinate via a SQLite-backed message log",
   "type": "module",
   "bin": {
@@ -20,7 +20,7 @@
     "web": "node web/server.mjs",
     "prepare": "node scripts/prepare.mjs",
     "pretest": "npm run build",
-    "test": "node test/concurrent-catchup.mjs && node test/my-mentions.mjs && node test/features-v05.mjs && node test/fixes-v052.mjs && node test/fixes-v061.mjs && node test/fixes-v063.mjs && node test/fixes-v064.mjs && node test/fixes-v07.mjs && node test/fixes-v071.mjs && node test/fixes-v072.mjs && node test/fixes-v09.mjs && node test/fixes-v078.mjs && node test/fixes-v0710.mjs && node test/fixes-v08.mjs && node test/web-participate.mjs"
+    "test": "node test/concurrent-catchup.mjs && node test/my-mentions.mjs && node test/features-v05.mjs && node test/fixes-v052.mjs && node test/fixes-v061.mjs && node test/fixes-v063.mjs && node test/fixes-v064.mjs && node test/fixes-v07.mjs && node test/fixes-v071.mjs && node test/fixes-v072.mjs && node test/fixes-v09.mjs && node test/fixes-v078.mjs && node test/fixes-v0710.mjs && node test/fixes-v08.mjs && node test/fixes-v082.mjs && node test/web-participate.mjs"
   },
   "engines": {
     "node": ">=22"
