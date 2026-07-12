@@ -593,13 +593,12 @@ export class ChatStore {
       CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(room_id, reply_to_seq);
       CREATE INDEX IF NOT EXISTS idx_messages_supersedes ON messages(room_id, supersedes_seq);
 
-      -- Per-session read cursors for identities running multiple concurrent
+      -- Per-session read CURSORS for identities running multiple concurrent
       -- sessions (join_room cursor:'private'). The memberships marker stays the
-      -- identity-level read receipt (advanced to the MAX across sessions).
-      -- left_at makes presence SESSION-aware: a private session that soft-leaves
-      -- sets its own left_at, and leaveRoom marks the IDENTITY (memberships)
-      -- left only when no un-left session row remains -- so one twin leaving no
-      -- longer evicts a live twin whose poller reads the identity-level flag.
+      -- identity-level read receipt (advanced to the MAX across sessions). The
+      -- left_at column here is VESTIGIAL and no longer read: presence moved to
+      -- the session_presence table below, which every session (shared too)
+      -- registers in, so a leave can no longer evict a live twin.
       CREATE TABLE IF NOT EXISTS session_markers (
         room_id       INTEGER NOT NULL REFERENCES rooms(id),
         agent_id      TEXT NOT NULL REFERENCES agents(id),
@@ -615,6 +614,25 @@ export class ChatStore {
       -- full session_markers scan on every liveness touch; this covers it.
       CREATE INDEX IF NOT EXISTS idx_session_markers_session
         ON session_markers(session_id);
+
+      -- Per-session PRESENCE, decoupled from cursors: EVERY session (shared or
+      -- private) registers a row here on join, keyed by its process nonce, so a
+      -- leave can tell whether any OTHER session of the identity is still here.
+      -- memberships.left_at is recomputed from this table as "present iff any
+      -- row is live (left_at IS NULL and refreshed within the GC window)", which
+      -- keeps the cross-process poller (it reads memberships.left_at) working
+      -- unchanged. Separate from session_markers so it never perturbs cursor
+      -- semantics (a shared session has a presence row but no cursor row).
+      CREATE TABLE IF NOT EXISTS session_presence (
+        room_id    INTEGER NOT NULL REFERENCES rooms(id),
+        agent_id   TEXT NOT NULL REFERENCES agents(id),
+        session_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+        left_at    TEXT,
+        PRIMARY KEY (room_id, agent_id, session_id)
+      );
+      CREATE INDEX IF NOT EXISTS idx_session_presence_session
+        ON session_presence(session_id);
 
       -- Advisory single-winner work claims with TTL. Purely advisory: nothing
       -- fences the claimed resource itself; expiry frees claims from crashed
@@ -986,53 +1004,128 @@ export class ChatStore {
   }
 
   /**
-   * Join (or rejoin) a room: clears any prior leave and refreshes liveness.
-   * With sessionId (a private cursor), also ensure a per-session read cursor,
-   * initialized from the identity marker so a new session starts where the
-   * identity left off; an existing session row keeps its position.
+   * Recompute memberships.left_at for ONE identity from its session_presence
+   * rows: present (left_at NULL) iff any row is LIVE (not left, and refreshed
+   * within the GC window); otherwise mark it left. A NO-OP when the identity has
+   * NO presence rows at all -- such an identity (a non-session caller: the web
+   * viewer, tests, or a pre-redesign build) manages memberships.left_at directly
+   * and must not be evicted by a presence recompute.
    */
-  joinRoom(roomId: number, agentId: string, sessionId: string | null = null): void {
+  private recomputeMembershipPresence(roomId: number, agentId: string): void {
+    const any = this.db
+      .prepare(
+        "SELECT 1 FROM session_presence WHERE room_id = ? AND agent_id = ? LIMIT 1",
+      )
+      .get(roomId, agentId);
+    if (!any) return;
+    const live = this.db
+      .prepare(
+        `SELECT 1 FROM session_presence
+         WHERE room_id = ? AND agent_id = ? AND left_at IS NULL
+           AND updated_at >= datetime('now', ?) LIMIT 1`,
+      )
+      .get(roomId, agentId, SESSION_GC_AGE);
+    if (live) {
+      this.db
+        .prepare(
+          "UPDATE memberships SET left_at = NULL WHERE room_id = ? AND agent_id = ?",
+        )
+        .run(roomId, agentId);
+    } else {
+      this.db
+        .prepare(
+          `UPDATE memberships SET left_at = datetime('now')
+           WHERE room_id = ? AND agent_id = ? AND left_at IS NULL`,
+        )
+        .run(roomId, agentId);
+    }
+  }
+
+  /**
+   * Reap dead session_presence rows for a room and reconcile presence. Recompute
+   * each affected identity FIRST -- while its rows still exist, so an identity
+   * whose only rows are expired is marked left rather than mistaken for an
+   * unmanaged (no-rows) identity -- THEN delete the left/expired rows.
+   */
+  private gcSessionPresence(roomId: number): void {
+    const dead = `left_at IS NOT NULL OR updated_at < datetime('now', ?)`;
+    const affected = this.db
+      .prepare(
+        `SELECT DISTINCT agent_id FROM session_presence WHERE room_id = ? AND (${dead})`,
+      )
+      .all(roomId, SESSION_GC_AGE) as { agent_id: string }[];
+    for (const { agent_id } of affected) {
+      this.recomputeMembershipPresence(roomId, agent_id);
+    }
+    this.db
+      .prepare(`DELETE FROM session_presence WHERE room_id = ? AND (${dead})`)
+      .run(roomId, SESSION_GC_AGE);
+  }
+
+  /**
+   * Join (or rejoin) a room: clears any prior leave, refreshes liveness, and
+   * registers this session's PRESENCE. presenceId (the process nonce) is set for
+   * every MCP session, shared OR private; sessionId (the cursor nonce) only for
+   * a private cursor. A null presenceId (non-session caller: web, tests) keeps
+   * the old identity-level presence, seeding no presence row.
+   */
+  joinRoom(
+    roomId: number,
+    agentId: string,
+    sessionId: string | null = null,
+    presenceId: string | null = null,
+  ): void {
     // One IMMEDIATE transaction: this was the file's only multi-statement
     // read-then-write path running autocommitted, where a cross-process
     // deleteRoom interleaving between statements surfaced as an opaque
     // NOT NULL/FK constraint error instead of a clean failure.
     const tx = this.db.transaction(() => {
-    // Existence check INSIDE the write transaction: the caller resolved the
-    // room in an earlier statement, and a cross-process delete_room in that
-    // window otherwise surfaces as a raw "FOREIGN KEY constraint failed".
-    this.requireRoom(roomId);
-    this.db
-      .prepare(
-        "INSERT OR IGNORE INTO memberships (room_id, agent_id) VALUES (?, ?)",
-      )
-      .run(roomId, agentId);
-    this.db
-      .prepare(
-        `UPDATE memberships SET left_at = NULL, last_seen = datetime('now')
-         WHERE room_id = ? AND agent_id = ?`,
-      )
-      .run(roomId, agentId);
-    if (sessionId !== null) {
-      // Refresh updated_at on rejoin (keeping the cursor position): the GC
-      // below must never reap the very session this join is resuming, which
-      // an INSERT OR IGNORE (no liveness refresh) allowed.
+      // Existence check INSIDE the write transaction: the caller resolved the
+      // room earlier, and a cross-process delete_room in that window otherwise
+      // surfaces as a raw "FOREIGN KEY constraint failed".
+      this.requireRoom(roomId);
       this.db
         .prepare(
-          `INSERT INTO session_markers (room_id, agent_id, session_id, last_read_seq)
-           VALUES (?, ?, ?, (SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?))
-           ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
-             updated_at = datetime('now'), left_at = NULL`,
+          "INSERT OR IGNORE INTO memberships (room_id, agent_id) VALUES (?, ?)",
         )
-        .run(roomId, agentId, sessionId, roomId, agentId);
-      // GC dead session cursors. Live sessions stay off this radar: the
-      // upsert above refreshes on join and touch() refreshes on every tool
-      // call, so only sessions silent for 7+ days qualify.
+        .run(roomId, agentId);
       this.db
         .prepare(
-          "DELETE FROM session_markers WHERE room_id = ? AND updated_at < datetime('now', ?)",
+          `UPDATE memberships SET left_at = NULL, last_seen = datetime('now')
+           WHERE room_id = ? AND agent_id = ?`,
         )
-        .run(roomId, SESSION_GC_AGE);
-    }
+        .run(roomId, agentId);
+      if (presenceId !== null) {
+        // Register/refresh this session's presence (present => left_at NULL).
+        this.db
+          .prepare(
+            `INSERT INTO session_presence (room_id, agent_id, session_id)
+             VALUES (?, ?, ?)
+             ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
+               updated_at = datetime('now'), left_at = NULL`,
+          )
+          .run(roomId, agentId, presenceId);
+        // Reap dead presence rows and reconcile memberships.left_at.
+        this.gcSessionPresence(roomId);
+      }
+      if (sessionId !== null) {
+        // Private cursor: seed a new one from the identity marker; an existing
+        // one keeps its position (refresh only updated_at against the GC, which
+        // must never reap the very session this join resumes).
+        this.db
+          .prepare(
+            `INSERT INTO session_markers (room_id, agent_id, session_id, last_read_seq)
+             VALUES (?, ?, ?, (SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?))
+             ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
+               updated_at = datetime('now')`,
+          )
+          .run(roomId, agentId, sessionId, roomId, agentId);
+        this.db
+          .prepare(
+            "DELETE FROM session_markers WHERE room_id = ? AND updated_at < datetime('now', ?)",
+          )
+          .run(roomId, SESSION_GC_AGE);
+      }
     });
     tx.immediate();
   }
@@ -1052,78 +1145,52 @@ export class ChatStore {
   }
 
   /**
-   * Soft leave: keep the membership row (and read position) but mark not
-   * present. Private session cursors are deliberately KEPT: the identity
-   * marker is the MAX across sessions, so a lagging session's true position
-   * exists ONLY in its session_markers row -- deleting it here would jump the
-   * session forward to its fastest twin's position on rejoin, silently
-   * skipping the gap. Dead rows are reaped by the 7-day GC in joinRoom.
+   * Soft leave: keep the membership row (and read positions) but mark THIS
+   * session not present. Private session cursors are deliberately KEPT: a
+   * lagging session's true read position lives only in its session_markers row,
+   * and dead ones are reaped by the 7-day GC.
    *
-   * SESSION-aware: with a sessionId, mark THIS private session left (its own
-   * session_markers.left_at) and set the IDENTITY-level memberships.left_at only
-   * when no OTHER session row is still un-left. So one twin leaving no longer
-   * evicts a live twin (whose separate-process poller reads memberships.left_at
-   * and would otherwise exit 2). Presence is keyed on the EXPLICIT session
-   * left_at, not liveness, so a twin that is merely POLLING (making no tool
-   * calls) still counts as present. Residual: if the last un-left session
-   * CRASHES without leaving, the identity lingers present until the 7-day
-   * session GC reaps its row -- a strictly milder error than evicting a live
-   * session, and a rejoin fixes it immediately.
-   *
-   * KNOWN LIMITATION (mixed cursor modes under ONE identity). The twin check
-   * below sees only session_markers rows, and ONLY private sessions create
-   * those; a shared session -- and the web viewer, which never creates one --
-   * is invisible to it. So under a single agent_id running BOTH a shared and a
-   * private session:
-   *   - a private session's leave marks the IDENTITY left even while a live
-   *     shared twin remains, evicting that twin (its poller reads
-   *     memberships.left_at and exits 2), and
-   *   - a shared session's leave NO-OPS (returns false, memberships unchanged)
-   *     while a private twin is present.
-   * The supported multi-session pattern is all-PRIVATE, under which the twin
-   * check sees every session and both symptoms vanish; MIXING modes, or reusing
-   * an active agent's id in the web viewer, is the unsupported corner. Left
-   * unfixed in the store BY DESIGN: a real fix needs presence tracked
-   * independently of cursor mode (a new table + API change), judged out of
-   * proportion to a bug only this narrow mix can trigger.
+   * SESSION-aware via session_presence: mark this session's presence row left,
+   * then recompute the identity-level memberships.left_at from the surviving
+   * sessions -- present iff any twin (shared OR private) still has a live
+   * presence row. So one session leaving never evicts a live twin, for EVERY
+   * cursor mode (the earlier session_markers-only twin check saw private
+   * sessions only, so shared twins evicted each other and a private leave
+   * evicted a shared twin). A caller with no presence row (presenceId null, or
+   * a pre-redesign session) falls back to an identity-level leave.
    */
   leaveRoom(
     roomId: number,
     agentId: string,
-    sessionId: string | null = null,
+    presenceId: string | null = null,
   ): boolean {
     const tx = this.db.transaction(() => {
-      let sessionLeft = false;
-      if (sessionId !== null) {
-        const s = this.db
+      if (presenceId !== null) {
+        const row = this.db
           .prepare(
-            `UPDATE session_markers SET left_at = datetime('now')
-             WHERE room_id = ? AND agent_id = ? AND session_id = ? AND left_at IS NULL`,
+            "SELECT 1 FROM session_presence WHERE room_id = ? AND agent_id = ? AND session_id = ?",
           )
-          .run(roomId, agentId, sessionId);
-        sessionLeft = s.changes > 0;
+          .get(roomId, agentId, presenceId);
+        if (row) {
+          const s = this.db
+            .prepare(
+              `UPDATE session_presence SET left_at = datetime('now')
+               WHERE room_id = ? AND agent_id = ? AND session_id = ? AND left_at IS NULL`,
+            )
+            .run(roomId, agentId, presenceId);
+          // Reconcile the identity flag from the sessions that remain.
+          this.recomputeMembershipPresence(roomId, agentId);
+          return s.changes > 0; // true iff this session went present -> left
+        }
+        // No presence row for this session: fall through to identity-level.
       }
-      // A still-present twin (any OTHER session row with left_at IS NULL) keeps
-      // the identity present. '' never equals a real nonce, so a shared leaver
-      // (sessionId null) compares against every session row.
-      const twin = this.db
+      const info = this.db
         .prepare(
-          `SELECT 1 FROM session_markers
-           WHERE room_id = ? AND agent_id = ? AND session_id != ? AND left_at IS NULL
-           LIMIT 1`,
+          `UPDATE memberships SET left_at = datetime('now'), last_seen = datetime('now')
+           WHERE room_id = ? AND agent_id = ? AND left_at IS NULL`,
         )
-        .get(roomId, agentId, sessionId ?? "");
-      let identityLeft = false;
-      if (!twin) {
-        const info = this.db
-          .prepare(
-            `UPDATE memberships SET left_at = datetime('now'), last_seen = datetime('now')
-             WHERE room_id = ? AND agent_id = ? AND left_at IS NULL`,
-          )
-          .run(roomId, agentId);
-        identityLeft = info.changes > 0;
-      }
-      return sessionLeft || identityLeft;
+        .run(roomId, agentId);
+      return info.changes > 0;
     });
     return tx.immediate();
   }
@@ -1149,24 +1216,34 @@ export class ChatStore {
   }
 
   /**
-   * Mark an active agent alive. Also clears left_at: an actively-acting session
-   * re-asserts presence, so a soft leave performed by another process using the
-   * same agent_id does not leave the live session showing as not-present. (A
-   * genuine leave_room clears the session, after which touch is never called.)
+   * Mark an active agent alive. Also clears the ACTIVE room's left_at (an
+   * actively-acting session re-asserts identity presence there). With
+   * presenceId, refresh this session's live presence and cursor rows in EVERY
+   * room against the 7-day GC.
    */
-  touch(roomId: number, agentId: string, sessionId: string | null = null): void {
+  touch(roomId: number, agentId: string, presenceId: string | null = null): void {
     this.db
       .prepare(
         "UPDATE memberships SET last_seen = datetime('now'), left_at = NULL WHERE room_id = ? AND agent_id = ?",
       )
       .run(roomId, agentId);
-    if (sessionId !== null) {
-      // Keep a live session's cursor rows out of the 7-day GC, in EVERY room:
-      // the session may hold private cursors in rooms it is not currently
-      // touching, and another agent's join in such a room must not reap a
-      // cursor whose owner is demonstrably alive.
-      this.touchSessionMarkers(agentId, sessionId);
-    }
+    if (presenceId !== null) this.touchSessionAlive(presenceId);
+  }
+
+  /**
+   * Shield a live session's cursor AND presence rows from the 7-day GC in EVERY
+   * room (keyed by the process nonce, so it also covers rooms the session is not
+   * currently active in). Only LIVE presence rows are refreshed -- a room the
+   * session explicitly left keeps its left_at and ages out. Used for the
+   * no-active-room case (post-leave my_mentions polling) and by touch().
+   */
+  touchSessionAlive(sessionId: string): void {
+    this.touchSessionMarkers("", sessionId);
+    this.db
+      .prepare(
+        "UPDATE session_presence SET updated_at = datetime('now') WHERE session_id = ? AND left_at IS NULL",
+      )
+      .run(sessionId);
   }
 
   getMembership(
@@ -2103,17 +2180,49 @@ export class ChatStore {
            WHERE g.seq > COALESCE(sm.last_read_seq, mb.last_read_seq)
              AND g.id > ? AND g.agent_id != ?
              AND ${directedAt("g")}
+             AND NOT EXISTS (SELECT 1 FROM session_presence sp
+                             WHERE sp.room_id = g.room_id AND sp.agent_id = mb.agent_id
+                               AND sp.session_id = ? AND sp.left_at IS NOT NULL)
            ORDER BY g.id ASC LIMIT ?`,
         ),
-        [agentId, sessionKey, afterId, agentId, agentId, agentId, limit + 1],
+        [agentId, sessionKey, afterId, agentId, agentId, agentId, sessionKey, limit + 1],
         maxBytes,
       );
       const hasExtra = fetched.length > limit;
       const rows = hasExtra ? fetched.slice(0, limit) : fetched;
 
-      // Placeholder text order: the SUM(CASE directedAt) pair, the membership
-      // join, the session-marker join key, then the author exclusion.
-      const allRooms = this.db
+      // total_directed: a SCALAR aggregate over all present, not-this-session-left
+      // rooms -- NOT a materialized per-room array reduced in JS (an agent in
+      // 100k unread rooms otherwise cloned and sorted the whole set). The
+      // NOT EXISTS mutes a room THIS session left even while a twin keeps the
+      // identity present. Placeholders: the membership join, the session-marker
+      // key, the author exclusion, the directedAt pair, then the presence key.
+      const { td } = this.db
+        .prepare(
+          `SELECT COUNT(*) AS td FROM messages g
+           JOIN memberships mb ON mb.room_id = g.room_id
+                AND mb.agent_id = ? AND mb.left_at IS NULL
+           LEFT JOIN session_markers sm ON sm.room_id = g.room_id
+                AND sm.agent_id = mb.agent_id AND sm.session_id = ?
+           WHERE g.seq > COALESCE(sm.last_read_seq, mb.last_read_seq)
+             AND g.agent_id != ?
+             AND ${directedAt("g")}
+             AND NOT EXISTS (SELECT 1 FROM session_presence sp
+                             WHERE sp.room_id = g.room_id AND sp.agent_id = mb.agent_id
+                               AND sp.session_id = ? AND sp.left_at IS NOT NULL)`,
+        )
+        .get(agentId, sessionKey, agentId, agentId, agentId, sessionKey) as {
+        td: number;
+      };
+      const total_directed = td;
+
+      // by_room: fetch only the TOP rooms by directed count in SQL (bounded
+      // memory), most-directed first, then trim to the byte budget. Same
+      // session-aware muting. Placeholders: the directedAt pair (SELECT), the
+      // membership join, the session-marker key, the author exclusion, the
+      // presence key, then the LIMIT.
+      const BY_ROOM_MAX = 4000;
+      let byRoom = this.db
         .prepare(
           `SELECT g.room_id AS room_id, r.name AS name, COUNT(*) AS unread,
                   SUM(CASE WHEN ${directedAt("g")} THEN 1 ELSE 0 END) AS directed
@@ -2125,34 +2234,29 @@ export class ChatStore {
            JOIN rooms r ON r.id = g.room_id
            WHERE g.seq > COALESCE(sm.last_read_seq, mb.last_read_seq)
              AND g.agent_id != ?
+             AND NOT EXISTS (SELECT 1 FROM session_presence sp
+                             WHERE sp.room_id = g.room_id AND sp.agent_id = mb.agent_id
+                               AND sp.session_id = ? AND sp.left_at IS NOT NULL)
            GROUP BY g.room_id, r.name
-           ORDER BY g.room_id`,
+           ORDER BY directed DESC, unread DESC, g.room_id ASC
+           LIMIT ?`,
         )
-        .all(agentId, agentId, agentId, sessionKey, agentId) as {
+        .all(agentId, agentId, agentId, sessionKey, agentId, sessionKey, BY_ROOM_MAX) as {
         room_id: number;
         name: string;
         unread: number;
         directed: number;
       }[];
-      const total_directed = allRooms.reduce((a, r) => a + r.directed, 0);
-
-      // Cap by_room to a third of the budget, most directed rooms first, so
-      // the response as a whole honors maxBytes.
-      let byRoom = [...allRooms].sort(
-        (a, b) =>
-          b.directed - a.directed || b.unread - a.unread || a.room_id - b.room_id,
-      );
+      // Rooms past BY_ROOM_MAX (the least-directed) are dropped -- flag it.
+      const roomLimitHit = byRoom.length >= BY_ROOM_MAX;
       const roomBudget = Math.floor(maxBytes / 3);
-      // Trim off the end (least-directed rooms) with the LINEAR fitRows, not a
-      // re-serialize-the-whole-array-per-pop loop: an agent present in hundreds
-      // of rooms that all have unread otherwise paid an O(n^2) trim. fitRows
-      // charges the array brackets + a comma per element, so its cut point is
-      // identical to JSON.stringify(byRoom).length <= roomBudget (the old
-      // predicate), and it always keeps at least one row -- so the single-entry
-      // name-halving below still handles a lone oversized room.
+      // Trim off the end (least-directed rooms, already SQL-ordered) with the
+      // LINEAR fitRows, not an O(n^2) re-serialize-per-pop loop. It always keeps
+      // at least one row, so the single-entry name-halving below still handles a
+      // lone oversized room.
       const trimmed = fitRows(byRoom, roomBudget);
       byRoom = trimmed.rows;
-      let by_room_truncated = trimmed.sizeTrimmed;
+      let by_room_truncated = trimmed.sizeTrimmed || roomLimitHit;
       // A single long-named room can still overflow a small budget: halve
       // the display name until the MEASURED serialized size fits (a fixed
       // code-unit cut under-counts JSON escaping, so a control-heavy name
@@ -2491,6 +2595,7 @@ export class ChatStore {
       this.db.prepare("DELETE FROM messages WHERE room_id = ?").run(roomId);
       this.db.prepare("DELETE FROM memberships WHERE room_id = ?").run(roomId);
       this.db.prepare("DELETE FROM session_markers WHERE room_id = ?").run(roomId);
+      this.db.prepare("DELETE FROM session_presence WHERE room_id = ?").run(roomId);
       this.db.prepare("DELETE FROM claims WHERE room_id = ?").run(roomId);
       this.db.prepare("DELETE FROM rooms WHERE id = ?").run(roomId);
       return { messages, members };

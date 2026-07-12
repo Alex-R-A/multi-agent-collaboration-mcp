@@ -76,7 +76,7 @@ function schemaGaps(d) {
     !!d
       .prepare("SELECT 1 FROM sqlite_master WHERE type IN ('table','trigger') AND name = ?")
       .get(t);
-  for (const t of ["rooms", "agents", "memberships", "messages", "session_markers", "claims"]) {
+  for (const t of ["rooms", "agents", "memberships", "messages", "session_markers", "session_presence", "claims"]) {
     if (!table(t)) gaps.push(`table ${t}`);
   }
   if (gaps.length) return gaps; // column checks would all fail anyway
@@ -493,6 +493,7 @@ function deleteRoomFull(d, roomId) {
     d.prepare("DELETE FROM messages WHERE room_id = ?").run(roomId);
     d.prepare("DELETE FROM memberships WHERE room_id = ?").run(roomId);
     d.prepare("DELETE FROM session_markers WHERE room_id = ?").run(roomId);
+    d.prepare("DELETE FROM session_presence WHERE room_id = ?").run(roomId);
     d.prepare("DELETE FROM claims WHERE room_id = ?").run(roomId);
     d.prepare("DELETE FROM rooms WHERE id = ?").run(roomId);
     return { deleted_room: roomId, name: room.name, messages, members };

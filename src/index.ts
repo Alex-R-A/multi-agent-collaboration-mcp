@@ -164,8 +164,8 @@ function touchSession(): void {
       store.touch(session.roomId, session.agentId, SESSION_NONCE);
     } else {
       // Identity without an active room (post-leave my_mentions polling):
-      // still shield this session's cursors from the GC.
-      store.touchSessionMarkers(session.agentId, SESSION_NONCE);
+      // still shield this session's cursors AND live presence rows from the GC.
+      store.touchSessionAlive(SESSION_NONCE);
     }
   } catch {
     // Liveness is best-effort: a briefly-locked database must not fail the
@@ -505,7 +505,7 @@ server.registerTool(
       const priv =
         cursor === "private" ||
         (cursor === undefined && session.privateRooms.has(key));
-      store.joinRoom(target.id, id, priv ? SESSION_NONCE : null);
+      store.joinRoom(target.id, id, priv ? SESSION_NONCE : null, SESSION_NONCE);
       if (priv) {
         session.privateRooms.add(key);
       } else {
@@ -565,10 +565,11 @@ server.registerTool(
     try {
       touchSession();
       const { agentId, roomId } = requireActive();
-      // Pass the private-cursor nonce (when the active room is private under
-      // this identity) so the leave is SESSION-scoped: it marks this session
-      // left without evicting a live twin from the identity-level presence.
-      const left = store.leaveRoom(roomId, agentId, cursorId());
+      // Pass the process nonce so the leave is SESSION-scoped: it marks THIS
+      // session's presence row left and recomputes identity presence, so a live
+      // twin (shared or private) is never evicted. Presence is per-session for
+      // every mode now, independent of the cursor nonce.
+      const left = store.leaveRoom(roomId, agentId, SESSION_NONCE);
       // Keep the identity: the session is still this agent, and my_mentions
       // (memberships elsewhere) must keep working after leaving one room. The
       // room's cursor-mode entry also stays: its private position is preserved
@@ -1054,8 +1055,12 @@ server.registerTool(
         run_as: "background shell task (do not wait for it inline)",
         how_to:
           "Run `command` in the background. It exits 0 when something new " +
-          "arrives, 124 on timeout with nothing new, 2 on error; re-launch it " +
-          "after each hit to keep watching. On exit 0, an unscoped watch does " +
+          "arrives, 124 on timeout with nothing new, 2 on error. To keep " +
+          "watching, RE-REQUEST wait_for_messages after each hit (and catch_up) " +
+          "rather than relaunching the SAME command: a private-cursor watch " +
+          "bakes a point-in-time --since baseline into it (baselined:true), so " +
+          "the stale command re-fires forever on messages you have since read. " +
+          "On exit 0, an unscoped watch does " +
           "NOT tell you WHICH room fired: use my_mentions (the cross-room " +
           "inbox) or catch_up in each joined room -- a plain catch_up only " +
           "reads your ACTIVE room, which may not be the one that woke the " +
@@ -1067,6 +1072,10 @@ server.registerTool(
           "124": "timed out, nothing new",
           "2": "error",
         },
+        // True when the command carries a fixed --since baseline (a private
+        // cursor watch): re-request wait_for_messages after each hit for a
+        // fresh one instead of relaunching this command.
+        baselined: sinceArg !== undefined,
       });
     } catch (e) {
       return fail(asMessage(e));

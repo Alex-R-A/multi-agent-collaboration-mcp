@@ -327,12 +327,14 @@ const NUL = String.fromCharCode(0);
 }
 
 // --- 6: session-aware presence -- one twin leaving does not evict a live twin -
+// The 4th joinRoom arg is the PRESENCE nonce (every session registers one now);
+// the 3rd is the cursor nonce. Here both twins are private (cursor + presence).
 {
   const s = new ChatStore(":memory:");
   const r = s.createRoom("r", null, null).id;
   s.upsertAgent("x", null, null, null);
-  s.joinRoom(r, "x", "sessA"); // private session A
-  s.joinRoom(r, "x", "sessB"); // private session B
+  s.joinRoom(r, "x", "sessA", "sessA"); // session A (cursor + presence)
+  s.joinRoom(r, "x", "sessB", "sessB"); // session B
   const leftA = s.leaveRoom(r, "x", "sessA");
   const afterA = s.getMembership(r, "x");
   check("session A leave returns true (it left)", leftA === true, leftA);
@@ -348,7 +350,7 @@ const NUL = String.fromCharCode(0);
     leftB === true && afterB.left_at !== null && s.presentRoomCount("x") === 0,
     { left_at: afterB.left_at, present: s.presentRoomCount("x") },
   );
-  s.joinRoom(r, "x", "sessA"); // rejoin clears this session's left flag
+  s.joinRoom(r, "x", "sessA", "sessA"); // rejoin clears this session's left flag
   check(
     "rejoin restores identity presence",
     s.getMembership(r, "x").left_at === null && s.presentRoomCount("x") === 1,
