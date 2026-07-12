@@ -251,7 +251,7 @@ server.registerTool(
   {
     title: "Server info",
     description:
-      "Report this server's version and build identity (git commit, build " +
+      `Version ${BUILD.version}: Report this server's version and build identity (git commit, build ` +
       "time). `stale:true` = a newer build was deployed since this process " +
       "started; reconnect the MCP to load it (stdio servers do not " +
       "hot-reload); `latest_commit`/`latest_built_at` name it. `commit` gets " +

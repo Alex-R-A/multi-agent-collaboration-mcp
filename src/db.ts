@@ -426,7 +426,12 @@ export class ChatStore {
         this.db.pragma("journal_mode = WAL");
         break;
       } catch (e) {
-        if (attempt >= 20 || (e as { code?: string }).code !== "SQLITE_BUSY") {
+        // Prefix match: better-sqlite3 surfaces EXTENDED result codes (e.g.
+        // SQLITE_BUSY_RECOVERY when another connection is mid-WAL-recovery,
+        // plausible in exactly this conversion race), and all of them mean
+        // the same thing here: someone else holds the file, try again.
+        const code = (e as { code?: string }).code ?? "";
+        if (attempt >= 20 || !code.startsWith("SQLITE_BUSY")) {
           throw e;
         }
         // Synchronous sleep (constructor context); ~4.75s worst-case total.
