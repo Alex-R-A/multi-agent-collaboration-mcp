@@ -241,6 +241,9 @@ export type AgentRow = {
   idle_seconds: number | null;
   present: boolean;
   active: boolean;
+  /** True ONLY while the agent has an open blocking catch_up wait in this
+   *  room (see RecipientStatus.watching). */
+  watching: boolean;
 };
 
 export type RecipientStatus = {
@@ -255,6 +258,11 @@ export type RecipientStatus = {
    *  caught up). Computed at call time; the poster's own message is not yet
    *  inserted when post_message asks, so it is excluded. null for unknown. */
   marker_behind: number | null;
+  /** True ONLY while the recipient has an open blocking catch_up wait in
+   *  this room (an in-turn wait lease): the model is mid-turn, awaiting the
+   *  call's return, so a message now is delivered into a live turn. Never
+   *  produced by detached pollers. */
+  watching: boolean;
 };
 
 export type ReplyRef = {
@@ -690,6 +698,23 @@ export class ChatStore {
         expires_at TEXT NOT NULL,
         updated_at TEXT NOT NULL DEFAULT (datetime('now')),
         PRIMARY KEY (room_id, key)
+      );
+
+      -- In-turn wait leases: a row exists ONLY while an agent's blocking
+      -- catch_up wait is open in that room, making "actively watching" a
+      -- verifiable server state (recipientStatus/list_agents expose it as
+      -- "watching"). expires_at is the wait deadline plus a small grace, so a
+      -- crashed waiter's row self-expires; the handler deletes it on every
+      -- normal or aborted exit. Detached pollers never write here (their
+      -- probe is query_only), which is deliberate: shell liveness must not
+      -- read as model availability.
+      CREATE TABLE IF NOT EXISTS wait_leases (
+        room_id    INTEGER NOT NULL REFERENCES rooms(id),
+        agent_id   TEXT NOT NULL REFERENCES agents(id),
+        session_id TEXT NOT NULL,
+        started_at TEXT NOT NULL DEFAULT (datetime('now')),
+        expires_at TEXT NOT NULL,
+        PRIMARY KEY (room_id, agent_id, session_id)
       );
     `);
     // Add session_markers.left_at to database files created before presence
@@ -1373,6 +1398,48 @@ export class ChatStore {
       .run(sessionId, agentId);
   }
 
+  /**
+   * Open an in-turn wait lease: this (room, agent, session) has a blocking
+   * catch_up call pending. TTL covers the wait plus grace, so a hard-killed
+   * process cannot leave a permanent "watching" ghost. Expired rows for the
+   * room are reaped in passing. IMMEDIATE (read-then-write) and room-checked,
+   * so a concurrently deleted room fails with the clean rejoin message
+   * instead of a raw FK error.
+   */
+  beginWaitLease(
+    roomId: number,
+    agentId: string,
+    sessionId: string,
+    ttlSeconds: number,
+  ): void {
+    const tx = this.db.transaction(() => {
+      this.requireRoom(roomId);
+      this.db
+        .prepare(
+          "DELETE FROM wait_leases WHERE room_id = ? AND expires_at <= datetime('now')",
+        )
+        .run(roomId);
+      this.db
+        .prepare(
+          `INSERT INTO wait_leases (room_id, agent_id, session_id, expires_at)
+           VALUES (?, ?, ?, datetime('now', '+' || ? || ' seconds'))
+           ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
+             started_at = datetime('now'), expires_at = excluded.expires_at`,
+        )
+        .run(roomId, agentId, sessionId, Math.max(1, Math.floor(ttlSeconds)));
+    });
+    tx.immediate();
+  }
+
+  /** Close an in-turn wait lease (normal return, timeout, or abort alike). */
+  endWaitLease(roomId: number, agentId: string, sessionId: string): void {
+    this.db
+      .prepare(
+        "DELETE FROM wait_leases WHERE room_id = ? AND agent_id = ? AND session_id = ?",
+      )
+      .run(roomId, agentId, sessionId);
+  }
+
   getMembership(
     roomId: number,
     agentId: string,
@@ -1467,17 +1534,21 @@ export class ChatStore {
                          CASE WHEN length(a.description) > ${PREVIEW} THEN 1 ELSE 0 END AS description_cut,
                          m.joined_at, m.rowid AS _rid,
                          m.last_read_seq, m.last_seen, m.left_at,
-                         (strftime('%s','now') - strftime('%s', m.last_seen)) AS idle_seconds
+                         (strftime('%s','now') - strftime('%s', m.last_seen)) AS idle_seconds,
+                         EXISTS(SELECT 1 FROM wait_leases wl
+                                WHERE wl.room_id = m.room_id AND wl.agent_id = m.agent_id
+                                  AND wl.expires_at > datetime('now')) AS watching
                   FROM memberships m JOIN agents a ON a.id = m.agent_id
                   WHERE m.room_id = @room`;
     const count = `SELECT COUNT(*) AS c
                    FROM memberships m JOIN agents a ON a.id = m.agent_id
                    WHERE m.room_id = @room`;
     const lim = Math.max(1, Math.floor(limit));
-    type Row = Omit<AgentRow, "present" | "active"> & {
+    type Row = Omit<AgentRow, "present" | "active" | "watching"> & {
       left_at: string | null;
       description_cut: number;
       _rid: number;
+      watching: number;
     };
     // Base params (room + optional filter) go to BOTH the row and count queries;
     // row-only params (keyset cursor, limit) are added separately so each
@@ -1519,7 +1590,7 @@ export class ChatStore {
     const page = hasMore ? rows.slice(0, lim) : rows;
     const threshold = activeWithinMinutes * 60;
     const mapped = page.map((r) => {
-      const { left_at, description_cut, _rid, ...rest } = r;
+      const { left_at, description_cut, _rid, watching, ...rest } = r;
       void _rid;
       return {
         ...rest,
@@ -1529,6 +1600,7 @@ export class ChatStore {
           left_at === null &&
           r.idle_seconds !== null &&
           r.idle_seconds <= threshold,
+        watching: watching === 1,
       };
     });
     const { rows: agents, sizeTrimmed } = fitRows(mapped, LIST_ROW_BUDGET);
@@ -2000,7 +2072,11 @@ export class ChatStore {
     const rows = this.db
       .prepare(
         `SELECT agent_id, last_read_seq, left_at,
-                (strftime('%s','now') - strftime('%s', last_seen)) AS idle_seconds
+                (strftime('%s','now') - strftime('%s', last_seen)) AS idle_seconds,
+                EXISTS(SELECT 1 FROM wait_leases wl
+                       WHERE wl.room_id = memberships.room_id
+                         AND wl.agent_id = memberships.agent_id
+                         AND wl.expires_at > datetime('now')) AS watching
          FROM memberships
          WHERE room_id = ? AND agent_id IN (${placeholders})`,
       )
@@ -2009,6 +2085,7 @@ export class ChatStore {
       last_read_seq: number;
       left_at: string | null;
       idle_seconds: number | null;
+      watching: number;
     }[];
     const byId = new Map(rows.map((r) => [r.agent_id, r]));
     const threshold = activeWithinMinutes * 60;
@@ -2022,6 +2099,7 @@ export class ChatStore {
           idle_seconds: null,
           last_read_seq: null,
           marker_behind: null,
+          watching: false,
         };
       }
       const present = r.left_at === null;
@@ -2034,6 +2112,7 @@ export class ChatStore {
         idle_seconds: r.idle_seconds,
         last_read_seq: r.last_read_seq,
         marker_behind: Math.max(0, latest - r.last_read_seq),
+        watching: r.watching === 1,
       };
     });
   }
@@ -2249,6 +2328,26 @@ export class ChatStore {
       )
       .get(roomId, lastReadSeq, agentId) as { c: number };
     return c;
+  }
+
+  /**
+   * Non-advancing unread probe for the blocking wait: EXACTLY catchUp's
+   * predicate (seq > cursor AND agent_id != self, the cursor resolved through
+   * the same session selector), minus the fetch and the advance. Any drift
+   * between this predicate and catchUp's makes the wait loop spin (a positive
+   * probe whose advancing read returns nothing). Autocommit reads: under WAL
+   * they take a shared lock, so a 500ms cadence never contends for the write
+   * lock the way catchUp's IMMEDIATE transaction would. Throws when the
+   * membership is gone (room deleted mid-wait), same as catchUp.
+   */
+  unreadProbe(
+    roomId: number,
+    agentId: string,
+    sessionId: string | null,
+  ): number {
+    const cursor = this.getCursor(roomId, agentId, sessionId);
+    if (!cursor) throw new Error("not a member of this room");
+    return this.unreadCount(roomId, cursor.last_read_seq, agentId);
   }
 
   /**
@@ -2877,6 +2976,7 @@ export class ChatStore {
       this.db.prepare("DELETE FROM session_markers WHERE room_id = ?").run(roomId);
       this.db.prepare("DELETE FROM session_presence WHERE room_id = ?").run(roomId);
       this.db.prepare("DELETE FROM claims WHERE room_id = ?").run(roomId);
+      this.db.prepare("DELETE FROM wait_leases WHERE room_id = ?").run(roomId);
       this.db.prepare("DELETE FROM rooms WHERE id = ?").run(roomId);
       return { messages, members };
     });

@@ -100,6 +100,11 @@ ROUTING
 - my_mentions: cross-room inbox of unread directed at you (mentions + replies to your messages); never moves markers; entries clear when you read their room; page with after_id = next_after_id; by_room reports each room's TOTAL unread.
 - read_history browses without moving markers. mark_read moves the marker without reading (omit seq to jump to latest; a LOWER seq re-exposes messages to catch_up).
 
+IN-CALL WAIT
+- catch_up wait_seconds (0..25) blocks that one call until a message from another agent lands in the target room, then returns it and advances: waiting for a reply costs one call. On timeout: timed_out:true, call_again:true, rooms_with_unread; call again to keep waiting (each re-call is cheap and re-reads your cursor fresh). Every waited response carries waited_ms.
+- While your wait is open, peers see watching:true for you (list_agents, post_message recipients): the one presence signal that means "a message now lands in a live turn". It is produced ONLY by an open blocking call and drops the moment the call returns or is cancelled; a detached poller never produces it.
+- The wait holds your turn open, so it fits "I am waiting for a reply and have nothing else to do". To be notified while doing other work, or for watches longer than the cap, use the background poller.
+
 SIZE AND PAGING
 - Bulk reads are byte-bounded (default ${DEFAULT_MAX_BYTES} serialized chars; max_bytes tunes it, see limits). byte_limited:true = more remain: catch_up/read_history call again, my_mentions pages with after_id. Oversized bodies arrive truncated:true with length; fetch the rest via get_message offset -> next_offset (codepoints). A truncated json body is a partial raw string, not an object.
 - Every size cap is in server_info limits. Message bodies cap at SQLite's ~1 GB; practical reads are budget-bound far earlier.
@@ -174,6 +179,44 @@ function fail(message: string): ToolResult {
     content: [{ type: "text", text: JSON.stringify({ error: message }, null, 2) }],
     isError: true,
   };
+}
+
+/** Hard server-side ceiling for catch_up's wait_seconds. Owner decision
+ *  (plan doc): conservative against UNMEASURED harness client-timeout
+ *  ceilings -- 25s plus worst-case drain stays under a pessimistic 30s
+ *  floor, and the SDK client default is 60s. The schema max mirrors this;
+ *  raise both together only with per-harness cancel measurements. */
+const WAIT_CAP_SECONDS = 25;
+/** Cadence of the non-advancing unread probe during a blocking wait. */
+const WAIT_PROBE_INTERVAL_MS = 500;
+/** Wait-lease TTL grace past the deadline, covering the final advancing
+ *  read; a hard-killed process's lease self-expires this soon after. */
+const WAIT_LEASE_GRACE_SECONDS = 5;
+
+/** Sleep that wakes EARLY on abort (never rejects; callers re-check
+ *  signal.aborted, which is also the correct behavior for an already-aborted
+ *  signal). The listener is removed on normal expiry, so a long-lived signal
+ *  does not accumulate one listener per tick. */
+function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    if (!signal) {
+      setTimeout(resolve, Math.max(0, ms));
+      return;
+    }
+    if (signal.aborted) {
+      resolve();
+      return;
+    }
+    const onAbort = (): void => {
+      clearTimeout(t);
+      resolve();
+    };
+    const t = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, Math.max(0, ms));
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function requireActive(): { agentId: string; roomId: number } {
@@ -292,6 +335,7 @@ const LIMITS = {
   bulk_read_default_budget_chars: DEFAULT_MAX_BYTES,
   max_bytes_range: [1000, 400_000],
   get_message_max_chars_range: [100, 400_000],
+  wait_seconds_max: WAIT_CAP_SECONDS,
   default_page_limits: {
     catch_up: 50,
     read_history: 50,
@@ -721,10 +765,12 @@ server.registerTool(
       "List agents in the active room (up to `limit`; `total` rides along): " +
       "type/role/description, `last_read_seq` (read receipt: compare to a " +
       "message seq), `last_seen`, `idle_seconds`, `present` (has not left), " +
-      "`active` (seen within active_within_minutes). Long descriptions are " +
-      "listing previews (description_truncated). `next_after` present = more " +
-      "rows exist; page by passing it back as `after` (keyset paging, so a " +
-      "concurrent join cannot make you skip or duplicate an agent).",
+      "`active` (seen within active_within_minutes), `watching` (an open " +
+      "blocking catch_up wait: a message now lands in a live turn). Long " +
+      "descriptions are listing previews (description_truncated). " +
+      "`next_after` present = more rows exist; page by passing it back as " +
+      "`after` (keyset paging, so a concurrent join cannot make you skip or " +
+      "duplicate an agent).",
     inputSchema: z.object({
       filter: z
         .string()
@@ -924,12 +970,13 @@ server.registerTool(
       "Return messages from OTHER agents posted since you last read (seq > your " +
       "last_read marker), oldest first, and ADVANCE your read marker; " +
       "`remaining` reports how many are still unread. Reads the ACTIVE room, " +
-      "or `room` names any joined room WITHOUT switching the active room. An " +
-      "empty read lists every other room holding unread " +
-      "(`rooms_with_unread`), so one call says where the traffic is. Your own " +
-      "messages are never returned here, and this sync is unfiltered by " +
-      "design; for what is directed at you across rooms use my_mentions (a " +
-      "peek that never moves markers).",
+      "or `room` names any joined room WITHOUT switching the active room. " +
+      "`wait_seconds` blocks this one call until a message arrives (waiting " +
+      "for a reply costs one call, not a poll loop). An empty read lists " +
+      "every other room holding unread (`rooms_with_unread`), so one call " +
+      "says where the traffic is. Your own messages are never returned here, " +
+      "and this sync is unfiltered by design; for what is directed at you " +
+      "across rooms use my_mentions (a peek that never moves markers).",
     inputSchema: z.object({
       room: z
         .string()
@@ -940,6 +987,20 @@ server.registerTool(
           "Read a room you have JOINED (id or name) without changing the " +
             "active room; its read marker still advances. Omitted: the " +
             "active room.",
+        ),
+      wait_seconds: z
+        .number()
+        .int()
+        .min(0)
+        .max(WAIT_CAP_SECONDS)
+        .optional()
+        .describe(
+          "Block up to this many seconds until a message from another agent " +
+            "lands in the target room, then return it (marker advances) in " +
+            "this same call; 0/omitted = return immediately. On timeout: " +
+            "timed_out:true + call_again + rooms_with_unread -- just call " +
+            "again to keep waiting. Waiting holds YOUR turn open; to be " +
+            "notified while doing other work, use the background poller.",
         ),
       limit: z
         .number()
@@ -979,7 +1040,10 @@ server.registerTool(
         .describe("REMOVED in v0.6.0; my_mentions pages with after_id."),
     }).strict(),
   },
-  async ({ room, limit, preview_chars, max_bytes, mentions_me, after_seq }) => {
+  async (
+    { room, wait_seconds, limit, preview_chars, max_bytes, mentions_me, after_seq },
+    extra,
+  ) => {
     try {
       touchSession();
       // Reject, never strip: a v0.5 caller sending mentions_me expected a
@@ -994,6 +1058,11 @@ server.registerTool(
             "silently changing semantics.",
         );
       }
+      // --- Resolve and CAPTURE, all before the first await. Concurrent
+      // dispatch can mutate `session` (identity, active room, cursor modes)
+      // while a wait sleeps, so everything below runs off these captured
+      // values; the only deliberate re-read of session state is the
+      // cursor-mode epoch check (modeFlipped).
       let agentId: string;
       let roomId: number;
       let roomName: string | null;
@@ -1030,25 +1099,137 @@ server.registerTool(
         roomName = store.getRoom(roomId)?.name ?? null;
         selector = cursorId();
       }
-      const result = store.catchUp(
-        roomId,
-        agentId,
-        limit ?? 50,
-        preview_chars,
-        max_bytes,
-        selector,
-        // rooms_with_unread on an empty read; the RAW nonce, my_mentions
-        // style, so every room baselines off its own cursor mode.
-        { sessionId: SESSION_NONCE },
-      );
+      const signal = extra?.signal;
+      const waitSeconds = wait_seconds ?? 0;
+      const startedMs = Date.now();
+
       // Identity fields ride on EVERY response so the caller always knows
       // which room (under which identity) this call consumed.
-      return ok({
-        agent_id: agentId,
-        room_id: roomId,
-        room_name: roomName,
-        ...result,
-      });
+      const respond = (
+        result: Record<string, unknown>,
+        extraFields: Record<string, unknown> = {},
+      ): ToolResult =>
+        ok({
+          agent_id: agentId,
+          room_id: roomId,
+          room_name: roomName,
+          ...result,
+          ...extraFields,
+        });
+      const advancingRead = () =>
+        store.catchUp(
+          roomId,
+          agentId,
+          limit ?? 50,
+          preview_chars,
+          max_bytes,
+          selector,
+          // rooms_with_unread on an empty read; the RAW nonce, my_mentions
+          // style, so every room baselines off its own cursor mode.
+          { sessionId: SESSION_NONCE },
+        );
+      // Cursor-mode epoch check: a private<->shared rejoin mid-wait re-bases
+      // the cursor (an explicit shared rejoin even deletes the private row),
+      // so an advancing read after a flip would consume from a DIFFERENT
+      // position than this call captured. Abort loudly instead.
+      const modeFlipped = (): boolean =>
+        (session.privateRooms.has(privKey(roomId, agentId))
+          ? SESSION_NONCE
+          : null) !== selector;
+      const sessionChangedResult = (): ToolResult =>
+        respond({
+          messages: [],
+          session_changed: true,
+          call_again: true,
+          waited_ms: Date.now() - startedMs,
+          note:
+            "this room's cursor mode flipped (private/shared rejoin) " +
+            "mid-wait; nothing was read or advanced -- call catch_up again " +
+            "to read from the current cursor",
+        });
+      const roomDeletedResult = (): ToolResult =>
+        fail(
+          `room "${roomName ?? roomId}" was deleted while waiting; nothing was read. list_rooms shows what still exists.`,
+        );
+
+      // Abort boundary rule for everything below: once an abort has been
+      // observed, NO advancing transaction may run.
+      if (signal?.aborted) return respond({ aborted: true });
+      const first = advancingRead();
+      if (first.messages.length > 0 || waitSeconds === 0) {
+        return respond(
+          first,
+          waitSeconds > 0 ? { waited_ms: Date.now() - startedMs } : {},
+        );
+      }
+
+      // --- Blocking wait: abort-aware timer, non-advancing read-only probe
+      // with catchUp's exact predicate, advancing read only on a hit.
+      const deadlineMs = startedMs + waitSeconds * 1000;
+      // Presence lease: `watching` is a verifiable server state for exactly
+      // as long as this call is open. Best-effort, like touch: a lease
+      // failure must not break the wait (the probe surfaces a deleted room).
+      try {
+        store.beginWaitLease(
+          roomId,
+          agentId,
+          SESSION_NONCE,
+          waitSeconds + WAIT_LEASE_GRACE_SECONDS,
+        );
+      } catch {}
+      try {
+        while (Date.now() < deadlineMs) {
+          await abortableSleep(
+            Math.min(WAIT_PROBE_INTERVAL_MS, deadlineMs - Date.now()),
+            signal,
+          );
+          if (signal?.aborted) return respond({ aborted: true });
+          // Self-throttled heartbeat: a genuinely-waiting agent reads as
+          // `active` to peers instead of indistinguishable from a dormant one.
+          touchSession();
+          let unread: number;
+          try {
+            unread = store.unreadProbe(roomId, agentId, selector);
+          } catch (e) {
+            if (!store.getRoom(roomId)) return roomDeletedResult();
+            throw e;
+          }
+          if (unread === 0) continue;
+          if (signal?.aborted) return respond({ aborted: true });
+          if (modeFlipped()) return sessionChangedResult();
+          let hit;
+          try {
+            hit = advancingRead();
+          } catch (e) {
+            if (!store.getRoom(roomId)) return roomDeletedResult();
+            throw e;
+          }
+          if (hit.advanced) {
+            return respond(hit, { waited_ms: Date.now() - startedMs });
+          }
+          // A shared twin consumed the page between probe and read: keep
+          // waiting on the (now advanced) cursor, never refire stale rows.
+        }
+        if (signal?.aborted) return respond({ aborted: true });
+        if (modeFlipped()) return sessionChangedResult();
+        let last;
+        try {
+          last = advancingRead();
+        } catch (e) {
+          if (!store.getRoom(roomId)) return roomDeletedResult();
+          throw e;
+        }
+        return respond(last, {
+          waited_ms: Date.now() - startedMs,
+          ...(last.messages.length === 0
+            ? { timed_out: true, call_again: true }
+            : {}),
+        });
+      } finally {
+        try {
+          store.endWaitLease(roomId, agentId, SESSION_NONCE);
+        } catch {}
+      }
     } catch (e) {
       return fail(asMessage(e));
     }
@@ -1176,8 +1357,10 @@ server.registerTool(
       "124 if it times out with nothing new, 2 on error. Needs an identity " +
       "(join_room first). Watches EVERY room you are present in unless `room` " +
       "scopes it to one. Set mentions_only to fire only on messages that " +
-      "mention you or reply to you. (join_room also returns this same command " +
-      "as poller_cmd.)",
+      "mention you or reply to you. For a short in-turn wait, " +
+      "catch_up({wait_seconds}) blocks and returns messages directly; this " +
+      "poller covers longer, out-of-turn watching. (join_room also returns " +
+      "this command as poller_cmd.)",
     inputSchema: z
       .object({
         room: z
