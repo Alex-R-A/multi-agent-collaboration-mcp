@@ -110,7 +110,8 @@ SIZE AND PAGING
 - Every size cap is in server_info limits. Message bodies cap at SQLite's ~1 GB; practical reads are budget-bound far earlier.
 
 POSTING
-- crossed counts ALL unread from others past your marker at post time (old backlog included, not only mid-composition arrivals); crossed_range gives the seq span. If crossed > 0, catch_up before acting on replies.
+- crossed counts ALL unread from others past your marker at post time (old backlog included, not only mid-composition arrivals); crossed_directed says how many are aimed at you; crossed_range gives the seq span. If crossed > 0, catch_up before acting on replies. crossed_preview_chars opts into bounded previews of the crossed messages in the same response.
+- Dispositive posts (verdicts, commissions, dispositions): if_last_read_seq is a conditional post -- rejected (posted:false) if ANYTHING from others landed past your token, with the crossed messages returned for review; nothing is stored, so re-sending the same content is idempotent. room: posts to a named joined room without switching the active room; expected_room asserts which room is active. Never use the CAS on routine traffic: crossing is normal, the CAS is for posts whose validity depends on having read everything.
 - recipients (per tagged id) is the delivery ground truth: status, idle_seconds, last_read_seq, marker_behind. delivery_warnings appears when a tagged recipient looks unlikely to see the message soon (never joined, left, or long idle); it is a liveness heuristic, not a delivery guarantee.
 - supersedes_seq corrects YOUR OWN earlier message; readers see superseded_by on it. reply_to_seq threads; the log stays flat and globally ordered.
 - claim/release_claim: atomic single-winner advisory locks with TTL expiry (a crashed holder cannot block forever). Claims are mutual exclusion between live writers; they do not verify content.
@@ -826,16 +827,19 @@ server.registerTool(
   {
     title: "Post message",
     description:
-      "Post to the active room. `content` is text or a JSON object/array; " +
-      "`to` = agent_ids the message is directed at (mentions); `reply_to_seq` " +
-      "tags an earlier message. Returns the assigned `seq` plus, per tagged " +
-      "id, `recipients`: `status` (unknown = never joined, the tag reaches no " +
-      "one; left; idle; active), `idle_seconds`, `last_read_seq` (below this " +
-      "seq = not read yet) and `marker_behind`; `delivery_warnings` appears " +
-      "when a tagged recipient looks unlikely to see this soon. `crossed` " +
-      "counts messages from others YOU had not read at post time " +
-      "(`crossed_range`): if > 0, catch_up, contradicting messages may have " +
-      "landed while you wrote. `supersedes_seq` marks YOUR OWN earlier " +
+      "Post to the active room, or to any JOINED room via `room` (active room " +
+      "unchanged). `content` is text or a JSON object/array; `to` = agent_ids " +
+      "the message is directed at; `reply_to_seq` tags an earlier message. " +
+      "Returns the assigned `seq` plus, per tagged id, `recipients` (status/" +
+      "idle_seconds/last_read_seq/marker_behind/watching); " +
+      "`delivery_warnings` appears when a tagged recipient looks unlikely to " +
+      "see this soon. `crossed` counts messages from others YOU had not read " +
+      "at post time (`crossed_directed` of them aimed at you): if > 0, " +
+      "catch_up, contradicting messages may have landed while you wrote. For " +
+      "DISPOSITIVE posts (verdicts, commissions): `if_last_read_seq` rejects " +
+      "the post if anything from others landed past that seq (posted:false + " +
+      "the crossed messages; re-send after reviewing), and `expected_room` " +
+      "asserts which room is active. `supersedes_seq` marks YOUR OWN earlier " +
       "message as corrected (readers see `superseded_by` on it).",
     inputSchema: z.object({
       // ONE bare z.custom for all three shapes, deliberately:
@@ -891,12 +895,110 @@ server.registerTool(
           "seq of YOUR OWN earlier message that this message supersedes " +
             "(correction/retraction)",
         ),
+      room: z
+        .string()
+        .min(1)
+        .max(500)
+        .optional()
+        .describe(
+          "Post to a room you have JOINED (id or name) without changing " +
+            "the active room. Omitted: the active room.",
+        ),
+      expected_room: z
+        .string()
+        .min(1)
+        .max(500)
+        .optional()
+        .describe(
+          "Assert the ACTIVE room is this one (id or name); a mismatch " +
+            "rejects the post. For dispositive posts, so the implicit " +
+            "active room cannot silently misroute them. Not combinable " +
+            "with room.",
+        ),
+      if_last_read_seq: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe(
+          "Conditional post (CAS) for dispositive messages: reject if ANY " +
+            "message from others carries a seq above this (use your last " +
+            "catch_up's new_last_read_seq). Rejection returns posted:false " +
+            "with the crossed messages; nothing is stored, re-send the same " +
+            "content after reviewing. Never needed for routine traffic.",
+        ),
+      crossed_preview_chars: z
+        .number()
+        .int()
+        .positive()
+        .max(2000)
+        .optional()
+        .describe(
+          "When crossed > 0, also return the crossed messages as bounded " +
+            "previews (crossed_messages, per-row directed flag; " +
+            "crossed_remaining when the bound cut the list).",
+        ),
     }).strict(),
   },
-  async ({ content, to, reply_to_seq, supersedes_seq }) => {
+  async ({
+    content,
+    to,
+    reply_to_seq,
+    supersedes_seq,
+    room,
+    expected_room,
+    if_last_read_seq,
+    crossed_preview_chars,
+  }) => {
     try {
       touchSession();
-      const { agentId, roomId } = requireActive();
+      if (room !== undefined && expected_room !== undefined) {
+        return fail(
+          "pass either room (explicit target) or expected_room (active-room " +
+            "assertion), not both",
+        );
+      }
+      let agentId: string;
+      let roomId: number;
+      let roomName: string | null;
+      let selector: string | null;
+      if (room !== undefined) {
+        // Explicit target: same membership rule as catch_up({room}).
+        if (session.agentId === null) {
+          return fail(
+            "join a room first with join_room to establish your identity",
+          );
+        }
+        agentId = session.agentId;
+        const target = store.resolveRoom(room);
+        if (!target) {
+          return fail(`no room "${room}". Use list_rooms to see options.`);
+        }
+        if (!store.getMembership(target.id, agentId)) {
+          return fail(
+            `you have never joined room "${target.name}"; join_room it before posting there`,
+          );
+        }
+        roomId = target.id;
+        roomName = target.name;
+        selector = session.privateRooms.has(privKey(target.id, agentId))
+          ? SESSION_NONCE
+          : null;
+      } else {
+        ({ agentId, roomId } = requireActive());
+        roomName = store.getRoom(roomId)?.name ?? null;
+        selector = cursorId();
+        if (expected_room !== undefined) {
+          const expect = store.resolveRoom(expected_room);
+          if (!expect || expect.id !== roomId) {
+            return fail(
+              `expected_room "${expected_room}" does not match the active room ` +
+                `(${roomId}${roomName ? ` "${roomName}"` : ""}); nothing was posted. ` +
+                "Pass room: to target a specific room, or join_room it first.",
+            );
+          }
+        }
+      }
       const isText = typeof content === "string";
       // Validate structured strings DURING serialization, before JSON.stringify
       // escapes lone surrogates to harmless-looking ASCII. The store validates
@@ -915,7 +1017,7 @@ server.registerTool(
       const recipients = mentions
         ? store.recipientStatus(roomId, mentions, 5)
         : [];
-      const { seq, crossed, crossed_range } = store.postMessage(
+      const res = store.postMessage(
         roomId,
         agentId,
         body,
@@ -923,8 +1025,35 @@ server.registerTool(
         mentions,
         reply_to_seq ?? null,
         supersedes_seq ?? null,
-        cursorId(),
+        selector,
+        {
+          ifLastReadSeq: if_last_read_seq ?? null,
+          crossedPreviewChars: crossed_preview_chars,
+        },
       );
+      if (!res.posted) {
+        // CAS reject: a structured non-error result (like claim's
+        // granted:false). Nothing was stored; the caller's payload is its
+        // own to re-send, so the reject carries the delta, not a draft.
+        return ok({
+          posted: false,
+          rejected: "stale_read",
+          room_id: roomId,
+          room_name: roomName,
+          crossed: res.crossed,
+          crossed_directed: res.crossed_directed,
+          crossed_range: res.crossed_range,
+          crossed_messages: res.crossed_messages,
+          ...(res.crossed_remaining !== undefined
+            ? { crossed_remaining: res.crossed_remaining }
+            : {}),
+          retry:
+            "review the crossed messages, then re-send the SAME content " +
+            "with if_last_read_seq set to the new last-read seq (nothing " +
+            "was stored)",
+        });
+      }
+      const { seq, crossed, crossed_directed, crossed_range } = res;
       // Loud delivery: one human-readable line per tagged recipient unlikely
       // to see this soon. A liveness heuristic (idle is not dead; a fresh
       // post is always unread), so it warns only on the strong signals:
@@ -946,14 +1075,24 @@ server.registerTool(
               : `${r.id}: likely unreachable right now (idle ${fmtIdle(r.idle_seconds ?? 0)}, marker ${r.marker_behind} behind)`,
         );
       return ok({
+        posted: true,
         seq,
+        room_id: roomId,
+        room_name: roomName,
         ...(delivery_warnings.length > 0 ? { delivery_warnings } : {}),
         format: isText ? "text" : "json",
         to: mentions,
         reply_to_seq: reply_to_seq ?? null,
         supersedes_seq: supersedes_seq ?? null,
         crossed,
+        crossed_directed,
         crossed_range,
+        ...(res.crossed_messages !== undefined
+          ? { crossed_messages: res.crossed_messages }
+          : {}),
+        ...(res.crossed_remaining !== undefined
+          ? { crossed_remaining: res.crossed_remaining }
+          : {}),
         recipients,
       });
     } catch (e) {

@@ -1620,14 +1620,65 @@ export class ChatStore {
   // --- messages ----------------------------------------------------------
 
   /**
+   * Bounded previews of the messages "crossing" a post: rows from others past
+   * `baseline`, oldest first, each with a per-row `directed` flag (aimed at
+   * the poster). Doubly bounded (row cap AND byte budget) because these ride
+   * inside a post RESPONSE, not a paged read; `remaining` reports what the
+   * bounds cut. Serves both the CAS-reject path (baseline = the caller's
+   * token) and the opt-in crossed_preview_chars path (baseline = the
+   * poster's cursor). Runs inside postMessage's transaction.
+   */
+  private crossedRows(
+    roomId: number,
+    baseline: number,
+    posterId: string,
+    previewChars: number | undefined,
+    totalCrossed: number,
+  ): { rows: (MessageRow & { directed: boolean })[]; remaining: number } {
+    const CROSSED_ROWS_MAX = 20;
+    const CROSSED_BYTES = 20_000;
+    // Previews cap at 2000 chars (schema), so a 2001-codepoint fetch always
+    // knows whether the body was cut; body_cp still carries the full length.
+    const pc = previewChars ?? 300;
+    const fetched = this.db
+      .prepare(
+        `SELECT ${messageCols(2001)}, (${directedAt("g")}) AS directed
+         FROM ${MESSAGE_FROM}
+         WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
+         ORDER BY g.seq ASC LIMIT ?`,
+      )
+      .all(posterId, posterId, roomId, baseline, posterId, CROSSED_ROWS_MAX) as (RawMessage & {
+      directed: number;
+    })[];
+    const { messages } = this.boundByBytes(fetched, pc, CROSSED_BYTES, (r, p) => ({
+      ...this.rowToMessage(r, p),
+      directed: (r as RawMessage & { directed: number }).directed === 1,
+    }));
+    return {
+      rows: messages,
+      remaining: Math.max(0, totalCrossed - messages.length),
+    };
+  }
+
+  /**
    * Insert a message, allocating the next per-room seq atomically. Also
    * reports the poster's blind spot: `crossed` counts messages from OTHERS the
-   * poster had not read at post time (cursor-relative), with the seq range, so
-   * a poster learns in the same call that it may have posted over unseen
+   * poster had not read at post time (cursor-relative), with the seq range and
+   * `crossed_directed` (how many of those are aimed at the poster), so a
+   * poster learns in the same call that it may have posted over unseen
    * traffic. supersedesSeq marks the poster's OWN earlier message as
    * superseded by this one. Both replyToSeq and supersedesSeq are validated
    * in-transaction, so a concurrent prune cannot slip a dangling reference
    * between a pre-check and the insert.
+   *
+   * opts.ifLastReadSeq: conditional post (CAS) for dispositive messages. If
+   * ANY message from others carries seq above the token, NOTHING is inserted
+   * and the reject result carries the crossing messages (bounded previews,
+   * per-row directed) so the caller can assess the delta and idempotently
+   * retry; the reject baseline is the TOKEN, unlike the accept path's
+   * cursor-relative crossed. opts.crossedPreviewChars additionally returns
+   * crossed previews on an ACCEPTED post. Neither path advances any read
+   * marker: posting is not a read.
    */
   postMessage(
     roomId: number,
@@ -1638,12 +1689,26 @@ export class ChatStore {
     replyToSeq: number | null,
     supersedesSeq: number | null = null,
     sessionId: string | null = null,
-  ): {
-    id: number;
-    seq: number;
-    crossed: number;
-    crossed_range: { from_seq: number; to_seq: number } | null;
-  } {
+    opts: { ifLastReadSeq?: number | null; crossedPreviewChars?: number } = {},
+  ):
+    | {
+        posted: true;
+        id: number;
+        seq: number;
+        crossed: number;
+        crossed_directed: number;
+        crossed_range: { from_seq: number; to_seq: number } | null;
+        crossed_messages?: (MessageRow & { directed: boolean })[];
+        crossed_remaining?: number;
+      }
+    | {
+        posted: false;
+        crossed: number;
+        crossed_directed: number;
+        crossed_range: { from_seq: number; to_seq: number } | null;
+        crossed_messages: (MessageRow & { directed: boolean })[];
+        crossed_remaining?: number;
+      } {
     // Reject unstorable text BEFORE the transaction: a body with an embedded
     // NUL reads back truncated (SQLite substr/length stop at NUL) and catch_up
     // would advance the marker past the lost tail. mentions are agent ids
@@ -1671,10 +1736,47 @@ export class ChatStore {
     }
     const mentionsJson =
       mentions && mentions.length > 0 ? JSON.stringify(mentions) : null;
+    const ifToken = opts.ifLastReadSeq ?? null;
     const tx = this.db.transaction(() => {
       // The caller's room reference predates this transaction; a concurrent
       // delete_room otherwise surfaces as a raw FK failure on the INSERT.
       this.requireRoom(roomId);
+      // CAS gate FIRST: a stale dispositive post rejects before any
+      // validation error can mask the staleness (the caller reassesses and
+      // retries with the same payload either way). In-transaction, so no
+      // message can land between this check and the insert below.
+      if (ifToken !== null) {
+        const stale = this.db
+          .prepare(
+            `SELECT COUNT(*) AS c, MIN(seq) AS mn, MAX(seq) AS mx,
+                    SUM(CASE WHEN ${directedAt("messages")} THEN 1 ELSE 0 END) AS d
+             FROM messages
+             WHERE room_id = ? AND seq > ? AND agent_id != ?`,
+          )
+          .get(agentId, agentId, roomId, ifToken, agentId) as {
+          c: number;
+          mn: number | null;
+          mx: number | null;
+          d: number | null;
+        };
+        if (stale.c > 0) {
+          const { rows, remaining } = this.crossedRows(
+            roomId,
+            ifToken,
+            agentId,
+            opts.crossedPreviewChars,
+            stale.c,
+          );
+          return {
+            posted: false as const,
+            crossed: stale.c,
+            crossed_directed: stale.d ?? 0,
+            crossed_range: { from_seq: stale.mn!, to_seq: stale.mx! },
+            crossed_messages: rows,
+            ...(remaining > 0 ? { crossed_remaining: remaining } : {}),
+          };
+        }
+      }
       let replyToAgent: string | null = null;
       if (replyToSeq !== null) {
         // Author only -- never fetch the body, which can be huge. The author
@@ -1708,18 +1810,22 @@ export class ChatStore {
         }
       }
       // Crossing report: computed before the insert so "unread" excludes the
-      // message being posted.
+      // message being posted. The directedAt pair binds FIRST (it sits in the
+      // SELECT list, ahead of the WHERE placeholders).
       const cursor = this.getCursor(roomId, agentId, sessionId);
       const from = cursor?.last_read_seq ?? 0;
       const crossing = this.db
         .prepare(
-          `SELECT COUNT(*) AS c, MIN(seq) AS mn, MAX(seq) AS mx FROM messages
+          `SELECT COUNT(*) AS c, MIN(seq) AS mn, MAX(seq) AS mx,
+                  SUM(CASE WHEN ${directedAt("messages")} THEN 1 ELSE 0 END) AS d
+           FROM messages
            WHERE room_id = ? AND seq > ? AND agent_id != ?`,
         )
-        .get(roomId, from, agentId) as {
+        .get(agentId, agentId, roomId, from, agentId) as {
         c: number;
         mn: number | null;
         mx: number | null;
+        d: number | null;
       };
       const { next } = this.db
         .prepare(
@@ -1743,14 +1849,39 @@ export class ChatStore {
           replyToAgent,
           supersedesSeq,
         );
+      // Opt-in crossed previews on an ACCEPTED post, in the same transaction
+      // (the poster's own just-inserted row is excluded by agent_id != self).
+      let crossedPreview: {
+        rows: (MessageRow & { directed: boolean })[];
+        remaining: number;
+      } | null = null;
+      if (crossing.c > 0 && opts.crossedPreviewChars !== undefined) {
+        crossedPreview = this.crossedRows(
+          roomId,
+          from,
+          agentId,
+          opts.crossedPreviewChars,
+          crossing.c,
+        );
+      }
       return {
+        posted: true as const,
         id: Number(info.lastInsertRowid),
         seq: next,
         crossed: crossing.c,
+        crossed_directed: crossing.d ?? 0,
         crossed_range:
           crossing.c > 0
             ? { from_seq: crossing.mn!, to_seq: crossing.mx! }
             : null,
+        ...(crossedPreview !== null
+          ? {
+              crossed_messages: crossedPreview.rows,
+              ...(crossedPreview.remaining > 0
+                ? { crossed_remaining: crossedPreview.remaining }
+                : {}),
+            }
+          : {}),
       };
     });
     // IMMEDIATE acquires the write lock before reading MAX(seq), so concurrent
