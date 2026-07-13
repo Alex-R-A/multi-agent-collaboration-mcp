@@ -936,7 +936,9 @@ server.registerTool(
         .describe(
           "When crossed > 0, also return the crossed messages as bounded " +
             "previews (crossed_messages, per-row directed flag; " +
-            "crossed_remaining when the bound cut the list).",
+            "crossed_remaining when the bound cut the list). Posting never " +
+            "advances your read marker: the previews remain unread for " +
+            "catch_up.",
         ),
     }).strict(),
   },

@@ -342,6 +342,29 @@ await (async () => {
     m10,
   );
 
+  // M12: identity mutation mid-wait -- a concurrent join under a NEW
+  // agent_id switches the session identity, but the captured identity
+  // governs: the wait returns and advances for the ORIGINAL agent.
+  const before12 = s.getMembership(rA, "u").last_read_seq;
+  const id12 = srv.sendCall("catch_up", { wait_seconds: 10 });
+  await sleep(600);
+  await srv.call("join_room", { room: "wait-b", agent_id: "v" }); // identity -> v
+  const seq12 = s.postMessage(rA, "peer", "for the old identity", "text", null, null).seq;
+  const m12 = srv.parse(await srv.waitFor(id12));
+  const who12 = await srv.call("whoami", {});
+  check(
+    "M12 identity change mid-wait: captured identity still receives and advances",
+    m12.data.agent_id === "u" && m12.data.messages.length === 1 &&
+      m12.data.messages[0].content === "for the old identity" &&
+      s.getMembership(rA, "u").last_read_seq === seq12 && before12 < seq12,
+    { data: m12.data, marker: s.getMembership(rA, "u").last_read_seq },
+  );
+  check(
+    "M12 the session itself now runs as the new identity",
+    who12.data.agent_id === "v",
+    who12.data,
+  );
+
   s.close();
   srv.child.kill();
 
