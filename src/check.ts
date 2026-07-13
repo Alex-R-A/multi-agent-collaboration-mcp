@@ -34,6 +34,22 @@ function fail(msg: string): never {
   process.exit(2);
 }
 
+const USAGE = `agent-chat-check: one-shot, read-only unread probe.
+Usage:
+  check.js --agent <agent_id> [--session <nonce>] [--mentions-only]   # all rooms
+  check.js --room <id|name> --agent <agent_id> [--since <seq>]        # one room
+Flags:
+  --agent <id>        identity to check; baselines are its read markers
+  --room <id|name>    scope to one room (default: every room the agent is in)
+  --since <seq>       explicit baseline instead of the read marker (needs --room)
+  --session <nonce>   session-aware all-rooms probe: mutes rooms that session
+                      left, baselines off its private cursors where they exist
+  --mentions-only     count only messages that mention --agent or reply to it
+  --help, -h          print this and exit 0
+Exit codes: 0 = updates exist (JSON status on stdout; rooms_with_updates names
+the rooms on the all-rooms path), 1 = nothing new, 2 = error.
+`;
+
 function parseArgs(argv: string[]): Args {
   const out: Args = { mentionsOnly: false };
   for (let i = 0; i < argv.length; i++) {
@@ -89,6 +105,9 @@ function parseArgs(argv: string[]): Args {
       // invisible here while its catch_up still had messages. Only meaningful
       // with the all-rooms (no --room) path; ignored otherwise.
       out.session = take(a);
+    } else if (a === "--help" || a === "-h") {
+      process.stdout.write(USAGE);
+      process.exit(0);
     } else {
       fail(`unknown argument: ${a}`);
     }
@@ -196,14 +215,46 @@ try {
               ? [agent, sess, agent, agent, agent, sess]
               : [agent, agent, agent, agent]),
           ) as { c: number };
-        return { rooms, unread, unreadMentions };
+        // Which rooms fired: same baseline/muting as the counts, read in the
+        // same snapshot. Gated behind an actual wake (quiet interval polls,
+        // the overwhelmingly common case, must not pay for the GROUP BY).
+        // Placeholders in SQL text order: the directedAt pair (SELECT), the
+        // membership join, the session key (if any), the author exclusion,
+        // the presence key (if any).
+        let roomsWithUpdates:
+          | { room_id: number; name: string; unread: number; directed: number }[]
+          | null = null;
+        if (args.mentionsOnly ? unreadMentions > 0 : unread > 0) {
+          roomsWithUpdates = db
+            .prepare(
+              `SELECT g.room_id AS room_id, r.name AS name, COUNT(*) AS unread,
+                      SUM(CASE WHEN ${directedAt("g")} THEN 1 ELSE 0 END) AS directed
+               FROM messages g
+               JOIN memberships mb ON mb.room_id = g.room_id
+                    AND mb.agent_id = ? AND mb.left_at IS NULL${smJoin}
+               JOIN rooms r ON r.id = g.room_id
+               WHERE g.seq > ${baseline} AND g.agent_id != ?${sessClause}
+               GROUP BY g.room_id, r.name
+               ORDER BY directed DESC, unread DESC, g.room_id ASC
+               LIMIT 20`,
+            )
+            .all(
+              ...(sess
+                ? [agent, agent, agent, sess, agent, sess]
+                : [agent, agent, agent, agent]),
+            ) as { room_id: number; name: string; unread: number; directed: number }[];
+        }
+        return { rooms, unread, unreadMentions, roomsWithUpdates };
       })
       .deferred();
     if (counts === null) fail(`agent "${agent}" is not a member of any room`);
-    const { rooms, unread, unreadMentions } = counts as {
+    const { rooms, unread, unreadMentions, roomsWithUpdates } = counts as {
       rooms: number;
       unread: number;
       unreadMentions: number;
+      roomsWithUpdates:
+        | { room_id: number; name: string; unread: number; directed: number }[]
+        | null;
     };
     db.close();
     const hasUpdates = args.mentionsOnly ? unreadMentions > 0 : unread > 0;
@@ -215,6 +266,9 @@ try {
         unread_mentions: unreadMentions,
         mentions_only: args.mentionsOnly,
         has_updates: hasUpdates,
+        ...(roomsWithUpdates !== null
+          ? { rooms_with_updates: roomsWithUpdates }
+          : {}),
       }) + "\n",
     );
     process.exit(hasUpdates ? 0 : 1);

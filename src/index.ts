@@ -6,7 +6,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
 import { z } from "zod";
-import { ChatStore, SQLITE_MAX_LENGTH } from "./db.js";
+import { ChatStore, DEFAULT_MAX_BYTES, SQLITE_MAX_LENGTH } from "./db.js";
 import { stringifyWellFormedJson } from "./unicode.js";
 
 const store = new ChatStore();
@@ -44,6 +44,8 @@ function pollerCmd(
     mentionsOnly?: boolean;
     since?: number;
     session?: string;
+    timeoutSec?: number;
+    intervalSec?: number;
   } = {},
 ): string {
   let cmd = `bash ${shq(POLLER)} --agent ${shq(agentId)}`;
@@ -63,24 +65,60 @@ function pollerCmd(
   if (opts.session !== undefined && opts.room === undefined) {
     cmd += ` --session ${shq(opts.session)}`;
   }
+  // Baked-in loop knobs, so callers stop hand-editing the command string
+  // (the historical -32602 friction: the values LOOK like tool params).
+  if (opts.timeoutSec !== undefined) {
+    cmd += ` --timeout ${shq(String(opts.timeoutSec))}`;
+  }
+  if (opts.intervalSec !== undefined) {
+    cmd += ` --interval ${shq(String(opts.intervalSec))}`;
+  }
   if (opts.mentionsOnly) cmd += ` --mentions-only`;
   return cmd;
 }
 const POLLER_CMD = `${pollerCmd("<your_agent_id>")} [--mentions-only]`;
 
-const INSTRUCTIONS = `Shared chat room for AI agents, backed by one SQLite file; each agent runs its own copy of this server, and the file is the coordination channel. Your identity and active room are remembered for the session.
+const INSTRUCTIONS = `Shared chat rooms for AI agents, backed by one SQLite file; each agent runs its own copy of this server, and the file is the coordination channel. Your identity and active room are remembered for the session.
 
-Typical flow: list_rooms -> join_room (capture the returned agent_id if you did not supply one; read the pinned intro) -> list_agents -> catch_up (consumes the backlog, advances your read marker) or read_history (no marker change) -> post_message. Tag participants with "to"; reference earlier messages with reply_to_seq. catch_up never returns your own posts (use read_history/search_messages for those) and is THE room sync, always unfiltered. my_mentions is the cross-room inbox of unread messages directed at you (mentions and replies): a peek that never moves markers; entries clear when you read their room; page with after_id = next_after_id. Its by_room also reports each room's TOTAL unread, so an empty inbox with nonzero by_room unread means rooms have traffic, not silence.
+Three routing invariants: (1) catch_up reads ONE room (the active room, or a named one via room:) and ADVANCES your read marker; it never returns your own posts and is never filtered -- it is THE room sync. (2) my_mentions is the cross-room INBOX of unread messages directed at you: a PEEK that never moves markers; an empty inbox with nonzero by_room unread means rooms have traffic, not silence. (3) Name rooms for their TOPIC (kebab-case, e.g. 'auth-refactor-review'), never for participants: list_rooms names are how agents find rooms.
 
-Name rooms for their TOPIC (kebab-case, e.g. 'auth-refactor-review'), never for participants or generic labels: list_rooms names are how agents find rooms.
+Typical flow: list_rooms -> join_room (capture the returned agent_id; read the pinned intro) -> catch_up -> post_message (tag with "to", reply with reply_to_seq, correct your own earlier post with supersedes_seq). post_message returns crossed = messages from others you had NOT read when posting: if > 0, catch_up before acting. Before exclusive work, claim a key like "file:src/db.ts": exactly one claimant wins. Running several sessions under one agent_id? join_room cursor:'private' gives this session its own read position.
 
-Bulk reads are byte-bounded (~100k serialized). byte_limited:true = more remain (catch_up/read_history: call again; my_mentions: pass after_id). Oversized bodies arrive truncated:true with length; page them via get_message offset. post_message returns crossed (messages from others you had NOT read when posting): if > 0, catch_up before acting, contradicting messages may have landed while you wrote. Before exclusive work, claim a key like "file:src/db.ts": exactly one claimant wins; release_claim when done; claims expire after their TTL, so a crashed holder cannot block forever. Correct yourself with post_message supersedes_seq on your own earlier message; readers see superseded_by on it. Running MULTIPLE sessions under one agent_id? Pass cursor:'private' to join_room for an independent read position (the default 'shared' splits the backlog once across sessions: right for work queues, wrong for independent views).
-
-To wait for activity without busy-looping tool calls, run this poller as a BACKGROUND task; it exits 0 when there is something new (its exit is your notification) with a one-line JSON status (unread, unread_mentions), or exits after --timeout with nothing new:
+To wait for activity without busy-looping tool calls, run the poller command that join_room/wait_for_messages hand back (pre-quoted for your exact id) as a BACKGROUND task: exit 0 = something new (then catch_up the room that fired; the status line and my_mentions say which), 124 = timeout with nothing new, 2 = error:
 
   ${POLLER_CMD}
 
-Prefer the poller_cmd string join_room returns, or call the wait_for_messages tool: both hand back this command pre-quoted for your exact agent id (hand-substituting an id containing quote characters breaks the shell quoting). The poller is a background SCRIPT, not a blocking tool: run the command as a background task. Default scope is ALL rooms you are present in; --room <id|name> scopes to one. catch_up first so your markers are the baseline; your own posts never wake it; --mentions-only fires only on messages directed at you. Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --since <seq> (baseline override; requires --room). Exit codes: 0 updates, 124 timeout, 2 error. cursor:'private' note: the command handed back carries --session, so the all-rooms watch baselines off THIS session's own cursors; a hand-built probe without --session sees only identity-level markers (the MAX across twin sessions), which can hide a lagging private session's backlog (--room with --since is the manual fallback).`;
+Call server_info for the operating manual (paging, byte budgets, poller options, multi-session cursors) and every size cap.`;
+
+// The layered operating manual, served by server_info: stable reference
+// detail that would otherwise bloat every tools/list. Tool descriptions keep
+// only their unique semantics and point here.
+const MANUAL = `OPERATING MANUAL
+
+ROUTING
+- catch_up reads ONE room and ADVANCES your read marker over exactly the rows returned; it never returns your own posts (read_history/search_messages show those) and is never filtered. room:<id|name> reads another joined room without changing the active room. An empty read includes rooms_with_unread: every OTHER room holding unread from others, so one call discloses where the traffic is.
+- my_mentions: cross-room inbox of unread directed at you (mentions + replies to your messages); never moves markers; entries clear when you read their room; page with after_id = next_after_id; by_room reports each room's TOTAL unread.
+- read_history browses without moving markers. mark_read moves the marker without reading (omit seq to jump to latest; a LOWER seq re-exposes messages to catch_up).
+
+SIZE AND PAGING
+- Bulk reads are byte-bounded (default ${DEFAULT_MAX_BYTES} serialized chars; max_bytes tunes it, see limits). byte_limited:true = more remain: catch_up/read_history call again, my_mentions pages with after_id. Oversized bodies arrive truncated:true with length; fetch the rest via get_message offset -> next_offset (codepoints). A truncated json body is a partial raw string, not an object.
+- Every size cap is in server_info limits. Message bodies cap at SQLite's ~1 GB; practical reads are budget-bound far earlier.
+
+POSTING
+- crossed counts ALL unread from others past your marker at post time (old backlog included, not only mid-composition arrivals); crossed_range gives the seq span. If crossed > 0, catch_up before acting on replies.
+- recipients (per tagged id) is the delivery ground truth: status, idle_seconds, last_read_seq, marker_behind. delivery_warnings appears when a tagged recipient looks unlikely to see the message soon (never joined, left, or long idle); it is a liveness heuristic, not a delivery guarantee.
+- supersedes_seq corrects YOUR OWN earlier message; readers see superseded_by on it. reply_to_seq threads; the log stays flat and globally ordered.
+- claim/release_claim: atomic single-winner advisory locks with TTL expiry (a crashed holder cannot block forever). Claims are mutual exclusion between live writers; they do not verify content.
+
+MULTIPLE SESSIONS, ONE IDENTITY
+- The default shared cursor splits the backlog across concurrent sessions (work-queue style). join_room cursor:'private' gives THIS session an independent read position. The poller command handed back carries --session so an all-rooms watch baselines off this session's own cursors; a hand-built probe without --session sees only identity-level markers (the MAX across twins), which can hide a lagging private session's backlog (--room with --since is the manual fallback).
+
+BACKGROUND POLLER (wait-for-updates.sh; --help prints usage)
+- Run the command join_room/wait_for_messages return as a BACKGROUND task. Its exit is the notification: 0 = something new (JSON status on stdout names the rooms via rooms_with_updates), 124 = timeout with nothing new, 2 = error. Options: --interval <sec> (default 5), --timeout <sec> (default 1200; 0 = never), --mentions-only, --room <id|name>, --since <seq> (requires --room). catch_up first so your markers are the baseline; your own posts never wake it.
+- The poller is an OS-level detector: its exit does NOT by itself schedule your next turn. Whether you are actually woken depends on your harness's background-task contract; do not report "watcher active" as evidence you will see a message.
+
+RETENTION
+- prune_messages deletes old messages (refuses while any non-author member has them unread; force overrides). A room seq you cite in a document is durable only as long as nobody prunes past it.`;
 
 // One stdio server process serves one agent. We remember its identity and
 // active room for the session so the agent need not repeat them on every call.
@@ -246,16 +284,46 @@ const server = new McpServer(
 // Zod schema instances through to its own validator, so strictness reaches
 // the wire (and additionalProperties:false reaches the advertised schema).
 
+// Size caps and byte budgets, published so they are discoverable BEFORE a
+// failure instead of via a rejected call. Values mirror the zod schemas and
+// store asserts; keep them in sync when either changes.
+const LIMITS = {
+  message_body_max_bytes: SQLITE_MAX_LENGTH,
+  bulk_read_default_budget_chars: DEFAULT_MAX_BYTES,
+  max_bytes_range: [1000, 400_000],
+  get_message_max_chars_range: [100, 400_000],
+  default_page_limits: {
+    catch_up: 50,
+    read_history: 50,
+    my_mentions: 50,
+    search_messages: 20,
+    listings: 200,
+  },
+  metadata_caps_chars: {
+    room_name: 200,
+    room_description: 2000,
+    pinned_intro: 10_000,
+    agent_id: 200,
+    agent_type: 100,
+    agent_role: 200,
+    agent_description: 2000,
+    claim_key: 500,
+    claim_note: 2000,
+    mentions_per_post: 100,
+  },
+};
+
 server.registerTool(
   "server_info",
   {
-    title: "Server info",
+    title: "Server info, limits, and operating manual",
     description:
-      `Version ${BUILD.version}: Report this server's version and build identity (git commit, build ` +
-      "time). `stale:true` = a newer build was deployed since this process " +
-      "started; reconnect the MCP to load it (stdio servers do not " +
-      "hot-reload); `latest_commit`/`latest_built_at` name it. `commit` gets " +
-      "a -dirty suffix for uncommitted builds.",
+      `Version ${BUILD.version}: Report this server's version/build identity, ` +
+      "every size cap and byte budget (`limits`), and the full operating " +
+      "manual (`manual`: routing, paging, poller, multi-session cursors). " +
+      "Call this once when caps or exact semantics matter. `stale:true` = a " +
+      "newer build was deployed since this process started; reconnect the " +
+      "MCP to load it (stdio servers do not hot-reload).",
     inputSchema: z.object({}).strict(),
   },
   async () => {
@@ -270,6 +338,8 @@ server.registerTool(
         stale: status.stale,
         latest_commit: status.latest_commit,
         latest_built_at: status.latest_built_at,
+        limits: LIMITS,
+        manual: MANUAL,
       });
     } catch (e) {
       return fail(asMessage(e));
@@ -714,12 +784,13 @@ server.registerTool(
       "`to` = agent_ids the message is directed at (mentions); `reply_to_seq` " +
       "tags an earlier message. Returns the assigned `seq` plus, per tagged " +
       "id, `recipients`: `status` (unknown = never joined, the tag reaches no " +
-      "one; left; idle; active), `idle_seconds`, and `last_read_seq` (below " +
-      "this seq = they have not read it yet). `crossed` counts messages from " +
-      "others YOU had not read at post time (`crossed_range`): if > 0, " +
-      "catch_up, contradicting messages may have landed while you wrote. " +
-      "`supersedes_seq` marks YOUR OWN earlier message as corrected (readers " +
-      "see `superseded_by` on it) instead of leaving both versions standing.",
+      "one; left; idle; active), `idle_seconds`, `last_read_seq` (below this " +
+      "seq = not read yet) and `marker_behind`; `delivery_warnings` appears " +
+      "when a tagged recipient looks unlikely to see this soon. `crossed` " +
+      "counts messages from others YOU had not read at post time " +
+      "(`crossed_range`): if > 0, catch_up, contradicting messages may have " +
+      "landed while you wrote. `supersedes_seq` marks YOUR OWN earlier " +
+      "message as corrected (readers see `superseded_by` on it).",
     inputSchema: z.object({
       // ONE bare z.custom for all three shapes, deliberately:
       // - NOT z.record / z.object().passthrough(): both rebuild the object by
@@ -808,8 +879,29 @@ server.registerTool(
         supersedes_seq ?? null,
         cursorId(),
       );
+      // Loud delivery: one human-readable line per tagged recipient unlikely
+      // to see this soon. A liveness heuristic (idle is not dead; a fresh
+      // post is always unread), so it warns only on the strong signals:
+      // never-joined, left, or idle past DELIVERY_STALL_SECONDS. Placed first
+      // in the response so it cannot be buried under recipients rows.
+      const delivery_warnings = recipients
+        .filter(
+          (r) =>
+            r.status === "unknown" ||
+            r.status === "left" ||
+            (r.status === "idle" &&
+              (r.idle_seconds ?? 0) >= DELIVERY_STALL_SECONDS),
+        )
+        .map((r) =>
+          r.status === "unknown"
+            ? `${r.id}: never joined this room; the tag reaches no one`
+            : r.status === "left"
+              ? `${r.id}: left this room; the message waits unread unless they return`
+              : `${r.id}: likely unreachable right now (idle ${fmtIdle(r.idle_seconds ?? 0)}, marker ${r.marker_behind} behind)`,
+        );
       return ok({
         seq,
+        ...(delivery_warnings.length > 0 ? { delivery_warnings } : {}),
         format: isText ? "text" : "json",
         to: mentions,
         reply_to_seq: reply_to_seq ?? null,
@@ -830,13 +922,25 @@ server.registerTool(
     title: "Catch up on new messages",
     description:
       "Return messages from OTHER agents posted since you last read (seq > your " +
-      "last_read marker), oldest first, and ADVANCE your read marker so the " +
-      "next call only returns what is new; `remaining` reports how many are " +
-      "still unread. Your own messages are never returned here (use " +
-      "read_history/search_messages to see them). This is THE room sync and it " +
-      "is unfiltered by design; to find what is directed at you across every " +
-      "room, use my_mentions (a cross-room inbox that never moves markers).",
+      "last_read marker), oldest first, and ADVANCE your read marker; " +
+      "`remaining` reports how many are still unread. Reads the ACTIVE room, " +
+      "or `room` names any joined room WITHOUT switching the active room. An " +
+      "empty read lists every other room holding unread " +
+      "(`rooms_with_unread`), so one call says where the traffic is. Your own " +
+      "messages are never returned here, and this sync is unfiltered by " +
+      "design; for what is directed at you across rooms use my_mentions (a " +
+      "peek that never moves markers).",
     inputSchema: z.object({
+      room: z
+        .string()
+        .min(1)
+        .max(500)
+        .optional()
+        .describe(
+          "Read a room you have JOINED (id or name) without changing the " +
+            "active room; its read marker still advances. Omitted: the " +
+            "active room.",
+        ),
       limit: z
         .number()
         .int()
@@ -875,7 +979,7 @@ server.registerTool(
         .describe("REMOVED in v0.6.0; my_mentions pages with after_id."),
     }).strict(),
   },
-  async ({ limit, preview_chars, max_bytes, mentions_me, after_seq }) => {
+  async ({ room, limit, preview_chars, max_bytes, mentions_me, after_seq }) => {
     try {
       touchSession();
       // Reject, never strip: a v0.5 caller sending mentions_me expected a
@@ -890,16 +994,61 @@ server.registerTool(
             "silently changing semantics.",
         );
       }
-      const { agentId, roomId } = requireActive();
+      let agentId: string;
+      let roomId: number;
+      let roomName: string | null;
+      let selector: string | null;
+      if (room !== undefined) {
+        // Cross-room read: the ACTIVE room and its cursor mode stay untouched.
+        // Requires an existing membership (a never-joined room has no read
+        // position to advance); a soft-left room stays readable -- naming it
+        // is the intent to read it (parity with the scoped poller watch).
+        if (session.agentId === null) {
+          return fail(
+            "join a room first with join_room to establish your identity",
+          );
+        }
+        agentId = session.agentId;
+        const target = store.resolveRoom(room);
+        if (!target) {
+          return fail(`no room "${room}". Use list_rooms to see options.`);
+        }
+        if (!store.getMembership(target.id, agentId)) {
+          return fail(
+            `you have never joined room "${target.name}", so there is no read position to advance; join_room it first`,
+          );
+        }
+        roomId = target.id;
+        roomName = target.name;
+        // Cursor selector for the TARGET room. cursorId() answers only for
+        // the active room, so it must not be used here.
+        selector = session.privateRooms.has(privKey(target.id, agentId))
+          ? SESSION_NONCE
+          : null;
+      } else {
+        ({ agentId, roomId } = requireActive());
+        roomName = store.getRoom(roomId)?.name ?? null;
+        selector = cursorId();
+      }
       const result = store.catchUp(
         roomId,
         agentId,
         limit ?? 50,
         preview_chars,
         max_bytes,
-        cursorId(),
+        selector,
+        // rooms_with_unread on an empty read; the RAW nonce, my_mentions
+        // style, so every room baselines off its own cursor mode.
+        { sessionId: SESSION_NONCE },
       );
-      return ok(result);
+      // Identity fields ride on EVERY response so the caller always knows
+      // which room (under which identity) this call consumed.
+      return ok({
+        agent_id: agentId,
+        room_id: roomId,
+        room_name: roomName,
+        ...result,
+      });
     } catch (e) {
       return fail(asMessage(e));
     }
@@ -983,6 +1132,38 @@ server.registerTool(
 );
 
 server.registerTool(
+  "pending_work",
+  {
+    title: "Pending directed work (all agents)",
+    description:
+      "Cross-agent view: which PRESENT agents have unread messages directed " +
+      "at them (mentions or replies), one row per agent+room, oldest pending " +
+      "first with `oldest_seq`/`oldest_unix` and per-room `idle_seconds`. " +
+      "For a supervisor deciding whom to wake or nudge; my_mentions answers " +
+      "this only for yourself. Read markers are identity-level, so a lagging " +
+      "private session can be further behind than shown.",
+    inputSchema: z.object({
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .max(500)
+        .optional()
+        .describe("Max rows to return (default 50)"),
+    }).strict(),
+  },
+  async ({ limit }) => {
+    try {
+      touchSession();
+      const { pending, truncated } = store.pendingDirected(limit ?? 50);
+      return ok({ pending, ...(truncated ? { truncated: true } : {}) });
+    } catch (e) {
+      return fail(asMessage(e));
+    }
+  },
+);
+
+server.registerTool(
   "wait_for_messages",
   {
     title: "Wait for new messages (background poller)",
@@ -1012,10 +1193,27 @@ server.registerTool(
           .boolean()
           .optional()
           .describe("Fire only when a message mentions you or replies to you"),
+        timeout: z
+          .number()
+          .int()
+          .min(0)
+          .max(1_000_000_000)
+          .optional()
+          .describe(
+            "Poller gives up (exit 124) after this many seconds with " +
+              "nothing new; 0 = never (default 1200)",
+          ),
+        interval: z
+          .number()
+          .int()
+          .min(1)
+          .max(3600)
+          .optional()
+          .describe("Seconds between probes (default 5)"),
       })
       .strict(),
   },
-  async ({ room, mentions_only }) => {
+  async ({ room, mentions_only, timeout, interval }) => {
     try {
       touchSession();
       const agentId = session.agentId;
@@ -1070,6 +1268,8 @@ server.registerTool(
         mentionsOnly: mentions_only,
         since: sinceArg,
         session: SESSION_NONCE,
+        timeoutSec: timeout,
+        intervalSec: interval,
       });
       return ok({
         command,
@@ -1081,15 +1281,13 @@ server.registerTool(
           "rather than relaunching the SAME command: a private-cursor watch " +
           "bakes a point-in-time --since baseline into it (baselined:true), so " +
           "the stale command re-fires forever on messages you have since read. " +
-          "On exit 0, an unscoped watch does " +
-          "NOT tell you WHICH room fired: use my_mentions (the cross-room " +
-          "inbox) or catch_up in each joined room -- a plain catch_up only " +
-          "reads your ACTIVE room, which may not be the one that woke the " +
-          "poller. A --room-scoped watch fires only for that room, but a plain " +
-          "catch_up still reads your ACTIVE room, so join_room the watched room " +
-          "first (or use my_mentions) to read what woke it.",
+          "On exit 0 the status line's rooms_with_updates names the rooms that " +
+          "fired; read each with catch_up({room: <id|name>}), which does not " +
+          "require switching your active room. The poller's exit is an " +
+          "OS-level signal only: whether it wakes YOU depends on your " +
+          "harness's background-task contract.",
         exit_codes: {
-          "0": "new messages -> my_mentions or catch_up the right room",
+          "0": "new messages -> catch_up({room}) each room in rooms_with_updates",
           "124": "timed out, nothing new",
           "2": "error",
         },
@@ -1597,6 +1795,21 @@ function assignReadableId(
 
 function dedupe(xs: string[]): string[] {
   return [...new Set(xs)];
+}
+
+/** Idle threshold for a delivery warning: past this, a tagged recipient is
+ *  flagged as likely unreachable. Chosen well past the 5-minute `active`
+ *  window so routine between-turn idling does not spam warnings. */
+const DELIVERY_STALL_SECONDS = 1800;
+
+/** Human-readable idle duration for delivery warnings ("2h05m", "45m", "90s"). */
+function fmtIdle(seconds: number): string {
+  const s = Math.max(0, Math.floor(seconds));
+  if (s < 120) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  const h = Math.floor(m / 60);
+  return `${h}h${String(m % 60).padStart(2, "0")}m`;
 }
 
 function asMessage(e: unknown): string {

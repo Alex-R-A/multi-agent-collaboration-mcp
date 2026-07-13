@@ -55,12 +55,38 @@ interval=5
 timeout=1200   # 20 minutes; quit even if no updates so a background task never hangs
 probe_args=()
 
+usage() {
+  cat <<'EOF'
+wait-for-updates.sh: block until there is something new for an agent, then exit.
+Run as a BACKGROUND task; its exit is the notification.
+
+Usage:
+  wait-for-updates.sh --agent <agent_id> [options]           # ALL your rooms
+  wait-for-updates.sh --room <id|name> --agent <agent_id>    # one room
+
+Options:
+  --agent <agent_id>   your identity (required unless --room + --since)
+  --room <id|name>     scope the watch to one room
+  --mentions-only      fire only on messages that tag --agent or reply to it
+  --since <seq>        baseline seq instead of the read marker (requires --room)
+  --session <nonce>    session-aware all-rooms watch (poller_cmd bakes it in)
+  --interval <sec>     poll interval (default 5)
+  --timeout <sec>      give up after this many seconds (default 1200; 0 = never)
+  --help, -h           print this and exit 0
+
+Exit codes: 0 = updates (JSON status printed; rooms_with_updates names the
+rooms), 124 = timed out with nothing new, 2 = error, 143 = SIGTERM. See the
+script header for scope and signal details.
+EOF
+}
+
 need_value() {  # $1 = flag name; ensures a value follows before we read $2
   [[ $# -ge 2 ]] || { echo "wait-for-updates: $1 needs a value" >&2; exit 2; }
 }
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --help|-h)  usage; exit 0 ;;
     --interval) need_value "$@"; interval="$2"; shift 2 ;;
     --timeout)  need_value "$@"; timeout="$2";  shift 2 ;;
     --interval=*) interval="${1#*=}"; shift ;;

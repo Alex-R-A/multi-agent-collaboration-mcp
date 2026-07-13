@@ -251,6 +251,10 @@ export type RecipientStatus = {
   present: boolean;
   idle_seconds: number | null;
   last_read_seq: number | null;
+  /** Room messages already past this recipient's read marker (0 = fully
+   *  caught up). Computed at call time; the poster's own message is not yet
+   *  inserted when post_message asks, so it is excluded. null for unknown. */
+  marker_behind: number | null;
 };
 
 export type ReplyRef = {
@@ -1985,6 +1989,14 @@ export class ChatStore {
   ): RecipientStatus[] {
     if (ids.length === 0) return [];
     const placeholders = ids.map(() => "?").join(",");
+    // marker_behind baseline. Read alongside the rows without a transaction:
+    // this is a liveness heuristic, not an invariant, and the method already
+    // runs autocommit.
+    const { latest } = this.db
+      .prepare(
+        "SELECT COALESCE(MAX(seq), 0) AS latest FROM messages WHERE room_id = ?",
+      )
+      .get(roomId) as { latest: number };
     const rows = this.db
       .prepare(
         `SELECT agent_id, last_read_seq, left_at,
@@ -2009,6 +2021,7 @@ export class ChatStore {
           present: false,
           idle_seconds: null,
           last_read_seq: null,
+          marker_behind: null,
         };
       }
       const present = r.left_at === null;
@@ -2020,8 +2033,69 @@ export class ChatStore {
         present,
         idle_seconds: r.idle_seconds,
         last_read_seq: r.last_read_seq,
+        marker_behind: Math.max(0, latest - r.last_read_seq),
       };
     });
+  }
+
+  /**
+   * Cross-agent pending-work view: for every PRESENT membership, the unread
+   * messages from others directed at that member (mentions, or replies to its
+   * messages), one row per (agent, room), oldest pending first (the most
+   * starved recipient leads). This is the read a supervisor polls to decide
+   * whom to wake; my_mentions is self-scoped and cannot answer it. Markers
+   * are identity-level (a lagging private session's cursor is invisible
+   * cross-agent, so an agent can be further behind than reported), and
+   * idle_seconds is per room membership, matching list_agents. The directed
+   * predicate is inlined rather than directedAt(): that helper binds one
+   * FIXED id, and here the id varies per membership row. Fetches limit+1 to
+   * report truncation without a tail COUNT. Read-only.
+   */
+  pendingDirected(limit = 50): {
+    pending: {
+      agent_id: string;
+      room_id: number;
+      room_name: string;
+      directed_unread: number;
+      oldest_seq: number;
+      oldest_unix: number;
+      idle_seconds: number | null;
+      last_read_seq: number;
+    }[];
+    truncated: boolean;
+  } {
+    const lim = Math.max(1, Math.floor(limit));
+    const rows = this.db
+      .prepare(
+        `SELECT mb.agent_id AS agent_id, mb.room_id AS room_id, r.name AS room_name,
+                COUNT(*) AS directed_unread,
+                MIN(g.seq) AS oldest_seq,
+                MIN(CAST(strftime('%s', g.created_at) AS INTEGER)) AS oldest_unix,
+                (strftime('%s','now') - strftime('%s', mb.last_seen)) AS idle_seconds,
+                mb.last_read_seq AS last_read_seq
+         FROM messages g
+         JOIN memberships mb ON mb.room_id = g.room_id AND mb.left_at IS NULL
+         JOIN rooms r ON r.id = g.room_id
+         WHERE g.seq > mb.last_read_seq
+           AND g.agent_id != mb.agent_id
+           AND (EXISTS (SELECT 1 FROM json_each(g.mentions) WHERE value = mb.agent_id)
+                OR IFNULL(g.reply_to_agent = mb.agent_id, 0))
+         GROUP BY mb.agent_id, mb.room_id
+         ORDER BY oldest_unix ASC, mb.agent_id ASC
+         LIMIT ?`,
+      )
+      .all(lim + 1) as {
+      agent_id: string;
+      room_id: number;
+      room_name: string;
+      directed_unread: number;
+      oldest_seq: number;
+      oldest_unix: number;
+      idle_seconds: number | null;
+      last_read_seq: number;
+    }[];
+    const truncated = rows.length > lim;
+    return { pending: truncated ? rows.slice(0, lim) : rows, truncated };
   }
 
   /** Fetch one raw message row (author + reply preview joined), body capped
@@ -2178,11 +2252,86 @@ export class ChatStore {
   }
 
   /**
+   * Bounded per-room unread summary for one agent: every room the agent is
+   * present in (rooms this session soft-left are muted) holding unread
+   * messages from others, with total `unread` and `directed` (aimed at the
+   * agent) counts, most-directed first. Feeds both my_mentions' by_room arm
+   * and catch_up's rooms_with_unread disclosure on an empty read. Session
+   * awareness matches my_mentions: with a sessionId, each room baselines off
+   * that session's OWN private cursor where one exists (COALESCE to the
+   * identity marker). excludeRoomId drops the room just read (catch_up's
+   * summary lists OTHER rooms). Fetches limit+1 to report truncation without
+   * a tail COUNT. Read-only, so it is safe inside deferred and immediate
+   * transactions alike.
+   */
+  unreadByRoom(
+    agentId: string,
+    sessionId: string | null,
+    limit: number,
+    excludeRoomId?: number,
+  ): {
+    rooms: { room_id: number; name: string; unread: number; directed: number }[];
+    truncated: boolean;
+  } {
+    // '' never collides with a real session id (same convention as myMentions).
+    const sessionKey = sessionId ?? "";
+    const lim = Math.max(1, Math.floor(limit));
+    const excl = excludeRoomId !== undefined ? " AND g.room_id != ?" : "";
+    // Placeholders in SQL text order: the directedAt pair (SELECT), the
+    // membership join, the session-marker key, the author exclusion, the
+    // presence key, the optional room exclusion, then the LIMIT.
+    const params: (string | number)[] = [
+      agentId,
+      agentId,
+      agentId,
+      sessionKey,
+      agentId,
+      sessionKey,
+    ];
+    if (excludeRoomId !== undefined) params.push(excludeRoomId);
+    params.push(lim + 1);
+    const rows = this.db
+      .prepare(
+        `SELECT g.room_id AS room_id, r.name AS name, COUNT(*) AS unread,
+                SUM(CASE WHEN ${directedAt("g")} THEN 1 ELSE 0 END) AS directed
+         FROM messages g
+         JOIN memberships mb ON mb.room_id = g.room_id
+              AND mb.agent_id = ? AND mb.left_at IS NULL
+         LEFT JOIN session_markers sm ON sm.room_id = g.room_id
+              AND sm.agent_id = mb.agent_id AND sm.session_id = ?
+         JOIN rooms r ON r.id = g.room_id
+         WHERE g.seq > COALESCE(sm.last_read_seq, mb.last_read_seq)
+           AND g.agent_id != ?
+           AND NOT EXISTS (SELECT 1 FROM session_presence sp
+                           WHERE sp.room_id = g.room_id AND sp.agent_id = mb.agent_id
+                             AND sp.session_id = ? AND sp.left_at IS NOT NULL)${excl}
+         GROUP BY g.room_id, r.name
+         ORDER BY directed DESC, unread DESC, g.room_id ASC
+         LIMIT ?`,
+      )
+      .all(...params) as {
+      room_id: number;
+      name: string;
+      unread: number;
+      directed: number;
+    }[];
+    const truncated = rows.length > lim;
+    return { rooms: truncated ? rows.slice(0, lim) : rows, truncated };
+  }
+
+  /**
    * Unread messages (seq > last_read_seq), oldest first; ADVANCES the read
    * marker over exactly the rows returned. Mention filtering deliberately does
    * NOT exist here: a filtered view of one room's stream gets mistaken for a
    * room sync (an agent concludes "quiet" while broadcasts sit unread). The
    * mentions inbox is myMentions: cross-room and never marker-advancing.
+   *
+   * unreadSummary (its sessionId is the RAW process nonce, my_mentions-style,
+   * not this room's cursor selector): on an EMPTY read, include a bounded
+   * rooms_with_unread summary of every OTHER room holding unread, computed in
+   * the SAME snapshot as the empty determination -- across two separate
+   * queries a message arriving in this room could make the read report
+   * "empty" while the summary lists this very room.
    */
   catchUp(
     roomId: number,
@@ -2191,12 +2340,20 @@ export class ChatStore {
     previewChars?: number,
     maxBytes: number = DEFAULT_MAX_BYTES,
     sessionId: string | null = null,
+    unreadSummary: { sessionId: string | null } | null = null,
   ): {
     messages: MessageRow[];
     new_last_read_seq: number;
     remaining: number;
     advanced: boolean;
     byte_limited?: boolean;
+    rooms_with_unread?: {
+      room_id: number;
+      name: string;
+      unread: number;
+      directed: number;
+    }[];
+    rooms_with_unread_truncated?: boolean;
   } {
     // Advancing path: read the cursor, fetch, and advance inside one IMMEDIATE
     // transaction so a concurrent same-identity call serializes behind it and
@@ -2231,6 +2388,19 @@ export class ChatStore {
       if (lastSeq > from) {
         this.setCursor(roomId, agentId, sessionId, lastSeq);
       }
+      // Empty read: same-snapshot disclosure of where the traffic actually
+      // is. Emitted even when no other room has unread ([]): that positively
+      // answers "is anything anywhere?", the question an empty read raises.
+      const UNREAD_SUMMARY_MAX = 20;
+      const summary =
+        unreadSummary !== null && messages.length === 0
+          ? this.unreadByRoom(
+              agentId,
+              unreadSummary.sessionId,
+              UNREAD_SUMMARY_MAX,
+              roomId,
+            )
+          : null;
       return {
         messages,
         new_last_read_seq: lastSeq,
@@ -2240,6 +2410,8 @@ export class ChatStore {
         // it that a preview/JSON shrink could otherwise hide. `remaining` is the
         // authoritative "more unread" count here, but keep byte_limited honest.
         ...(byteLimited || !exhausted ? { byte_limited: true } : {}),
+        ...(summary !== null ? { rooms_with_unread: summary.rooms } : {}),
+        ...(summary?.truncated ? { rooms_with_unread_truncated: true } : {}),
       };
     });
     return tx.immediate();
@@ -2346,38 +2518,14 @@ export class ChatStore {
       const total_directed = td;
 
       // by_room: fetch only the TOP rooms by directed count in SQL (bounded
-      // memory), most-directed first, then trim to the byte budget. Same
-      // session-aware muting. Placeholders: the directedAt pair (SELECT), the
-      // membership join, the session-marker key, the author exclusion, the
-      // presence key, then the LIMIT.
+      // memory), most-directed first, then trim to the byte budget. The query
+      // lives in unreadByRoom (shared with catch_up's rooms_with_unread) and
+      // carries the same session-aware muting and cursor baselines.
       const BY_ROOM_MAX = 4000;
-      let byRoom = this.db
-        .prepare(
-          `SELECT g.room_id AS room_id, r.name AS name, COUNT(*) AS unread,
-                  SUM(CASE WHEN ${directedAt("g")} THEN 1 ELSE 0 END) AS directed
-           FROM messages g
-           JOIN memberships mb ON mb.room_id = g.room_id
-                AND mb.agent_id = ? AND mb.left_at IS NULL
-           LEFT JOIN session_markers sm ON sm.room_id = g.room_id
-                AND sm.agent_id = mb.agent_id AND sm.session_id = ?
-           JOIN rooms r ON r.id = g.room_id
-           WHERE g.seq > COALESCE(sm.last_read_seq, mb.last_read_seq)
-             AND g.agent_id != ?
-             AND NOT EXISTS (SELECT 1 FROM session_presence sp
-                             WHERE sp.room_id = g.room_id AND sp.agent_id = mb.agent_id
-                               AND sp.session_id = ? AND sp.left_at IS NOT NULL)
-           GROUP BY g.room_id, r.name
-           ORDER BY directed DESC, unread DESC, g.room_id ASC
-           LIMIT ?`,
-        )
-        .all(agentId, agentId, agentId, sessionKey, agentId, sessionKey, BY_ROOM_MAX) as {
-        room_id: number;
-        name: string;
-        unread: number;
-        directed: number;
-      }[];
-      // Rooms past BY_ROOM_MAX (the least-directed) are dropped -- flag it.
-      const roomLimitHit = byRoom.length >= BY_ROOM_MAX;
+      const byRoomFetch = this.unreadByRoom(agentId, sessionId, BY_ROOM_MAX);
+      let byRoom = byRoomFetch.rooms;
+      // Rooms past BY_ROOM_MAX (the least-directed) were dropped -- flag it.
+      const roomLimitHit = byRoomFetch.truncated;
       const roomBudget = Math.floor(maxBytes / 3);
       // Trim off the end (least-directed rooms, already SQL-ordered) with the
       // LINEAR fitRows, not an O(n^2) re-serialize-per-pop loop. It always keeps
