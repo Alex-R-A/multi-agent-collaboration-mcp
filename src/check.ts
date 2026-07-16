@@ -5,7 +5,8 @@
 // to scope to one room (with an optional --since seq baseline; seqs are
 // per-room, so --since requires --room).
 // Exit 0 = updates exist, 1 = none yet, 2 = error. Prints a JSON status line.
-// Used by scripts/wait-for-updates.sh to poll without touching read markers.
+// Diagnostic one-shot. The background watcher is src/poller.ts and keeps one
+// connection instead of launching this process on every interval.
 //
 // The bare --agent baseline is the IDENTITY-level marker
 // (memberships.last_read_seq, the MAX across that identity's sessions), which
@@ -27,6 +28,7 @@ type Args = {
   db?: string;
   session?: string;
   mentionsOnly: boolean;
+  wakeOnly: boolean;
 };
 
 function fail(msg: string): never {
@@ -47,11 +49,12 @@ Flags:
   --mentions-only     count only messages that mention --agent or reply to it
   --help, -h          print this and exit 0
 Exit codes: 0 = updates exist (JSON status on stdout; rooms_with_updates names
-the rooms on the all-rooms path), 1 = nothing new, 2 = error.
+up to 20 firing rooms on the all-rooms path and
+rooms_with_updates_truncated:true means more fired), 1 = nothing new, 2 = error.
 `;
 
 function parseArgs(argv: string[]): Args {
-  const out: Args = { mentionsOnly: false };
+  const out: Args = { mentionsOnly: false, wakeOnly: false };
   for (let i = 0; i < argv.length; i++) {
     // Accept both `--flag value` and `--flag=value` (the wrapper script
     // accepts the = form for its own flags, so the probe must not reject it).
@@ -77,6 +80,12 @@ function parseArgs(argv: string[]): Args {
     if (a === "--mentions-only") {
       if (inline !== undefined) fail("--mentions-only takes no value");
       out.mentionsOnly = true;
+    } else if (a === "--wake-only") {
+      // Internal poller mode: on a quiet cycle, answer via indexed EXISTS and
+      // skip exact counts that no caller will see. Kept out of --help because
+      // direct one-shot users should retain the full status object.
+      if (inline !== undefined) fail("--wake-only takes no value");
+      out.wakeOnly = true;
     } else if (a === "--room") {
       out.room = take(a);
     } else if (a === "--agent") {
@@ -194,6 +203,31 @@ try {
           )
           .get(agent) as { n: number };
         if (rooms === 0) return null;
+        if (args.wakeOnly) {
+          const candidateClause = args.mentionsOnly
+            ? ` AND (g.mentions IS NOT NULL OR g.reply_to_agent IS NOT NULL)
+                AND ${directedAt("g")}`
+            : "";
+          const hit = db
+            .prepare(
+              `SELECT 1 FROM messages g
+               JOIN memberships mb ON mb.room_id = g.room_id
+                    AND mb.agent_id = ? AND mb.left_at IS NULL${smJoin}
+               WHERE g.seq > ${baseline} AND g.agent_id != ?
+                 ${candidateClause}${sessClause}
+               LIMIT 1`,
+            )
+            .get(
+              ...(sess
+                ? args.mentionsOnly
+                  ? [agent, sess, agent, agent, agent, sess]
+                  : [agent, sess, agent, sess]
+                : args.mentionsOnly
+                  ? [agent, agent, agent, agent]
+                  : [agent, agent]),
+            );
+          if (!hit) return { rooms, wakeOnlyQuiet: true as const };
+        }
         const { c: unread } = db
           .prepare(
             `SELECT COUNT(*) AS c FROM messages g
@@ -208,6 +242,7 @@ try {
              JOIN memberships mb ON mb.room_id = g.room_id
                   AND mb.agent_id = ? AND mb.left_at IS NULL${smJoin}
              WHERE g.seq > ${baseline} AND g.agent_id != ?
+               AND (g.mentions IS NOT NULL OR g.reply_to_agent IS NOT NULL)
                AND ${directedAt("g")}${sessClause}`,
           )
           .get(
@@ -224,8 +259,15 @@ try {
         let roomsWithUpdates:
           | { room_id: number; name: string; unread: number; directed: number }[]
           | null = null;
+        let roomsWithUpdatesTruncated = false;
         if (args.mentionsOnly ? unreadMentions > 0 : unread > 0) {
-          roomsWithUpdates = db
+          const mentionsHaving = args.mentionsOnly
+            ? " HAVING directed > 0"
+            : "";
+          const candidateClause = args.mentionsOnly
+            ? " AND (g.mentions IS NOT NULL OR g.reply_to_agent IS NOT NULL)"
+            : "";
+          const grouped = db
             .prepare(
               `SELECT g.room_id AS room_id, r.name AS name, COUNT(*) AS unread,
                       SUM(CASE WHEN ${directedAt("g")} THEN 1 ELSE 0 END) AS directed
@@ -233,28 +275,63 @@ try {
                JOIN memberships mb ON mb.room_id = g.room_id
                     AND mb.agent_id = ? AND mb.left_at IS NULL${smJoin}
                JOIN rooms r ON r.id = g.room_id
-               WHERE g.seq > ${baseline} AND g.agent_id != ?${sessClause}
+               WHERE g.seq > ${baseline} AND g.agent_id != ?${candidateClause}${sessClause}
                GROUP BY g.room_id, r.name
+               ${mentionsHaving}
                ORDER BY directed DESC, unread DESC, g.room_id ASC
-               LIMIT 20`,
+               LIMIT 21`,
             )
             .all(
               ...(sess
                 ? [agent, agent, agent, sess, agent, sess]
                 : [agent, agent, agent, agent]),
             ) as { room_id: number; name: string; unread: number; directed: number }[];
+          // The summary drives which rooms callers read next. Silently
+          // dropping its tail made firing rooms look quiet; in mentions-only
+          // mode, broadcast-only groups did not fire and must not appear.
+          roomsWithUpdatesTruncated = grouped.length > 20;
+          roomsWithUpdates = roomsWithUpdatesTruncated
+            ? grouped.slice(0, 20)
+            : grouped;
         }
-        return { rooms, unread, unreadMentions, roomsWithUpdates };
+        return {
+          rooms,
+          unread,
+          unreadMentions,
+          roomsWithUpdates,
+          roomsWithUpdatesTruncated,
+        };
       })
       .deferred();
     if (counts === null) fail(`agent "${agent}" is not a member of any room`);
-    const { rooms, unread, unreadMentions, roomsWithUpdates } = counts as {
+    if ("wakeOnlyQuiet" in counts && counts.wakeOnlyQuiet) {
+      db.close();
+      process.stdout.write(
+        JSON.stringify({
+          agent,
+          rooms: counts.rooms,
+          ...(args.mentionsOnly ? { unread_count_skipped: true } : { unread: 0 }),
+          unread_mentions: 0,
+          mentions_only: args.mentionsOnly,
+          has_updates: false,
+        }) + "\n",
+      );
+      process.exit(1);
+    }
+    const {
+      rooms,
+      unread,
+      unreadMentions,
+      roomsWithUpdates,
+      roomsWithUpdatesTruncated,
+    } = counts as {
       rooms: number;
       unread: number;
       unreadMentions: number;
       roomsWithUpdates:
         | { room_id: number; name: string; unread: number; directed: number }[]
         | null;
+      roomsWithUpdatesTruncated: boolean;
     };
     db.close();
     const hasUpdates = args.mentionsOnly ? unreadMentions > 0 : unread > 0;
@@ -268,6 +345,9 @@ try {
         has_updates: hasUpdates,
         ...(roomsWithUpdates !== null
           ? { rooms_with_updates: roomsWithUpdates }
+          : {}),
+        ...(roomsWithUpdatesTruncated
+          ? { rooms_with_updates_truncated: true }
           : {}),
       }) + "\n",
     );
@@ -310,6 +390,29 @@ try {
         baseline = m.last_read_seq;
       }
 
+      if (args.wakeOnly) {
+        const authorClause = args.agent ? " AND agent_id != ?" : "";
+        const directedClause = args.mentionsOnly
+          ? ` AND (mentions IS NOT NULL OR reply_to_agent IS NOT NULL)
+              AND ${directedAt("messages")}`
+          : "";
+        const hit = db
+          .prepare(
+            `SELECT 1 FROM messages
+             WHERE room_id = ? AND seq > ?${authorClause}${directedClause}
+             LIMIT 1`,
+          )
+          .get(
+            roomId,
+            baseline,
+            ...(args.agent ? [args.agent] : []),
+            ...(args.mentionsOnly && args.agent
+              ? [args.agent, args.agent]
+              : []),
+          );
+        if (!hit) return { baseline, wakeOnlyQuiet: true as const };
+      }
+
       // Exclude the agent's own messages: posting should not make you "have updates".
       const unread = (
         args.agent
@@ -332,6 +435,7 @@ try {
             .prepare(
               `SELECT COUNT(*) AS c FROM messages
                WHERE room_id = ? AND seq > ? AND agent_id != ?
+                 AND (mentions IS NOT NULL OR reply_to_agent IS NOT NULL)
                  AND ${directedAt("messages")}`,
             )
             .get(roomId, baseline, args.agent, args.agent, args.agent) as { c: number }
@@ -352,6 +456,21 @@ try {
     fail(
       `agent "${args.agent}" is not a member of room ${roomId}; join first or pass --since`,
     );
+  }
+  if ("wakeOnlyQuiet" in snap && snap.wakeOnlyQuiet) {
+    db.close();
+    process.stdout.write(
+      JSON.stringify({
+        room_id: roomId,
+        agent: args.agent ?? null,
+        baseline_seq: snap.baseline,
+        ...(args.mentionsOnly ? { unread_count_skipped: true } : { unread: 0 }),
+        unread_mentions: 0,
+        mentions_only: args.mentionsOnly,
+        has_updates: false,
+      }) + "\n",
+    );
+    process.exit(1);
   }
   const { baseline, unread, unreadMentions, latest } = snap as {
     baseline: number;

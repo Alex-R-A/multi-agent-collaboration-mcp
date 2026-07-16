@@ -28,7 +28,9 @@ const DB = join(dir, "web.db");
   s.upsertAgent("bot", "claude", null, null);
   s.joinRoom(1, "bot");
   s.postMessage(1, "bot", "first", "text", null, null);
-  s.postMessage(1, "bot", "second", "text", null, null);
+  s.postMessage(1, "bot", "second", "text", null, null, null, null, {
+    priority: true,
+  });
   s.close();
 }
 
@@ -37,18 +39,25 @@ const child = spawn("node", [join(ROOT, "web", "server.mjs")], {
   stdio: ["ignore", "pipe", "inherit"],
 });
 
-const port = await new Promise((resolve, reject) => {
-  const t = setTimeout(() => reject(new Error("server did not start")), 10_000);
-  let out = "";
-  child.stdout.on("data", (d) => {
-    out += d;
-    const m = out.match(/http:\/\/127\.0\.0\.1:(\d+)/);
-    if (m) {
-      clearTimeout(t);
-      resolve(Number(m[1]));
-    }
+let port;
+try {
+  port = await new Promise((resolve, reject) => {
+    const t = setTimeout(() => reject(new Error("server did not start")), 10_000);
+    let out = "";
+    child.stdout.on("data", (d) => {
+      out += d;
+      const m = out.match(/http:\/\/127\.0\.0\.1:(\d+)/);
+      if (m) {
+        clearTimeout(t);
+        resolve(Number(m[1]));
+      }
+    });
   });
-});
+} catch (error) {
+  child.kill("SIGKILL");
+  rmSync(dir, { recursive: true, force: true });
+  throw error;
+}
 const base = `http://127.0.0.1:${port}`;
 check(
   "PORT=0 bound a real ephemeral port (printed URL is usable, not :0)",
@@ -81,6 +90,27 @@ try {
   // post with reply + mention
   const p = await post("/api/post", { room: 1, name: "alex", body: "hello @bot from the web", reply_to_seq: 1 });
   check("post succeeds with seq 3", p.status === 200 && p.data.seq === 3, p);
+  {
+    const s = new ChatStore(DB);
+    check(
+      "web post does not normalize across the two unseen bot messages",
+      s.getMembership(1, "alex").last_read_seq === 0,
+      s.getMembership(1, "alex"),
+    );
+    s.close();
+  }
+
+  // Recurring room metadata omits exact history counts, and displaced-room
+  // deletion checks use a one-row existence endpoint.
+  const roomsMeta = await (await fetch(`${base}/api/rooms`)).json();
+  const roomMeta = await (await fetch(`${base}/api/room?id=1`)).json();
+  const roomExists = await (await fetch(`${base}/api/room-exists?id=1`)).json();
+  check(
+    "room metadata avoids exact message/total recounts",
+    !Object.hasOwn(roomsMeta, "total") && !Object.hasOwn(roomMeta.room, "messages") &&
+      roomExists.exists === true,
+    { roomsMeta, room: roomMeta.room, roomExists },
+  );
 
   // reply to a nonexistent message rejected
   const dangling = await post("/api/post", { room: 1, name: "alex", body: "x", reply_to_seq: 999 });
@@ -102,6 +132,12 @@ try {
     msg && msg.from === "alex" && msg.type === "human" &&
       Array.isArray(msg.mentions) && msg.mentions[0] === "bot" && msg.reply_to_seq === 1,
     msg,
+  );
+  check(
+    "web message API exposes MCP priority as a boolean",
+    list.messages.find((m) => m.seq === 2)?.priority === true &&
+      msg.priority === false,
+    list.messages.slice(0, 3),
   );
 
   // read marker: monotonic
@@ -141,6 +177,15 @@ try {
     Array.isArray(tail.messages[0].mentions) && tail.messages[0].mentions[0] === "bot",
     tail.messages[0],
   );
+  {
+    const s = new ChatStore(DB);
+    check(
+      "web own-only posts advance the durable baseline",
+      s.getMembership(1, "alex").last_read_seq === punct.data.seq,
+      s.getMembership(1, "alex"),
+    );
+    s.close();
+  }
 
   // a JSON `null` body is a 400 validation error, not a 500
   const nul = await fetch(base + "/api/post", {
@@ -221,6 +266,28 @@ try {
   // full room deletion cascades to every related table
   {
     const s = new ChatStore(DB);
+    const rid = s.createRoom("waiting-doomed", null, null).id;
+    s.upsertAgent("waiter", null, null, null);
+    s.joinRoom(rid, "waiter", null, "WAIT-PRESENCE");
+    s.beginWaitLease(rid, "waiter", "WAIT-CALL", 300);
+    s.close();
+
+    const del = await post("/api/delete-room", { room: rid, confirm: true });
+    const raw = new Database(DB);
+    const remains = {
+      room: raw.prepare("SELECT COUNT(*) AS c FROM rooms WHERE id = ?").get(rid).c,
+      leases: raw.prepare("SELECT COUNT(*) AS c FROM wait_leases WHERE room_id = ?").get(rid).c,
+    };
+    raw.close();
+    check(
+      "delete-room clears wait leases before deleting the room",
+      del.status === 200 && Object.values(remains).every((v) => v === 0),
+      { del, remains },
+    );
+  }
+
+  {
+    const s = new ChatStore(DB);
     const rid = s.createRoom("doomed", null, null).id;
     s.upsertAgent("ghost", null, null, null);
     s.joinRoom(rid, "ghost", "SX"); // membership + session marker
@@ -256,8 +323,43 @@ try {
     check("float limit is handled, not a 500", floaty.status === 200, floaty.status);
     const coerced = await post("/api/join", { room: true, name: "coerce" });
     check("room:true is rejected (no Number() coercion)", coerced.status === 400, coerced);
+    const unsafeRoom = await post("/api/join", {
+      room: Number.MAX_SAFE_INTEGER + 1,
+      name: "unsafe-room",
+    });
+    check(
+      "unsafe integer room ids are rejected instead of rounded",
+      unsafeRoom.status === 400 && /safe integer/.test(unsafeRoom.data.error),
+      unsafeRoom,
+    );
+    const unsafeRoomGet = await fetch(
+      `${base}/api/room?id=${Number.MAX_SAFE_INTEGER + 1}`,
+    );
+    check(
+      "unsafe integer room ids are rejected on read endpoints too",
+      unsafeRoomGet.status === 400,
+      unsafeRoomGet.status,
+    );
+    const unsafeAfter = await fetch(
+      `${base}/api/messages?room=1&after=${Number.MAX_SAFE_INTEGER + 1}`,
+    );
+    check(
+      "unsafe integer message cursors are rejected instead of rounded",
+      unsafeAfter.status === 400,
+      unsafeAfter.status,
+    );
     const nullSeq = await post("/api/read", { room: 1, name: "alex", seq: null });
     check("seq:null is rejected", nullSeq.status === 400, nullSeq);
+    const unsafeSeq = await post("/api/read", {
+      room: 1,
+      name: "alex",
+      seq: Number.MAX_SAFE_INTEGER + 1,
+    });
+    check(
+      "unsafe integer message seqs are rejected instead of rounded",
+      unsafeSeq.status === 400 && /safe integer/.test(unsafeSeq.data.error),
+      unsafeSeq,
+    );
     const big = await fetch(base + "/api/post", {
       method: "POST",
       headers: { "Content-Type": "application/json" },

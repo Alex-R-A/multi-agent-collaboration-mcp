@@ -53,6 +53,31 @@ const check = (n, c, x) => {
 // --- S2/S3/S6: CAS reject --------------------------------------------------------
 {
   const s = new ChatStore(":memory:");
+  const r = s.createRoom("cas-future-token", null, null).id;
+  s.upsertAgent("me", null, null, null);
+  s.upsertAgent("peer", null, null, null);
+  s.joinRoom(r, "me");
+  s.joinRoom(r, "peer");
+  s.postMessage(r, "peer", "unread context", "text", null, null); // cursor=0, seq=1
+  let aheadError = "";
+  try {
+    s.postMessage(r, "me", "must not post", "text", null, null, null, null, {
+      ifLastReadSeq: 1,
+    });
+  } catch (e) {
+    aheadError = String(e?.message ?? e);
+  }
+  check(
+    "S2 CAS rejects a token ahead of the effective read cursor",
+    /ahead of.*read (marker|cursor)/i.test(aheadError) &&
+      !s.readHistory(r, 10).messages.some((m) => m.content === "must not post"),
+    { aheadError, history: s.readHistory(r, 10).messages },
+  );
+  s.close();
+}
+
+{
+  const s = new ChatStore(":memory:");
   const r = s.createRoom("cas-room", null, null).id;
   s.upsertAgent("me", null, null, null);
   s.upsertAgent("peer", null, null, null);
@@ -272,6 +297,7 @@ await (async () => {
       p3rej.data.rejected === "stale_read" &&
       p3rej.data.crossed_messages.length === 1 &&
       p3rej.data.crossed_messages[0].directed === true &&
+      /call catch_up/.test(p3rej.data.retry) &&
       /re-send the SAME content/.test(p3rej.data.retry),
     p3rej.data,
   );
@@ -281,6 +307,18 @@ await (async () => {
     if_last_read_seq: reread.data.new_last_read_seq,
   });
   check("P3 retry with the fresh token posts", p3ok.data.posted === true, p3ok.data);
+
+  const beforeAhead = s.readHistory(rA, 100).messages.length;
+  const p3ahead = await call("post_message", {
+    content: "must not bypass with a future token",
+    if_last_read_seq: reread.data.new_last_read_seq + 1000,
+  });
+  check(
+    "P3 future CAS token fails without storing a post",
+    p3ahead.isError === true && /ahead of.*read (marker|cursor)/i.test(p3ahead.data.error) &&
+      s.readHistory(rA, 100).messages.length === beforeAhead,
+    { result: p3ahead.data, beforeAhead, after: s.readHistory(rA, 100).messages.length },
+  );
 
   // P4: back-compat accept shape.
   const p4 = await call("post_message", { content: "plain", to: ["peer"] });

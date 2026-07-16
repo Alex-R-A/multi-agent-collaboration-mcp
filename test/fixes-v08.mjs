@@ -7,7 +7,7 @@
 //      longer lingers present forever
 //  #2  my_mentions is session-aware: a session that left a room sees it muted
 //      even while a twin keeps the identity present
-//  #3  wait_for_messages flags baselined:true for a private-cursor --since watch
+//  #3  wait_for_messages uses a live --session cursor, never frozen --since
 import { ChatStore } from "../dist/db.js";
 import Database from "better-sqlite3";
 import { spawn } from "node:child_process";
@@ -106,7 +106,7 @@ const check = (n, c, x) => {
   s.close();
 }
 
-// --- #3: wait_for_messages flags baselined for a private scoped watch ---------
+// --- #3: wait_for_messages uses live session cursor for scoped watches --------
 await (async () => {
   const dir = mkdtempSync(join(tmpdir(), "v08-since-"));
   const DB = join(dir, "t.db");
@@ -124,12 +124,14 @@ await (async () => {
   await call("create_room", { name: "watch-room" });
   await call("join_room", { room: "watch-room", agent_id: "watcher", cursor: "private" });
   const wf = await call("wait_for_messages", { room: "watch-room" });
-  check("#3 private scoped watch flags baselined:true and emits --since",
-    wf.baselined === true && /--since /.test(wf.command), { baselined: wf.baselined, cmd: wf.command });
-  // A shared (default) watch is not baselined.
+  check("#3 private scoped watch is live-session based, never frozen --since",
+    wf.baselined === false && /--session /.test(wf.command) && !/--since /.test(wf.command),
+    { baselined: wf.baselined, cmd: wf.command });
+  // Shared mode uses the same restart-safe command; the watcher resolves the
+  // current shared/private marker on every probe.
   await call("join_room", { room: "watch-room", agent_id: "watcher", cursor: "shared" });
   const wf2 = await call("wait_for_messages", { room: "watch-room" });
-  check("#3 shared scoped watch is NOT baselined", wf2.baselined === false && !/--since /.test(wf2.command), { baselined: wf2.baselined, cmd: wf2.command });
+  check("#3 shared scoped watch is also live-session based", wf2.baselined === false && /--session /.test(wf2.command) && !/--since /.test(wf2.command), { baselined: wf2.baselined, cmd: wf2.command });
   child.kill();
   rmSync(dir, { recursive: true, force: true });
 })();

@@ -25,6 +25,10 @@ function resolveDbPath(): string {
 
 /** SQLite's default maximum string/blob byte length (SQLITE_MAX_LENGTH). */
 export const SQLITE_MAX_LENGTH = 1_000_000_000;
+/** Application safety cap. SQLite's ~1 GB theoretical ceiling is not a safe
+ * API limit: JSON parsing, validation, binding, WAL, and FTS can hold several
+ * copies of one body at once. */
+export const MAX_MESSAGE_BODY_BYTES = 10_000_000;
 
 /** Above this body length the store's json well-formedness re-validation is
  *  skipped: parsing a ~GB body into memory to walk it would defeat the
@@ -60,6 +64,44 @@ const CATCH_UP_ENVELOPE =
     remaining: WIDE,
     advanced: false,
     byte_limited: true,
+  }).length - 2;
+const CATCH_UP_SUMMARY_ENVELOPE =
+  JSON.stringify({
+    messages: [],
+    new_last_read_seq: WIDE,
+    remaining: WIDE,
+    advanced: false,
+    byte_limited: true,
+    rooms_with_unread: [],
+    rooms_with_unread_truncated: true,
+  }).length - 2;
+const PRIORITY_CATCH_UP_ENVELOPE =
+  JSON.stringify({
+    messages: [],
+    new_last_read_seq: WIDE,
+    remaining: WIDE,
+    advanced: false,
+    byte_limited: true,
+    lossy: false,
+    priority_only: false,
+    skipped_count: WIDE,
+    qualifying_remaining: WIDE,
+    cutoff_seq: WIDE,
+  }).length - 2;
+const PRIORITY_CATCH_UP_SUMMARY_ENVELOPE =
+  JSON.stringify({
+    messages: [],
+    new_last_read_seq: WIDE,
+    remaining: WIDE,
+    advanced: false,
+    byte_limited: true,
+    lossy: false,
+    priority_only: false,
+    skipped_count: WIDE,
+    qualifying_remaining: WIDE,
+    cutoff_seq: WIDE,
+    rooms_with_unread: [],
+    rooms_with_unread_truncated: true,
   }).length - 2;
 const HISTORY_ENVELOPE =
   JSON.stringify({
@@ -97,6 +139,14 @@ const THREAD_ENVELOPE =
 /** Serialized-size allowance below which shrinkToFit is guaranteed to fit any
  *  legal row as a stub (fixed fields ~430 worst case); budgets floor here. */
 const STUB_ALLOWANCE = 500;
+
+/** Smallest budget that can safely carry catch_up's fixed fields plus one
+ *  shrunk message stub. The MCP wrapper subtracts its own routing/wait
+ *  metadata before entering the advancing transaction; if less than this
+ *  remains it must reject the call rather than advance past an undeliverable
+ *  page. */
+export const MIN_CATCH_UP_RESULT_BUDGET =
+  Math.max(CATCH_UP_ENVELOPE, PRIORITY_CATCH_UP_ENVELOPE) + STUB_ALLOWANCE;
 
 /** Age (SQLite datetime modifier) past which a silent private session cursor
  *  is dead: reaped by the join-time GC and by prune (a dead cursor must not
@@ -173,8 +223,8 @@ function assertStorable(value: string | null, field: string): void {
  * assume them. fitRows always keeps at least one row (paging must progress)
  * and LIST_ROW_BUDGET's cursor reserve assumes a claim key <= 500 chars, so a
  * direct store caller (web viewer, tests) writing a 120k-char key shipped an
- * over-budget listing no MCP input could ever produce. Message BODIES are
- * exempt: they are data, capped by SQLITE_MAX_LENGTH and shrunk at read time.
+ * over-budget listing no MCP input could ever produce. Message bodies use the
+ * separate MAX_MESSAGE_BODY_BYTES safety cap and are shrunk at read time.
  */
 function assertMaxLen(value: string | null, field: string, max: number): void {
   if (value !== null && value.length > max) {
@@ -255,14 +305,20 @@ export type RecipientStatus = {
   idle_seconds: number | null;
   last_read_seq: number | null;
   /** Room messages already past this recipient's read marker (0 = fully
-   *  caught up). Computed at call time; the poster's own message is not yet
-   *  inserted when post_message asks, so it is excluded. null for unknown. */
+   *  caught up). Computed at call time; post_message samples it after its new
+   *  row is inserted, inside that same transaction. null for unknown. */
   marker_behind: number | null;
   /** True ONLY while the recipient has an open blocking catch_up wait in
    *  this room (an in-turn wait lease): the model is mid-turn, awaiting the
    *  call's return, so a message now is delivered into a live turn. Never
    *  produced by detached pollers. */
   watching: boolean;
+};
+
+export type PendingCursor = {
+  oldest_unix: number;
+  agent_id: string;
+  room_id: number;
 };
 
 export type ReplyRef = {
@@ -277,6 +333,9 @@ export type MessageRow = {
   from_type: string | null;
   from_role: string | null;
   format: "text" | "json";
+  /** Author-declared durable checkpoint for lossy priority catch-up. Omitted
+   *  when false to keep ordinary pages compact. */
+  priority?: true;
   content: unknown;
   to: string[] | null;
   reply_to: ReplyRef | null;
@@ -313,6 +372,7 @@ type RawMessage = {
   from_type: string | null;
   from_role: string | null;
   format: "text" | "json";
+  priority: number;
   body: string;
   /** Exact UTF-16 length of the FULL body (the fetched body may be capped).
    *  NULL only for rows written by an old build during a mixed-version window
@@ -362,7 +422,7 @@ function messageCols(bodyCap: number): string {
   // astral factor (an emoji is 1 codepoint but 2 UTF-16 units). NUL is
   // rejected/sanitized, so length() is exact.
   return `g.seq, g.agent_id, a.type AS from_type, a.role AS from_role,
-          g.format, substr(g.body, 1, ${cap}) AS body, g.body_len,
+          g.format, g.priority, substr(g.body, 1, ${cap}) AS body, g.body_len,
           length(g.body) AS body_cp,
           g.mentions, g.reply_to_seq,
           datetime(g.created_at, 'localtime') AS created_local,
@@ -452,7 +512,17 @@ export class ChatStore {
     }
     this.db.pragma("busy_timeout = 5000");
     this.db.pragma("foreign_keys = ON");
-    this.migrate();
+    // One process performs versioned data maintenance at a time. Without an
+    // IMMEDIATE transaction, concurrent MCP startups could all observe the
+    // old version and then repeat full-corpus backfills/FTS rebuilds.
+    try {
+      this.db.transaction(() => this.migrate()).immediate();
+    } catch (error) {
+      // A constructor that throws has no caller-visible instance on which to
+      // call close(); release the native handle here instead of waiting for GC.
+      this.db.close();
+      throw error;
+    }
   }
 
   private migrate(): void {
@@ -489,6 +559,7 @@ export class ChatStore {
         seq          INTEGER NOT NULL,
         agent_id     TEXT NOT NULL REFERENCES agents(id),
         format       TEXT NOT NULL DEFAULT 'text',
+        priority     INTEGER NOT NULL DEFAULT 0,
         body         TEXT NOT NULL,
         mentions     TEXT,
         reply_to_seq INTEGER,
@@ -504,6 +575,7 @@ export class ChatStore {
     this.ensureColumn("memberships", "last_seen", "TEXT");
     this.ensureColumn("memberships", "left_at", "TEXT");
     this.ensureColumn("messages", "format", "TEXT NOT NULL DEFAULT 'text'");
+    this.ensureColumn("messages", "priority", "INTEGER NOT NULL DEFAULT 0");
     this.ensureColumn("messages", "reply_to_seq", "INTEGER");
     this.ensureColumn("messages", "mentions", "TEXT");
     this.ensureColumn("messages", "supersedes_seq", "INTEGER");
@@ -547,6 +619,13 @@ export class ChatStore {
         SELECT RAISE(ABORT, 'message body contains a NUL character (U+0000), which SQLite cannot store without silently truncating');
       END;
     `);
+    const SCHEMA_VERSION = 2;
+    const currentVersion = this.db.pragma("user_version", {
+      simple: true,
+    }) as number;
+    const needsMaintenance = currentVersion < SCHEMA_VERSION;
+    const needsHeal = currentVersion < 1;
+
     // Backfill the denormalized reply author AFTER the old-writer trigger above
     // exists, closing a rolling-upgrade gap: with the backfill running FIRST, an
     // old build inserting a reply in the window between the two steps hit
@@ -556,12 +635,14 @@ export class ChatStore {
     // trigger is caught here; one inserted after is stamped by the trigger.
     // Rows whose parent is already gone stay NULL (unrecoverable) and are
     // re-examined harmlessly.
-    this.db.exec(`
-      UPDATE messages SET reply_to_agent =
-        (SELECT p.agent_id FROM messages p
-          WHERE p.room_id = messages.room_id AND p.seq = messages.reply_to_seq)
-      WHERE reply_to_seq IS NOT NULL AND reply_to_agent IS NULL
-    `);
+    if (needsMaintenance) {
+      this.db.exec(`
+        UPDATE messages SET reply_to_agent =
+          (SELECT p.agent_id FROM messages p
+            WHERE p.room_id = messages.room_id AND p.seq = messages.reply_to_seq)
+        WHERE reply_to_seq IS NOT NULL AND reply_to_agent IS NULL
+      `);
+    }
     // The message-body NUL scan below runs ONLY until this file is marked
     // migrated via PRAGMA user_version. It reads EVERY body to evaluate
     // instr(body, char(0)) -- costly on a large corpus (a 1 GB body is read
@@ -570,11 +651,6 @@ export class ChatStore {
     // of migrate(), so a crash mid-scan just re-runs. Everything else
     // (schema/index/trigger creation, the cheap body_len backfill and small
     // metadata heals) stays ungated.
-    const SCHEMA_VERSION = 1;
-    const needsHeal =
-      (this.db.pragma("user_version", { simple: true }) as number) <
-      SCHEMA_VERSION;
-
     // Heal existing rows that already hold a NUL (written by a pre-guard build):
     // a plain SELECT is NOT NUL-terminated, so the full body is recoverable;
     // replace each NUL with U+FFFD so substr()/length() readers see it whole,
@@ -585,20 +661,33 @@ export class ChatStore {
     // array on an all-NUL body). instr() detects them; healing a row clears its
     // NUL, so the predicate never revisits it and the id cursor moves strictly
     // forward.
+    let healedMessageBody = false;
     if (needsHeal) {
       const nextNul = this.db.prepare(
-        "SELECT id, body FROM messages WHERE instr(body, char(0)) > 0 AND id > ? ORDER BY id LIMIT 1",
+        `SELECT id, length(CAST(body AS BLOB)) AS bytes
+         FROM messages
+         WHERE instr(body, char(0)) > 0 AND id > ?
+         ORDER BY id LIMIT 1`,
       );
+      const getBody = this.db.prepare("SELECT body FROM messages WHERE id = ?");
       const fix = this.db.prepare(
         "UPDATE messages SET body = ?, body_len = NULL WHERE id = ?",
       );
       let cursor = 0;
       for (;;) {
         const row = nextNul.get(cursor) as
-          | { id: number; body: string }
+          | { id: number; bytes: number }
           | undefined;
         if (!row) break;
-        fix.run(row.body.replace(/\u0000/g, "\ufffd"), row.id);
+        if (row.bytes > MAX_MESSAGE_BODY_BYTES) {
+          throw new Error(
+            `legacy message ${row.id} is ${row.bytes} bytes and contains NUL; ` +
+              `refusing to load it above the ${MAX_MESSAGE_BODY_BYTES}-byte safety limit`,
+          );
+        }
+        const { body } = getBody.get(row.id) as { body: string };
+        fix.run(body.replace(/\u0000/g, "\ufffd"), row.id);
+        healedMessageBody = true;
         cursor = row.id;
       }
     }
@@ -611,11 +700,9 @@ export class ChatStore {
     // count via SQL (a low-but-nonzero bound; the web viewer's COALESCE still
     // shows a length and its total>shown guard tolerates the codepoint skew).
     // Cursored by id so the whole sweep is one table pass, one body resident.
-    // NOT gated: on a migrated file this reads NO bodies -- body_len IS NULL
-    // short-circuits before length(body), and new inserts always stamp body_len
-    // -- so it stays cheap while still backfilling a rolling-upgrade old-build
-    // row that landed a NULL body_len after this file was marked migrated.
-    {
+    // Version-gated: new inserts stamp body_len. A mixed-version legacy row can
+    // use the viewer's SQL-length fallback until explicit maintenance.
+    if (needsMaintenance) {
       const BACKFILL_MAX_CHARS = 1_000_000;
       this.db
         .prepare(
@@ -645,6 +732,18 @@ export class ChatStore {
       DROP INDEX IF EXISTS idx_messages_room_seq;
       CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(room_id, reply_to_seq);
       CREATE INDEX IF NOT EXISTS idx_messages_supersedes ON messages(room_id, supersedes_seq);
+      -- A mentions-only poll must not rescan every broadcast in a large unread
+      -- backlog every few seconds. Its candidate predicate uses this partial
+      -- index, then evaluates json_each only for rows that could be directed.
+      CREATE INDEX IF NOT EXISTS idx_messages_directed_candidates
+        ON messages(room_id, seq)
+        WHERE mentions IS NOT NULL OR reply_to_agent IS NOT NULL;
+
+      -- The memberships PK starts with room_id, while all-rooms poller probes
+      -- start with one agent. Without this reverse index every quiet interval
+      -- scanned the complete membership table before checking any room.
+      CREATE INDEX IF NOT EXISTS idx_memberships_agent_present
+        ON memberships(agent_id, left_at, room_id);
 
       -- Per-session read CURSORS for identities running multiple concurrent
       -- sessions (join_room cursor:'private'). The memberships marker stays the
@@ -667,6 +766,8 @@ export class ChatStore {
       -- full session_markers scan on every liveness touch; this covers it.
       CREATE INDEX IF NOT EXISTS idx_session_markers_session
         ON session_markers(session_id);
+      CREATE INDEX IF NOT EXISTS idx_session_markers_room_updated
+        ON session_markers(room_id, updated_at);
 
       -- Per-session PRESENCE, decoupled from cursors: EVERY session (shared or
       -- private) registers a row here on join, keyed by its process nonce, so a
@@ -686,6 +787,8 @@ export class ChatStore {
       );
       CREATE INDEX IF NOT EXISTS idx_session_presence_session
         ON session_presence(session_id);
+      CREATE INDEX IF NOT EXISTS idx_session_presence_room_updated
+        ON session_presence(room_id, updated_at);
 
       -- Advisory single-winner work claims with TTL. Purely advisory: nothing
       -- fences the claimed resource itself; expiry frees claims from crashed
@@ -726,12 +829,14 @@ export class ChatStore {
     // healed above, with their body_len reset). Listing SQL uses substr(), which
     // stops at the first NUL, so a legacy NUL silently truncated the shown
     // value. Runs after every table exists; new writes are already rejected.
-    // NOT gated: metadata columns are small (<=10k) so these scans are cheap,
-    // and unlike the message-body NUL scan they never read a 1 GB body.
-    this.healNulColumn("rooms", "description");
-    this.healNulColumn("rooms", "pinned");
-    this.healNulColumn("agents", "description");
-    this.healNulColumn("claims", "note");
+    // Run once with the versioned maintenance pass. Even small full-table
+    // scans become expensive when multiplied across many MCP processes.
+    if (needsMaintenance) {
+      this.healNulColumn("rooms", "description");
+      this.healNulColumn("rooms", "pinned");
+      this.healNulColumn("agents", "description");
+      this.healNulColumn("claims", "note");
+    }
 
     // Full-text search over message bodies. External-content FTS5 mirrors
     // messages.body keyed by messages.id; triggers keep it in sync.
@@ -758,22 +863,26 @@ export class ChatStore {
     // statement (a single consistent snapshot): two separate SELECTs could
     // straddle a concurrent insert -- messages counted pre-insert, fts counted
     // post-trigger -- making an already-inconsistent {2,1} file read as {2,2}
-    // and skip the rebuild it actually needed.
-    const { msgCount, ftsCount } = this.db
-      .prepare(
-        `SELECT (SELECT COUNT(*) FROM messages) AS msgCount,
-                (SELECT COUNT(*) FROM messages_fts_docsize) AS ftsCount`,
-      )
-      .get() as { msgCount: number; ftsCount: number };
-    if (ftsCount !== msgCount) {
-      this.db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+    // and skip the rebuild it actually needed. A legacy NUL repair changes a
+    // body before these triggers exist; row counts still match in that case,
+    // so the repair flag must force a rebuild to replace stale tokens.
+    if (needsMaintenance) {
+      const { msgCount, ftsCount } = this.db
+        .prepare(
+          `SELECT (SELECT COUNT(*) FROM messages) AS msgCount,
+                  (SELECT COUNT(*) FROM messages_fts_docsize) AS ftsCount`,
+        )
+        .get() as { msgCount: number; ftsCount: number };
+      if (healedMessageBody || ftsCount !== msgCount) {
+        this.db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
+      }
     }
 
     // Mark this file migrated so the message-body NUL scan above is skipped on
     // future startups (one-time work; the reject trigger keeps new rows clean).
     // Set LAST, only after the scan ran, so a crash mid-scan leaves user_version
     // unchanged and it re-runs.
-    if (needsHeal) this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    if (needsMaintenance) this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
   }
 
   private ensureColumn(table: string, column: string, type: string): void {
@@ -1399,6 +1508,45 @@ export class ChatStore {
   }
 
   /**
+   * Refresh activity for one room captured by a cross-room operation without
+   * silently rejoining it. The exact session-presence row must still be live;
+   * a left/tombstoned or never-joined session is a no-op even when a twin keeps
+   * the identity-level membership present. IMMEDIATE makes the live-row check
+   * and refresh atomic with a concurrent leave.
+   */
+  touchSessionRoom(
+    roomId: number,
+    agentId: string,
+    sessionId: string,
+  ): boolean {
+    const tx = this.db.transaction(() => {
+      const live = this.db
+        .prepare(
+          `SELECT 1 FROM session_presence
+           WHERE room_id = ? AND agent_id = ? AND session_id = ?
+             AND left_at IS NULL`,
+        )
+        .get(roomId, agentId, sessionId);
+      if (!live) return false;
+      this.db
+        .prepare(
+          `UPDATE session_presence SET updated_at = datetime('now')
+           WHERE room_id = ? AND agent_id = ? AND session_id = ?
+             AND left_at IS NULL`,
+        )
+        .run(roomId, agentId, sessionId);
+      this.db
+        .prepare(
+          `UPDATE memberships SET last_seen = datetime('now'), left_at = NULL
+           WHERE room_id = ? AND agent_id = ?`,
+        )
+        .run(roomId, agentId);
+      return true;
+    });
+    return tx.immediate();
+  }
+
+  /**
    * Open an in-turn wait lease: this (room, agent, session) has a blocking
    * catch_up call pending. TTL covers the wait plus grace, so a hard-killed
    * process cannot leave a permanent "watching" ghost. Expired rows for the
@@ -1513,6 +1661,62 @@ export class ChatStore {
   }
 
   /**
+   * Return the furthest cursor that can be reached after `afterSeq` without
+   * crossing a message from another author. A cursor need not name a surviving
+   * row (pruning can leave sequence gaps), so one before the next peer row is
+   * safe. Called only inside an IMMEDIATE transaction: no writer can insert a
+   * peer row between this proof and the cursor update.
+   */
+  private ownOnlyFloor(
+    roomId: number,
+    agentId: string,
+    afterSeq: number,
+  ): number {
+    const { floor } = this.db
+      .prepare(
+        `SELECT COALESCE(
+           (SELECT seq - 1 FROM messages
+            WHERE room_id = ? AND seq > ? AND agent_id != ?
+            ORDER BY seq ASC LIMIT 1),
+           (SELECT max(?, COALESCE(MAX(seq), 0)) FROM messages WHERE room_id = ?)
+         ) AS floor`,
+      )
+      .get(roomId, afterSeq, agentId, afterSeq, roomId) as { floor: number };
+    return floor;
+  }
+
+  /**
+   * Advance shared/private cursors at or beyond a proven safe floor through an
+   * accepted self-authored post. The caller derives that floor from the crossing
+   * aggregate: it is either the latest peer seq in the room or the posting
+   * cursor when no later peer exists. This is a plain indexed marker pass, not a
+   * correlated history scan per private session. Sibling marker timestamps are
+   * deliberately untouched: active sessions refresh their own liveness, while
+   * dead cursors must still GC.
+   */
+  private advanceOwnOnlyCursors(
+    roomId: number,
+    agentId: string,
+    throughSeq: number,
+    safeFloor: number,
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE memberships
+         SET last_read_seq = max(last_read_seq, ?)
+         WHERE room_id = ? AND agent_id = ? AND last_read_seq >= ?`,
+      )
+      .run(throughSeq, roomId, agentId, safeFloor);
+    this.db
+      .prepare(
+        `UPDATE session_markers
+         SET last_read_seq = max(last_read_seq, ?)
+         WHERE room_id = ? AND agent_id = ? AND last_read_seq >= ?`,
+      )
+      .run(throughSeq, roomId, agentId, safeFloor);
+  }
+
+  /**
    * Agents in a room, bounded like listRooms: at most `limit` rows (with the
    * filtered total riding along) and descriptions cut to listing previews.
    */
@@ -1592,15 +1796,16 @@ export class ChatStore {
     const mapped = page.map((r) => {
       const { left_at, description_cut, _rid, watching, ...rest } = r;
       void _rid;
+      const isWatching = watching === 1;
       return {
         ...rest,
         ...(description_cut ? { description_truncated: true } : {}),
         present: left_at === null,
         active:
           left_at === null &&
-          r.idle_seconds !== null &&
-          r.idle_seconds <= threshold,
-        watching: watching === 1,
+          (isWatching ||
+            (r.idle_seconds !== null && r.idle_seconds <= threshold)),
+        watching: isWatching,
       };
     });
     const { rows: agents, sizeTrimmed } = fitRows(mapped, LIST_ROW_BUDGET);
@@ -1675,10 +1880,14 @@ export class ChatStore {
    * ANY message from others carries seq above the token, NOTHING is inserted
    * and the reject result carries the crossing messages (bounded previews,
    * per-row directed) so the caller can assess the delta and idempotently
-   * retry; the reject baseline is the TOKEN, unlike the accept path's
+   * retry; a token ahead of this session's effective cursor is invalid (it
+   * cannot have come from that cursor's catch_up and would otherwise bypass
+   * the guard). The reject baseline is the TOKEN, unlike the accept path's
    * cursor-relative crossed. opts.crossedPreviewChars additionally returns
-   * crossed previews on an ACCEPTED post. Neither path advances any read
-   * marker: posting is not a read.
+   * crossed previews on an ACCEPTED post. A post never consumes an unseen peer
+   * message. After an accepted post, the posting cursor and sibling cursors at
+   * the proven safe peer floor are normalized through the new own row so their
+   * recurring probes do not rescan that suffix.
    */
   postMessage(
     roomId: number,
@@ -1689,7 +1898,12 @@ export class ChatStore {
     replyToSeq: number | null,
     supersedesSeq: number | null = null,
     sessionId: string | null = null,
-    opts: { ifLastReadSeq?: number | null; crossedPreviewChars?: number } = {},
+    opts: {
+      ifLastReadSeq?: number | null;
+      crossedPreviewChars?: number;
+      recipientActiveWithinMinutes?: number;
+      priority?: boolean;
+    } = {},
   ):
     | {
         posted: true;
@@ -1700,6 +1914,8 @@ export class ChatStore {
         crossed_range: { from_seq: number; to_seq: number } | null;
         crossed_messages?: (MessageRow & { directed: boolean })[];
         crossed_remaining?: number;
+        recipients?: RecipientStatus[];
+        priority: boolean;
       }
     | {
         posted: false;
@@ -1714,6 +1930,12 @@ export class ChatStore {
     // would advance the marker past the lost tail. mentions are agent ids
     // (already control-char-validated upstream) but guard defensively.
     assertStorable(body, "message body");
+    const bodyBytes = Buffer.byteLength(body, "utf8");
+    if (bodyBytes > MAX_MESSAGE_BODY_BYTES) {
+      throw new Error(
+        `message body exceeds the ${MAX_MESSAGE_BODY_BYTES}-byte safety limit`,
+      );
+    }
     // Defense in depth for DIRECT store callers (the MCP handler already
     // validated pre-serialization): a json body can hide a nested lone
     // surrogate as an ASCII \uXXXX escape that assertStorable's raw-string check
@@ -1745,7 +1967,20 @@ export class ChatStore {
       // validation error can mask the staleness (the caller reassesses and
       // retries with the same payload either way). In-transaction, so no
       // message can land between this check and the insert below.
+      const cursor = this.getCursor(roomId, agentId, sessionId);
+      const from = cursor?.last_read_seq ?? 0;
       if (ifToken !== null) {
+        // A future/wrong-cursor token made the predicate `seq > token` empty
+        // and silently disabled the CAS while unread messages still existed.
+        // Bind the token to the effective shared/private cursor that could
+        // actually have produced it. This is misuse detection, not auth: the
+        // optional guard remains a caller-chosen safety primitive.
+        if (ifToken > from) {
+          throw new Error(
+            `if_last_read_seq ${ifToken} is ahead of the current read marker ${from}; ` +
+              "call catch_up for this room and use its new_last_read_seq",
+          );
+        }
         const stale = this.db
           .prepare(
             `SELECT COUNT(*) AS c, MIN(seq) AS mn, MAX(seq) AS mx,
@@ -1812,8 +2047,6 @@ export class ChatStore {
       // Crossing report: computed before the insert so "unread" excludes the
       // message being posted. The directedAt pair binds FIRST (it sits in the
       // SELECT list, ahead of the WHERE placeholders).
-      const cursor = this.getCursor(roomId, agentId, sessionId);
-      const from = cursor?.last_read_seq ?? 0;
       const crossing = this.db
         .prepare(
           `SELECT COUNT(*) AS c, MIN(seq) AS mn, MAX(seq) AS mx,
@@ -1834,14 +2067,15 @@ export class ChatStore {
         .get(roomId) as { next: number };
       const info = this.db
         .prepare(
-          `INSERT INTO messages (room_id, seq, agent_id, format, body, body_len, mentions, reply_to_seq, reply_to_agent, supersedes_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO messages (room_id, seq, agent_id, format, priority, body, body_len, mentions, reply_to_seq, reply_to_agent, supersedes_seq)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           roomId,
           next,
           agentId,
           format,
+          opts.priority === true ? 1 : 0,
           body,
           body.length, // exact UTF-16; readers use it when the fetch is capped
           mentionsJson,
@@ -1849,6 +2083,14 @@ export class ChatStore {
           replyToAgent,
           supersedesSeq,
         );
+      // Own rows are never returned by catch_up, so leaving a cursor behind an
+      // own-only suffix made every 5s poll (and every 500ms blocking probe) walk
+      // that suffix forever. If crossing found peers after `from`, its MAX is
+      // the room's latest peer row; otherwise `from` itself is known safe. Any
+      // cursor at/after that floor can move through this own post. This protects
+      // caught-up sibling sessions without scanning history once per sibling.
+      const safeCursorFloor = crossing.c > 0 ? crossing.mx! : from;
+      this.advanceOwnOnlyCursors(roomId, agentId, next, safeCursorFloor);
       // Opt-in crossed previews on an ACCEPTED post, in the same transaction
       // (the poster's own just-inserted row is excluded by agent_id != self).
       let crossedPreview: {
@@ -1864,10 +2106,22 @@ export class ChatStore {
           crossing.c,
         );
       }
+      // Delivery status belongs to the same transaction as the post. Sampling
+      // before INSERT omitted this new unread row from marker_behind; sampling
+      // after commit could fail after storing and invite a duplicate retry.
+      const recipients =
+        mentions !== null && opts.recipientActiveWithinMinutes !== undefined
+          ? this.recipientStatus(
+              roomId,
+              mentions,
+              opts.recipientActiveWithinMinutes,
+            )
+          : undefined;
       return {
         posted: true as const,
         id: Number(info.lastInsertRowid),
         seq: next,
+        priority: opts.priority === true,
         crossed: crossing.c,
         crossed_directed: crossing.d ?? 0,
         crossed_range:
@@ -1882,6 +2136,7 @@ export class ChatStore {
                 : {}),
             }
           : {}),
+        ...(recipients !== undefined ? { recipients } : {}),
       };
     });
     // IMMEDIATE acquires the write lock before reading MAX(seq), so concurrent
@@ -1913,6 +2168,7 @@ export class ChatStore {
       from_type: r.from_type,
       from_role: r.from_role,
       format: r.format,
+      ...(r.priority > 0 ? { priority: true as const } : {}),
       content,
       to: r.mentions ? (safeParse(r.mentions) as string[]) : null,
       reply_to:
@@ -2234,8 +2490,11 @@ export class ChatStore {
         };
       }
       const present = r.left_at === null;
+      const isWatching = r.watching === 1;
       const active =
-        present && r.idle_seconds !== null && r.idle_seconds <= threshold;
+        present &&
+        (isWatching ||
+          (r.idle_seconds !== null && r.idle_seconds <= threshold));
       return {
         id,
         status: present ? (active ? "active" : "idle") : "left",
@@ -2243,7 +2502,7 @@ export class ChatStore {
         idle_seconds: r.idle_seconds,
         last_read_seq: r.last_read_seq,
         marker_behind: Math.max(0, latest - r.last_read_seq),
-        watching: r.watching === 1,
+        watching: isWatching,
       };
     });
   }
@@ -2259,9 +2518,11 @@ export class ChatStore {
    * idle_seconds is per room membership, matching list_agents. The directed
    * predicate is inlined rather than directedAt(): that helper binds one
    * FIXED id, and here the id varies per membership row. Fetches limit+1 to
-   * report truncation without a tail COUNT. Read-only.
+   * report truncation without a tail COUNT. Keyset paging makes a bounded
+   * supervisor sweep possible; room_id is the final tie-breaker because one
+   * agent can have same-second pending rows in several rooms. Read-only.
    */
-  pendingDirected(limit = 50): {
+  pendingDirected(limit = 50, after?: PendingCursor): {
     pending: {
       agent_id: string;
       room_id: number;
@@ -2273,28 +2534,47 @@ export class ChatStore {
       last_read_seq: number;
     }[];
     truncated: boolean;
+    size_trimmed: boolean;
+    next_after?: PendingCursor;
   } {
     const lim = Math.max(1, Math.floor(limit));
-    const rows = this.db
-      .prepare(
-        `SELECT mb.agent_id AS agent_id, mb.room_id AS room_id, r.name AS room_name,
+    const cursorClause = after
+      ? `WHERE oldest_unix > @oldest_unix
+           OR (oldest_unix = @oldest_unix AND agent_id > @agent_id)
+           OR (oldest_unix = @oldest_unix AND agent_id = @agent_id
+               AND room_id > @room_id)`
+      : "";
+    const statement = this.db.prepare(
+      `WITH pending_rows AS (
+         SELECT mb.agent_id AS agent_id, mb.room_id AS room_id, r.name AS room_name,
                 COUNT(*) AS directed_unread,
                 MIN(g.seq) AS oldest_seq,
                 MIN(CAST(strftime('%s', g.created_at) AS INTEGER)) AS oldest_unix,
                 (strftime('%s','now') - strftime('%s', mb.last_seen)) AS idle_seconds,
                 mb.last_read_seq AS last_read_seq
-         FROM messages g
-         JOIN memberships mb ON mb.room_id = g.room_id AND mb.left_at IS NULL
-         JOIN rooms r ON r.id = g.room_id
-         WHERE g.seq > mb.last_read_seq
+         FROM memberships mb
+         JOIN rooms r ON r.id = mb.room_id
+         CROSS JOIN messages g INDEXED BY idx_messages_directed_candidates
+         WHERE mb.left_at IS NULL
+           AND g.room_id = mb.room_id
+           AND g.seq > mb.last_read_seq
            AND g.agent_id != mb.agent_id
-           AND (EXISTS (SELECT 1 FROM json_each(g.mentions) WHERE value = mb.agent_id)
-                OR IFNULL(g.reply_to_agent = mb.agent_id, 0))
+           AND (g.mentions IS NOT NULL OR g.reply_to_agent IS NOT NULL)
+           AND (g.reply_to_agent = mb.agent_id OR EXISTS (
+             SELECT 1 FROM json_each(g.mentions) j
+             WHERE j.type = 'text' AND CAST(j.value AS TEXT) = mb.agent_id
+           ))
          GROUP BY mb.agent_id, mb.room_id
-         ORDER BY oldest_unix ASC, mb.agent_id ASC
-         LIMIT ?`,
-      )
-      .all(lim + 1) as {
+       )
+       SELECT * FROM pending_rows
+       ${cursorClause}
+       ORDER BY oldest_unix ASC, agent_id ASC, room_id ASC
+       LIMIT @limit`,
+    );
+    const bindings = after
+      ? { ...after, limit: lim + 1 }
+      : { limit: lim + 1 };
+    const rows = statement.all(bindings) as {
       agent_id: string;
       room_id: number;
       room_name: string;
@@ -2304,8 +2584,28 @@ export class ChatStore {
       idle_seconds: number | null;
       last_read_seq: number;
     }[];
-    const truncated = rows.length > lim;
-    return { pending: truncated ? rows.slice(0, lim) : rows, truncated };
+    const rowLimited = rows.length > lim;
+    const candidates = rowLimited ? rows.slice(0, lim) : rows;
+    const { rows: pending, sizeTrimmed } = fitRows(
+      candidates,
+      LIST_ROW_BUDGET,
+    );
+    const truncated = rowLimited || sizeTrimmed;
+    const last = pending[pending.length - 1];
+    return {
+      pending,
+      truncated,
+      size_trimmed: sizeTrimmed,
+      ...(truncated && last
+        ? {
+            next_after: {
+              oldest_unix: last.oldest_unix,
+              agent_id: last.agent_id,
+              room_id: last.room_id,
+            },
+          }
+        : {}),
+    };
   }
 
   /** Fetch one raw message row (author + reply preview joined), body capped
@@ -2478,7 +2778,17 @@ export class ChatStore {
   ): number {
     const cursor = this.getCursor(roomId, agentId, sessionId);
     if (!cursor) throw new Error("not a member of this room");
-    return this.unreadCount(roomId, cursor.last_read_seq, agentId);
+    // A wait only needs a yes/no wake signal. COUNT(*) rescanned the complete
+    // unread tail twice per second per wait (including a large self-authored
+    // tail that never advances); the room/seq index lets this stop at one row.
+    return this.db
+      .prepare(
+        `SELECT 1 FROM messages
+         WHERE room_id = ? AND seq > ? AND agent_id != ? LIMIT 1`,
+      )
+      .get(roomId, cursor.last_read_seq, agentId)
+      ? 1
+      : 0;
   }
 
   /**
@@ -2550,11 +2860,12 @@ export class ChatStore {
   }
 
   /**
-   * Unread messages (seq > last_read_seq), oldest first; ADVANCES the read
-   * marker over exactly the rows returned. Mention filtering deliberately does
-   * NOT exist here: a filtered view of one room's stream gets mistaken for a
-   * room sync (an agent concludes "quiet" while broadcasts sit unread). The
-   * mentions inbox is myMentions: cross-room and never marker-advancing.
+   * Unread messages (seq > last_read_seq), oldest first; normally ADVANCES the
+   * read marker over returned peer rows plus any following own-only suffix,
+   * never across an undelivered peer row. The explicit priorityOnly mode
+   * is deliberately LOSSY backlog triage: it returns priority OR directed rows
+   * and advances over lower-priority rows through a disclosed cutoff. Directed
+   * rows always qualify so advancing cannot silently erase my_mentions items.
    *
    * unreadSummary (its sessionId is the RAW process nonce, my_mentions-style,
    * not this room's cursor selector): on an EMPTY read, include a bounded
@@ -2570,13 +2881,21 @@ export class ChatStore {
     previewChars?: number,
     maxBytes: number = DEFAULT_MAX_BYTES,
     sessionId: string | null = null,
-    unreadSummary: { sessionId: string | null } | null = null,
+    unreadSummary: {
+      sessionId: string | null;
+      priorityOnly?: boolean;
+    } | null = null,
   ): {
     messages: MessageRow[];
     new_last_read_seq: number;
     remaining: number;
     advanced: boolean;
     byte_limited?: boolean;
+    lossy?: true;
+    priority_only?: true;
+    skipped_count?: number;
+    qualifying_remaining?: number;
+    cutoff_seq?: number;
     rooms_with_unread?: {
       room_id: number;
       name: string;
@@ -2585,23 +2904,49 @@ export class ChatStore {
     }[];
     rooms_with_unread_truncated?: boolean;
   } {
+    if (maxBytes < MIN_CATCH_UP_RESULT_BUDGET) {
+      throw new Error(
+        `catch_up result budget must be at least ${MIN_CATCH_UP_RESULT_BUDGET} serialized characters`,
+      );
+    }
     // Advancing path: read the cursor, fetch, and advance inside one IMMEDIATE
     // transaction so a concurrent same-identity call serializes behind it and
     // reads the updated cursor instead of returning overlapping messages.
-    // The byte bound trims BEFORE the advance, so the cursor only ever covers
-    // rows actually included in the response: a response the client rejects as
-    // oversized can no longer strand messages behind an advanced marker.
+    // The byte bound trims BEFORE the advance, so the cursor never covers an
+    // undelivered peer row (it may later normalize across own rows, which are
+    // never returned): a response the client rejects as oversized can no
+    // longer strand a peer message behind an advanced marker.
     const tx = this.db.transaction(() => {
       const cursor = this.getCursor(roomId, agentId, sessionId);
       if (!cursor) throw new Error("not a member of this room");
       const from = cursor.last_read_seq;
-      const { rows, exhausted } = this.fetchBounded<RawMessage>(
-        this.db.prepare(
-          `SELECT ${messageCols(maxBytes)} FROM ${MESSAGE_FROM}
+      const priorityOnly = unreadSummary?.priorityOnly === true;
+      // Captured under the same IMMEDIATE snapshot as the filtered scan. Own
+      // rows count toward the cutoff but never toward skipped/remaining.
+      const snapshotLatest = priorityOnly
+        ? (
+            this.db
+              .prepare(
+                "SELECT COALESCE(MAX(seq), 0) AS latest FROM messages WHERE room_id = ?",
+              )
+              .get(roomId) as { latest: number }
+          ).latest
+        : from;
+      const priorityPredicate = `(g.priority > 0 OR ${directedAt("g")})`;
+      const pageSql = priorityOnly
+        ? `SELECT ${messageCols(maxBytes)} FROM ${MESSAGE_FROM}
            WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
-           ORDER BY g.seq ASC LIMIT ?`,
-        ),
-        [roomId, from, agentId, limit],
+             AND ${priorityPredicate}
+           ORDER BY g.seq ASC LIMIT ?`
+        : `SELECT ${messageCols(maxBytes)} FROM ${MESSAGE_FROM}
+           WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
+           ORDER BY g.seq ASC LIMIT ?`;
+      const pageParams = priorityOnly
+        ? [roomId, from, agentId, agentId, agentId, limit]
+        : [roomId, from, agentId, limit];
+      const { rows, exhausted } = this.fetchBounded<RawMessage>(
+        this.db.prepare(pageSql),
+        pageParams,
         maxBytes,
       );
       // Exact envelope reserve so the WHOLE response honors maxBytes, not
@@ -2610,11 +2955,66 @@ export class ChatStore {
       const { messages, byteLimited } = this.boundByBytes(
         rows,
         previewChars,
-        Math.max(STUB_ALLOWANCE, maxBytes - CATCH_UP_ENVELOPE),
+        Math.max(
+          STUB_ALLOWANCE,
+          maxBytes -
+            (priorityOnly ? PRIORITY_CATCH_UP_ENVELOPE : CATCH_UP_ENVELOPE),
+        ),
         (r, pc) => this.rowToMessage(r, pc),
       );
-      const lastSeq =
-        messages.length > 0 ? messages[messages.length - 1].seq : from;
+      let lastSeq =
+        messages.length > 0
+          ? messages[messages.length - 1].seq
+          : priorityOnly
+            ? snapshotLatest
+            : from;
+      // Ordinary catch_up never returns own rows. Move across an own-only
+      // suffix now, stopping immediately before the next undelivered peer row.
+      // This makes an empty historical self-tail a one-time scan instead of a
+      // permanent hot path for the poller and blocking wait.
+      if (!priorityOnly) {
+        lastSeq = this.ownOnlyFloor(roomId, agentId, lastSeq);
+      }
+      let skippedCount = 0;
+      let qualifyingRemaining = 0;
+      if (priorityOnly) {
+        qualifyingRemaining = (
+          this.db
+            .prepare(
+              `SELECT COUNT(*) AS c FROM messages g
+               WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
+                 AND ${priorityPredicate}`,
+            )
+            .get(
+              roomId,
+              lastSeq,
+              agentId,
+              agentId,
+              agentId,
+            ) as { c: number }
+        ).c;
+        // If every qualifying row in the snapshot was delivered, consume the
+        // trailing low-priority chatter too; otherwise priority-only would
+        // leave the very backlog it exists to discard. A row/byte cut leaves
+        // later qualifying rows unread, so stop at the last delivered one.
+        if (qualifyingRemaining === 0) lastSeq = snapshotLatest;
+        skippedCount = (
+          this.db
+            .prepare(
+              `SELECT COUNT(*) AS c FROM messages g
+               WHERE g.room_id = ? AND g.seq > ? AND g.seq <= ?
+                 AND g.agent_id != ? AND NOT ${priorityPredicate}`,
+            )
+            .get(
+              roomId,
+              from,
+              lastSeq,
+              agentId,
+              agentId,
+              agentId,
+            ) as { c: number }
+        ).c;
+      }
       if (lastSeq > from) {
         this.setCursor(roomId, agentId, sessionId, lastSeq);
       }
@@ -2622,20 +3022,67 @@ export class ChatStore {
       // is. Emitted even when no other room has unread ([]): that positively
       // answers "is anything anywhere?", the question an empty read raises.
       const UNREAD_SUMMARY_MAX = 20;
-      const summary =
-        unreadSummary !== null && messages.length === 0
-          ? this.unreadByRoom(
-              agentId,
-              unreadSummary.sessionId,
-              UNREAD_SUMMARY_MAX,
-              roomId,
-            )
-          : null;
+      let summary:
+        | {
+            rooms: {
+              room_id: number;
+              name: string;
+              unread: number;
+              directed: number;
+            }[];
+            truncated: boolean;
+          }
+        | null = null;
+      if (unreadSummary !== null && messages.length === 0) {
+        const fetched = this.unreadByRoom(
+          agentId,
+          unreadSummary.sessionId,
+          UNREAD_SUMMARY_MAX,
+          roomId,
+        );
+        // The v0.9 summary was appended after catch_up had already spent the
+        // entire page budget. Twenty legal, control-heavy room names could
+        // inflate a declared 1k response past 25k. Bound the summary within
+        // the same result budget, using the same measured-fit/name-halving
+        // pattern as my_mentions.by_room.
+        const roomBudget =
+          maxBytes -
+          (priorityOnly
+            ? PRIORITY_CATCH_UP_SUMMARY_ENVELOPE
+            : CATCH_UP_SUMMARY_ENVELOPE);
+        const fitted = fitRows(fetched.rooms, roomBudget);
+        const rooms = fitted.rows;
+        let truncated = fetched.truncated || fitted.sizeTrimmed;
+        if (rooms.length === 1 && JSON.stringify(rooms).length > roomBudget) {
+          let entry = { ...rooms[0] };
+          while (
+            JSON.stringify([entry]).length > roomBudget &&
+            entry.name.length > 0
+          ) {
+            entry = {
+              ...entry,
+              name: safeCut(entry.name, Math.floor(entry.name.length / 2)),
+            };
+          }
+          rooms[0] = entry;
+          truncated = true;
+        }
+        summary = { rooms, truncated };
+      }
       return {
         messages,
         new_last_read_seq: lastSeq,
         remaining: this.unreadCount(roomId, lastSeq, agentId),
         advanced: lastSeq > from,
+        ...(priorityOnly
+          ? {
+              lossy: true as const,
+              priority_only: true as const,
+              skipped_count: skippedCount,
+              qualifying_remaining: qualifyingRemaining,
+              cutoff_seq: lastSeq,
+            }
+          : {}),
         // !exhausted: fetchBounded stopped on the raw budget with rows behind
         // it that a preview/JSON shrink could otherwise hide. `remaining` is the
         // authoritative "more unread" count here, but keep byte_limited honest.

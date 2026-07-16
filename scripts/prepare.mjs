@@ -11,5 +11,7 @@ if (!existsSync(new URL("../src", import.meta.url))) {
 const r = spawnSync("npm", ["run", "build"], {
   stdio: "inherit",
   shell: process.platform === "win32",
+  timeout: 120_000,
+  killSignal: "SIGKILL",
 });
 process.exit(r.status ?? 1);

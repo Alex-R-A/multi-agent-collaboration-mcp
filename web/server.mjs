@@ -76,7 +76,7 @@ function schemaGaps(d) {
     !!d
       .prepare("SELECT 1 FROM sqlite_master WHERE type IN ('table','trigger') AND name = ?")
       .get(t);
-  for (const t of ["rooms", "agents", "memberships", "messages", "session_markers", "session_presence", "claims"]) {
+  for (const t of ["rooms", "agents", "memberships", "messages", "session_markers", "session_presence", "claims", "wait_leases"]) {
     if (!table(t)) gaps.push(`table ${t}`);
   }
   if (gaps.length) return gaps; // column checks would all fail anyway
@@ -86,6 +86,7 @@ function schemaGaps(d) {
     ["messages", "supersedes_seq"],
     ["messages", "reply_to_agent"],
     ["messages", "body_len"],
+    ["messages", "priority"],
   ]) {
     if (!col(t, c)) gaps.push(`${t}.${c}`);
   }
@@ -121,12 +122,14 @@ function getDb() {
   return db;
 }
 
-// The sidebar's 6-second refresh: it shows name/activity/counts only, so this
+// The sidebar's 30-second refresh: it shows name/activity/presence only, so this
 // carries NO pinned and only a SHORT description snippet (for the filter box).
 // The full pinned/description are fetched by /api/room when a room is opened.
 // Dropping the pinned from this list is what keeps 1000 rooms with 10k intros
-// from producing a ~24 MB response every 6 seconds. `total` reports the true
-// room count; only the most-recently-active ROOMS_MAX are listed.
+// from producing a ~24 MB response every refresh. Only the most-recently-active
+// ROOMS_MAX are listed. Exact message
+// counts are deliberately absent: recounting history for decorative UI text is
+// recurring work with no bearing on room selection.
 const ROOM_DESC_SNIPPET = 200;
 const ROOMS_MAX = 1000;
 function listRooms() {
@@ -137,28 +140,39 @@ function listRooms() {
       `SELECT r.id, r.name,
               substr(r.description, 1, ${ROOM_DESC_SNIPPET}) AS description,
               (SELECT COUNT(*) FROM memberships m WHERE m.room_id = r.id AND m.left_at IS NULL) AS members,
-              (SELECT COUNT(*) FROM messages g WHERE g.room_id = r.id) AS messages,
-              (SELECT MAX(created_at) FROM messages g WHERE g.room_id = r.id) AS last_activity
+              (SELECT created_at FROM messages g WHERE g.room_id = r.id
+               ORDER BY seq DESC LIMIT 1) AS last_activity
        FROM rooms r ORDER BY last_activity DESC, r.id DESC LIMIT ${ROOMS_MAX}`,
     )
     .all();
-  const { c: total } = d.prepare("SELECT COUNT(*) AS c FROM rooms").get();
-  return { rooms, total };
+  return { rooms };
 }
 
 // Full detail for ONE room (name, description, and the WHOLE pinned intro),
 // fetched when a room is opened -- the sidebar list omits the pinned. Returns
-// null when the room does not exist, which also lets the client CONFIRM a
-// deletion instead of wrongly inferring it from a room's absence in the
-// capped /api/rooms list.
+// null when the room does not exist. Deletion confirmation uses the lean
+// /api/room-exists probe so it never re-fetches a large pinned document.
 function getRoomDetail(roomId) {
   const d = getDb();
   if (!d) return null;
   return (
     d
-      .prepare("SELECT id, name, description, pinned FROM rooms WHERE id = ?")
+      .prepare(
+        `SELECT r.id, r.name, r.description, r.pinned,
+                (SELECT COUNT(*) FROM memberships m
+                 WHERE m.room_id = r.id AND m.left_at IS NULL) AS members,
+                (SELECT created_at FROM messages g WHERE g.room_id = r.id
+                 ORDER BY seq DESC LIMIT 1) AS last_activity
+         FROM rooms r WHERE r.id = ?`,
+      )
       .get(roomId) ?? null
   );
+}
+
+function roomExists(roomId) {
+  const d = getDb();
+  if (!d) return null;
+  return !!d.prepare("SELECT 1 FROM rooms WHERE id = ?").get(roomId);
 }
 
 // Message columns for the JSON endpoints. Bodies are capped in SQL (substr
@@ -174,7 +188,7 @@ const MSG_COLS = `g.seq, g.agent_id AS "from", a.role, a.type,
               substr(g.body, 1, ${MAX_BODY_CHARS}) AS body,
               CASE WHEN length(g.body) > ${MAX_BODY_CHARS}
                    THEN COALESCE(g.body_len, length(g.body)) ELSE NULL END AS body_length,
-              g.format,
+              g.format, g.priority,
               g.mentions, g.reply_to_seq, g.reply_to_agent, g.supersedes_seq,
               g.created_at AS at,
               (SELECT s.seq FROM messages s
@@ -216,6 +230,7 @@ function takeBudgeted(iter) {
 // Parse the mentions JSON and apply the body-cap flag for one row. Done BEFORE
 // measuring in takeBudgeted so the measured size is the real serialized size.
 function finalizeRow(r) {
+  r.priority = r.priority === 1;
   if (r.mentions) {
     try {
       r.mentions = JSON.parse(r.mentions);
@@ -454,6 +469,25 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
       }
       replyToAgent = parent.agent_id;
     }
+    const { last_read_seq: from } = d
+      .prepare(
+        "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
+      )
+      .get(roomId, name);
+    // A backward "latest peer" search becomes quadratic when one unread peer is
+    // followed by a growing self tail: every post re-walks that tail. Probe
+    // forward instead, stopping at the first peer. If one exists, conservatively
+    // normalize no cursor here; catch_up will deliver it and repair own gaps. If
+    // none exists, `from` is a safe floor for the shared cursor and private
+    // siblings at or beyond it. One history probe, never one per sibling.
+    const unreadPeer = d
+      .prepare(
+        `SELECT 1 FROM messages
+         WHERE room_id = ? AND seq > ? AND agent_id != ?
+         ORDER BY seq ASC LIMIT 1`,
+      )
+      .get(roomId, from, name);
+    const canNormalize = unreadPeer ? 0 : 1;
     const { next } = d
       .prepare(
         "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM messages WHERE room_id = ?",
@@ -465,9 +499,22 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
       `INSERT INTO messages (room_id, seq, agent_id, format, body, body_len, mentions, reply_to_seq, reply_to_agent)
        VALUES (?, ?, ?, 'text', ?, ?, ?, ?, ?)`,
     ).run(roomId, next, name, body, body.length, mentionsJson, replyToSeq, replyToAgent);
+    // Own rows are excluded from unread delivery. Move only cursors at/after the
+    // proven safe floor through this row; a lagging peer remains unread.
     d.prepare(
-      "UPDATE memberships SET last_seen = datetime('now') WHERE room_id = ? AND agent_id = ?",
-    ).run(roomId, name);
+      `UPDATE memberships
+       SET last_read_seq = CASE WHEN ? = 1 AND last_read_seq >= ?
+              THEN max(last_read_seq, ?) ELSE last_read_seq END,
+           last_seen = datetime('now')
+       WHERE room_id = ? AND agent_id = ?`,
+    ).run(canNormalize, from, next, roomId, name);
+    if (canNormalize === 1) {
+      d.prepare(
+        `UPDATE session_markers
+         SET last_read_seq = max(last_read_seq, ?)
+         WHERE room_id = ? AND agent_id = ? AND last_read_seq >= ?`,
+      ).run(next, roomId, name, from);
+    }
     // Posting is active participation: re-assert this web session's presence
     // (recreating a row the 7-day GC reaped), matching the MCP store's touch().
     d.prepare(
@@ -533,9 +580,9 @@ function markRead(d, roomId, name, seq) {
 }
 
 // Full room deletion, mirroring ChatStore.deleteRoom: messages first (so the
-// FTS delete-trigger fires), then memberships, session markers, claims, and
-// the room row, in one IMMEDIATE transaction. Unauthenticated by design,
-// exactly like the MCP delete_room tool.
+// FTS delete-trigger fires), then memberships, session markers/presence,
+// wait leases, claims, and the room row, in one IMMEDIATE transaction.
+// Unauthenticated by design, exactly like the MCP delete_room tool.
 function deleteRoomFull(d, roomId) {
   const tx = d.transaction(() => {
     const room = d.prepare("SELECT name FROM rooms WHERE id = ?").get(roomId);
@@ -550,6 +597,10 @@ function deleteRoomFull(d, roomId) {
     d.prepare("DELETE FROM memberships WHERE room_id = ?").run(roomId);
     d.prepare("DELETE FROM session_markers WHERE room_id = ?").run(roomId);
     d.prepare("DELETE FROM session_presence WHERE room_id = ?").run(roomId);
+    // v0.10 added a rooms(id) FK from wait_leases. Omitting it made a live or
+    // lingering blocking wait turn confirmed web deletion into a rolled-back
+    // FOREIGN KEY failure; the store's deleteRoom already clears this table.
+    d.prepare("DELETE FROM wait_leases WHERE room_id = ?").run(roomId);
     d.prepare("DELETE FROM claims WHERE room_id = ?").run(roomId);
     d.prepare("DELETE FROM rooms WHERE id = ?").run(roomId);
     return { deleted_room: roomId, name: room.name, messages, members };
@@ -693,11 +744,13 @@ async function handlePost(url, req, res) {
   // Require a real JSON number: Number() coercion accepted true/[1]/"1"
   // (all of which coerce to a usable integer) despite the error text below.
   const roomId =
-    typeof payload.room === "number" && Number.isInteger(payload.room)
+    typeof payload.room === "number" && Number.isSafeInteger(payload.room)
       ? payload.room
       : NaN;
-  if (!Number.isInteger(roomId) || roomId <= 0) {
-    return sendJson(res, 400, { error: "room must be a positive integer id" });
+  if (!Number.isSafeInteger(roomId) || roomId <= 0) {
+    return sendJson(res, 400, {
+      error: "room must be a positive safe integer id",
+    });
   }
 
   if (url.pathname === "/api/delete-room") {
@@ -732,11 +785,13 @@ async function handlePost(url, req, res) {
   }
   if (url.pathname === "/api/read") {
     const seq =
-      typeof payload.seq === "number" && Number.isInteger(payload.seq)
+      typeof payload.seq === "number" && Number.isSafeInteger(payload.seq)
         ? payload.seq
         : NaN;
-    if (!Number.isInteger(seq) || seq < 0) {
-      return sendJson(res, 400, { error: "seq must be a non-negative integer" });
+    if (!Number.isSafeInteger(seq) || seq < 0) {
+      return sendJson(res, 400, {
+        error: "seq must be a non-negative safe integer",
+      });
     }
     const r = markRead(d, roomId, name, seq);
     return sendJson(res, r.error ? 400 : 200, r);
@@ -758,12 +813,12 @@ async function handlePost(url, req, res) {
     if (payload.reply_to_seq !== undefined && payload.reply_to_seq !== null) {
       replyTo =
         typeof payload.reply_to_seq === "number" &&
-        Number.isInteger(payload.reply_to_seq)
+        Number.isSafeInteger(payload.reply_to_seq)
           ? payload.reply_to_seq
           : NaN;
-      if (!Number.isInteger(replyTo) || replyTo <= 0) {
+      if (!Number.isSafeInteger(replyTo) || replyTo <= 0) {
         return sendJson(res, 400, {
-          error: "reply_to_seq must be a positive integer",
+          error: "reply_to_seq must be a positive safe integer",
         });
       }
     }
@@ -819,29 +874,56 @@ const server = createServer(async (req, res) => {
       if (result === null)
         return sendJson(res, 200, {
           rooms: [],
-          total: 0,
           error: dbUnavailableError(),
         });
-      return sendJson(res, 200, { rooms: result.rooms, total: result.total });
+      return sendJson(res, 200, { rooms: result.rooms });
     }
     if (url.pathname === "/api/room") {
       // Full detail for one room (name, description, WHOLE pinned), fetched on
-      // open; also lets the client confirm a room really is deleted.
+      // open. Recurring deletion checks use /api/room-exists below.
       const roomId = Number(url.searchParams.get("id"));
-      if (!Number.isInteger(roomId) || roomId <= 0)
-        return sendJson(res, 400, { error: "id must be a positive integer" });
+      if (!Number.isSafeInteger(roomId) || roomId <= 0)
+        return sendJson(res, 400, {
+          error: "id must be a positive safe integer",
+        });
       const d = getDb();
       if (!d) return sendJson(res, 200, { room: null, error: dbUnavailableError() });
       return sendJson(res, 200, { room: getRoomDetail(roomId) });
     }
+    if (url.pathname === "/api/room-exists") {
+      // Deletion confirmation for an open room displaced from the capped room
+      // list. Keep this a one-row existence probe: /api/room may carry a large
+      // pinned document and should only be fetched when a room is opened.
+      const roomId = Number(url.searchParams.get("id"));
+      if (!Number.isSafeInteger(roomId) || roomId <= 0)
+        return sendJson(res, 400, {
+          error: "id must be a positive safe integer",
+        });
+      const exists = roomExists(roomId);
+      if (exists === null)
+        return sendJson(res, 200, { exists: null, error: dbUnavailableError() });
+      return sendJson(res, 200, { exists });
+    }
     if (url.pathname === "/api/messages") {
       const roomId = Number(url.searchParams.get("room"));
-      if (!Number.isInteger(roomId) || roomId <= 0)
-        return sendJson(res, 400, { error: "room must be a positive integer" });
-      // floor everything bound to SQL integer slots: a float LIMIT is a
-      // "datatype mismatch" 500 out of SQLite.
-      const after = Math.floor(Number(url.searchParams.get("after"))) || 0;
-      const before = Math.floor(Number(url.searchParams.get("before"))) || 0;
+      if (!Number.isSafeInteger(roomId) || roomId <= 0)
+        return sendJson(res, 400, {
+          error: "room must be a positive safe integer",
+        });
+      const after = Number(url.searchParams.get("after") ?? 0);
+      const before = Number(url.searchParams.get("before") ?? 0);
+      if (
+        !Number.isSafeInteger(after) ||
+        after < 0 ||
+        !Number.isSafeInteger(before) ||
+        before < 0
+      ) {
+        return sendJson(res, 400, {
+          error: "after/before must be non-negative safe integers",
+        });
+      }
+      // Floor only LIMIT: floats used to reach SQLite and trigger a 500, and
+      // limit is a page-size knob rather than a durable sequence identity.
       const limit = Math.max(
         1,
         Math.min(Math.floor(Number(url.searchParams.get("limit"))) || 200, 1000),
@@ -864,7 +946,7 @@ const server = createServer(async (req, res) => {
       // marker after a reload so gap-aware read marking works.
       const roomId = Number(url.searchParams.get("room"));
       const name = (url.searchParams.get("name") || "").trim();
-      if (!Number.isInteger(roomId) || roomId <= 0 || !name)
+      if (!Number.isSafeInteger(roomId) || roomId <= 0 || !name)
         return sendJson(res, 400, { error: "room (id) and name are required" });
       const d = getDb();
       if (!d)
@@ -887,8 +969,10 @@ const server = createServer(async (req, res) => {
     }
     if (url.pathname === "/api/search") {
       const roomId = Number(url.searchParams.get("room"));
-      if (!Number.isInteger(roomId) || roomId <= 0)
-        return sendJson(res, 400, { error: "room must be a positive integer" });
+      if (!Number.isSafeInteger(roomId) || roomId <= 0)
+        return sendJson(res, 400, {
+          error: "room must be a positive safe integer",
+        });
       const q = (url.searchParams.get("q") || "").trim();
       if (!q) return sendJson(res, 400, { error: "q is required" });
       const limit = Math.max(

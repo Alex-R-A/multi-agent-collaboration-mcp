@@ -58,6 +58,11 @@ const throws = (fn, re) => {
       gm.content === "abc�def",
       gm.content,
     );
+    check(
+      "healing also rebuilds FTS so post-NUL tokens are searchable",
+      s.searchMessages(1, "def", 10).matches.length === 1,
+      s.searchMessages(1, "def", 10),
+    );
     // An old build trying to insert ANOTHER NUL row is now rejected by the trigger.
     const raw = new Database(DB);
     let rejected = false;
@@ -172,10 +177,10 @@ const throws = (fn, re) => {
     setup.close();
   }
   const POLLER = join(ROOT, "scripts", "wait-for-updates.sh");
-  const padded = spawnSync("bash", [POLLER, "--agent", "w", "--interval", "0000000001", "--timeout", "1"], { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20_000 });
+  const padded = spawnSync("bash", [POLLER, "--agent", "w", "--interval", "0000000005", "--timeout", "1"], { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20_000 });
   check("poller accepts a zero-padded --interval (times out cleanly)", padded.status === 124, { status: padded.status, stderr: padded.stderr });
   const huge = spawnSync("bash", [POLLER, "--agent", "w", "--interval", "99999999999", "--timeout", "1"], { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20_000 });
-  check("poller rejects a genuinely huge --interval", huge.status === 2 && /too large/.test(huge.stderr), { status: huge.status, stderr: huge.stderr });
+  check("poller rejects a genuinely huge --interval", huge.status === 2 && /between 5 and 3600/.test(huge.stderr), { status: huge.status, stderr: huge.stderr });
 
   rmSync(dir, { recursive: true, force: true });
 }

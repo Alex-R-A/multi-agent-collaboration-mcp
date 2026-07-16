@@ -153,15 +153,13 @@ const NUL = String.fromCharCode(0);
   const never = await call("wait_for_messages", { room: "nope-never" });
   check("wait_for_messages still refuses a never-existent room", never.isErr, never);
 
-  // #5: a scoped watch on a PRIVATE-cursor room emits --since (this session's
-  // own position) so the poller does not fall back to the identity marker a
-  // twin may have advanced; a shared-cursor room omits it.
+  // #5: scoped watches carry the live session, never a frozen --since value.
   await call("join_room", { room: "watch-me", agent_id: "p", cursor: "private" });
   const priv = await call("wait_for_messages", { room: "watch-me" });
-  check("private scoped watch emits --since", !priv.isErr && /--since /.test(priv.data.command || ""), priv.data.command);
+  check("private scoped watch emits --session, not --since", !priv.isErr && /--session /.test(priv.data.command || "") && !/--since /.test(priv.data.command || ""), priv.data.command);
   await call("join_room", { room: "watch-me", agent_id: "p", cursor: "shared" });
   const shared = await call("wait_for_messages", { room: "watch-me" });
-  check("shared scoped watch omits --since", !shared.isErr && !/--since /.test(shared.data.command || ""), shared.data.command);
+  check("shared scoped watch also omits --since", !shared.isErr && /--session /.test(shared.data.command || "") && !/--since /.test(shared.data.command || ""), shared.data.command);
 
   // #11: JSON.stringify normally turns a semantic lone surrogate into the
   // ASCII escape "\\ud800", so the storage-level string guard cannot see it.
@@ -237,10 +235,10 @@ const NUL = String.fromCharCode(0);
   { const s = new ChatStore(DB); s.createRoom("r", null, null); s.upsertAgent("w", null, null, null); s.joinRoom(1, "w"); s.close(); }
   const POLLER = join(ROOT, "scripts", "wait-for-updates.sh");
   const run = (a) => spawnSync("bash", [POLLER, ...a], { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20000 });
-  const padded = run(["--agent", "w", "--interval", "00000000001", "--timeout", "1"]);
+  const padded = run(["--agent", "w", "--interval", "00000000005", "--timeout", "1"]);
   check("poller accepts an 11-digit zero-padded value (times out cleanly)", padded.status === 124, { status: padded.status, stderr: padded.stderr });
   const huge = run(["--agent", "w", "--interval", "99999999999", "--timeout", "1"]);
-  check("poller still rejects a genuinely huge value", huge.status === 2 && /too large/.test(huge.stderr), { status: huge.status });
+  check("poller still rejects a genuinely huge value", huge.status === 2 && /between 5 and 3600/.test(huge.stderr), { status: huge.status });
   rmSync(dir, { recursive: true, force: true });
 }
 

@@ -9,6 +9,8 @@
 //     watching:true while open, false after
 //  M3 timeout carries timed_out/call_again/waited_ms/rooms_with_unread
 //  M4 wait_seconds omitted keeps the exact v0.9 response shape
+//  M4b concurrent waits in one process keep independent leases
+//  M4c named-room waits heartbeat the captured room, not the active room
 //  M5 active-room change mid-wait: captured room governs
 //  M6 cursor-mode flip mid-wait: session_changed, nothing advanced
 //  M7 shared twin consumes mid-wait: no stale refire, later message delivered
@@ -67,12 +69,48 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const s = new ChatStore(DB);
   const r = s.createRoom("lease-room", null, null).id;
   s.upsertAgent("w", null, null, null);
-  s.joinRoom(r, "w");
+  s.joinRoom(r, "w", null, "P");
+  {
+    const raw = new Database(DB);
+    raw.prepare(
+      "UPDATE memberships SET last_seen = datetime('now','-2 hours') WHERE room_id = ? AND agent_id = 'w'",
+    ).run(r);
+    raw.close();
+  }
+  check(
+    "S2 captured-room touch refreshes an exact live session",
+    s.touchSessionRoom(r, "w", "P") === true &&
+      s.recipientStatus(r, ["w"], 5)[0].status === "active",
+    s.recipientStatus(r, ["w"], 5)[0],
+  );
+  s.leaveRoom(r, "w", "P");
+  check(
+    "S2 captured-room touch cannot resurrect a left session",
+    s.touchSessionRoom(r, "w", "P") === false &&
+      s.getMembership(r, "w").left_at !== null,
+    s.getMembership(r, "w"),
+  );
+  s.joinRoom(r, "w", null, "P");
+  {
+    const raw = new Database(DB);
+    raw.prepare(
+      "UPDATE memberships SET last_seen = datetime('now','-2 hours') WHERE room_id = ? AND agent_id = 'w'",
+    ).run(r);
+    raw.close();
+  }
   s.beginWaitLease(r, "w", "NONCE", 30);
   let st = s.recipientStatus(r, ["w"], 5);
-  check("S2 open lease reads as watching in recipientStatus", st[0].watching === true, st);
+  check(
+    "S2 open lease is watching+active despite an old heartbeat",
+    st[0].watching === true && st[0].status === "active",
+    st,
+  );
   const la = s.listAgents(r, 5).agents.find((a) => a.id === "w");
-  check("S2 open lease reads as watching in list_agents", la.watching === true, la);
+  check(
+    "S2 open lease is watching+active in list_agents",
+    la.watching === true && la.active === true,
+    la,
+  );
   s.endWaitLease(r, "w", "NONCE");
   st = s.recipientStatus(r, ["w"], 5);
   check("S2 closed lease reads as not watching", st[0].watching === false, st);
@@ -213,6 +251,69 @@ await (async () => {
     "M4 omitted wait_seconds adds no wait fields",
     m4.data.waited_ms === undefined && m4.data.timed_out === undefined,
     m4.data,
+  );
+
+  // M4b: two calls from ONE MCP process used to share one lease row. The
+  // short timeout then deleted it while the longer call was still live.
+  const short4b = srv.sendCall("catch_up", { wait_seconds: 1 });
+  const long4b = srv.sendCall("catch_up", { wait_seconds: 10 });
+  await sleep(700);
+  {
+    const raw = new Database(DB);
+    const leases = raw
+      .prepare(
+        "SELECT COUNT(*) AS c FROM wait_leases WHERE room_id = ? AND agent_id = 'u'",
+      )
+      .get(rA);
+    raw.close();
+    check("M4b same-process waits create two lease rows", leases.c === 2, leases);
+  }
+  const shortResult4b = srv.parse(await srv.waitFor(short4b));
+  const between4b = s.recipientStatus(rA, ["u"], 5)[0];
+  check(
+    "M4b first timeout leaves the second wait watching",
+    shortResult4b.data.timed_out === true && between4b.watching === true,
+    { short: shortResult4b.data, between: between4b },
+  );
+  s.postMessage(rA, "peer", "for the surviving wait", "text", null, null);
+  const longResult4b = srv.parse(await srv.waitFor(long4b));
+  check(
+    "M4b surviving wait receives the later post",
+    longResult4b.data.messages.some((m) => m.content === "for the surviving wait") &&
+      s.recipientStatus(rA, ["u"], 5)[0].watching === false,
+    longResult4b.data,
+  );
+
+  // M4c: explicit-room activity must refresh the room the wait captured,
+  // while leaving the active-room selection alone.
+  {
+    const raw = new Database(DB);
+    raw.prepare(
+      "UPDATE memberships SET last_seen = datetime('now','-2 hours') WHERE room_id = ? AND agent_id = 'u'",
+    ).run(rB);
+    raw.close();
+  }
+  const cross4c = srv.sendCall("catch_up", {
+    room: "wait-b",
+    wait_seconds: 10,
+  });
+  await sleep(700);
+  const during4c = s.recipientStatus(rB, ["u"], 5)[0];
+  check(
+    "M4c named-room wait heartbeats its captured room",
+    during4c.status === "active" && during4c.watching === true &&
+      (during4c.idle_seconds ?? Infinity) < 60,
+    during4c,
+  );
+  s.postMessage(rB, "peer", "cross-room handoff", "text", null, null);
+  const result4c = srv.parse(await srv.waitFor(cross4c));
+  const who4c = await srv.call("whoami", {});
+  check(
+    "M4c named-room wait receives without switching active room",
+    result4c.data.room_id === rB &&
+      result4c.data.messages.some((m) => m.content === "cross-room handoff") &&
+      who4c.data.room_id === rA,
+    { result: result4c.data, who: who4c.data },
   );
 
   // M5: active-room change mid-wait; the captured room governs.

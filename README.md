@@ -26,6 +26,13 @@ npm install
 npm run build
 ```
 
+`npm run mcp:refresh` rebuilds a source checkout and refreshes supported client
+registrations. Existing Codex/Claude registrations are preserved because an
+in-place build needs no destructive remove/add; set
+`AGENT_CHAT_FORCE_REREGISTER=1` only when the registered path itself changed.
+The published package omits TypeScript sources, so its refresh path reuses the
+prebuilt `dist` rather than trying to compile files that are not shipped.
+
 ## Register with an MCP client
 
 Add an entry to your client's MCP config (for example a project `.mcp.json`, or
@@ -77,24 +84,40 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
   `active_within_minutes`, default 5). `filter` matches a substring of
   id/type/role/description. `next_after` means more rows exist; pass it back as
   `after` (keyset paging).
-- `post_message(content, to?, reply_to_seq?, supersedes_seq?)` — post to the
+- `post_message(content, to?, reply_to_seq?, supersedes_seq?, priority?)` — post to the
   active room. `content` is plain text **or** a JSON object/array. `to` is an
   optional list of agent_ids the message is directed at (mentions).
   `reply_to_seq` tags another message. `supersedes_seq` marks **your own**
   earlier message as superseded by this one (a correction/retraction); readers
-  see `superseded_by` on the old message. Returns the assigned message number
+  see `superseded_by` on the old message. `priority: true` marks a durable
+  high-signal checkpoint for later priority-only backlog reads; it is immutable,
+  so correct it by superseding it with a new priority post. Returns the assigned message number
   (`seq`) plus `crossed`/`crossed_range`: how many messages from others you had
   **not read** at post time (if > 0, catch up, contradicting messages may have
-  landed while you wrote).
-- `catch_up(limit?, preview_chars?, max_bytes?)` — messages posted since you
+  landed while you wrote). An accepted post never consumes an unseen message
+  from someone else; it only normalizes read cursors across a suffix containing
+  your own posts, which `catch_up` would never return.
+- `catch_up(room?, wait_seconds?, priority_only?, limit?, preview_chars?, max_bytes?)` — messages posted since you
   last read, oldest first, and **advances** your read marker. This is THE room
-  sync and it is deliberately unfiltered (a filtered stream gets mistaken for
-  a sync while broadcasts sit unread); mention filtering lives in
-  `my_mentions` instead. Responses are byte-bounded (default ~100k
-  serialized): the marker only advances over messages actually returned, and
-  `byte_limited: true` means more remain, call again. A single oversized
+  sync and is lossless by default. `priority_only: true` is an explicitly
+  **lossy** way to triage a large backlog: it returns `priority: true` messages
+  plus every mention/reply directed at you, advances past lower-priority rows,
+  and reports `skipped_count`, `cutoff_seq`, and `qualifying_remaining`.
+  Directed rows always qualify so this mode cannot silently erase an unread
+  inbox item. It cannot be combined with `wait_seconds`; use it once for old
+  backlog, then ordinary catch-up/wait for live traffic. Responses are byte-bounded (default ~100k
+  serialized): normal mode never advances past an undelivered message from
+  another author. It may also normalize across your own rows before that next
+  peer message so the watcher does not rescan them forever; an otherwise empty
+  page can therefore report `advanced: true`. `byte_limited: true`
+  means more remain, call again. A single oversized
   message arrives truncated (with `truncated`/`length`); page its full body
-  via `get_message`. Call again later to get only what is new; `remaining`
+  via `get_message` (pass the same `room` for an explicit cross-room read).
+  The complete response, including routing metadata and the bounded
+  `rooms_with_unread` summary, honors `max_bytes`; if unusually escape-heavy
+  routing metadata cannot leave room for one recoverable message stub, the
+  call fails before reading or advancing and reports the required minimum.
+  Call again later to get only what is new; `remaining`
   reports how many are still unread.
 - `my_mentions(limit?, preview_chars?, max_bytes?, after_id?)` — the cross-room
   **inbox**: unread messages directed at you (your `to` mentions, or replies to
@@ -110,29 +133,41 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
   budget with `by_room_truncated: true`), reporting both `directed` and total
   `unread` (broadcasts included), so an empty inbox with nonzero `unread`
   means rooms still have traffic to sync, not silence.
+- `pending_work(limit?, after?)` — bounded cross-agent view of unread directed
+  work, one row per present agent and room. If `next_after` is present, pass it
+  back as `after`; because this is a live view, dedupe `agent_id` + `room_id`
+  during a paged supervisor sweep. This is an on-demand supervisor snapshot,
+  not the five-second watcher: it computes exact unread counts, while the
+  watcher uses only an indexed existence probe.
 - `read_history(limit?, before_seq?, preview_chars?, max_bytes?)`
   — browse **without** moving your read marker. No `before_seq` returns the
   most recent `limit` messages (e.g. the last 5); page backward by passing
   `before_seq = oldest_seq` from the prior call. Returned oldest-first,
   byte-bounded like `catch_up`.
-- `get_message(seq, offset?, max_chars?)` — fetch one message by its number,
+- `get_message(room?, seq, offset?, max_chars?)` — fetch one message by its number,
   e.g. to resolve a reference like "see message 8". Bodies are returned up to
   `max_chars` per call (default 100k); a longer body carries
   `truncated`/`length`/`offset`/`next_offset`, page it by setting `offset =
   next_offset` until `truncated` is false. `offset`/`length`/`next_offset`
   count characters (codepoints), and only the requested window is read, so
-  paging a huge body never loads its prefix.
-- `get_thread(seq, max_depth?, preview_chars?)` — a message plus its parent and
+  paging a huge body never loads its prefix. `room` reads another room you
+  have joined without changing the active room; use it for rows returned by
+  cross-room `catch_up` or `my_mentions`, because sequence numbers are
+  per-room.
+- `get_thread(room?, seq, max_depth?, preview_chars?)` — a message plus its parent and
   a bounded recursive tree of its replies (pre-order, `depth`-annotated,
-  `max_depth` default 3). Makes `reply_to` tags navigable.
-- `claim(key, ttl_seconds?, note?)` — claim exclusive (advisory) ownership of a
+  `max_depth` default 3). Makes `reply_to` tags navigable. `room` has the same
+  explicit cross-room semantics as `get_message`.
+- `claim(room?, key, ttl_seconds?, note?)` — claim exclusive (advisory) ownership of a
   named resource, e.g. `file:src/db.ts`, **before** working on it. Atomic
   single-winner: exactly one of two simultaneous claimants is granted, unlike
   crossed "I claim X" chat posts. Claims expire after `ttl_seconds` (default
   900), so crashed holders cannot block forever; re-claim to renew. Advisory
-  only: nothing physically locks the resource.
-- `release_claim(key)` — release your claim so others can take it.
-- `list_claims(limit?, after_key?)` — active claims in the room (up to `limit`,
+  only: nothing physically locks the resource. `room` targets another room you
+  have joined without changing the active room.
+- `release_claim(room?, key)` — release your claim so others can take it.
+- `list_claims(room?, limit?, after_key?)` — active claims in the active or named
+  joined room (up to `limit`,
   default 200, with `total`) with holder, note, and expiry. `next_key` in the
   response means more rows exist; pass it back as `after_key` (keyset paging,
   so a claim expiring between pages cannot make you skip a live one).
@@ -140,11 +175,11 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
   string clears it).
 - `wait_for_messages(room?, mentions_only?)` — returns the exact background
   poller **command** to watch for new messages without busy-looping tool calls
-  (the poller is a bash script, not an MCP tool, so it does not appear in the
-  tool list by itself; this tool surfaces it). Run the returned `command` as a
-  background task: it exits `0` the moment a message lands (then `catch_up`),
-  `124` on timeout, `2` on error. `join_room` returns the same string as
-  `poller_cmd`.
+  (the poller is a separate, childless Node process, not an MCP tool, so it does
+  not appear in the tool list by itself; this tool surfaces it). Run the
+  returned `command` as a background task: it exits `0` the moment a message
+  lands (then `catch_up`), `124` on timeout, `2` on error. `join_room` returns
+  the same string as `poller_cmd`.
 - `search_messages(query, limit?, offset?)` — full-text (FTS5) search of message
   bodies in the active room, best matches first. `query` is FTS5 syntax: bare
   terms are ANDed; supports `OR`, `NOT`, quoted `"phrases"`, and `prefix*`. A
@@ -167,8 +202,9 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
 1. `list_rooms` then `join_room` (capturing the returned `agent_id` if you did
    not supply one).
 2. `list_agents` to learn who is present and their roles.
-3. `read_history` to skim recent context, or `catch_up` to consume the backlog
-   and mark it read.
+3. `read_history` to skim recent context, `catch_up` to consume the full
+   backlog, or `catch_up({ priority_only: true })` to deliberately discard
+   low-priority backlog while preserving checkpoints and directed messages.
 4. `post_message` to report progress; reference others with `reply_to_seq`.
 5. Later, `catch_up` again to receive only messages added while you were away,
    and `my_mentions` to see what is directed at you across every room you have
@@ -176,42 +212,42 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
 
 ## Waiting for updates (background poller)
 
-Rather than busy-looping `catch_up` tool calls, watch the room with a bash
-poller that exits as soon as there is something new, so its exit is the
-notification. It reads the SQLite file directly (a one-shot Node probe,
-`dist/check.js`) and never advances your read marker.
+Rather than busy-looping `catch_up` tool calls, use the bounded Node watcher.
+It opens SQLite once, runs one indexed `LIMIT 1` query every five seconds, and
+exits as soon as there is something new. It never advances a read marker and
+never launches child processes.
 
 ```
-bash scripts/wait-for-updates.sh --agent <your_agent_id> [--mentions-only]
+node dist/poller.js --agent <your_agent_id> [--mentions-only]
 ```
 
 Run it as a background task. Prefer the `poller_cmd` string `join_room`
-returns: it is this exact command with your agent id shell-quoted (ids may
-contain quotes or `$()`, which hand-substitution breaks). It reads the same
-built-in database as every server on the machine, nothing to point anywhere.
+returns: it contains your shell-quoted id and the exact Node executable running
+the MCP. It reads the same built-in database as every server on the machine.
 Without `--room` it watches **all rooms you are
 present in** at once; add `--room <id|name>` to scope it to one room.
 `catch_up` first so your read markers are the baseline; the poller then fires
 on the next message (or, with `--mentions-only`, only when a message tags you
 or replies to you, exactly what `my_mentions` then shows). On a positive check
-it prints a one-line JSON status (`unread`, `unread_mentions`, plus
-`latest_seq` in single-room mode) and exits.
+it prints one firing `room_id`/`room_name` and exits; run `catch_up` for that
+room, then start a fresh watcher if needed.
 
-Options: `--interval <sec>` (default 5), `--timeout <sec>` (default 1200 = 20
-minutes, so a background task never hangs; `0` = never), `--since <seq>` to use
-an explicit baseline instead of the read marker (requires `--room`: seqs are
-per-room), `--session <nonce>` (baked into `poller_cmd`) to make the all-rooms
-watch session-aware: rooms that session soft-left are muted and each room
-baselines off that session's own private cursor where one exists. Pass
-`--agent` to skip your own posts; `--since`
-**without** `--agent` is a room-wide watcher that wakes on any message,
-including your own. Exit codes: `0` updates found (read them with `catch_up` /
-`my_mentions`), `124` timed out with nothing new, `2` error, `130`/`143`
-killed by SIGINT/SIGTERM. The server also
-reports this in its MCP `instructions`, with the script's absolute path.
+Quiet cycles run no counts or grouping. An atomic scope lock rejects an
+equivalent duplicate watcher instead of multiplying database probes. If a
+watcher is killed without cleanup, its error reports the stale lock path for
+explicit removal; it never races to steal another process's lock.
 
-The probe is installed as the `agent-chat-check` bin; the loop lives at
-`scripts/wait-for-updates.sh`.
+Options: `--interval <sec>` (5..3600, default 5), `--timeout <sec>` (1..86400,
+default 1200), `--room <id|name>`, `--mentions-only`, and `--session <nonce>`.
+Generated commands include the live session, so scoped and all-room watches
+resolve the current private/shared cursor on every probe. Frozen `--since`
+baselines are rejected because an automatically restarted stale command can
+re-fire forever. Exit codes: `0` update found, `124` timeout, `2` error or
+duplicate watcher, `130`/`143` terminated.
+
+`agent-chat-check` remains a one-shot diagnostic with exact counts. The old
+`scripts/wait-for-updates.sh` path is a compatibility shim that immediately
+replaces itself with the childless Node watcher.
 
 ## Message numbering and concurrency
 
@@ -222,9 +258,10 @@ coordinating agents; it is not tuned for high write contention.
 
 `catch_up` advances the read marker inside the same kind of `IMMEDIATE`
 transaction, so two processes draining the same identity's backlog partition it
-with no overlap and no loss. `npm test`
-(`test/concurrent-catchup.mjs`) proves this with four processes draining one
-backlog concurrently. That splitting is the **shared** (default) cursor mode
+with no overlap and no loss. The opt-in, process-bounded
+`npm run test:concurrency` check proves this with two workers draining one
+backlog concurrently; it is deliberately separate from the default suite.
+That splitting is the **shared** (default) cursor mode
 and is right for work queues; sessions that instead want independent full views
 of the stream under one identity join with `cursor: "private"`, which gives
 each session its own read position while the shared marker (what others see as
@@ -254,10 +291,11 @@ message, so a reader resolves "re #8" without a second call.
   need identity passed per call instead.
 - Identity is self-asserted and unauthenticated: any caller can claim any
   `agent_id`. Attribution is only trustworthy among cooperating agents.
-- Message bodies are bounded only by SQLite's max length (~1 GB) at write time,
-  but bulk reads are byte-bounded (~100k serialized per response by default)
-  and `get_message` pages long bodies via `offset`/`max_chars`, so a huge
-  message cannot wedge readers behind a client output cap.
+- Message bodies are capped at 10 MB at both the MCP and store boundaries.
+  Bulk reads are byte-bounded (~100k serialized per response by default), and
+  `get_message` pages long bodies via `offset`/`max_chars`. Incoming MCP stdio
+  frames are linearly framed and capped at 64 MiB before SDK parsing (larger
+  than the body cap to allow worst-case JSON escaping).
 - Retention is manual: `prune_messages` trims a room and `delete_room` removes
   one entirely. Nothing is pruned automatically, so an unmanaged shared DB grows
   without bound.
@@ -265,11 +303,9 @@ message, so a reader resolves "re #8" without a second call.
   new message with `supersedes_seq` pointing at your own earlier message (the
   old one stays in history, annotated `superseded_by`); claims are advisory
   coordination, not enforcement.
-- Your own messages never count as unread to you: `catch_up` and the poller skip
-  them (the poller skips them only when `--agent` identifies you; `--since`
-  without `--agent` is a room-wide watcher that counts everyone's posts), so a
-  normal `--agent` watch does not wake on your own post. Use `read_history` or
-  `search_messages` to see your own posts.
+- Your own messages never count as unread to you: `catch_up` and the watcher
+  skip them, and cursors may advance across an own-only suffix without hiding a
+  peer message. Use `read_history` or `search_messages` to see your own posts.
 - Upgrading to v0.8+ requires restarting/reconnecting every older MCP server
   process. Pre-v0.8 processes register no session presence, so a current
   process's leave (or the presence GC) can mark their membership left; an old

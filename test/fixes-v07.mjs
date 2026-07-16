@@ -221,7 +221,7 @@ function mcpClient(env) {
   check(
     "wait_for_messages returns a runnable command for THIS identity",
     typeof w.command === "string" &&
-      w.command.includes("wait-for-updates.sh") &&
+      w.command.includes("poller.js") &&
       w.command.includes("--agent 'poller-user'") &&
       !w.command.includes("--room") &&
       !w.command.includes("--mentions-only"),
@@ -253,7 +253,7 @@ function mcpClient(env) {
   // it carries -- e.g. --session), appending a short timeout/interval.
   const runnable = spawnSync(
     "bash",
-    ["-c", `${w.command} --timeout 3 --interval 1`],
+    ["-c", `${w.command} --timeout 3 --interval 5`],
     { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 15_000 },
   );
   check(
@@ -762,7 +762,7 @@ if (process.platform !== "win32") {
   rmSync(dir, { recursive: true, force: true });
 }
 
-// --- poller: base-10 interval, sleep-child cleanup; check: unsafe --since ---------
+// --- poller: base-10 interval, childless lifecycle; check: unsafe --since ---------
 {
   const dir = mkdtempSync(join(tmpdir(), "aichat-poll7-"));
   const DB = join(dir, "t.db");
@@ -790,28 +790,26 @@ if (process.platform !== "win32") {
       env: { ...process.env, AGENT_CHAT_DB: DB },
       stdio: "ignore",
     });
-    // Wait for the nap's sleep child to appear.
-    let sleepPid = null;
-    for (let i = 0; i < 50 && sleepPid === null; i++) {
-      await sleep(200);
-      const ps = spawnSync("pgrep", ["-P", String(poller.pid), "sleep"], { encoding: "utf8" });
-      const pid = Number((ps.stdout || "").trim().split("\n")[0]);
-      if (Number.isInteger(pid) && pid > 0) sleepPid = pid;
-    }
-    check("poller spawned its interruptible sleep child", sleepPid !== null, sleepPid);
-    if (sleepPid !== null) {
-      poller.kill("SIGTERM");
-      await sleep(600);
-      let alive = true;
-      try {
-        process.kill(sleepPid, 0);
-      } catch {
-        alive = false;
-      }
-      check("SIGTERM kills the sleep child too (no orphan naps)", alive === false, { sleepPid, alive });
-    } else {
-      poller.kill("SIGKILL");
-    }
+    await sleep(300);
+    const children = spawnSync("pgrep", ["-P", String(poller.pid)], {
+      encoding: "utf8",
+    });
+    check(
+      "watcher holds no polling child processes",
+      (children.stdout || "").trim() === "",
+      children.stdout,
+    );
+    poller.kill("SIGTERM");
+    await new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        poller.kill("SIGKILL");
+        resolve();
+      }, 2_000);
+      poller.once("close", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+    });
   }
 
   const huge = spawnSync(

@@ -132,15 +132,17 @@ const throws = (fn, re) => {
   s.upsertAgent("b", null, null, null);
   s.joinRoom(r, "a");
   s.joinRoom(r, "b");
-  // 100 legal 400k bodies. A fetch-all would materialize ~40 MB to return one.
-  for (let i = 0; i < 100; i++) s.postMessage(r, "b", "z".repeat(400_000), "text", null, null);
+  // 20 legal 400k bodies. A fetch-all would still materialize ~8 MB to return
+  // one, enough to violate the 5 MB assertion without making routine tests a
+  // host stress workload.
+  for (let i = 0; i < 20; i++) s.postMessage(r, "b", "z".repeat(400_000), "text", null, null);
   const heapBefore = process.memoryUsage().heapUsed;
   const page = s.catchUp(r, "a", 500, undefined, 100_000);
   const heapGrowth = process.memoryUsage().heapUsed - heapBefore;
   check("catch_up over huge bodies still fits max_bytes", size(page) <= 100_000, size(page));
   check("catch_up delivers the head and flags byte_limited", page.messages.length >= 1 && page.byte_limited === true, page.messages.length);
   check(
-    "catch_up did not materialize all 100 bodies at once (~<5 MB, not ~40 MB)",
+    "catch_up did not materialize all 20 bodies at once (~<5 MB, not ~8 MB)",
     heapGrowth < 5_000_000,
     { heapGrowth },
   );

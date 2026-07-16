@@ -8,6 +8,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SERVER_PATH="$ROOT_DIR/dist/index.js"
 MCP_NAME="${AGENT_CHAT_MCP_NAME:-agent-chat}"
 NODE_BIN="${AGENT_CHAT_NODE_BIN:-${npm_node_execpath:-}}"
+FORCE_REREGISTER="${AGENT_CHAT_FORCE_REREGISTER:-0}"
 
 if [[ -z "$NODE_BIN" ]]; then
   NODE_BIN="$(command -v node || true)"
@@ -19,6 +20,10 @@ if [[ -z "$MCP_NAME" ]]; then
 fi
 if [[ -z "$NODE_BIN" || ! -x "$NODE_BIN" ]]; then
   echo "refresh-mcp: Node.js was not found; install Node 22+ or set AGENT_CHAT_NODE_BIN" >&2
+  exit 2
+fi
+if [[ "$FORCE_REREGISTER" != "0" && "$FORCE_REREGISTER" != "1" ]]; then
+  echo "refresh-mcp: AGENT_CHAT_FORCE_REREGISTER must be 0 or 1" >&2
   exit 2
 fi
 if [[ ! -f "$SERVER_PATH" ]]; then
@@ -60,9 +65,15 @@ add_registration() {
 }
 
 if command -v codex >/dev/null 2>&1; then
-  remove_registration "Codex" codex mcp remove "$MCP_NAME"
-  add_registration "Codex" \
-    codex mcp add "$MCP_NAME" -- "$NODE_BIN" "$SERVER_PATH"
+  if [[ "$FORCE_REREGISTER" == "0" ]] &&
+     codex mcp get "$MCP_NAME" >/dev/null 2>&1; then
+    echo "[Codex] existing '$MCP_NAME' registration preserved; build refreshed in place"
+    refreshed=$((refreshed + 1))
+  else
+    remove_registration "Codex" codex mcp remove "$MCP_NAME"
+    add_registration "Codex" \
+      codex mcp add "$MCP_NAME" -- "$NODE_BIN" "$SERVER_PATH"
+  fi
 else
   echo "[Codex] skipped: 'codex' is not installed" >&2
   skipped=$((skipped + 1))
@@ -116,9 +127,15 @@ if (
   throw new Error(`${configPath}: mcpServers must be a JSON object`);
 }
 
-// Explicit remove + add semantics, committed as one atomic file replacement.
-delete config.mcpServers[name];
-config.mcpServers[name] = { command, args: [serverPath] };
+// Preserve target-specific environment, timeout, and tool-filter fields. A
+// refresh changes only the executable pair; deleting/recreating this object
+// silently discarded user configuration.
+const prior = config.mcpServers[name];
+const retained =
+  prior !== null && typeof prior === "object" && !Array.isArray(prior)
+    ? prior
+    : {};
+config.mcpServers[name] = { ...retained, command, args: [serverPath] };
 
 const dir = pathModule.dirname(configPath);
 fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -151,11 +168,17 @@ else
 fi
 
 if command -v claude >/dev/null 2>&1; then
-  remove_registration "Claude" \
-    claude mcp remove --scope user "$MCP_NAME"
-  add_registration "Claude" \
-    claude mcp add --scope user --transport stdio \
-      "$MCP_NAME" -- "$NODE_BIN" "$SERVER_PATH"
+  if [[ "$FORCE_REREGISTER" == "0" ]] &&
+     claude mcp get "$MCP_NAME" >/dev/null 2>&1; then
+    echo "[Claude] existing '$MCP_NAME' registration preserved; build refreshed in place"
+    refreshed=$((refreshed + 1))
+  else
+    remove_registration "Claude" \
+      claude mcp remove --scope user "$MCP_NAME"
+    add_registration "Claude" \
+      claude mcp add --scope user --transport stdio \
+        "$MCP_NAME" -- "$NODE_BIN" "$SERVER_PATH"
+  fi
 else
   echo "[Claude] skipped: 'claude' is not installed" >&2
   skipped=$((skipped + 1))

@@ -20,7 +20,13 @@
 import { ChatStore } from "../dist/db.js";
 import Database from "better-sqlite3";
 import { spawnSync, spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -309,6 +315,81 @@ await (async () => {
   );
   void unjoined;
 
+  // Cross-room rows must remain expandable in their SOURCE room. Sequences
+  // are per-room, so silently falling back to the active room can return a
+  // real but unrelated message with the same seq.
+  const pageA = s.createRoom("page-active", null, null).id;
+  const pageB = s.createRoom("page-source", null, null).id;
+  s.joinRoom(pageA, "peer");
+  s.joinRoom(pageB, "peer");
+  await call("join_room", { room: "page-source" });
+  await call("join_room", { room: "page-active" });
+  s.postMessage(pageA, "peer", "WRONG active-room body", "text", null, null);
+  s.postMessage(pageB, "peer", "B".repeat(500), "text", null, null);
+  const cut = await call("catch_up", { room: "page-source", preview_chars: 10 });
+  check(
+    "B1 cross-room catch_up returns a truncated source-room row",
+    cut.data.room_id === pageB && cut.data.messages[0]?.truncated === true &&
+      cut.data.messages[0]?.content === "B".repeat(10),
+    cut.data,
+  );
+  const activeMsg = await call("get_message", { seq: 1 });
+  const sourceMsg = await call("get_message", { room: "page-source", seq: 1 });
+  check(
+    "B1 get_message(room) expands the source row, not same-seq active content",
+    activeMsg.data.content === "WRONG active-room body" &&
+      sourceMsg.data.content === "B".repeat(500),
+    { active: activeMsg.data.content, source: sourceMsg.data.content?.slice(0, 20) },
+  );
+  const sourceThread = await call("get_thread", { room: String(pageB), seq: 1 });
+  check(
+    "B1 get_thread(room) expands the source room without switching active",
+    sourceThread.data.message?.content === "B".repeat(500) &&
+      (await call("whoami", {})).data.room_id === pageA,
+    sourceThread.data,
+  );
+
+  // The MCP handler's routing fields are part of max_bytes too. A dense row
+  // that makes the store spend almost the full budget must be shrunk enough
+  // that adding agent_id/room_id/room_name cannot push the wire result over.
+  const budgetRoom = s.createRoom("budget-room", null, null).id;
+  s.upsertAgent("noisy", "\u0001".repeat(100), "\u0002".repeat(200), null);
+  s.joinRoom(budgetRoom, "noisy");
+  await call("join_room", { room: "budget-room" });
+  s.postMessage(budgetRoom, "noisy", "\u0003".repeat(5000), "text", null, null);
+  const bounded = await call("catch_up", { max_bytes: 1000 });
+  check(
+    "B1 complete advancing catch_up response honors max_bytes",
+    !bounded.isError && bounded.data.advanced === true &&
+      bounded.data.messages.length === 1 && JSON.stringify(bounded.data).length <= 1000,
+    { size: JSON.stringify(bounded.data).length, data: bounded.data },
+  );
+
+  // If the fixed routing metadata itself leaves less than one safe stub, the
+  // handler must reject BEFORE entering the advancing store transaction.
+  const denseRoomName = "meta-" + "\u0001".repeat(190);
+  const denseRoom = s.createRoom(denseRoomName, null, null).id;
+  s.joinRoom(denseRoom, "peer");
+  await call("join_room", { room: denseRoomName });
+  s.postMessage(denseRoom, "peer", "recoverable", "text", null, null);
+  const tooSmall = await call("catch_up", { max_bytes: 1000 });
+  check(
+    "B1 an impossible metadata budget fails before marker advance",
+    tooSmall.isError === true && /too small/.test(tooSmall.data.error) &&
+      s.getMembership(denseRoom, "u").last_read_seq === 0,
+    { result: tooSmall.data, membership: s.getMembership(denseRoom, "u") },
+  );
+  const retried = await call("catch_up", { max_bytes: 3000 });
+  check(
+    "B1 larger-budget retry recovers the unadvanced message",
+    !retried.isError && retried.data.messages[0]?.content === "recoverable" &&
+      JSON.stringify(retried.data).length <= 3000,
+    { size: JSON.stringify(retried.data).length, data: retried.data },
+  );
+
+  // Restore the original active room for the delivery-status checks below.
+  await call("join_room", { room: "active-room" });
+
   // B2: delivery warnings. ghost = never joined; leaver = joined then left;
   // stale = present but idle 2h; peer = active.
   s.upsertAgent("leaver", null, null, null);
@@ -316,17 +397,22 @@ await (async () => {
   s.leaveRoom(rA, "leaver");
   s.upsertAgent("stale", null, null, null);
   s.joinRoom(rA, "stale");
+  s.markRead(rA, "stale");
+  s.upsertAgent("watcher", null, null, null);
+  s.joinRoom(rA, "watcher");
+  s.markRead(rA, "watcher");
   {
     const raw = new Database(DB);
     raw.prepare(
-      "UPDATE memberships SET last_seen = datetime('now','-2 hours') WHERE agent_id = 'stale'",
+      "UPDATE memberships SET last_seen = datetime('now','-2 hours') WHERE agent_id IN ('stale','watcher')",
     ).run();
     raw.close();
   }
+  s.beginWaitLease(rA, "watcher", "OPEN-WAIT", 30);
   s.touch(rA, "peer");
   const post = await call("post_message", {
     content: "fanout",
-    to: ["ghost", "leaver", "stale", "peer"],
+    to: ["ghost", "leaver", "stale", "watcher", "peer"],
   });
   const w = post.data.delivery_warnings ?? [];
   check(
@@ -338,16 +424,22 @@ await (async () => {
     w,
   );
   check(
-    "B2 no warning for the active recipient",
-    !w.some((x) => x.startsWith("peer:")),
+    "B2 no warning for active or watching recipients",
+    !w.some((x) => x.startsWith("peer:")) &&
+      !w.some((x) => x.startsWith("watcher:")),
     w,
   );
   check(
-    "B2 recipients rows carry marker_behind",
+    "B2 post-transaction recipient rows include the new unread message",
     post.data.recipients.every((r) => "marker_behind" in r) &&
-      post.data.recipients.find((r) => r.id === "ghost").marker_behind === null,
+      post.data.recipients.find((r) => r.id === "ghost").marker_behind === null &&
+      post.data.recipients.find((r) => r.id === "stale").marker_behind === 1 &&
+      post.data.recipients.find((r) => r.id === "watcher").marker_behind === 1 &&
+      post.data.recipients.find((r) => r.id === "watcher").watching === true &&
+      post.data.recipients.find((r) => r.id === "watcher").status === "active",
     post.data.recipients,
   );
+  s.endWaitLease(rA, "watcher", "OPEN-WAIT");
   const clean = await call("post_message", { content: "to peer", to: ["peer"] });
   check(
     "B2 all-active post omits delivery_warnings",
@@ -367,7 +459,7 @@ await (async () => {
   const info = await call("server_info", {});
   check(
     "B3 server_info publishes limits and the manual",
-    info.data.limits?.message_body_max_bytes === 1_000_000_000 &&
+    info.data.limits?.message_body_max_bytes === 10_000_000 &&
       info.data.limits?.bulk_read_default_budget_chars === 100_000 &&
       info.data.limits?.metadata_caps_chars?.claim_key === 500 &&
       typeof info.data.manual === "string" &&
@@ -375,16 +467,19 @@ await (async () => {
       info.data.manual.includes("--session"),
     info.data.limits,
   );
-  const wfm = await call("wait_for_messages", { timeout: 90, interval: 2 });
+  const wfm = await call("wait_for_messages", { timeout: 90, interval: 5 });
   check(
     "B3 wait_for_messages threads timeout/interval into the command",
-    wfm.data.command.includes("--timeout '90'") && wfm.data.command.includes("--interval '2'"),
+    wfm.data.command.includes("--timeout '90'") && wfm.data.command.includes("--interval '5'"),
     wfm.data.command,
   );
   const wfmDefault = await call("wait_for_messages", {});
   check(
     "B3 omitted knobs emit no flags (script defaults govern)",
-    !wfmDefault.data.command.includes("--timeout") && !wfmDefault.data.command.includes("--interval"),
+    !wfmDefault.data.command.includes("--timeout") &&
+      !wfmDefault.data.command.includes("--interval") &&
+      wfmDefault.data.command.includes("poller.js") &&
+      wfmDefault.data.single_process === true,
     wfmDefault.data.command,
   );
 
@@ -420,6 +515,138 @@ await (async () => {
       hitJson.rooms_with_updates[0].unread === 1 &&
       hitJson.rooms_with_updates[0].directed === 1,
     { status: hit.status, out: hit.stdout, err: hit.stderr },
+  );
+
+  // --mentions-only must name only rooms that actually contributed a
+  // directed wake, not every room with unrelated broadcast traffic.
+  {
+    const extra = new ChatStore(DB);
+    const broadcast = extra.createRoom("broadcast-only", null, null).id;
+    extra.upsertAgent("c", null, null, null);
+    extra.joinRoom(broadcast, "a");
+    extra.joinRoom(broadcast, "b");
+    extra.joinRoom(broadcast, "c");
+    extra.postMessage(broadcast, "b", "not directed", "text", null, null);
+    extra.close();
+  }
+  const mentionHit = spawnSync(
+    "node",
+    [CHECK, "--agent", "a", "--mentions-only"],
+    { env, encoding: "utf8" },
+  );
+  const mentionJson = mentionHit.status === 0 ? JSON.parse(mentionHit.stdout) : null;
+  check(
+    "C1 mentions-only summary omits broadcast-only rooms",
+    mentionHit.status === 0 && mentionJson.rooms_with_updates?.length === 1 &&
+      mentionJson.rooms_with_updates[0].room_id === r1 &&
+      mentionJson.rooms_with_updates[0].directed === 1,
+    { status: mentionHit.status, out: mentionHit.stdout, err: mentionHit.stderr },
+  );
+
+  const leanQuiet = spawnSync(
+    "node",
+    [CHECK, "--wake-only", "--agent", "c", "--mentions-only"],
+    { env, encoding: "utf8" },
+  );
+  const leanJson = leanQuiet.status === 1 ? JSON.parse(leanQuiet.stdout) : null;
+  check(
+    "C1 poller quiet path skips repeated exact broadcast-backlog counts",
+    leanQuiet.status === 1 && leanJson?.has_updates === false &&
+      leanJson?.unread_count_skipped === true &&
+      !("unread" in leanJson),
+    { status: leanQuiet.status, out: leanQuiet.stdout, err: leanQuiet.stderr },
+  );
+  const scopedLean = spawnSync(
+    "node",
+    [
+      CHECK,
+      "--wake-only",
+      "--room",
+      "broadcast-only",
+      "--agent",
+      "c",
+      "--mentions-only",
+    ],
+    { env, encoding: "utf8" },
+  );
+  const scopedLeanJson =
+    scopedLean.status === 1 ? JSON.parse(scopedLean.stdout) : null;
+  check(
+    "C1 scoped mentions-only quiet path skips the broadcast count too",
+    scopedLean.status === 1 && scopedLeanJson?.has_updates === false &&
+      scopedLeanJson?.unread_count_skipped === true,
+    { status: scopedLean.status, out: scopedLean.stdout, err: scopedLean.stderr },
+  );
+
+  // Count Node launches during a bounded quiet watch. The compatibility shell
+  // must exec exactly one persistent watcher, not spawn one probe per tick.
+  const countFile = join(dir, "probe-count");
+  const nodeWrapper = join(dir, "counting-node.sh");
+  writeFileSync(countFile, "");
+  writeFileSync(
+    nodeWrapper,
+    '#!/bin/sh\nprintf "x\\n" >> "$COUNT_FILE"\nexec "$REAL_NODE" "$@"\n',
+  );
+  chmodSync(nodeWrapper, 0o700);
+  const pollStarted = Date.now();
+  const boundedPoll = spawnSync(
+    "bash",
+    [
+      join(ROOT, "scripts", "wait-for-updates.sh"),
+      "--node",
+      nodeWrapper,
+      "--agent",
+      "c",
+      "--mentions-only",
+      "--interval",
+      "5",
+      "--timeout",
+      "1",
+    ],
+    {
+      env: { ...env, COUNT_FILE: countFile, REAL_NODE: process.execPath },
+      encoding: "utf8",
+      timeout: 10_000,
+    },
+  );
+  const pollElapsed = Date.now() - pollStarted;
+  const probeLog = readFileSync(countFile, "utf8").trim();
+  const probeCount = probeLog === "" ? 0 : probeLog.split("\n").length;
+  check(
+    "C1 bounded quiet watch uses one Node process and exits 124",
+    boundedPoll.status === 124 && probeCount === 1 &&
+      pollElapsed >= 1000 && pollElapsed < 6000,
+    {
+      status: boundedPoll.status,
+      probes: probeCount,
+      elapsed: pollElapsed,
+      out: boundedPoll.stdout,
+      err: boundedPoll.stderr,
+    },
+  );
+
+  // The room summary is capped for a small status line, but callers route
+  // catch_up calls from it; disclose when additional firing rooms were cut.
+  {
+    const extra = new ChatStore(DB);
+    for (let i = 0; i < 21; i++) {
+      const room = extra.createRoom(`wake-${i}`, null, null).id;
+      extra.joinRoom(room, "a");
+      extra.joinRoom(room, "b");
+      extra.postMessage(room, "b", "directed", "text", ["a"], null);
+    }
+    extra.close();
+  }
+  const manyHit = spawnSync("node", [CHECK, "--agent", "a"], {
+    env,
+    encoding: "utf8",
+  });
+  const manyJson = manyHit.status === 0 ? JSON.parse(manyHit.stdout) : null;
+  check(
+    "C1 >20 firing rooms set rooms_with_updates_truncated",
+    manyHit.status === 0 && manyJson.rooms_with_updates?.length === 20 &&
+      manyJson.rooms_with_updates_truncated === true,
+    { status: manyHit.status, out: manyHit.stdout, err: manyHit.stderr },
   );
   const quiet = spawnSync("node", [CHECK, "--agent", "b"], { env, encoding: "utf8" });
   const quietJson = quiet.status === 1 ? JSON.parse(quiet.stdout) : null;
@@ -471,6 +698,27 @@ await (async () => {
   );
   const json = JSON.stringify(res);
   check("D1 summary serializes to valid JSON", JSON.parse(json) !== null, null);
+
+  // The summary shares catch_up's hard response budget. Legal control-heavy
+  // room names escape to ~6x their in-memory length; the v0.9 implementation
+  // appended up to twenty of them after spending the entire message budget.
+  for (let i = 0; i < 20; i++) {
+    const name = `dense-${String(i).padStart(2, "0")}-` + "\u0001".repeat(190);
+    const room = s.createRoom(name, null, null).id;
+    s.joinRoom(room, "a");
+    s.joinRoom(room, "b");
+    s.postMessage(room, "b", "unread", "text", null, null);
+  }
+  const boundedSummary = s.catchUp(home, "a", 50, undefined, 1000, null, {
+    sessionId: null,
+  });
+  check(
+    "D1 rooms_with_unread shares the complete catch_up byte budget",
+    JSON.stringify(boundedSummary).length <= 1000 &&
+      boundedSummary.rooms_with_unread.length > 0 &&
+      boundedSummary.rooms_with_unread_truncated === true,
+    { size: JSON.stringify(boundedSummary).length, summary: boundedSummary },
+  );
   s.close();
 }
 

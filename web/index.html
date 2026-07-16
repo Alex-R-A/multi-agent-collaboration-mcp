@@ -1245,8 +1245,11 @@
       const ROOM_KEY = "agent-chat.room";
       const SEEN_KEY = "agent-chat.seen";
       const POLL_MS = 1500;
-      const ROOMS_MS = 6000;
+      const ROOMS_MS = 30000;
       const PAGE = 400;
+      const MAX_RENDERED_MESSAGES = 2400;
+      const TRIM_RENDERED_TO = 1600;
+      const FETCH_TIMEOUT_MS = 10000;
       const GROUP_GAP_MS = 3 * 60 * 1000;
 
       const el = {};
@@ -1305,6 +1308,7 @@
         // be told apart from the current visit (id comparison alone cannot).
         roomEpoch: 0,
         searchSeq: 0, // orders concurrent search requests
+        searchController: null, // aborts the superseded/abandoned search request
         // A rename that lands WHILE search mode hides the stream cannot rebuild
         // the (hidden) rows' identity-derived decoration then; this defers it
         // to exitSearch.
@@ -1458,15 +1462,24 @@
         return sameRoom(room) && epoch === state.roomEpoch;
       }
 
-      async function postJson(url, payload) {
-        const r = await fetch(url, {
+      async function requestJson(url, options = {}, controller = new AbortController()) {
+        const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+        try {
+          const r = await fetch(url, { ...options, signal: controller.signal });
+          const data = await r.json().catch(() => ({}));
+          if (!r.ok) throw new Error(data.error || "HTTP " + r.status);
+          return data;
+        } finally {
+          clearTimeout(timeout);
+        }
+      }
+
+      function postJson(url, payload) {
+        return requestJson(url, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload),
         });
-        const data = await r.json().catch(() => ({}));
-        if (!r.ok) throw new Error(data.error || "HTTP " + r.status);
-        return data;
       }
 
       // ---- utilities ------------------------------------------------------
@@ -1590,9 +1603,7 @@
       }
 
       async function fetchJson(url) {
-        const r = await fetch(url);
-        if (!r.ok) throw new Error("HTTP " + r.status);
-        return r.json();
+        return requestJson(url);
       }
 
       function noteOk() {
@@ -1665,10 +1676,7 @@
 
           const meta = document.createElement("div");
           meta.className = "meta";
-          const bits = [
-            room.messages + " msg" + (room.messages === 1 ? "" : "s"),
-            room.members + " present",
-          ];
+          const bits = [room.members + " present"];
           if (room.last_activity) bits.push(fmtRel(room.last_activity));
           meta.textContent = bits.join("  /  ");
           card.append(meta);
@@ -1706,8 +1714,8 @@
         const epoch = state.roomEpoch;
         let gone = false;
         try {
-          const data = await fetchJson(`/api/room?id=${room.id}`);
-          gone = data.room === null && !data.error;
+          const data = await fetchJson(`/api/room-exists?id=${room.id}`);
+          gone = data.exists === false && !data.error;
         } catch {
           return; // server unreachable: keep the room, retry next refresh
         }
@@ -1745,14 +1753,18 @@
               // and no pinned, so replacing wholesale would blank the header.
               const pinned = state.current.pinned;
               const fullDesc = state.current.description;
-              state.current = { ...cur, pinned, description: fullDesc ?? cur.description };
+              state.current = {
+                ...cur,
+                pinned,
+                description: fullDesc ?? cur.description,
+              };
               state.seen[cur.id] = cur.last_activity;
               saveSeen();
               renderRoomHead();
             } else {
               // The open room is ABSENT from the (capped, most-recently-active)
               // list. That does NOT prove deletion -- 1000+ newer rooms could
-              // have displaced it. Confirm with /api/room before tearing down,
+              // have displaced it. Confirm with a lean existence probe,
               // so a still-existing open room is never falsely reported gone.
               confirmRoomGone(state.current);
             }
@@ -1789,8 +1801,7 @@
         if (!r) return;
         el.roomName.textContent = r.name;
         el.roomDesc.textContent = r.description || "";
-        el.roomStats.textContent =
-          r.messages + " messages  /  " + r.members + " present";
+        el.roomStats.textContent = r.members + " present";
         el.mobileTitle.textContent = r.name;
         if (r.pinned) {
           el.pinned.hidden = false;
@@ -1907,62 +1918,40 @@
 
       const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-      // Scroll a message into view, paging older history in (bounded) when the
-      // target is not loaded yet. Retries briefly when the fetch lock is busy.
+      // Scroll a message into view. If it is outside the bounded DOM window,
+      // fetch a page starting at that seq directly; never walk/rebuild
+      // thousands of intermediate pages.
       async function jumpToSeq(seq) {
-        // Guarded like every other multi-await flow: this loop spans seconds
-        // on deep history, and after a room switch the live selectors would
-        // match (and page toward) the NEW room's unrelated seq numbers.
         const room = state.current;
         const epoch = state.roomEpoch;
-        // Bounded by NO-PROGRESS (with a generous safety cap), not a fixed 20
-        // pages: a deep reply-jump toward seq 1 in a large room used to stop
-        // hundreds of messages short. loadOlder returning false with the older
-        // button still shown means the fetch lock was momentarily busy, so
-        // retry a few times before giving up.
-        let backStalls = 0;
-        for (let i = 0; i < 2000; i++) {
-          if (!sameView(room, epoch)) return;
-          if (el.msgs.querySelector(`[data-seq="${seq}"]`)) break;
-          const first = state.msgs[0];
-          if (!first || first.seq <= 1 || first.seq <= seq) break;
-          const changed = await loadOlder();
-          if (changed) {
-            backStalls = 0;
-            continue;
+        if (!room || !Number.isSafeInteger(seq) || seq < 1) return;
+        let target = el.msgs.querySelector(`[data-seq="${seq}"]`);
+        if (!target) {
+          // A search exit may have one ordinary tail refresh in flight. Wait a
+          // short bounded period for its lock, then give up rather than overlap
+          // mutations of the same DOM/state window.
+          for (let i = 0; i < 20 && state.loadingMsgs; i++) await sleep(100);
+          if (!sameView(room, epoch) || state.loadingMsgs) return;
+          state.loadingMsgs = true;
+          try {
+            const anchor = seq === 1 ? "before=2&limit=1" : `after=${seq - 1}&limit=${PAGE}`;
+            const data = await fetchJson(`/api/messages?room=${room.id}&${anchor}`);
+            if (!sameView(room, epoch) || data.error || !data.messages) return;
+            state.msgs = data.messages;
+            state.noOlderHistory = false;
+            rebuildStream();
+            updateOlderButton();
+            computeGap();
+            hidePlaceholder();
+          } catch {
+            noteFail();
+            return;
+          } finally {
+            state.loadingMsgs = false;
           }
-          if (el.older.hidden) break; // history exhausted or room switched
-          if (++backStalls > 8) break; // lock stayed busy; give up gracefully
-          await sleep(150);
-        }
-        // Forward: the target can be NEWER than the rendered tail (a search
-        // hit posted while search mode paused the stream). The exitSearch
-        // refresh runs un-awaited, so page the tail in here and wait for it;
-        // the backward-only walk just returned without scrolling. Bounded by
-        // NO-PROGRESS (plus a generous safety cap), not a fixed page count: a
-        // fixed 20 stopped ~50 messages short after a large burst of arrivals.
-        let stalls = 0;
-        for (let i = 0; i < 2000; i++) {
-          if (!sameView(room, epoch)) return;
-          if (el.msgs.querySelector(`[data-seq="${seq}"]`)) break;
-          const last = state.msgs[state.msgs.length - 1];
-          if (!last || last.seq >= seq) break;
-          const before = last.seq;
-          await loadNew(false);
-          const now = state.msgs[state.msgs.length - 1];
-          if (now && now.seq > before) {
-            stalls = 0;
-            continue;
-          }
-          // No progress: the fetch lock may be held by exitSearch's own
-          // un-awaited loadNew. Retry a few times before giving up, rather
-          // than bailing on the first stall (which could leave a valid
-          // forward search-result click un-scrolled).
-          if (++stalls > 8) break;
-          await sleep(150);
+          target = el.msgs.querySelector(`[data-seq="${seq}"]`);
         }
         if (!sameView(room, epoch)) return;
-        const target = el.msgs.querySelector(`[data-seq="${seq}"]`);
         if (!target) return;
         target.scrollIntoView({ block: "center" });
         target.classList.remove("flash");
@@ -2058,6 +2047,13 @@
             chips.append(chip);
           }
         }
+        if (m.priority) {
+          const chip = document.createElement("span");
+          chip.className = "chip";
+          chip.textContent = "priority";
+          chip.title = "durable checkpoint included in priority-only catch-up";
+          chips.append(chip);
+        }
         if (m.supersedes_seq) {
           const chip = document.createElement("button");
           chip.className = "chip reply";
@@ -2129,6 +2125,12 @@
           prev = m;
         }
         el.msgs.append(frag);
+        if (state.msgs.length > MAX_RENDERED_MESSAGES) {
+          state.msgs = state.msgs.slice(-TRIM_RENDERED_TO);
+          state.noOlderHistory = false;
+          rebuildStream();
+          updateOlderButton();
+        }
         if (fresh) {
           for (const m of rows) {
             if (m.supersedes_seq) patchSuperseded(m.supersedes_seq, m.seq);
@@ -2141,7 +2143,11 @@
         // Hide when the oldest rendered message is seq 1 (nothing older exists)
         // OR paging already proved the floor empty (older messages were pruned,
         // so the button would fetch nothing but still invite a dead click).
-        el.older.hidden = !first || first.seq <= 1 || state.noOlderHistory;
+        el.older.hidden =
+          !first ||
+          first.seq <= 1 ||
+          state.noOlderHistory ||
+          state.msgs.length >= MAX_RENDERED_MESSAGES;
       }
 
       function updateTitle() {
@@ -2246,13 +2252,22 @@
         const room = state.current;
         const epoch = state.roomEpoch;
         const first = state.msgs[0];
-        if (!room || !first || state.loadingMsgs) return false;
+        if (
+          !room ||
+          !first ||
+          state.loadingMsgs ||
+          state.msgs.length >= MAX_RENDERED_MESSAGES
+        ) return false;
         state.loadingMsgs = true;
         el.older.disabled = true;
         let changed = false;
         try {
+          const pageLimit = Math.min(
+            PAGE,
+            MAX_RENDERED_MESSAGES - state.msgs.length,
+          );
           const data = await fetchJson(
-            `/api/messages?room=${room.id}&before=${first.seq}&limit=${PAGE}`,
+            `/api/messages?room=${room.id}&before=${first.seq}&limit=${pageLimit}`,
           );
           if (!sameView(room, epoch) || data.error || !data.messages) return false;
           if (data.messages.length) {
@@ -2347,15 +2362,21 @@
         // Order concurrent searches: a slow older query must not overwrite a
         // newer query's already-rendered results.
         const mySeq = ++state.searchSeq;
+        state.searchController?.abort();
+        const controller = new AbortController();
+        state.searchController = controller;
         let data;
         try {
-          const r = await fetch(
+          data = await requestJson(
             `/api/search?room=${room.id}&q=${encodeURIComponent(q)}&limit=50`,
+            {},
+            controller,
           );
-          data = await r.json().catch(() => ({}));
-          if (!r.ok || data.error) throw new Error(data.error || "HTTP " + r.status);
+          if (data.error) throw new Error(data.error);
         } catch (e) {
           data = { matches: [], failed: e.message };
+        } finally {
+          if (state.searchController === controller) state.searchController = null;
         }
         if (!sameView(room, epoch) || mySeq !== state.searchSeq) return;
         state.searchMode = true;
@@ -2385,6 +2406,8 @@
         // Invalidate any search still in flight: without this, a delayed
         // response re-opens search mode over the freshly restored stream.
         state.searchSeq += 1;
+        state.searchController?.abort();
+        state.searchController = null;
         state.searchMode = false;
         el.searchBar.hidden = true;
         el.results.hidden = true;
@@ -2757,8 +2780,7 @@
         const room = state.current;
         if (!room) return;
         el.deleteInfo.textContent =
-          `Permanently delete "${room.name}" with all ${room.messages} ` +
-          "message" + (room.messages === 1 ? "" : "s") +
+          `Permanently delete "${room.name}" with all messages` +
           ", its memberships, read positions, and claims? This cannot be undone.";
         el.deleteConfirm.hidden = false;
         el.deleteYes.focus();
@@ -2816,6 +2838,8 @@
       function openRoom(room) {
         // Preserve the draft being typed in the room we are leaving.
         if (state.current) state.drafts[state.current.id] = el.composeText.value;
+        state.searchController?.abort();
+        state.searchController = null;
         state.current = room;
         state.msgs = [];
         state.newCount = 0;
@@ -2858,15 +2882,14 @@
         fetchRoomDetail(room, state.roomEpoch); // full pinned/description
       }
 
-      // The sidebar list carries only a short description snippet and NO pinned
-      // (keeping /api/rooms small); fetch the full intro when a room is opened
-      // and merge it onto the live room object so the header shows all of it.
+      // The recurring sidebar list carries only selection metadata. Fetch the
+      // full intro once when a room is opened; decorative history counts are
+      // intentionally omitted rather than repeatedly recomputed.
       async function fetchRoomDetail(room, epoch) {
         try {
           const data = await fetchJson(`/api/room?id=${room.id}`);
           if (!sameView(room, epoch) || !data.room) return;
-          state.current.description = data.room.description;
-          state.current.pinned = data.room.pinned;
+          state.current = { ...state.current, ...data.room };
           renderRoomHead();
         } catch {}
       }
@@ -2973,7 +2996,12 @@
       el.deleteNo.addEventListener("click", () => {
         el.deleteConfirm.hidden = true;
       });
-      document.addEventListener("visibilitychange", maybeMarkRead);
+      document.addEventListener("visibilitychange", () => {
+        if (document.hidden) return;
+        loadNew(false);
+        loadRooms();
+        maybeMarkRead();
+      });
 
       // Another tab changing the identity or the membership map invalidates
       // every in-flight operation issued under the old identity in THIS tab:
@@ -3002,8 +3030,12 @@
         }
       });
 
-      setInterval(() => loadNew(false), POLL_MS);
-      setInterval(loadRooms, ROOMS_MS);
+      setInterval(() => {
+        if (!document.hidden) loadNew(false);
+      }, POLL_MS);
+      setInterval(() => {
+        if (!document.hidden) loadRooms();
+      }, ROOMS_MS);
 
       (async function init() {
         showPlaceholder("Loading...", "");
