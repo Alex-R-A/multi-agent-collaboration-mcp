@@ -8,10 +8,12 @@
 //  S5 adversarial bodies in crossed previews: astral codepoint cuts, huge
 //     bodies bounded, control-char escaping bounded, json partials
 //  S6 a reject consumes nothing: catch_up still delivers the crossed rows
+//  S7 client_message_id deduplicates exact lost-response retries, rejects reuse
 //  P1 MCP: room targets a joined room without switching active
 //  P2 MCP: expected_room asserts the active room; mutual exclusion with room
 //  P3 MCP: CAS reject shape + idempotent retry succeeds
 //  P4 MCP: back-compat accept shape (posted:true rides along)
+//  P5 MCP: client_message_id returns original seq on exact retry
 import { ChatStore } from "../dist/db.js";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -217,6 +219,51 @@ const check = (n, c, x) => {
   s.close();
 }
 
+// --- S7: sparse, opt-in post idempotency --------------------------------------
+{
+  const s = new ChatStore(":memory:");
+  const r = s.createRoom("idempotent-post", null, null).id;
+  s.upsertAgent("me", null, null, null);
+  s.upsertAgent("peer", null, null, null);
+  s.joinRoom(r, "me");
+  s.joinRoom(r, "peer");
+  const opts = { clientMessageId: "verdict-req-1", ifLastReadSeq: 0 };
+  const first = s.postMessage(r, "me", "verdict", "text", ["peer"], null, null, null, opts);
+  s.postMessage(r, "peer", "later context", "text", null, null);
+  const retry = s.postMessage(r, "me", "verdict", "text", ["peer"], null, null, null, opts);
+  check(
+    "S7 exact retry returns the original seq despite later CAS-stale traffic",
+    first.posted === true && first.deduplicated === false &&
+      retry.posted === true && retry.deduplicated === true &&
+      retry.seq === first.seq &&
+      s.readHistory(r, 20).messages.filter((m) => m.content === "verdict").length === 1,
+    { first, retry, history: s.readHistory(r, 20).messages },
+  );
+  let collision = "";
+  try {
+    s.postMessage(
+      r,
+      "me",
+      "different verdict",
+      "text",
+      ["peer"],
+      null,
+      null,
+      null,
+      { clientMessageId: "verdict-req-1" },
+    );
+  } catch (e) {
+    collision = String(e?.message ?? e);
+  }
+  check(
+    "S7 reusing a key for a different stored payload fails without another row",
+    /already attached to a different stored payload/.test(collision) &&
+      s.readHistory(r, 20).messages.filter((m) => /verdict/.test(String(m.content))).length === 1,
+    { collision, history: s.readHistory(r, 20).messages },
+  );
+  s.close();
+}
+
 // --- P: MCP surface -----------------------------------------------------------------
 await (async () => {
   const dir = mkdtempSync(join(tmpdir(), "v0110-mcp-"));
@@ -229,7 +276,20 @@ await (async () => {
   let buf = "";
   child.stdout.on("data", (d) => { buf += d; let i; while ((i = buf.indexOf("\n")) >= 0) { const l = buf.slice(0, i); buf = buf.slice(i + 1); if (!l.trim()) continue; try { const m = JSON.parse(l); if (m.id !== undefined) R.set(m.id, m); } catch {} } });
   const send = (o) => child.stdin.write(JSON.stringify(o) + "\n");
-  const wait = (id) => new Promise((res) => { const t = setInterval(() => { if (R.has(id)) { clearInterval(t); res(R.get(id)); } }, 15); });
+  const wait = (id) => new Promise((res, rej) => {
+    const deadline = setTimeout(() => {
+      clearInterval(poll);
+      child.kill("SIGKILL");
+      rej(new Error(`MCP reply timeout id ${id}`));
+    }, 15_000);
+    const poll = setInterval(() => {
+      if (R.has(id)) {
+        clearInterval(poll);
+        clearTimeout(deadline);
+        res(R.get(id));
+      }
+    }, 15);
+  });
   send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "0" } } });
   await wait(1);
   send({ jsonrpc: "2.0", method: "notifications/initialized" });
@@ -328,6 +388,34 @@ await (async () => {
       typeof p4.data.crossed === "number" && typeof p4.data.crossed_directed === "number" &&
       Array.isArray(p4.data.recipients),
     p4.data,
+  );
+
+  // P5: a lost response can be retried without duplicating the post.
+  const p5first = await call("post_message", {
+    content: "large dispositive result",
+    client_message_id: "mcp-request-1",
+  });
+  s.postMessage(rA, "peer", "later traffic", "text", null, null);
+  const p5retry = await call("post_message", {
+    content: "large dispositive result",
+    client_message_id: "mcp-request-1",
+  });
+  check(
+    "P5 exact idempotent retry returns the original seq and inserts no duplicate",
+    p5first.data.posted === true && p5first.data.deduplicated === undefined &&
+      p5retry.data.posted === true && p5retry.data.deduplicated === true &&
+      p5retry.data.seq === p5first.data.seq &&
+      s.readHistory(rA, 100).messages.filter((m) => m.content === "large dispositive result").length === 1,
+    { first: p5first.data, retry: p5retry.data },
+  );
+  const p5collision = await call("post_message", {
+    content: "different result",
+    client_message_id: "mcp-request-1",
+  });
+  check(
+    "P5 key reuse with a different stored payload fails",
+    p5collision.isError === true && /different stored payload/.test(p5collision.data.error),
+    p5collision.data,
   );
 
   s.close();

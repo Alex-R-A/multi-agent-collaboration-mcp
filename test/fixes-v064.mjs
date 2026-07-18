@@ -60,7 +60,6 @@ const check = (n, c, x) => {
   const send = (o) => child.stdin.write(JSON.stringify(o) + "\n");
   const waitFor = (id) =>
     new Promise((res, rej) => {
-      const dead = setTimeout(() => rej(new Error("MCP reply timeout id " + id)), 15_000);
       const t = setInterval(() => {
         if (replies.has(id)) {
           clearTimeout(dead);
@@ -68,6 +67,11 @@ const check = (n, c, x) => {
           res(replies.get(id));
         }
       }, 20);
+      const dead = setTimeout(() => {
+        clearInterval(t);
+        child.kill("SIGKILL");
+        rej(new Error("MCP reply timeout id " + id));
+      }, 15_000);
     });
   const call = async (id, name, args) => {
     send({ jsonrpc: "2.0", id, method: "tools/call", params: { name, arguments: args } });

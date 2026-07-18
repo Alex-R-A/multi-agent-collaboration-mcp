@@ -9,6 +9,8 @@ import { z } from "zod";
 import {
   ChatStore,
   DEFAULT_MAX_BYTES,
+  MAX_CLIENT_MESSAGE_ID_CHARS,
+  MAX_CROSSED_PREVIEW_CHARS,
   MAX_MESSAGE_BODY_BYTES,
   MIN_CATCH_UP_RESULT_BUDGET,
 } from "./db.js";
@@ -67,22 +69,38 @@ function pollerCmd(
   if (opts.intervalSec !== undefined) {
     cmd += ` --interval ${shq(String(opts.intervalSec))}`;
   }
+  // Generated commands treat an expected quiet deadline as successful
+  // completion. `has_updates` in stdout distinguishes timeout from a hit;
+  // direct legacy CLI invocations without this flag retain exit 124.
+  cmd += ` --ok-on-timeout`;
   if (opts.mentionsOnly) cmd += ` --mentions-only`;
   return cmd;
 }
-const POLLER_CMD = `${pollerCmd("<your_agent_id>")} [--mentions-only]`;
+/** A client that abandons a request without delivering cancellation can leave
+ * the server able to advance a marker into an undeliverable response. Keep the
+ * safe default below even pessimistic host deadlines; longer waits are an
+ * explicit deployment choice, bounded by a small hard ceiling. */
+const DEFAULT_WAIT_CAP_SECONDS = 25;
+const HARD_WAIT_CAP_SECONDS = 120;
+function configuredWaitCapSeconds(): number {
+  const raw = process.env.AGENT_CHAT_MAX_WAIT_SECONDS;
+  if (raw === undefined || raw === "") return DEFAULT_WAIT_CAP_SECONDS;
+  if (!/^\d+$/.test(raw)) {
+    throw new Error(
+      `AGENT_CHAT_MAX_WAIT_SECONDS must be an integer from 1 to ${HARD_WAIT_CAP_SECONDS}`,
+    );
+  }
+  const value = Number(raw);
+  if (!Number.isSafeInteger(value) || value < 1 || value > HARD_WAIT_CAP_SECONDS) {
+    throw new Error(
+      `AGENT_CHAT_MAX_WAIT_SECONDS must be an integer from 1 to ${HARD_WAIT_CAP_SECONDS}`,
+    );
+  }
+  return value;
+}
+const WAIT_CAP_SECONDS = configuredWaitCapSeconds();
 
-const INSTRUCTIONS = `Shared chat rooms for AI agents, backed by one SQLite file; each agent runs its own copy of this server, and the file is the coordination channel. Your identity and active room are remembered for the session.
-
-Three routing invariants: (1) catch_up reads ONE room (the active room, or a named one via room:) and ADVANCES your read marker; ordinary calls are lossless, while explicit priority_only:true is deliberately lossy backlog triage that keeps priority + directed rows and reports every skip. (2) my_mentions is the cross-room INBOX of unread messages directed at you: a PEEK that never moves markers; an empty inbox with nonzero by_room unread means rooms have traffic, not silence. (3) Name rooms for their TOPIC (kebab-case, e.g. 'auth-refactor-review'), never for participants: list_rooms names are how agents find rooms.
-
-Typical flow: list_rooms -> join_room (capture the returned agent_id; read the pinned intro) -> catch_up -> post_message (tag with "to", reply with reply_to_seq, correct your own earlier post with supersedes_seq). post_message returns crossed = messages from others you had NOT read when posting: if > 0, catch_up before acting. Before exclusive work, claim a key like "file:src/db.ts": exactly one claimant wins. Running several sessions under one agent_id? join_room cursor:'private' gives this session its own read position.
-
-To wait for activity without busy-looping tool calls, run the poller command that join_room/wait_for_messages hand back (pre-quoted for your exact id) as a BACKGROUND task: exit 0 = something new (then catch_up the room that fired; the status line and my_mentions say which), 124 = timeout with nothing new, 2 = error:
-
-  ${POLLER_CMD}
-
-Call server_info for the operating manual (paging, byte budgets, poller options, multi-session cursors) and every size cap.`;
+const INSTRUCTIONS = `Agent Chat is a local SQLite ledger. Start list_rooms -> join_room -> catch_up. catch_up advances one room; my_mentions peeks across rooms. priority_only is explicitly lossy. server_info holds routing/shared budgets; each tool schema states its cap.`;
 
 // The layered operating manual, served by server_info: stable reference
 // detail that would otherwise bloat every tools/list. Tool descriptions keep
@@ -95,18 +113,19 @@ ROUTING
 - read_history browses without moving markers. mark_read moves the marker without reading (omit seq to jump to latest; a LOWER seq re-exposes messages to catch_up).
 
 IN-CALL WAIT
-- catch_up wait_seconds (0..25) blocks that one call until a message from another agent lands in the target room, then returns it and advances: waiting for a reply costs one call. On timeout: timed_out:true, call_again:true, rooms_with_unread; call again to keep waiting (each re-call is cheap and re-reads your cursor fresh). Every waited response carries waited_ms.
-- While your wait is open, peers see watching:true for you (list_agents, post_message recipients): the one presence signal that means "a message now lands in a live turn". It is produced ONLY by an open blocking call and drops the moment the call returns or is cancelled; a detached poller never produces it.
+- catch_up wait_seconds (0..${WAIT_CAP_SECONDS} effective max) blocks that one call until a message from another agent lands in the target room, then returns it and advances. The safe default max is 25s; an operator may set AGENT_CHAT_MAX_WAIT_SECONDS up to 120 only after measuring end-to-end behavior on that host. wait_seconds bounds the polling deadline, not total RPC wall time: SQLite contention, lease cleanup, and serialization can add several bounded busy-timeout windows. On timeout: timed_out:true, call_again:true, rooms_with_unread. Normal hit/timeout responses carry waited_ms; cancellation/deletion errors may not.
+- The best-effort watching lease expires wait_seconds+5s after it begins. Raising the cap therefore also lengthens the maximum stale watching:true window after a hard-killed host; this is part of the operator opt-in.
+- While your wait is open and its lease write succeeds, peers see watching:true for you (list_agents, post_message recipients): evidence that a blocking call was open, not a delivery guarantee. It drops on normal return/cancellation; TTL bounds a hard-kill ghost. A detached poller never produces it.
 - The wait holds your turn open, so it fits "I am waiting for a reply and have nothing else to do". To be notified while doing other work, or for watches longer than the cap, use the background poller.
 
 SIZE AND PAGING
 - Bulk reads are byte-bounded (default ${DEFAULT_MAX_BYTES} serialized chars; max_bytes tunes it, see limits). byte_limited:true = more remain: catch_up/read_history call again, my_mentions pages with after_id. Priority-only catch_up never advances past an unseen qualifying row when a row/byte cap cuts the page. Oversized bodies arrive truncated:true with length; fetch the rest via get_message offset -> next_offset (codepoints), passing room when the source row came from a non-active room. A truncated json body is a partial raw string, not an object.
-- Every size cap is in server_info limits. Message bodies cap at ${MAX_MESSAGE_BODY_BYTES} UTF-8 bytes; the newline-delimited stdio frame has a separate ${MAX_MCP_FRAME_BYTES}-byte wire cap to allow JSON escaping without unbounded pre-parse buffering.
+- Shared size and response budgets are in server_info limits; each tool schema states its own local cap. Message bodies cap at ${MAX_MESSAGE_BODY_BYTES} UTF-8 bytes; the newline-delimited stdio frame has a separate ${MAX_MCP_FRAME_BYTES}-byte wire cap to allow JSON escaping without unbounded pre-parse buffering.
 
 POSTING
 - crossed counts ALL unread from others past your marker at post time (old backlog included, not only mid-composition arrivals); crossed_directed says how many are aimed at you; crossed_range gives the seq span. If crossed > 0, catch_up before acting on replies. crossed_preview_chars opts into bounded previews of the crossed messages in the same response.
-- Dispositive posts (verdicts, commissions, dispositions): if_last_read_seq is a conditional post -- rejected (posted:false) if ANYTHING from others landed past your token, with bounded crossed previews returned; call catch_up for the complete delta before retrying. A token ahead of the target room's effective cursor is invalid and fails before posting. Nothing is stored on either rejection, so re-sending the same content is idempotent. room: posts to a named joined room without switching the active room; expected_room asserts which room is active. Never use the CAS on routine traffic: crossing is normal, the CAS is for posts whose validity depends on having read everything.
-- recipients (per tagged id) is the delivery ground truth: status, idle_seconds, last_read_seq, marker_behind. delivery_warnings appears when a tagged recipient looks unlikely to see the message soon (never joined, left, or long idle); it is a liveness heuristic, not a delivery guarantee.
+- Dispositive posts (verdicts, commissions, dispositions): if_last_read_seq is a conditional post -- rejected (posted:false) if ANYTHING from others landed past your token, with bounded crossed previews returned; call catch_up for the complete delta before retrying. A token ahead of the target room's effective cursor is invalid and fails before posting. client_message_id makes an exact lost-response retry return the original seq instead of inserting twice; its guarantee lasts while that message is retained. Repeat the same explicit room or expected_room on retry so active-room drift cannot create a post in another room; a deduplicated response does not replay the original crossed/recipient snapshot, so catch_up for current state. room: posts to a named joined room without switching the active room; expected_room asserts which room is active. Never use the CAS on routine traffic: crossing is normal, the CAS is for posts whose validity depends on having read everything.
+- recipients reports factual room-local state: status, idle_seconds, last_read_seq, marker_behind. A new unread tag normally adds one to marker_behind. delivery_warnings is definitive for never-joined/left recipients; a long-idle warning is emitted only for pre-existing lag and states observed facts, never a responsiveness prediction.
 - supersedes_seq corrects YOUR OWN earlier message; readers see superseded_by on it. reply_to_seq threads; the log stays flat and globally ordered.
 - priority:true marks an immutable high-signal checkpoint for priority-only catch-up. Use it sparingly; correct a priority post with a new priority post + supersedes_seq rather than mutating history.
 - claim/release_claim: atomic single-winner advisory locks with TTL expiry (a crashed holder cannot block forever). Claims are mutual exclusion between live writers; they do not verify content.
@@ -115,7 +134,7 @@ MULTIPLE SESSIONS, ONE IDENTITY
 - The default shared cursor splits the backlog across concurrent sessions (work-queue style). join_room cursor:'private' gives THIS session an independent read position. The poller command carries --session and resolves that session's current cursor on each probe; it never freezes a --since baseline.
 
 BACKGROUND POLLER
-- Run the command join_room/wait_for_messages return as a BACKGROUND task. One Node process holds one SQLite connection and runs one indexed LIMIT 1 probe after each sleep; it launches no children. Exit 0 identifies one firing room in room_id/room_name, 124 = timeout, 2 = error or an equivalent watcher is already running. Options: --interval <sec> (minimum/default 5), --timeout <sec> (default 1200, finite), --mentions-only, --room <id|name>. Your own posts never wake it.
+- Run the command join_room/wait_for_messages return as a BACKGROUND task. One Node process holds one SQLite connection and runs one indexed LIMIT 1 probe after each sleep; it launches no children. Generated commands exit 0 for either a hit or quiet deadline: parse stdout has_updates true/false. Direct CLI calls without --ok-on-timeout retain exit 124 on timeout. Exit 2 is an error or equivalent watcher. Options: --interval <sec> (minimum/default 5), --timeout <sec> (default 1200, finite), --ok-on-timeout, --mentions-only, --room <id|name>. Your own posts never wake it.
 - The poller is an OS-level detector: its exit does NOT by itself schedule your next turn. Whether you are actually woken depends on your harness's background-task contract; do not report "watcher active" as evidence you will see a message.
 
 RETENTION
@@ -177,12 +196,6 @@ function fail(message: string): ToolResult {
   };
 }
 
-/** Hard server-side ceiling for catch_up's wait_seconds. Owner decision
- *  (plan doc): conservative against UNMEASURED harness client-timeout
- *  ceilings -- 25s plus worst-case drain stays under a pessimistic 30s
- *  floor, and the SDK client default is 60s. The schema max mirrors this;
- *  raise both together only with per-harness cancel measurements. */
-const WAIT_CAP_SECONDS = 25;
 /** Cadence of the non-advancing unread probe during a blocking wait. */
 const WAIT_PROBE_INTERVAL_MS = 500;
 /** Bound aggregate timer/SQLite pressure when a client accidentally dispatches
@@ -419,6 +432,10 @@ const LIMITS = {
   max_bytes_range: [1000, 400_000],
   get_message_max_chars_range: [100, 400_000],
   wait_seconds_max: WAIT_CAP_SECONDS,
+  wait_seconds_default_max: DEFAULT_WAIT_CAP_SECONDS,
+  wait_seconds_configurable_hard_max: HARD_WAIT_CAP_SECONDS,
+  crossed_preview_chars_max: MAX_CROSSED_PREVIEW_CHARS,
+  client_message_id_max_chars: MAX_CLIENT_MESSAGE_ID_CHARS,
   default_page_limits: {
     catch_up: 50,
     read_history: 50,
@@ -446,7 +463,7 @@ server.registerTool(
     title: "Server info, limits, and operating manual",
     description:
       `Version ${BUILD.version}: Report this server's version/build identity, ` +
-      "every size cap and byte budget (`limits`), and the full operating " +
+      "shared size/response budgets (`limits`), and the full operating " +
       "manual (`manual`: routing, paging, poller, multi-session cursors). " +
       "Call this once when caps or exact semantics matter. `stale:true` = a " +
       "newer build was deployed since this process started; reconnect the " +
@@ -911,22 +928,14 @@ server.registerTool(
   {
     title: "Post message",
     description:
-      "Post to the active room, or to any JOINED room via `room` (active room " +
-      "unchanged). `content` is text or a JSON object/array; `to` = agent_ids " +
-      "the message is directed at; `reply_to_seq` tags an earlier message. " +
-      "Returns the assigned `seq` plus, per tagged id, `recipients` (status/" +
-      "idle_seconds/last_read_seq/marker_behind/watching); " +
-      "`delivery_warnings` appears when a tagged recipient looks unlikely to " +
-      "see this soon. `crossed` counts messages from others YOU had not read " +
-      "at post time (`crossed_directed` of them aimed at you): if > 0, " +
-      "catch_up, contradicting messages may have landed while you wrote. For " +
-      "DISPOSITIVE posts (verdicts, commissions): `if_last_read_seq` rejects " +
-      "the post if anything from others landed past that seq (posted:false + " +
-      "the crossed messages; re-send after reviewing), and `expected_room` " +
-      "asserts which room is active. `supersedes_seq` marks YOUR OWN earlier " +
-      "message as corrected (readers see `superseded_by` on it). Set " +
-      "`priority:true` only for a durable high-signal checkpoint that should " +
-      "survive a later priority-only backlog read.",
+      "Post text/JSON to the active or explicit joined `room`. Returns `seq`, " +
+      "factual recipient state, and `crossed` unread peer traffic for a new " +
+      "insert. A deduplicated retry returns the original seq/key only; catch " +
+      "up for current state. For a " +
+      "dispositive post, use `if_last_read_seq` + `expected_room`; use " +
+      "`client_message_id` to deduplicate an exact lost-response retry. " +
+      "`crossed_preview_chars` max is 2000. `priority:true` survives explicit " +
+      "priority-only backlog triage; `supersedes_seq` corrects your own post.",
     inputSchema: z.object({
       // ONE bare z.custom for all three shapes, deliberately:
       // - NOT z.record / z.object().passthrough(): both rebuild the object by
@@ -988,6 +997,20 @@ server.registerTool(
           "Durable high-signal checkpoint for priority-only catch-up. " +
             "Immutable; correct it with a new priority post + supersedes_seq.",
         ),
+      client_message_id: z
+        .string()
+        .min(1)
+        .max(MAX_CLIENT_MESSAGE_ID_CHARS)
+        .refine((s) => !/[\u0000-\u001f\u007f]/.test(s), {
+          message: "control characters are not allowed",
+        })
+        .optional()
+        .describe(
+          "Opaque idempotency key for this author+room. Repeating the exact " +
+            "stored payload returns the original seq; reusing it for a " +
+            "different payload fails. Repeat the same room/expected_room on " +
+            "retry. Retained only as long as the message.",
+        ),
       room: z
         .string()
         .min(1)
@@ -1026,10 +1049,10 @@ server.registerTool(
         .number()
         .int()
         .positive()
-        .max(2000)
+        .max(MAX_CROSSED_PREVIEW_CHARS)
         .optional()
         .describe(
-          "When crossed > 0, also return the crossed messages as bounded " +
+          `Max ${MAX_CROSSED_PREVIEW_CHARS}. When crossed > 0, also return the crossed messages as bounded ` +
             "previews (crossed_messages, per-row directed flag; " +
             "crossed_remaining when the bound cut the list). Posting never " +
             "consumes a crossed peer message: previews remain unread for " +
@@ -1048,6 +1071,7 @@ server.registerTool(
     if_last_read_seq,
     crossed_preview_chars,
     priority,
+    client_message_id,
   }) => {
     try {
       touchSession();
@@ -1126,6 +1150,7 @@ server.registerTool(
           crossedPreviewChars: crossed_preview_chars,
           recipientActiveWithinMinutes: mentions ? 5 : undefined,
           priority: priority === true,
+          clientMessageId: client_message_id ?? null,
         },
       );
       if (!res.posted) {
@@ -1150,29 +1175,49 @@ server.registerTool(
             "call's new_last_read_seq (nothing was stored)",
         });
       }
+      if (res.deduplicated) {
+        return ok({
+          posted: true,
+          deduplicated: true,
+          seq: res.seq,
+          room_id: roomId,
+          room_name: roomName,
+          client_message_id: res.client_message_id,
+          note:
+            "the original post was already stored; no second row was inserted. " +
+            "The original crossed/recipient snapshot is not replayed; call catch_up for current state",
+        });
+      }
       const { seq, crossed, crossed_directed, crossed_range } = res;
       const recipients = res.recipients ?? [];
-      // Loud delivery: one human-readable line per tagged recipient unlikely
-      // to see this soon. A liveness heuristic (idle is not dead; a fresh
-      // post is always unread), so it warns only on the strong signals:
-      // never-joined, left, or idle past DELIVERY_STALL_SECONDS. Placed first
-      // in the response so it cannot be buried under recipients rows.
-      const delivery_warnings = recipients
-        .filter(
-          (r) =>
-            !r.watching &&
-            (r.status === "unknown" ||
-              r.status === "left" ||
-              (r.status === "idle" &&
-                (r.idle_seconds ?? 0) >= DELIVERY_STALL_SECONDS)),
-        )
-        .map((r) =>
-          r.status === "unknown"
-            ? `${r.id}: never joined this room; the tag reaches no one`
-            : r.status === "left"
-              ? `${r.id}: left this room; the message waits unread unless they return`
-              : `${r.id}: likely unreachable right now (idle ${fmtIdle(r.idle_seconds ?? 0)}, marker ${r.marker_behind} behind)`,
-        );
+      // Loud but factual delivery state. Unknown/left are definitive routing
+      // facts. Room-local idleness is not a responsiveness prediction, so it
+      // is mentioned only when older backlog already existed; seq-1 is the
+      // pre-insert room maximum and costs no extra query.
+      const delivery_warnings = recipients.flatMap((r) => {
+        if (r.status === "unknown") {
+          return [`${r.id}: never joined this room; the tag reaches no one`];
+        }
+        if (r.status === "left") {
+          return [
+            `${r.id}: left this room; the message waits unread unless they return`,
+          ];
+        }
+        if (r.watching) return [];
+        const priorMarkerBehind =
+          r.last_read_seq === null ? 0 : Math.max(0, seq - 1 - r.last_read_seq);
+        if (
+          r.status === "idle" &&
+          (r.idle_seconds ?? 0) >= DELIVERY_STALL_SECONDS &&
+          priorMarkerBehind > 0
+        ) {
+          return [
+            `${r.id}: no observed activity in this room for ${fmtIdle(r.idle_seconds ?? 0)}; ` +
+              `marker was ${priorMarkerBehind} seq behind before this post`,
+          ];
+        }
+        return [];
+      });
       return ok({
         posted: true,
         seq,
@@ -1181,6 +1226,9 @@ server.registerTool(
         ...(delivery_warnings.length > 0 ? { delivery_warnings } : {}),
         format: isText ? "text" : "json",
         priority: res.priority,
+        ...(res.client_message_id !== undefined
+          ? { client_message_id: res.client_message_id }
+          : {}),
         to: mentions,
         reply_to_seq: reply_to_seq ?? null,
         supersedes_seq: supersedes_seq ?? null,
@@ -1206,22 +1254,11 @@ server.registerTool(
   {
     title: "Catch up on new messages",
     description:
-      "Return messages from OTHER agents posted since you last read (seq > your " +
-      "last_read marker), oldest first, and ADVANCE your read marker; " +
-      "`remaining` reports how many are still unread. Reads the ACTIVE room, " +
-      "or `room` names any joined room WITHOUT switching the active room. " +
-      "Normally this is a lossless room sync. Explicit `priority_only:true` " +
-      "is lossy backlog triage: it returns priority messages plus every " +
-      "message directed at you, advances past lower-priority chatter, and " +
-      "reports `skipped_count`/`cutoff_seq`/`qualifying_remaining`. " +
-      "`wait_seconds` blocks this one call until a message arrives (waiting " +
-      "for a reply costs one call, not a poll loop). An empty read lists " +
-      "every other room holding unread (`rooms_with_unread`), so one call " +
-      "says where the traffic is. Your own messages are never returned here. " +
-      "The marker may normalize across an own-only suffix, but never past an " +
-      "undelivered message from another author. " +
-      "For what is directed at you across rooms use my_mentions (a peek that " +
-      "never moves markers).",
+      "Read one active/explicit joined room and ADVANCE its marker. Default is " +
+      "lossless; `priority_only:true` is explicit lossy triage that always " +
+      `keeps directed rows. \`wait_seconds\` blocks this call (effective max ${WAIT_CAP_SECONDS}; ` +
+      "host/client limits may be lower). Empty reads disclose other unread " +
+      "rooms. Own posts are skipped; use my_mentions for a cross-room peek.",
     inputSchema: z.object({
       room: z
         .string()
@@ -1240,12 +1277,12 @@ server.registerTool(
         .max(WAIT_CAP_SECONDS)
         .optional()
         .describe(
-          "Block up to this many seconds until a message from another agent " +
+          `Effective max ${WAIT_CAP_SECONDS}. Block until a message from another agent ` +
             "lands in the target room, then return it (marker advances) in " +
             "this same call; 0/omitted = return immediately. On timeout: " +
-            "timed_out:true + call_again + rooms_with_unread -- just call " +
-            "again to keep waiting. Waiting holds YOUR turn open; to be " +
-            "notified while doing other work, use the background poller.",
+            "timed_out:true + call_again. Default max: 25. Operators may set " +
+            "AGENT_CHAT_MAX_WAIT_SECONDS up to 120 only after measuring the " +
+            "host timeout. Waiting holds YOUR turn; use the poller while doing other work.",
         ),
       priority_only: z
         .boolean()
@@ -1310,6 +1347,7 @@ server.registerTool(
     },
     extra,
   ) => {
+    const startedMs = Date.now();
     let heldWaitSlot = false;
     try {
       touchSession();
@@ -1331,6 +1369,20 @@ server.registerTool(
             "wait_seconds; run priority_only once, then use ordinary " +
             "catch_up({wait_seconds}) for live traffic",
         );
+      }
+      const waitSeconds = wait_seconds ?? 0;
+      // Acquire the bounded-wait slot before room resolution or liveness
+      // writes. Otherwise a burst of rejected waits aimed at distinct rooms
+      // could still perform an unbounded burst of synchronous DB work.
+      if (waitSeconds > 0) {
+        if (activeBlockingWaits >= MAX_CONCURRENT_WAITS) {
+          return fail(
+            `at most ${MAX_CONCURRENT_WAITS} blocking catch_up waits may run ` +
+              "in one MCP process; wait for one to finish or use the background watcher",
+          );
+        }
+        activeBlockingWaits++;
+        heldWaitSlot = true;
       }
       // --- Resolve and CAPTURE, all before the first await. Concurrent
       // dispatch can mutate `session` (identity, active room, cursor modes)
@@ -1375,19 +1427,6 @@ server.registerTool(
       }
       touchCapturedRoom(roomId, agentId);
       const signal = extra?.signal;
-      const waitSeconds = wait_seconds ?? 0;
-      if (waitSeconds > 0) {
-        if (activeBlockingWaits >= MAX_CONCURRENT_WAITS) {
-          return fail(
-            `at most ${MAX_CONCURRENT_WAITS} blocking catch_up waits may run ` +
-              "in one MCP process; wait for one to finish or use the background watcher",
-          );
-        }
-        activeBlockingWaits++;
-        heldWaitSlot = true;
-      }
-      const startedMs = Date.now();
-
       // max_bytes bounds the COMPLETE JSON text returned to the MCP client,
       // not merely ChatStore.catchUp's inner object. v0.9 added routing fields
       // and v0.10 added wait fields after the store had spent the full budget;
@@ -1492,8 +1531,8 @@ server.registerTool(
       // One lease token per CALL, not per process. Concurrent waits from one
       // MCP process must not overwrite and then delete each other's row.
       const waitLeaseId = `${SESSION_NONCE}:${randomUUID()}`;
-      // Presence lease: `watching` is a verifiable server state for exactly
-      // as long as this call is open. Best-effort, like touch: a lease
+      // Presence lease: when its best-effort write succeeds, `watching`
+      // records that this call was open. TTL bounds a hard-kill ghost; a lease
       // failure must not break the wait (the probe surfaces a deleted room).
       try {
         store.beginWaitLease(
@@ -1510,6 +1549,10 @@ server.registerTool(
             signal,
           );
           if (signal?.aborted) return respond({ aborted: true });
+          // The final advancing read below is the deadline check. Do not start
+          // a heartbeat/probe after the requested wait has elapsed: either can
+          // consume SQLite's busy timeout and needlessly extend total RPC time.
+          if (Date.now() >= deadlineMs) break;
           // Self-throttled heartbeat: a genuinely-waiting agent reads as
           // `active` to peers instead of indistinguishable from a dormant one.
           touchCapturedRoom(roomId, agentId);
@@ -1704,18 +1747,10 @@ server.registerTool(
   {
     title: "Wait for new messages (background poller)",
     description:
-      "Get the exact command to WATCH for new messages without " +
-      "busy-looping tool calls. IMPORTANT: this tool does NOT block or wait " +
-      "itself; it RETURNS a single-process watcher `command` for you to " +
-      "run in the background. It exits 0 the " +
-      "moment a new message arrives (that exit is your signal to catch_up), " +
-      "124 if it times out with nothing new, 2 on error. Needs an identity " +
-      "(join_room first). Watches EVERY room you are present in unless `room` " +
-      "scopes it to one. Set mentions_only to fire only on messages that " +
-      "mention you or reply to you. For a short in-turn wait, " +
-      "catch_up({wait_seconds}) blocks and returns messages directly; this " +
-      "poller covers longer, out-of-turn watching. (join_room also returns " +
-      "this command as poller_cmd.)",
+      "Return (do not run) one childless background watcher command. It watches " +
+      "all joined rooms or one `room`; `mentions_only` narrows it. Generated " +
+      "commands exit 0 on hit or quiet deadline: parse stdout `has_updates`. " +
+      "Use catch_up({wait_seconds}) for an in-turn blocking read.",
     inputSchema: z
       .object({
         room: z
@@ -1738,8 +1773,9 @@ server.registerTool(
           .max(86_400)
           .optional()
           .describe(
-            "Watcher gives up (exit 124) after this many seconds with " +
-              "nothing new (default 1200; infinite watches are not allowed)",
+            "Absolute finite deadline (default 1200). Generated commands " +
+              "report a quiet deadline as has_updates:false with exit 0; " +
+              "direct CLI without --ok-on-timeout uses exit 124.",
           ),
         interval: z
           .number()
@@ -1801,17 +1837,14 @@ server.registerTool(
         command,
         run_as: "background process (do not wait for it inline)",
         how_to:
-          "Run `command` in the background. It exits 0 when something new " +
-          "arrives, 124 on timeout with nothing new, 2 on error or when an " +
-          "equivalent watcher already exists. On exit 0, catch_up the returned " +
-          "room_id or room_name, then re-request this command if you still need " +
-          "a watcher. The command uses the session's live cursor and is never " +
-          "based on a frozen --since value. The watcher's exit is an " +
-          "OS-level signal only: whether it wakes YOU depends on your " +
-          "harness's background-task contract.",
+          "Run `command` in the background. On exit 0, parse stdout: " +
+          "has_updates:true names the room to catch_up; has_updates:false is a " +
+          "normal quiet deadline. Exit 2 is an error/duplicate watcher. Re-arm " +
+          "only if still needed. The exit is only an OS signal; whether it " +
+          "wakes YOU depends on the harness.",
         exit_codes: {
-          "0": "new messages -> catch_up({room: room_id})",
-          "124": "timed out, nothing new",
+          "0": "normal completion; inspect stdout has_updates",
+          "124": "quiet timeout only for direct CLI without --ok-on-timeout",
           "2": "error or equivalent watcher already running",
         },
         baselined: false,
@@ -2110,7 +2143,7 @@ server.registerTool(
       "Claim exclusive (advisory) ownership of a named resource BEFORE " +
       "working on it, e.g. 'file:src/db.ts' or 'task:B-414'. Atomic " +
       "single-winner (unlike 'I claim X' chat posts, which can cross). " +
-      "Returns granted:true with expires_at, or granted:false with the " +
+      "Returns granted:true with RFC3339-UTC expires_at, or granted:false with the " +
       "holder. Claims expire after ttl_seconds (default 900); re-claim your " +
       "own key to renew. Advisory only: nothing is physically locked, " +
       "cooperating agents must check. Ownership is per agent_id. Pass room " +
@@ -2212,7 +2245,8 @@ server.registerTool(
       "note_truncated flags a cut), and seconds until expiry. Check before " +
       "starting work that overlaps someone's claim. `next_key` present = more " +
       "rows exist; page by passing it back as `after_key` (keyset paging, so a " +
-      "claim expiring between pages cannot make you skip a live one).",
+      "claim expiring between pages cannot make you skip a live one). " +
+      "expires_at is RFC3339 UTC; expires_in_seconds is relative.",
     inputSchema: z
       .object({
         room: z
@@ -2394,9 +2428,8 @@ function dedupe(xs: string[]): string[] {
   return [...new Set(xs)];
 }
 
-/** Idle threshold for a delivery warning: past this, a tagged recipient is
- *  flagged as likely unreachable. Chosen well past the 5-minute `active`
- *  window so routine between-turn idling does not spam warnings. */
+/** Room-local inactivity threshold for a factual pre-existing-backlog warning.
+ * Chosen well past the 5-minute `active` window to avoid routine idle noise. */
 const DELIVERY_STALL_SECONDS = 1800;
 
 /** Human-readable idle duration for delivery warnings ("2h05m", "45m", "90s"). */

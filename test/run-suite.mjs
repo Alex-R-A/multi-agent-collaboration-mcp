@@ -46,6 +46,10 @@ function run(file) {
     const child = spawn(process.execPath, [path], {
       stdio: "inherit",
       detached: grouped,
+      // Keep suite behavior deterministic even when an operator has opted a
+      // deployed MCP into longer waits. Tests that cover the opt-in override
+      // this explicitly in their child environment.
+      env: { ...process.env, AGENT_CHAT_MAX_WAIT_SECONDS: "25" },
     });
     active = child;
     let timedOut = false;

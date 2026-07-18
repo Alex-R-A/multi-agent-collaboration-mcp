@@ -29,6 +29,12 @@ export const SQLITE_MAX_LENGTH = 1_000_000_000;
  * API limit: JSON parsing, validation, binding, WAL, and FTS can hold several
  * copies of one body at once. */
 export const MAX_MESSAGE_BODY_BYTES = 10_000_000;
+/** Crossed-message previews ride inside a post response rather than a paged
+ * read, so keep each body small and the aggregate response separately capped. */
+export const MAX_CROSSED_PREVIEW_CHARS = 2_000;
+/** Caller-supplied post idempotency keys are opaque, room/author scoped, and
+ * intentionally small enough to keep the sparse unique index cheap. */
+export const MAX_CLIENT_MESSAGE_ID_CHARS = 200;
 
 /** Above this body length the store's json well-formedness re-validation is
  *  skipped: parsing a ~GB body into memory to walk it would defeat the
@@ -563,6 +569,7 @@ export class ChatStore {
         body         TEXT NOT NULL,
         mentions     TEXT,
         reply_to_seq INTEGER,
+        client_message_id TEXT,
         created_at   TEXT NOT NULL DEFAULT (datetime('now')),
         UNIQUE (room_id, seq)
       );
@@ -581,6 +588,7 @@ export class ChatStore {
     this.ensureColumn("messages", "supersedes_seq", "INTEGER");
     this.ensureColumn("messages", "reply_to_agent", "TEXT");
     this.ensureColumn("messages", "body_len", "INTEGER");
+    this.ensureColumn("messages", "client_message_id", "TEXT");
     // DB-level enforcement for MIXED-VERSION windows: a still-running old
     // build inserts without these columns, and if the reply's parent is
     // pruned before any new-build process restarts, the startup backfill
@@ -732,6 +740,11 @@ export class ChatStore {
       DROP INDEX IF EXISTS idx_messages_room_seq;
       CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(room_id, reply_to_seq);
       CREATE INDEX IF NOT EXISTS idx_messages_supersedes ON messages(room_id, supersedes_seq);
+      -- Routine posts store NULL and therefore occupy no entry in this sparse
+      -- index. Only callers opting into lost-response deduplication pay for it.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_client_message_id
+        ON messages(room_id, agent_id, client_message_id)
+        WHERE client_message_id IS NOT NULL;
       -- A mentions-only poll must not rescan every broadcast in a large unread
       -- backlog every few seconds. Its candidate predicate uses this partial
       -- index, then evaluates json_each only for rows that could be directed.
@@ -1842,12 +1855,12 @@ export class ChatStore {
   ): { rows: (MessageRow & { directed: boolean })[]; remaining: number } {
     const CROSSED_ROWS_MAX = 20;
     const CROSSED_BYTES = 20_000;
-    // Previews cap at 2000 chars (schema), so a 2001-codepoint fetch always
-    // knows whether the body was cut; body_cp still carries the full length.
+    // Fetch one codepoint beyond the public cap so truncation is known without
+    // loading a large body; body_cp still carries the full length.
     const pc = previewChars ?? 300;
     const fetched = this.db
       .prepare(
-        `SELECT ${messageCols(2001)}, (${directedAt("g")}) AS directed
+        `SELECT ${messageCols(MAX_CROSSED_PREVIEW_CHARS + 1)}, (${directedAt("g")}) AS directed
          FROM ${MESSAGE_FROM}
          WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
          ORDER BY g.seq ASC LIMIT ?`,
@@ -1903,10 +1916,12 @@ export class ChatStore {
       crossedPreviewChars?: number;
       recipientActiveWithinMinutes?: number;
       priority?: boolean;
+      clientMessageId?: string | null;
     } = {},
   ):
     | {
         posted: true;
+        deduplicated: false;
         id: number;
         seq: number;
         crossed: number;
@@ -1916,6 +1931,15 @@ export class ChatStore {
         crossed_remaining?: number;
         recipients?: RecipientStatus[];
         priority: boolean;
+        client_message_id?: string;
+      }
+    | {
+        posted: true;
+        deduplicated: true;
+        id: number;
+        seq: number;
+        priority: boolean;
+        client_message_id: string;
       }
     | {
         posted: false;
@@ -1958,11 +1982,75 @@ export class ChatStore {
     }
     const mentionsJson =
       mentions && mentions.length > 0 ? JSON.stringify(mentions) : null;
+    const clientMessageId = opts.clientMessageId ?? null;
+    if (clientMessageId !== null) {
+      assertStorable(clientMessageId, "client_message_id");
+      if (clientMessageId.length === 0) {
+        throw new Error("client_message_id must not be empty");
+      }
+      assertMaxLen(
+        clientMessageId,
+        "client_message_id",
+        MAX_CLIENT_MESSAGE_ID_CHARS,
+      );
+      if (/[\u0000-\u001f\u007f]/.test(clientMessageId)) {
+        throw new Error("client_message_id cannot contain control characters");
+      }
+    }
     const ifToken = opts.ifLastReadSeq ?? null;
     const tx = this.db.transaction(() => {
       // The caller's room reference predates this transaction; a concurrent
       // delete_room otherwise surfaces as a raw FK failure on the INSERT.
       this.requireRoom(roomId);
+      // Lost-response retry: one indexed lookup only when the caller opted in.
+      // It precedes CAS/reference validation so a committed first attempt is
+      // recoverable even if room state or a referenced parent later changed.
+      if (clientMessageId !== null) {
+        const prior = this.db
+          .prepare(
+            `SELECT id, seq, priority,
+                    (format = @format AND priority = @priority AND body = @body
+                     AND mentions IS @mentions
+                     AND reply_to_seq IS @reply_to_seq
+                     AND supersedes_seq IS @supersedes_seq) AS same_payload
+             FROM messages
+             WHERE room_id = @room_id AND agent_id = @agent_id
+               AND client_message_id = @client_message_id`,
+          )
+          .get({
+            format,
+            priority: opts.priority === true ? 1 : 0,
+            body,
+            mentions: mentionsJson,
+            reply_to_seq: replyToSeq,
+            supersedes_seq: supersedesSeq,
+            room_id: roomId,
+            agent_id: agentId,
+            client_message_id: clientMessageId,
+          }) as
+          | {
+              id: number;
+              seq: number;
+              priority: number;
+              same_payload: number;
+            }
+          | undefined;
+        if (prior) {
+          if (prior.same_payload !== 1) {
+            throw new Error(
+              `client_message_id "${clientMessageId}" is already attached to a different stored payload in this room`,
+            );
+          }
+          return {
+            posted: true as const,
+            deduplicated: true as const,
+            id: prior.id,
+            seq: prior.seq,
+            priority: prior.priority === 1,
+            client_message_id: clientMessageId,
+          };
+        }
+      }
       // CAS gate FIRST: a stale dispositive post rejects before any
       // validation error can mask the staleness (the caller reassesses and
       // retries with the same payload either way). In-transaction, so no
@@ -2067,8 +2155,8 @@ export class ChatStore {
         .get(roomId) as { next: number };
       const info = this.db
         .prepare(
-          `INSERT INTO messages (room_id, seq, agent_id, format, priority, body, body_len, mentions, reply_to_seq, reply_to_agent, supersedes_seq)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          `INSERT INTO messages (room_id, seq, agent_id, format, priority, body, body_len, mentions, reply_to_seq, reply_to_agent, supersedes_seq, client_message_id)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         )
         .run(
           roomId,
@@ -2082,6 +2170,7 @@ export class ChatStore {
           replyToSeq,
           replyToAgent,
           supersedesSeq,
+          clientMessageId,
         );
       // Own rows are never returned by catch_up, so leaving a cursor behind an
       // own-only suffix made every 5s poll (and every 500ms blocking probe) walk
@@ -2119,9 +2208,13 @@ export class ChatStore {
           : undefined;
       return {
         posted: true as const,
+        deduplicated: false as const,
         id: Number(info.lastInsertRowid),
         seq: next,
         priority: opts.priority === true,
+        ...(clientMessageId !== null
+          ? { client_message_id: clientMessageId }
+          : {}),
         crossed: crossing.c,
         crossed_directed: crossing.d ?? 0,
         crossed_range:
@@ -3598,7 +3691,8 @@ export class ChatStore {
       this.requireRoom(roomId);
       const row = this.db
         .prepare(
-          `SELECT agent_id, note, expires_at,
+          `SELECT agent_id, note,
+                  strftime('%Y-%m-%dT%H:%M:%SZ', expires_at) AS expires_at,
                   (strftime('%s', expires_at) - strftime('%s', 'now')) AS remaining
            FROM claims WHERE room_id = ? AND key = ?`,
         )
@@ -3630,7 +3724,10 @@ export class ChatStore {
         )
         .run(roomId, key, agentId, note, ttlSeconds);
       const { expires_at } = this.db
-        .prepare("SELECT expires_at FROM claims WHERE room_id = ? AND key = ?")
+        .prepare(
+          `SELECT strftime('%Y-%m-%dT%H:%M:%SZ', expires_at) AS expires_at
+           FROM claims WHERE room_id = ? AND key = ?`,
+        )
         .get(roomId, key) as { expires_at: string };
       return {
         granted: true as const,
@@ -3716,7 +3813,7 @@ export class ChatStore {
           `SELECT key, agent_id AS holder,
                   substr(note, 1, ${PREVIEW}) AS note,
                   CASE WHEN length(note) > ${PREVIEW} THEN 1 ELSE 0 END AS note_cut,
-                  expires_at,
+                  strftime('%Y-%m-%dT%H:%M:%SZ', expires_at) AS expires_at,
                   (strftime('%s', expires_at) - strftime('%s', 'now')) AS expires_in_seconds
            FROM claims WHERE room_id = ? AND key > ? ORDER BY key LIMIT ?`,
         )

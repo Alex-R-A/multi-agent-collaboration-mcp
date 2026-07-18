@@ -3,6 +3,14 @@
 // control-flow mistake from becoming recursive process creation.
 import { ChatStore } from "../../dist/db.js";
 
+const WORKER_ROLE_ENV = "AICHAT_CONCURRENCY_WORKER";
+if (process.env[WORKER_ROLE_ENV] !== "1") {
+  throw new Error("concurrency worker requires coordinator authorization");
+}
+// A mistakenly self-spawned descendant inherits no authorization and fails
+// before doing work, so one bad path cannot multiply process generations.
+delete process.env[WORKER_ROLE_ENV];
+
 const [dbPath, startText, roomText, agentId, limitText, maxCallsText] =
   process.argv.slice(2);
 const startAt = Number(startText);

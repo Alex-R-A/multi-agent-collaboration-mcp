@@ -7,6 +7,7 @@ import Database from "better-sqlite3";
 import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
+  cpSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
@@ -264,21 +265,44 @@ function setup(name = "priority-room") {
   const dbPath = join(dir, "t.db");
   new ChatStore(dbPath).close();
   const raw = new Database(dbPath);
-  raw.exec("ALTER TABLE messages DROP COLUMN priority");
+  raw.exec(`
+    DROP INDEX idx_messages_client_message_id;
+    ALTER TABLE messages DROP COLUMN client_message_id;
+    ALTER TABLE messages DROP COLUMN priority;
+  `);
   raw.close();
   const migrated = new ChatStore(dbPath);
   const inspect = new Database(dbPath, { readonly: true });
-  const col = inspect
+  const priorityCol = inspect
     .prepare(
       `SELECT dflt_value, "notnull" AS required
        FROM pragma_table_info('messages') WHERE name = 'priority'`,
     )
     .get();
+  const idempotencyCol = inspect
+    .prepare(
+      `SELECT type FROM pragma_table_info('messages')
+       WHERE name = 'client_message_id'`,
+    )
+    .get();
+  const idempotencyIndex = inspect
+    .prepare(
+      `SELECT sql FROM sqlite_master
+       WHERE type = 'index' AND name = 'idx_messages_client_message_id'`,
+    )
+    .get();
   inspect.close();
   check(
     "S5 legacy database gains NOT NULL priority default 0",
-    col?.required === 1 && String(col?.dflt_value) === "0",
-    col,
+    priorityCol?.required === 1 && String(priorityCol?.dflt_value) === "0",
+    priorityCol,
+  );
+  check(
+    "S5 legacy database gains sparse client-message idempotency index",
+    idempotencyCol?.type === "TEXT" &&
+      /UNIQUE INDEX/.test(idempotencyIndex?.sql ?? "") &&
+      /WHERE client_message_id IS NOT NULL/.test(idempotencyIndex?.sql ?? ""),
+    { idempotencyCol, idempotencyIndex },
   );
   migrated.close();
   rmSync(dir, { recursive: true, force: true });
@@ -355,7 +379,12 @@ function setup(name = "priority-room") {
 await (async () => {
   const dir = mkdtempSync(join(tmpdir(), "v0120-mcp-"));
   const DB = join(dir, "t.db");
-  const child = spawn("node", [join(ROOT, "dist", "index.js")], {
+  // P5 edits build-info to exercise stale-build detection. Stage the tiny
+  // dist tree in an ignored project-local directory so a forced test kill can
+  // never leave the real deployed artifact modified.
+  const stageRoot = mkdtempSync(join(ROOT, ".aichat-v0120-"));
+  cpSync(join(ROOT, "dist"), join(stageRoot, "dist"), { recursive: true });
+  const child = spawn("node", [join(stageRoot, "dist", "index.js")], {
     env: { ...process.env, AGENT_CHAT_DB: DB },
     stdio: ["pipe", "pipe", "ignore"],
   });
@@ -375,12 +404,18 @@ await (async () => {
   });
   const send = (value) => child.stdin.write(`${JSON.stringify(value)}\n`);
   const wait = (id) =>
-    new Promise((resolve) => {
+    new Promise((resolve, reject) => {
       const timer = setInterval(() => {
         if (!responses.has(id)) return;
         clearInterval(timer);
+        clearTimeout(deadline);
         resolve(responses.get(id));
       }, 15);
+      const deadline = setTimeout(() => {
+        clearInterval(timer);
+        child.kill("SIGKILL");
+        reject(new Error(`MCP reply timeout id ${id}`));
+      }, 15_000);
     });
   send({
     jsonrpc: "2.0",
@@ -483,8 +518,12 @@ await (async () => {
   check(
     "P3 claim/list can target another joined room without changing active room",
     claimed.data.granted === true && claimed.data.room_id === otherRoom &&
+      /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(claimed.data.expires_at) &&
       listedOther.data.room_id === otherRoom &&
-      listedOther.data.claims.some((c) => c.key === "probe:cross-room") &&
+      listedOther.data.claims.some((c) =>
+        c.key === "probe:cross-room" &&
+        /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(c.expires_at),
+      ) &&
       listedActive.data.room_name === "mcp-priority" &&
       !listedActive.data.claims.some((c) => c.key === "probe:cross-room"),
     { claimed: claimed.data, listedOther: listedOther.data, listedActive: listedActive.data },
@@ -537,7 +576,7 @@ await (async () => {
     },
   );
 
-  const buildInfoPath = join(ROOT, "dist", "build-info.json");
+  const buildInfoPath = join(stageRoot, "dist", "build-info.json");
   const originalBuildText = readFileSync(buildInfoPath, "utf8");
   const originalBuild = JSON.parse(originalBuildText);
   try {
@@ -571,6 +610,7 @@ await (async () => {
 
   store.close();
   child.kill();
+  rmSync(stageRoot, { recursive: true, force: true });
   rmSync(dir, { recursive: true, force: true });
 })();
 

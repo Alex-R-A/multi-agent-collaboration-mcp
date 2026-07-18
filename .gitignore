@@ -8,3 +8,4 @@ dist/
 *.sqlite-shm
 .DS_Store
 .serena/
+.aichat-v0120-*/

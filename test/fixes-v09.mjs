@@ -123,7 +123,19 @@ const NUL = String.fromCharCode(0);
   let buf = "";
   child.stdout.on("data", (d) => { buf += d; let i; while ((i = buf.indexOf("\n")) >= 0) { const l = buf.slice(0, i); buf = buf.slice(i + 1); if (!l.trim()) continue; try { const m = JSON.parse(l); if (m.id !== undefined) R.set(m.id, m); } catch {} } });
   const s = (o) => child.stdin.write(JSON.stringify(o) + "\n");
-  const w = (id) => new Promise((res) => { const t = setInterval(() => { if (R.has(id)) { clearInterval(t); res(R.get(id)); } }, 15); });
+  const w = (id) => new Promise((res, rej) => {
+    const t = setInterval(() => {
+      if (!R.has(id)) return;
+      clearInterval(t);
+      clearTimeout(dead);
+      res(R.get(id));
+    }, 15);
+    const dead = setTimeout(() => {
+      clearInterval(t);
+      child.kill("SIGKILL");
+      rej(new Error(`MCP reply timeout id ${id}`));
+    }, 15_000);
+  });
   let id = 1;
   const call = async (name, args) => {
     const i = ++id;

@@ -17,7 +17,7 @@
 //  M8 client cancellation: response suppressed, marker NOT advanced, lease
 //     dropped, backlog recoverable
 //  M9 room deleted mid-wait: clean error, not a raw constraint failure
-//  M10 wait_seconds above the 25s cap is rejected
+//  M10 120s server cap returns immediate backlog; 121 is rejected
 //  M11 two waiters (separate server processes) both receive one post
 import { ChatStore } from "../dist/db.js";
 import Database from "better-sqlite3";
@@ -148,7 +148,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // --- MCP harness -----------------------------------------------------------------
 function startServer(DB) {
   const child = spawn("node", [join(ROOT, "dist", "index.js")], {
-    env: { ...process.env, AGENT_CHAT_DB: DB },
+    env: {
+      ...process.env,
+      AGENT_CHAT_DB: DB,
+      AGENT_CHAT_MAX_WAIT_SECONDS: "120",
+    },
     stdio: ["pipe", "pipe", "ignore"],
   });
   const R = new Map();
@@ -161,13 +165,20 @@ function startServer(DB) {
     send({ jsonrpc: "2.0", id: i, method: "tools/call", params: { name, arguments: args } });
     return i;
   };
-  const waitFor = (i, timeoutMs = 30_000) =>
-    new Promise((res) => {
-      const t0 = Date.now();
+  const waitFor = (i, timeoutMs = 15_000, allowNoResponse = false) =>
+    new Promise((res, rej) => {
       const t = setInterval(() => {
         if (R.has(i)) { clearInterval(t); res(R.get(i)); }
-        else if (Date.now() - t0 > timeoutMs) { clearInterval(t); res(null); }
+        else if (Date.now() >= deadline) {
+          clearInterval(t);
+          if (allowNoResponse) res(null);
+          else {
+            child.kill("SIGKILL");
+            rej(new Error(`MCP reply timeout id ${i}`));
+          }
+        }
       }, 15);
+      const deadline = Date.now() + timeoutMs;
     });
   const parse = (m) => {
     if (!m) return { timedOutWaiting: true };
@@ -403,7 +414,7 @@ await (async () => {
   await sleep(200);
   const before8 = s.getMembership(rA, "u").last_read_seq;
   const seq8 = s.postMessage(rA, "peer", "posted after cancel", "text", null, null).seq;
-  const m8 = await srv.waitFor(id8, 2500);
+  const m8 = await srv.waitFor(id8, 2500, true);
   check("M8 cancelled call's response is suppressed", m8 === null, m8);
   check(
     "M8 no marker advance after the observed abort",
@@ -434,12 +445,21 @@ await (async () => {
   );
   await srv.call("join_room", { room: "wait-a" });
 
-  // M10: the cap is enforced at the schema.
-  const m10 = await srv.call("catch_up", { wait_seconds: 26 });
+  // M10: opt into the deployment ceiling and prove it without sleeping for it:
+  // existing backlog returns immediately; one second above rejects in schema.
+  s.postMessage(rA, "peer", "upper-cap immediate backlog", "text", null, null);
+  const m10edge = await srv.call("catch_up", { wait_seconds: 120 });
   check(
-    "M10 wait_seconds above the 25s cap is rejected",
+    "M10 configured wait_seconds=120 returns existing backlog immediately",
+    m10edge.data.messages.some((m) => m.content === "upper-cap immediate backlog") &&
+      m10edge.data.waited_ms < 2000,
+    m10edge,
+  );
+  const m10 = await srv.call("catch_up", { wait_seconds: 121 });
+  check(
+    "M10 wait_seconds above the 120s cap is rejected",
     (m10.rpcError !== undefined || m10.isError === true) &&
-      /25/.test(JSON.stringify(m10)),
+      /120/.test(JSON.stringify(m10)),
     m10,
   );
 

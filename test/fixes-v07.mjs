@@ -57,7 +57,6 @@ function mcpClient(env) {
   const send = (o) => child.stdin.write(JSON.stringify(o) + "\n");
   const waitFor = (id) =>
     new Promise((res, rej) => {
-      const dead = setTimeout(() => rej(new Error("MCP reply timeout id " + id)), 15_000);
       const t = setInterval(() => {
         if (replies.has(id)) {
           clearTimeout(dead);
@@ -65,6 +64,11 @@ function mcpClient(env) {
           res(replies.get(id));
         }
       }, 20);
+      const dead = setTimeout(() => {
+        clearInterval(t);
+        child.kill("SIGKILL");
+        rej(new Error("MCP reply timeout id " + id));
+      }, 15_000);
     });
   let nextId = 100;
   // Raw reply: callers inspect the rejection (the SDK surfaces its own
@@ -223,6 +227,7 @@ function mcpClient(env) {
     typeof w.command === "string" &&
       w.command.includes("poller.js") &&
       w.command.includes("--agent 'poller-user'") &&
+      w.command.includes("--ok-on-timeout") &&
       !w.command.includes("--room") &&
       !w.command.includes("--mentions-only"),
     w.command,

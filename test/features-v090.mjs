@@ -241,14 +241,30 @@ await (async () => {
   const dir = mkdtempSync(join(tmpdir(), "v090-mcp-"));
   const DB = join(dir, "t.db");
   const child = spawn("node", [join(ROOT, "dist", "index.js")], {
-    env: { ...process.env, AGENT_CHAT_DB: DB },
+    env: {
+      ...process.env,
+      AGENT_CHAT_DB: DB,
+      AGENT_CHAT_MAX_WAIT_SECONDS: "25",
+    },
     stdio: ["pipe", "pipe", "ignore"],
   });
   const R = new Map();
   let buf = "";
   child.stdout.on("data", (d) => { buf += d; let i; while ((i = buf.indexOf("\n")) >= 0) { const l = buf.slice(0, i); buf = buf.slice(i + 1); if (!l.trim()) continue; try { const m = JSON.parse(l); if (m.id !== undefined) R.set(m.id, m); } catch {} } });
   const send = (o) => child.stdin.write(JSON.stringify(o) + "\n");
-  const wait = (id) => new Promise((res) => { const t = setInterval(() => { if (R.has(id)) { clearInterval(t); res(R.get(id)); } }, 15); });
+  const wait = (id) => new Promise((res, rej) => {
+    const t = setInterval(() => {
+      if (!R.has(id)) return;
+      clearInterval(t);
+      clearTimeout(dead);
+      res(R.get(id));
+    }, 15);
+    const dead = setTimeout(() => {
+      clearInterval(t);
+      child.kill("SIGKILL");
+      rej(new Error(`MCP reply timeout id ${id}`));
+    }, 15_000);
+  });
   send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "0" } } });
   await wait(1);
   send({ jsonrpc: "2.0", method: "notifications/initialized" });
@@ -391,9 +407,13 @@ await (async () => {
   await call("join_room", { room: "active-room" });
 
   // B2: delivery warnings. ghost = never joined; leaver = joined then left;
-  // stale = present but idle 2h; peer = active.
+  // stale = idle with older backlog; idle-caught-up = idle but current before
+  // this send; peer = active. Only factual pre-existing lag warrants idle text.
   s.upsertAgent("leaver", null, null, null);
   s.joinRoom(rA, "leaver");
+  // Model the leave/wait race: a lease may outlive membership presence. A
+  // definitive left warning must win over stale watching:true state.
+  s.beginWaitLease(rA, "leaver", "STALE-LEAVER-WAIT", 30);
   s.leaveRoom(rA, "leaver");
   s.upsertAgent("stale", null, null, null);
   s.joinRoom(rA, "stale");
@@ -401,10 +421,14 @@ await (async () => {
   s.upsertAgent("watcher", null, null, null);
   s.joinRoom(rA, "watcher");
   s.markRead(rA, "watcher");
+  s.postMessage(rA, "peer", "older backlog", "text", null, null);
+  s.upsertAgent("idle-caught-up", null, null, null);
+  s.joinRoom(rA, "idle-caught-up");
+  s.markRead(rA, "idle-caught-up");
   {
     const raw = new Database(DB);
     raw.prepare(
-      "UPDATE memberships SET last_seen = datetime('now','-2 hours') WHERE agent_id IN ('stale','watcher')",
+      "UPDATE memberships SET last_seen = datetime('now','-2 hours') WHERE agent_id IN ('stale','watcher','idle-caught-up')",
     ).run();
     raw.close();
   }
@@ -412,7 +436,7 @@ await (async () => {
   s.touch(rA, "peer");
   const post = await call("post_message", {
     content: "fanout",
-    to: ["ghost", "leaver", "stale", "watcher", "peer"],
+    to: ["ghost", "leaver", "stale", "idle-caught-up", "watcher", "peer"],
   });
   const w = post.data.delivery_warnings ?? [];
   check(
@@ -420,25 +444,35 @@ await (async () => {
     w.length === 3 &&
       w.some((x) => x.startsWith("ghost:") && /never joined/.test(x)) &&
       w.some((x) => x.startsWith("leaver:") && /left/.test(x)) &&
-      w.some((x) => x.startsWith("stale:") && /idle 2h/.test(x) && /marker \d+ behind/.test(x)),
+      w.some((x) =>
+        x.startsWith("stale:") &&
+        /no observed activity in this room for 2h/.test(x) &&
+        /marker was 1 seq behind before this post/.test(x),
+      ) &&
+      !w.some((x) => /likely unreachable/.test(x)),
     w,
   );
   check(
     "B2 no warning for active or watching recipients",
-    !w.some((x) => x.startsWith("peer:")) &&
-      !w.some((x) => x.startsWith("watcher:")),
+      !w.some((x) => x.startsWith("peer:")) &&
+      !w.some((x) => x.startsWith("watcher:")) &&
+      !w.some((x) => x.startsWith("idle-caught-up:")),
     w,
   );
   check(
     "B2 post-transaction recipient rows include the new unread message",
     post.data.recipients.every((r) => "marker_behind" in r) &&
       post.data.recipients.find((r) => r.id === "ghost").marker_behind === null &&
-      post.data.recipients.find((r) => r.id === "stale").marker_behind === 1 &&
-      post.data.recipients.find((r) => r.id === "watcher").marker_behind === 1 &&
+      post.data.recipients.find((r) => r.id === "leaver").status === "left" &&
+      post.data.recipients.find((r) => r.id === "leaver").watching === true &&
+      post.data.recipients.find((r) => r.id === "stale").marker_behind === 2 &&
+      post.data.recipients.find((r) => r.id === "idle-caught-up").marker_behind === 1 &&
+      post.data.recipients.find((r) => r.id === "watcher").marker_behind === 2 &&
       post.data.recipients.find((r) => r.id === "watcher").watching === true &&
       post.data.recipients.find((r) => r.id === "watcher").status === "active",
     post.data.recipients,
   );
+  s.endWaitLease(rA, "leaver", "STALE-LEAVER-WAIT");
   s.endWaitLease(rA, "watcher", "OPEN-WAIT");
   const clean = await call("post_message", { content: "to peer", to: ["peer"] });
   check(
@@ -459,8 +493,13 @@ await (async () => {
   const info = await call("server_info", {});
   check(
     "B3 server_info publishes limits and the manual",
-    info.data.limits?.message_body_max_bytes === 10_000_000 &&
+      info.data.limits?.message_body_max_bytes === 10_000_000 &&
       info.data.limits?.bulk_read_default_budget_chars === 100_000 &&
+      info.data.limits?.wait_seconds_max === 25 &&
+      info.data.limits?.wait_seconds_default_max === 25 &&
+      info.data.limits?.wait_seconds_configurable_hard_max === 120 &&
+      info.data.limits?.crossed_preview_chars_max === 2000 &&
+      info.data.limits?.client_message_id_max_chars === 200 &&
       info.data.limits?.metadata_caps_chars?.claim_key === 500 &&
       typeof info.data.manual === "string" &&
       info.data.manual.includes("OPERATING MANUAL") &&
@@ -470,14 +509,17 @@ await (async () => {
   const wfm = await call("wait_for_messages", { timeout: 90, interval: 5 });
   check(
     "B3 wait_for_messages threads timeout/interval into the command",
-    wfm.data.command.includes("--timeout '90'") && wfm.data.command.includes("--interval '5'"),
+    wfm.data.command.includes("--timeout '90'") &&
+      wfm.data.command.includes("--interval '5'") &&
+      wfm.data.command.includes("--ok-on-timeout"),
     wfm.data.command,
   );
   const wfmDefault = await call("wait_for_messages", {});
   check(
-    "B3 omitted knobs emit no flags (script defaults govern)",
-    !wfmDefault.data.command.includes("--timeout") &&
+    "B3 omitted valued knobs keep defaults; generated timeout is benign",
+    !/--timeout(?:=|\s)/.test(wfmDefault.data.command) &&
       !wfmDefault.data.command.includes("--interval") &&
+      wfmDefault.data.command.includes("--ok-on-timeout") &&
       wfmDefault.data.command.includes("poller.js") &&
       wfmDefault.data.single_process === true,
     wfmDefault.data.command,
@@ -602,6 +644,7 @@ await (async () => {
       "5",
       "--timeout",
       "1",
+      "--ok-on-timeout",
     ],
     {
       env: { ...env, COUNT_FILE: countFile, REAL_NODE: process.execPath },
@@ -612,9 +655,15 @@ await (async () => {
   const pollElapsed = Date.now() - pollStarted;
   const probeLog = readFileSync(countFile, "utf8").trim();
   const probeCount = probeLog === "" ? 0 : probeLog.split("\n").length;
+  let boundedJson = null;
+  try {
+    boundedJson = JSON.parse(boundedPoll.stdout.trim());
+  } catch {}
   check(
-    "C1 bounded quiet watch uses one Node process and exits 124",
-    boundedPoll.status === 124 && probeCount === 1 &&
+    "C1 benign quiet timeout uses one Node process and exits 0 with typed stdout",
+    boundedPoll.status === 0 && probeCount === 1 &&
+      boundedJson?.has_updates === false && boundedJson?.timed_out === true &&
+      boundedPoll.stderr === "" &&
       pollElapsed >= 1000 && pollElapsed < 6000,
     {
       status: boundedPoll.status,
@@ -622,6 +671,7 @@ await (async () => {
       elapsed: pollElapsed,
       out: boundedPoll.stdout,
       err: boundedPoll.stderr,
+      parsed: boundedJson,
     },
   );
 

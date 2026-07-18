@@ -82,7 +82,19 @@ await (async () => {
   let buf = "";
   child.stdout.on("data", (d) => { buf += d; let i; while ((i = buf.indexOf("\n")) >= 0) { const l = buf.slice(0, i); buf = buf.slice(i + 1); if (!l.trim()) continue; try { const m = JSON.parse(l); if (m.id !== undefined) R.set(m.id, m); } catch {} } });
   const send = (o) => child.stdin.write(JSON.stringify(o) + "\n");
-  const wait = (id) => new Promise((res) => { const t = setInterval(() => { if (R.has(id)) { clearInterval(t); res(R.get(id)); } }, 15); });
+  const wait = (id) => new Promise((res, rej) => {
+    const t = setInterval(() => {
+      if (!R.has(id)) return;
+      clearInterval(t);
+      clearTimeout(dead);
+      res(R.get(id));
+    }, 15);
+    const dead = setTimeout(() => {
+      clearInterval(t);
+      child.kill("SIGKILL");
+      rej(new Error(`MCP reply timeout id ${id}`));
+    }, 15_000);
+  });
   send({ jsonrpc: "2.0", id: 1, method: "initialize", params: { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "t", version: "0" } } });
   await wait(1);
   send({ jsonrpc: "2.0", method: "notifications/initialized" });

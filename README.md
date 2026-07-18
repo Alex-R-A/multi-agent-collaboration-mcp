@@ -53,6 +53,17 @@ every server on the machine shares the built-in default file automatically.
 During development you can point `args` at the TypeScript entry via `tsx`
 instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/index.ts"]`.
 
+Blocking `catch_up` waits default to a conservative 25-second maximum. A host
+whose request timeout and cancellation behavior have been measured may set
+`AGENT_CHAT_MAX_WAIT_SECONDS` to an integer from 1 through 120. This changes
+only the accepted deadline; probe cadence and the four-waits-per-process bound
+stay fixed. `wait_seconds` bounds the polling deadline, not total RPC wall
+time: SQLite contention, lease cleanup, and serialization can add several
+bounded five-second busy-timeout windows, so measure the whole call on the
+target host. The watching lease lasts up to the requested wait plus five
+seconds, so a higher cap also lengthens the maximum stale `watching:true`
+window after a hard-killed host.
+
 ## Tools
 
 - `create_room(name, description?, pinned?)` — make a room (rooms must exist
@@ -84,7 +95,7 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
   `active_within_minutes`, default 5). `filter` matches a substring of
   id/type/role/description. `next_after` means more rows exist; pass it back as
   `after` (keyset paging).
-- `post_message(content, to?, reply_to_seq?, supersedes_seq?, priority?)` — post to the
+- `post_message(content, to?, reply_to_seq?, supersedes_seq?, priority?, client_message_id?)` — post to the
   active room. `content` is plain text **or** a JSON object/array. `to` is an
   optional list of agent_ids the message is directed at (mentions).
   `reply_to_seq` tags another message. `supersedes_seq` marks **your own**
@@ -96,7 +107,17 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
   **not read** at post time (if > 0, catch up, contradicting messages may have
   landed while you wrote). An accepted post never consumes an unseen message
   from someone else; it only normalizes read cursors across a suffix containing
-  your own posts, which `catch_up` would never return.
+  your own posts, which `catch_up` would never return. `client_message_id`
+  (max 200 chars) is an opt-in, author+room-scoped idempotency key: retrying the
+  exact stored payload returns the original `seq`; changing content, priority,
+  recipients, reply, or supersession metadata with the same key fails. The key
+  lasts while the message is retained. Repeat the same explicit `room` or
+  `expected_room` on retry so active-room drift cannot post elsewhere. A
+  deduplicated response does not replay the original crossed/recipient
+  snapshot; call `catch_up` for current state. Crossed body previews are
+  opt-in via `crossed_preview_chars` (max 2000). Recipient rows are factual,
+  room-local observations; idle warnings report older backlog, not predicted
+  responsiveness. A fresh tagged post normally makes `marker_behind` at least 1.
 - `catch_up(room?, wait_seconds?, priority_only?, limit?, preview_chars?, max_bytes?)` — messages posted since you
   last read, oldest first, and **advances** your read marker. This is THE room
   sync and is lossless by default. `priority_only: true` is an explicitly
@@ -118,7 +139,10 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
   routing metadata cannot leave room for one recoverable message stub, the
   call fails before reading or advancing and reports the required minimum.
   Call again later to get only what is new; `remaining`
-  reports how many are still unread.
+  reports how many are still unread. `wait_seconds` defaults to a 25-second
+  maximum. An operator may raise the effective server maximum to at most 120
+  through `AGENT_CHAT_MAX_WAIT_SECONDS`, but only after measuring the complete
+  call under representative database contention on that host.
 - `my_mentions(limit?, preview_chars?, max_bytes?, after_id?)` — the cross-room
   **inbox**: unread messages directed at you (your `to` mentions, or replies to
   messages you wrote) across **every room you are present in**, oldest first,
@@ -164,22 +188,24 @@ instead: `"command": "npx", "args": ["tsx", "/Users/alexaustin/code/aichat/src/i
   crossed "I claim X" chat posts. Claims expire after `ttl_seconds` (default
   900), so crashed holders cannot block forever; re-claim to renew. Advisory
   only: nothing physically locks the resource. `room` targets another room you
-  have joined without changing the active room.
+  have joined without changing the active room. `expires_at` is RFC3339 UTC.
 - `release_claim(room?, key)` — release your claim so others can take it.
 - `list_claims(room?, limit?, after_key?)` — active claims in the active or named
   joined room (up to `limit`,
-  default 200, with `total`) with holder, note, and expiry. `next_key` in the
+  default 200, with `total`) with holder, note, RFC3339-UTC expiry, and relative
+  `expires_in_seconds`. `next_key` in the
   response means more rows exist; pass it back as `after_key` (keyset paging,
   so a claim expiring between pages cannot make you skip a live one).
 - `set_room_intro(text)` — set/update the active room's pinned intro (empty
   string clears it).
-- `wait_for_messages(room?, mentions_only?)` — returns the exact background
+- `wait_for_messages(room?, mentions_only?, timeout?, interval?)` — returns the exact background
   poller **command** to watch for new messages without busy-looping tool calls
   (the poller is a separate, childless Node process, not an MCP tool, so it does
   not appear in the tool list by itself; this tool surfaces it). Run the
-  returned `command` as a background task: it exits `0` the moment a message
-  lands (then `catch_up`), `124` on timeout, `2` on error. `join_room` returns
-  the same string as `poller_cmd`.
+  returned `command` as a background task. Generated commands exit `0` for a
+  hit or quiet deadline; parse stdout `has_updates` to distinguish them. Exit
+  `2` is an error. Direct CLI calls without `--ok-on-timeout` retain exit `124` on
+  timeout. `join_room` returns the same string as `poller_cmd`.
 - `search_messages(query, limit?, offset?)` — full-text (FTS5) search of message
   bodies in the active room, best matches first. `query` is FTS5 syntax: bare
   terms are ANDed; supports `OR`, `NOT`, quoted `"phrases"`, and `prefix*`. A
@@ -238,12 +264,15 @@ watcher is killed without cleanup, its error reports the stale lock path for
 explicit removal; it never races to steal another process's lock.
 
 Options: `--interval <sec>` (5..3600, default 5), `--timeout <sec>` (1..86400,
-default 1200), `--room <id|name>`, `--mentions-only`, and `--session <nonce>`.
+default 1200), `--ok-on-timeout`, `--room <id|name>`, `--mentions-only`, and
+`--session <nonce>`.
 Generated commands include the live session, so scoped and all-room watches
 resolve the current private/shared cursor on every probe. Frozen `--since`
 baselines are rejected because an automatically restarted stale command can
-re-fire forever. Exit codes: `0` update found, `124` timeout, `2` error or
-duplicate watcher, `130`/`143` terminated.
+re-fire forever. Generated commands include `--ok-on-timeout`: exit `0` is normal
+completion and stdout says `has_updates:true` (catch up the named room) or
+`has_updates:false` (quiet deadline). A manual command without that flag uses
+`124` for timeout. Exit `2` is error/duplicate watcher; `130`/`143` terminated.
 
 `agent-chat-check` remains a one-shot diagnostic with exact counts. The old
 `scripts/wait-for-updates.sh` path is a compatibility shim that immediately
@@ -261,6 +290,11 @@ transaction, so two processes draining the same identity's backlog partition it
 with no overlap and no loss. The opt-in, process-bounded
 `npm run test:concurrency` check proves this with two workers draining one
 backlog concurrently; it is deliberately separate from the default suite.
+Its coordinator and childless worker are separate files, fixed at two workers,
+and protected by one-generation role authorization plus wall-time/output caps,
+so a miswired worker path fails before it can multiply processes. The default
+suite runs files sequentially and kills each POSIX test process group after a
+30-second deadline.
 That splitting is the **shared** (default) cursor mode
 and is right for work queues; sessions that instead want independent full views
 of the stream under one identity join with `cursor: "private"`, which gives

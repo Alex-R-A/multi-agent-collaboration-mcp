@@ -108,6 +108,11 @@ const c1 = s.claimResource(room, "file:src/db.ts", "alice", 900, "editing");
 check(c1.granted === true && c1.renewed === false, "first claim granted");
 const c2 = s.claimResource(room, "file:src/db.ts", "bob", 900, null);
 check(c2.granted === false && c2.holder === "alice", "second claimant denied with holder info");
+check(
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(c1.expires_at) &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(c2.expires_at),
+  "claim success and denial use unambiguous RFC3339 UTC expiry",
+);
 const c3 = s.claimResource(room, "file:src/db.ts", "alice", 900, "still editing");
 check(c3.granted === true && c3.renewed === true, "same holder renews");
 const rel1 = s.releaseClaim(room, "file:src/db.ts", "bob");
@@ -117,7 +122,12 @@ check(rel2.released === true, "holder releases");
 const c4 = s.claimResource(room, "file:src/db.ts", "bob", 900, null);
 check(c4.granted === true, "released key claimable by another agent");
 const { claims: list } = s.listClaims(room);
-check(list.length === 1 && list[0].holder === "bob" && list[0].expires_in_seconds > 0, "list_claims shows active holder");
+check(
+  list.length === 1 && list[0].holder === "bob" &&
+    list[0].expires_in_seconds > 0 &&
+    /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$/.test(list[0].expires_at),
+  "list_claims shows active holder with RFC3339 UTC expiry",
+);
 
 // expiry: a 1-second claim frees itself
 const exp = s.claimResource(room, "task:short", "alice", 1, null);

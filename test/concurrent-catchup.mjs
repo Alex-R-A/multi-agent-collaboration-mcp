@@ -20,6 +20,13 @@ const WORKERS = 2;
 const LIMIT = 3;
 const WORKER_TIMEOUT_MS = 20_000;
 const MAX_OUTPUT_BYTES = 128_000;
+const WORKER_ROLE_ENV = "AICHAT_CONCURRENCY_WORKER";
+
+// One-generation fuse: if a future edit accidentally points WORKER back at
+// this coordinator, its child exits here before it can spawn another child.
+if (process.env[WORKER_ROLE_ENV] === "1") {
+  throw new Error("concurrency coordinator cannot run in worker role");
+}
 
 const tmpDir = mkdtempSync(join(tmpdir(), "aichat-race-"));
 const DB = join(tmpDir, "race.db");
@@ -62,7 +69,10 @@ function runWorker(index, startAt) {
     const child = spawn(
       process.execPath,
       [WORKER, DB, String(startAt), String(ROOM), AGENT, String(LIMIT), String(N + 1)],
-      { stdio: ["ignore", "pipe", "inherit"] },
+      {
+        stdio: ["ignore", "pipe", "inherit"],
+        env: { ...process.env, [WORKER_ROLE_ENV]: "1" },
+      },
     );
     children.add(child);
     let output = "";

@@ -25,6 +25,7 @@ type Args = {
   mentionsOnly: boolean;
   intervalSeconds: number;
   timeoutSeconds: number;
+  timeoutOk: boolean;
 };
 
 type Hit = { room_id: number; room_name: string };
@@ -33,10 +34,12 @@ const USAGE = `agent-chat-poller: wait for unread work with one SQLite probe eve
 Usage:
   poller.js --agent <id> [--room <id|name>] [--session <nonce>]
             [--mentions-only] [--interval <seconds>] [--timeout <seconds>]
+            [--ok-on-timeout]
 
 The interval must be 5..3600 seconds (default 5). The timeout must be
-1..86400 seconds (default 1200). Exit 0 = work exists, 124 = timeout,
-2 = invalid arguments, duplicate watcher, or database error.
+1..86400 seconds (default 1200). Exit 0 = work exists; with --ok-on-timeout,
+exit 0 also reports a quiet deadline as has_updates:false. Without it,
+timeout exits 124. Exit 2 = invalid arguments, duplicate watcher, or DB error.
 `;
 
 function argumentError(message: string): never {
@@ -60,6 +63,7 @@ function parseArgs(argv: string[]): Args {
   let mentionsOnly = false;
   let intervalSeconds = 5;
   let timeoutSeconds = 1200;
+  let timeoutOk = false;
 
   for (let i = 0; i < argv.length; i++) {
     let flag = argv[i];
@@ -88,6 +92,9 @@ function parseArgs(argv: string[]): Args {
     } else if (flag === "--mentions-only") {
       if (inline !== undefined) argumentError(`${flag} takes no value`);
       mentionsOnly = true;
+    } else if (flag === "--ok-on-timeout") {
+      if (inline !== undefined) argumentError(`${flag} takes no value`);
+      timeoutOk = true;
     } else if (flag === "--since") {
       argumentError(
         "--since is intentionally unsupported: frozen baselines can re-fire forever; use --session",
@@ -112,6 +119,7 @@ function parseArgs(argv: string[]): Args {
     mentionsOnly,
     intervalSeconds,
     timeoutSeconds,
+    timeoutOk,
   };
 }
 
@@ -310,8 +318,18 @@ try {
   const deadline = Date.now() + args.timeoutSeconds * 1000;
   for (;;) {
     if (Date.now() >= deadline) {
-      process.stderr.write('{"timed_out":true}\n');
-      exitCode = 124;
+      if (args.timeoutOk) {
+        await new Promise<void>((resolveWrite, rejectWrite) => {
+          process.stdout.write(
+            '{"has_updates":false,"timed_out":true}\n',
+            (error) => (error ? rejectWrite(error) : resolveWrite()),
+          );
+        });
+        exitCode = 0;
+      } else {
+        process.stderr.write('{"timed_out":true}\n');
+        exitCode = 124;
+      }
       break;
     }
     const hit = probe();
