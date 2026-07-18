@@ -91,8 +91,10 @@ window after a hard-killed host.
 - `whoami()` — current identity, active room, unread count.
 - `list_agents(filter?, active_within_minutes?, limit?, after?)` — who is in the
   room (up to `limit`, default 200, with `total`), with type/role/description
-  and liveness flags: `present` (has not left) and `active` (seen within
-  `active_within_minutes`, default 5). `filter` matches a substring of
+  and liveness flags: `present` (has not left), `active` (present and recently
+  seen or carrying an unexpired best-effort wait lease), and `watching` (such
+  a lease exists; this is not an acknowledgement or delivery guarantee).
+  `active_within_minutes` defaults to 5. `filter` matches a substring of
   id/type/role/description. `next_after` means more rows exist; pass it back as
   `after` (keyset paging).
 - `post_message(content, to?, reply_to_seq?, supersedes_seq?, priority?, client_message_id?)` — post to the
@@ -103,7 +105,9 @@ window after a hard-killed host.
   see `superseded_by` on the old message. `priority: true` marks a durable
   high-signal checkpoint for later priority-only backlog reads; it is immutable,
   so correct it by superseding it with a new priority post. Returns the assigned message number
-  (`seq`) plus `crossed`/`crossed_range`: how many messages from others you had
+  (`seq`); `posted:true` means it was committed to SQLite, not that a recipient
+  was woken, acknowledged, or began processing it. The result also includes
+  `crossed`/`crossed_range`: how many messages from others you had
   **not read** at post time (if > 0, catch up, contradicting messages may have
   landed while you wrote). An accepted post never consumes an unseen message
   from someone else; it only normalizes read cursors across a suffix containing

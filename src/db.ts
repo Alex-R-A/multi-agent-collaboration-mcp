@@ -302,15 +302,16 @@ export type AgentRow = {
   idle_seconds: number | null;
   present: boolean;
   active: boolean;
-  /** True ONLY while the agent has an open blocking catch_up wait in this
-   *  room (see RecipientStatus.watching). */
+  /** True while an unexpired best-effort blocking catch_up wait lease exists
+   *  in this room (see RecipientStatus.watching). */
   watching: boolean;
 };
 
 export type RecipientStatus = {
   id: string;
   /** unknown = never joined, left = joined then left, idle = present but not
-   *  seen recently, active = present and seen within the liveness window. */
+   *  seen recently, active = present and recently seen OR carrying an
+   *  unexpired best-effort wait lease. */
   status: "active" | "idle" | "left" | "unknown";
   present: boolean;
   idle_seconds: number | null;
@@ -319,10 +320,10 @@ export type RecipientStatus = {
    *  caught up). Computed at call time; post_message samples it after its new
    *  row is inserted, inside that same transaction. null for unknown. */
   marker_behind: number | null;
-  /** True ONLY while the recipient has an open blocking catch_up wait in
-   *  this room (an in-turn wait lease): the model is mid-turn, awaiting the
-   *  call's return, so a message now is delivered into a live turn. Never
-   *  produced by detached pollers. */
+  /** True while the recipient has an unexpired best-effort blocking catch_up
+   *  wait lease in this room. It is not an acknowledgement or delivery
+   *  guarantee and may briefly outlive cancellation or hard termination.
+   *  Never produced by detached pollers. */
   watching: boolean;
 };
 
@@ -3177,7 +3178,12 @@ export class ChatStore {
     // longer strand a peer message behind an advanced marker.
     const tx = this.db.transaction(() => {
       const cursor = this.getCursor(roomId, agentId, sessionId);
-      if (!cursor) throw new Error("not a member of this room");
+      if (!cursor) {
+        // Distinguish a real non-member from a room deleted after the caller
+        // resolved it. This extra PK lookup runs only on the error path.
+        this.requireRoom(roomId);
+        throw new Error("not a member of this room");
+      }
       const from = cursor.last_read_seq;
       const priorityOnly = unreadSummary?.priorityOnly === true;
       // Captured under the same IMMEDIATE snapshot as the filtered scan. Own

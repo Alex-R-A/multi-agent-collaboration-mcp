@@ -992,8 +992,9 @@ server.registerTool(
       "List agents in the active room (up to `limit`; `total` rides along): " +
       "type/role/description, `last_read_seq` (read receipt: compare to a " +
       "message seq), `last_seen`, `idle_seconds`, `present` (has not left), " +
-      "`active` (seen within active_within_minutes), `watching` (an open " +
-      "blocking catch_up wait: a message now lands in a live turn). Long " +
+      "`active` (present and recently seen or carrying an unexpired wait lease), " +
+      "`watching` (an unexpired best-effort blocking catch_up wait lease; " +
+      "not an acknowledgement or delivery guarantee). Long " +
       "descriptions are listing previews (description_truncated). " +
       "`next_after` present = more rows exist; page by passing it back as " +
       "`after` (keyset paging, so a concurrent join cannot make you skip or " +
@@ -1009,7 +1010,10 @@ server.registerTool(
         .positive()
         .max(1440)
         .optional()
-        .describe("Window for the `active` flag (default 5 minutes)"),
+        .describe(
+          "Recent-seen window for `active`; an unexpired wait lease also " +
+            "makes a present agent active (default 5 minutes)",
+        ),
       limit: z
         .number()
         .int()
@@ -1055,7 +1059,9 @@ server.registerTool(
     description:
       "Post text/JSON to the active or explicit joined `room`. Returns `seq`, " +
       "factual recipient state, and `crossed` unread peer traffic for a new " +
-      "insert. A deduplicated retry returns the original seq/key only; catch " +
+      "insert. `posted:true` means committed to SQLite only, not that a " +
+      "recipient was woken, acknowledged, or began processing it. A " +
+      "deduplicated retry returns the original seq/key only; catch " +
       "up for current state. For a " +
       "dispositive post, use `if_last_read_seq` + `expected_room`; use " +
       "`client_message_id` to deduplicate an exact lost-response retry. " +
@@ -1648,10 +1654,17 @@ server.registerTool(
             "mid-wait; nothing was read or advanced -- call catch_up again " +
             "to read from the current cursor",
         });
-      const roomDeletedResult = (): ToolResult =>
-        fail(
-          `room "${roomName ?? roomId}" was deleted while waiting; nothing was read. list_rooms shows what still exists.`,
+      const roomDeletedResult = (duringWait = false): ToolResult => {
+        // A delete racing the active-room read invalidates that active route.
+        // Do not clear a different room selected by a concurrent join, nor the
+        // active room during an explicit cross-room catch_up.
+        if (session.roomId === roomId && session.agentId === agentId) {
+          session.roomId = null;
+        }
+        return fail(
+          `room "${roomName ?? roomId}" was deleted while ${duringWait ? "waiting" : "reading"}; nothing was read. list_rooms shows what still exists.`,
         );
+      };
 
       // Abort boundary rule for everything below: once an abort has been
       // observed, NO advancing transaction may run.
@@ -1659,7 +1672,13 @@ server.registerTool(
       // A blocking wait discards an initial empty result. Do not compute its
       // exact cross-room unread summary only to throw it away; the timeout read
       // below includes the summary that is actually returned.
-      const first = advancingRead(waitSeconds === 0);
+      let first: ReturnType<typeof advancingRead>;
+      try {
+        first = advancingRead(waitSeconds === 0);
+      } catch (e) {
+        if (!store.getRoom(roomId)) return roomDeletedResult();
+        throw e;
+      }
       if (first.messages.length > 0 || waitSeconds === 0) {
         return respond(
           first,
@@ -1702,7 +1721,7 @@ server.registerTool(
           try {
             unread = store.unreadProbe(roomId, agentId, selector);
           } catch (e) {
-            if (!store.getRoom(roomId)) return roomDeletedResult();
+            if (!store.getRoom(roomId)) return roomDeletedResult(true);
             throw e;
           }
           if (unread === 0) continue;
@@ -1714,7 +1733,7 @@ server.registerTool(
             // so omit the cross-room exact-count summary here as well.
             hit = advancingRead(false);
           } catch (e) {
-            if (!store.getRoom(roomId)) return roomDeletedResult();
+            if (!store.getRoom(roomId)) return roomDeletedResult(true);
             throw e;
           }
           // Cursor normalization may advance across an own-only suffix while
@@ -1731,7 +1750,7 @@ server.registerTool(
         try {
           last = advancingRead(true);
         } catch (e) {
-          if (!store.getRoom(roomId)) return roomDeletedResult();
+          if (!store.getRoom(roomId)) return roomDeletedResult(true);
           throw e;
         }
         return respond(last, {

@@ -64,11 +64,38 @@ add_registration() {
   fi
 }
 
+# Both supported CLIs print one command and one args line for stdio servers.
+# Parse those fields and require exact values: a substring check accepts stale
+# targets such as dist/index.js.old or an unrelated extra argument that merely
+# mentions this checkout. Unknown future output formats fail closed and can be
+# replaced explicitly with AGENT_CHAT_FORCE_REREGISTER=1.
+registration_targets_checkout() {
+  local registration=$1
+  local line
+  local registered_command=""
+  local registered_args=""
+  while IFS= read -r line; do
+    line="${line#"${line%%[![:space:]]*}"}"
+    case "$line" in
+      command:\ *) registered_command="${line#command: }" ;;
+      Command:\ *) registered_command="${line#Command: }" ;;
+      args:\ *) registered_args="${line#args: }" ;;
+      Args:\ *) registered_args="${line#Args: }" ;;
+    esac
+  done <<< "$registration"
+  [[ "$registered_command" == "$NODE_BIN" && "$registered_args" == "$SERVER_PATH" ]]
+}
+
 if command -v codex >/dev/null 2>&1; then
   if [[ "$FORCE_REREGISTER" == "0" ]] &&
-     codex mcp get "$MCP_NAME" >/dev/null 2>&1; then
-    echo "[Codex] existing '$MCP_NAME' registration preserved; build refreshed in place"
-    refreshed=$((refreshed + 1))
+     codex_registration="$(codex mcp get "$MCP_NAME" 2>/dev/null)"; then
+    if registration_targets_checkout "$codex_registration"; then
+      echo "[Codex] existing '$MCP_NAME' registration already targets this checkout; build refreshed in place"
+      refreshed=$((refreshed + 1))
+    else
+      echo "[Codex] existing '$MCP_NAME' registration does not point at $SERVER_PATH; left unchanged. Set AGENT_CHAT_FORCE_REREGISTER=1 to replace it." >&2
+      failed=$((failed + 1))
+    fi
   else
     remove_registration "Codex" codex mcp remove "$MCP_NAME"
     add_registration "Codex" \
@@ -169,9 +196,14 @@ fi
 
 if command -v claude >/dev/null 2>&1; then
   if [[ "$FORCE_REREGISTER" == "0" ]] &&
-     claude mcp get "$MCP_NAME" >/dev/null 2>&1; then
-    echo "[Claude] existing '$MCP_NAME' registration preserved; build refreshed in place"
-    refreshed=$((refreshed + 1))
+     claude_registration="$(claude mcp get "$MCP_NAME" 2>/dev/null)"; then
+    if registration_targets_checkout "$claude_registration"; then
+      echo "[Claude] existing '$MCP_NAME' registration already targets this checkout; build refreshed in place"
+      refreshed=$((refreshed + 1))
+    else
+      echo "[Claude] existing '$MCP_NAME' registration does not point at $SERVER_PATH; left unchanged. Set AGENT_CHAT_FORCE_REREGISTER=1 to replace it." >&2
+      failed=$((failed + 1))
+    fi
   else
     remove_registration "Claude" \
       claude mcp remove --scope user "$MCP_NAME"

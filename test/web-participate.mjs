@@ -3,7 +3,7 @@
 // and interop (an agent's catch_up sees a web-posted message as directed).
 import { spawn } from "node:child_process";
 import { request as httpRequest } from "node:http";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,6 +17,22 @@ const check = (n, c, x) => {
   console.log(`${c ? "PASS" : "FAIL"}  ${n}${c ? "" : "  >> " + JSON.stringify(x)}`);
   if (!c) failures++;
 };
+
+// The viewer has no DOM dependency in the test package. Keep a focused source
+// contract for the historical-window state machine alongside the endpoint
+// integration tests: an old jump freezes ordinary polling and only an explicit
+// tail action performs a full bounded refresh.
+const viewerSource = readFileSync(join(ROOT, "web", "index.html"), "utf8");
+check(
+  "historical viewer snapshots do not poll through the intervening backlog",
+  viewerSource.includes("state.historicalWindow = true;") &&
+    viewerSource.includes("if (state.historicalWindow && !initial) return;") &&
+    viewerSource.includes('el.jump.textContent = "return to latest";') &&
+    /if \(state\.historicalWindow\) \{[\s\S]{0,400}?if \(state\.searchMode\) exitSearch\(false\);\s*state\.historicalWindow = false;[\s\S]{0,300}?loadNew\(true\);/.test(
+      viewerSource,
+    ),
+  null,
+);
 
 const dir = mkdtempSync(join(tmpdir(), "aichat-web-"));
 const DB = join(dir, "web.db");

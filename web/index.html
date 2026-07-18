@@ -1271,6 +1271,10 @@
         msgs: [],
         follow: true,
         newCount: 0,
+        // An off-window jump is a bounded historical snapshot, not a new live
+        // cursor. Freeze it until the user explicitly returns to the tail so
+        // polling cannot walk and rebuild every intervening 400-row page.
+        historicalWindow: false,
         failures: 0,
         loadingMsgs: false,
         loadingRooms: false,
@@ -1941,11 +1945,15 @@
             const data = await fetchJson(`/api/messages?room=${room.id}&${anchor}`);
             if (!sameView(room, epoch) || data.error || !data.messages) return;
             state.msgs = data.messages;
+            state.historicalWindow = true;
+            state.follow = false;
+            state.newCount = 0;
             state.noOlderHistory = false;
             rebuildStream();
             updateOlderButton();
             computeGap();
             hidePlaceholder();
+            updateJump();
           } catch {
             noteFail();
             return;
@@ -2160,7 +2168,10 @@
       }
 
       function updateJump() {
-        if (state.newCount > 0 && !state.follow) {
+        if (state.historicalWindow) {
+          el.jump.hidden = false;
+          el.jump.textContent = "return to latest";
+        } else if (state.newCount > 0 && !state.follow) {
           el.jump.hidden = false;
           el.jump.textContent =
             state.newCount + " new  /  jump to latest";
@@ -2174,6 +2185,7 @@
         const room = state.current;
         const epoch = state.roomEpoch;
         if (!room || state.searchMode) return;
+        if (state.historicalWindow && !initial) return;
         if (state.loadingMsgs) {
           if (initial) state.pendingInitial = true;
           return;
@@ -2646,6 +2658,7 @@
         const epoch = state.roomEpoch;
         const body = el.composeText.value.trim();
         if (!room || !joinedHere() || !body || state.sending) return;
+        let refreshFromTail = false;
         state.sending = true;
         el.send.disabled = true;
         el.composeError.textContent = "";
@@ -2665,6 +2678,8 @@
             autosize();
             clearReply();
             if (state.searchMode) exitSearch();
+            refreshFromTail = state.historicalWindow;
+            state.historicalWindow = false;
             state.follow = true;
             state.newCount = 0;
             updateJump();
@@ -2676,7 +2691,9 @@
           el.send.disabled = false;
           if (sameView(room, epoch)) el.composeText.focus();
         }
-        if (sameView(room, epoch)) loadNew(false); // pull the just-posted message in
+        // Posting from a historical snapshot returns with one bounded tail
+        // refresh; an incremental read would otherwise begin walking the gap.
+        if (sameView(room, epoch)) loadNew(refreshFromTail);
       }
 
       function autosize() {
@@ -2870,6 +2887,7 @@
         state.msgs = [];
         state.newCount = 0;
         state.follow = true;
+        state.historicalWindow = false;
         state.replyTo = null;
         state.lastReadSent = 0;
         state.marker = -1;
@@ -2938,6 +2956,18 @@
       });
 
       el.jump.addEventListener("click", () => {
+        if (state.historicalWindow) {
+          // The pill remains above search results. Exit search while the
+          // historical freeze is still set, so exitSearch's incremental
+          // refresh is a no-op; then issue exactly one full tail refresh.
+          if (state.searchMode) exitSearch(false);
+          state.historicalWindow = false;
+          state.follow = true;
+          state.newCount = 0;
+          updateJump();
+          loadNew(true);
+          return;
+        }
         state.follow = true;
         state.newCount = 0;
         updateJump();

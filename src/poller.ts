@@ -6,6 +6,7 @@ import Database from "better-sqlite3";
 import {
   closeSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
@@ -169,7 +170,9 @@ function acquireLock(path: string, token: string): void {
       owner = Number(JSON.parse(readFileSync(path, "utf8")).pid);
     } catch {}
     if (processIsAlive(owner)) {
-      argumentError(`an equivalent watcher is already running (pid ${owner})`);
+      argumentError(
+        `an equivalent watcher is already running (pid ${owner}; lock: ${path})`,
+      );
     }
     // Fail closed. Automatic stale-lock stealing needs a second interprocess
     // lock to avoid two reapers deleting each other's replacement.
@@ -200,8 +203,7 @@ async function sleepWhileOwnerAlive(
 }
 
 let database: Database.Database | null = null;
-let lockPath: string | null = null;
-let lockOwned = false;
+const lockPaths: string[] = [];
 const lockToken = randomUUID();
 let cleaned = false;
 function cleanup(): void {
@@ -210,7 +212,7 @@ function cleanup(): void {
   try {
     database?.close();
   } catch {}
-  if (lockOwned && lockPath) {
+  for (const lockPath of lockPaths) {
     try {
       const current = JSON.parse(readFileSync(lockPath, "utf8")) as {
         token?: string;
@@ -269,8 +271,38 @@ try {
     if (!resolvedRoom) argumentError(`no room "${args.room}"`);
   }
 
-  const lockDir = join(tmpdir(), "agent-chat-pollers");
-  mkdirSync(lockDir, { recursive: true, mode: 0o700 });
+  // A global /tmp/agent-chat-pollers directory makes the first OS user its
+  // owner (0700) and prevents every other user from starting a watcher. Use a
+  // per-UID primary directory on POSIX. When this user owns the legacy
+  // directory, acquire the same scoped lock there first as a zero-runtime-cost
+  // rolling-upgrade guard: old and new pollers must not bypass each other's
+  // singleton merely because the lock directory changed.
+  const uid = typeof process.getuid === "function" ? process.getuid() : null;
+  const legacyLockDir = join(tmpdir(), "agent-chat-pollers");
+  try {
+    mkdirSync(legacyLockDir, { recursive: true, mode: 0o700 });
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (uid === null || !["EACCES", "EPERM", "EEXIST"].includes(code ?? "")) {
+      throw error;
+    }
+  }
+  const legacyStat = lstatSync(legacyLockDir);
+  const lockDirs: string[] = [];
+  if (legacyStat.isDirectory() && (uid === null || legacyStat.uid === uid)) {
+    lockDirs.push(legacyLockDir);
+  } else if (uid === null) {
+    argumentError(`watcher lock path is not a directory: ${legacyLockDir}`);
+  }
+  if (uid !== null) {
+    const uidLockDir = join(tmpdir(), `agent-chat-pollers-${uid}`);
+    mkdirSync(uidLockDir, { recursive: true, mode: 0o700 });
+    const uidStat = lstatSync(uidLockDir);
+    if (!uidStat.isDirectory() || uidStat.uid !== uid) {
+      argumentError(`watcher lock directory is owned by another user: ${uidLockDir}`);
+    }
+    lockDirs.push(uidLockDir);
+  }
   const scopeKey = JSON.stringify([
     path,
     args.agent,
@@ -278,12 +310,15 @@ try {
     args.session ?? null,
     args.mentionsOnly,
   ]);
-  lockPath = join(
-    lockDir,
-    createHash("sha256").update(scopeKey).digest("hex") + ".lock",
-  );
-  acquireLock(lockPath, lockToken);
-  lockOwned = true;
+  const lockName =
+    createHash("sha256").update(scopeKey).digest("hex") + ".lock";
+  for (const lockDir of lockDirs) {
+    const lockPath = join(lockDir, lockName);
+    // Register before acquiring: a signal delivered immediately after the
+    // synchronous create still lets cleanup find the token-owned file.
+    lockPaths.push(lockPath);
+    acquireLock(lockPath, lockToken);
+  }
 
   const params: Record<string, string | number> = {
     agent: args.agent,

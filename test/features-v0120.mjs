@@ -722,7 +722,7 @@ await (async () => {
   mkdirSync(bin);
   const fakeClient =
     '#!/bin/sh\nprintf "%s %s\\n" "${0##*/}" "$*" >> "$FAKE_LOG"\n' +
-    'if [ "$1" = "mcp" ] && [ "$2" = "get" ]; then exit 0; fi\nexit 97\n';
+    'if [ "$1" = "mcp" ] && [ "$2" = "get" ]; then if [ "${0##*/}" = "claude" ]; then printf "Command: %s\\nArgs: %s\\n" "$FAKE_NODE_BIN" "$FAKE_SERVER_PATH"; else printf "command: %s\\nargs: %s\\n" "$FAKE_NODE_BIN" "$FAKE_SERVER_PATH"; fi; exit 0; fi\nexit 97\n';
   for (const name of ["codex", "claude"]) {
     const path = join(bin, name);
     writeFileSync(path, fakeClient);
@@ -755,6 +755,8 @@ await (async () => {
         AGENT_CHAT_AGY_CONFIG: configPath,
         AGENT_CHAT_NODE_BIN: process.execPath,
         FAKE_LOG: logPath,
+        FAKE_NODE_BIN: process.execPath,
+        FAKE_SERVER_PATH: join(ROOT, "dist", "index.js"),
       },
       encoding: "utf8",
       timeout: 10_000,
@@ -778,6 +780,37 @@ await (async () => {
     /node scripts\/prepare\.mjs/.test(pkg.scripts["mcp:refresh"]) &&
       !/npm run build/.test(pkg.scripts["mcp:refresh"]),
     pkg.scripts["mcp:refresh"],
+  );
+  writeFileSync(logPath, "");
+  const mismatched = spawnSync(
+    "bash",
+    [join(ROOT, "scripts", "refresh-mcp.sh")],
+    {
+      env: {
+        ...process.env,
+        PATH: `${bin}:${process.env.PATH}`,
+        AGENT_CHAT_AGY_CONFIG: configPath,
+        AGENT_CHAT_NODE_BIN: process.execPath,
+        FAKE_LOG: logPath,
+        FAKE_NODE_BIN: process.execPath,
+        FAKE_SERVER_PATH: join(ROOT, "dist", "index.js") + ".old",
+      },
+      encoding: "utf8",
+      timeout: 10_000,
+    },
+  );
+  const mismatchCalls = readFileSync(logPath, "utf8");
+  check(
+    "R1 refresh rejects an exact-path near miss instead of claiming success",
+    mismatched.status === 1 &&
+      /AGENT_CHAT_FORCE_REREGISTER=1/.test(mismatched.stderr) &&
+      !/mcp remove|mcp add/.test(mismatchCalls),
+    {
+      status: mismatched.status,
+      calls: mismatchCalls,
+      out: mismatched.stdout,
+      err: mismatched.stderr,
+    },
   );
   rmSync(dir, { recursive: true, force: true });
 }

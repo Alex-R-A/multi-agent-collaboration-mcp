@@ -537,6 +537,7 @@ function mcpClient(env) {
     }
   };
   expectClean("postMessage", () => s.postMessage(r, "a", "x", "text", null, null));
+  expectClean("catchUp", () => s.catchUp(r, "a", 50));
   expectClean("joinRoom", () => s.joinRoom(r, "a"));
   expectClean("claimResource", () => s.claimResource(r, "k", "a", 900, null));
   expectClean("releaseClaim", () => s.releaseClaim(r, "k", "a"));
