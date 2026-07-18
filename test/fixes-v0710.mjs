@@ -31,7 +31,7 @@ const NUL = String.fromCharCode(0);
   const DB = join(dir, "t.db");
   { const s = new ChatStore(DB); s.createRoom("r", null, null); s.upsertAgent("b", null, null, null); s.joinRoom(1, "b"); s.close(); }
   const uv = new Database(DB).pragma("user_version", { simple: true });
-  check("#1 user_version marked after first migrate", uv === 2, uv);
+  check("#1 user_version marked after first migrate", uv === 3, uv);
 
   // A NUL inserted while the marker stands (trigger dropped only to simulate an
   // old writer) is NOT re-healed -- the scan is gated -- proving it is skipped.

@@ -418,6 +418,41 @@ await (async () => {
     p5collision.data,
   );
 
+  // P6: pruning must not erase the evidence behind a dispositive CAS token.
+  const pruneRoom = s.createRoom("cas-prune", null, null).id;
+  s.joinRoom(pruneRoom, "peer");
+  await call("join_room", { room: "cas-prune" });
+  const oldToken = (await call("catch_up", {})).data.new_last_read_seq;
+  s.postMessage(pruneRoom, "peer", "contradiction", "text", null, null); // seq 1
+  await call("catch_up", {}); // user has read it, but oldToken remains 0
+  await call("post_message", { content: "own suffix" }); // seq 2
+  s.markRead(pruneRoom, "peer");
+  const pruned = s.pruneMessages(pruneRoom, 1, false);
+  const evidenceGone = await call("post_message", {
+    content: "must not land",
+    if_last_read_seq: oldToken,
+  });
+  check(
+    "P6 CAS rejects when pruning removed evidence after the token",
+    pruned.deleted === 1 && evidenceGone.isError !== true &&
+      evidenceGone.data.posted === false &&
+      evidenceGone.data.rejected === "evidence_pruned" &&
+      evidenceGone.data.pruned_through_seq === 1 &&
+      /cannot prove/.test(evidenceGone.data.retry) &&
+      !s.readHistory(pruneRoom, 20).messages.some((m) => m.content === "must not land"),
+    { pruned, result: evidenceGone.data },
+  );
+  const freshToken = (await call("catch_up", {})).data.new_last_read_seq;
+  const afterPrune = await call("post_message", {
+    content: "fresh decision",
+    if_last_read_seq: freshToken,
+  });
+  check(
+    "P6 catch_up supplies a fresh token that can post",
+    freshToken === 2 && afterPrune.data.posted === true,
+    { freshToken, result: afterPrune.data },
+  );
+
   s.close();
   child.kill();
   rmSync(dir, { recursive: true, force: true });

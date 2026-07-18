@@ -6,7 +6,7 @@
 // to surface. dist/build-info.json is gitignored (dist/ is not tracked).
 import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
-import { readFileSync, readdirSync, statSync, writeFileSync } from "node:fs";
+import { lstatSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join, relative } from "node:path";
 
@@ -40,12 +40,23 @@ const files = [];
 const walk = (dir) => {
   for (const name of readdirSync(dir)) {
     const path = join(dir, name);
-    if (statSync(path).isDirectory()) walk(path);
+    const stat = lstatSync(path);
+    // dist is generated output. Never follow a stray symlink during a build:
+    // a loop or a link to a large tree could turn stamping into an unbounded
+    // traversal, and the linked bytes are not part of the packaged artifact.
+    if (stat.isSymbolicLink()) continue;
+    if (stat.isDirectory()) walk(path);
     else if (name.endsWith(".js")) files.push(path);
   }
 };
 walk(dist);
-files.sort((a, b) => relative(root, a).localeCompare(relative(root, b)));
+// Code-unit comparison is deterministic across LANG/LC_ALL. localeCompare
+// made identical artifacts hash differently under locales such as cs_CZ.
+files.sort((a, b) => {
+  const ar = relative(root, a);
+  const br = relative(root, b);
+  return ar < br ? -1 : ar > br ? 1 : 0;
+});
 const hash = createHash("sha256");
 const runtimeDependencies = Object.keys(pkg.dependencies ?? {})
   .sort()

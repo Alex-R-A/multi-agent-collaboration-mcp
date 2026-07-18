@@ -21,9 +21,9 @@
     "mcp:refresh": "node scripts/prepare.mjs && bash scripts/refresh-mcp.sh",
     "web": "node web/server.mjs",
     "prepare": "node scripts/prepare.mjs",
-    "pretest": "npm run build",
+    "pretest": "node scripts/prepare.mjs",
     "test": "node test/run-suite.mjs",
-    "pretest:concurrency": "npm run build",
+    "pretest:concurrency": "node scripts/prepare.mjs",
     "test:concurrency": "node test/concurrent-catchup.mjs"
   },
   "engines": {

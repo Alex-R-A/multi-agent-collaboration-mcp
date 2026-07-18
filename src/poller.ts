@@ -21,6 +21,7 @@ type Args = {
   agent: string;
   room?: string;
   session?: string;
+  ownerPid?: number;
   db?: string;
   mentionsOnly: boolean;
   intervalSeconds: number;
@@ -33,6 +34,7 @@ type Hit = { room_id: number; room_name: string };
 const USAGE = `agent-chat-poller: wait for unread work with one SQLite probe every five seconds.
 Usage:
   poller.js --agent <id> [--room <id|name>] [--session <nonce>]
+            [--owner-pid <pid>]
             [--mentions-only] [--interval <seconds>] [--timeout <seconds>]
             [--ok-on-timeout]
 
@@ -59,6 +61,7 @@ function parseArgs(argv: string[]): Args {
   let agent: string | undefined;
   let room: string | undefined;
   let session: string | undefined;
+  let ownerPid: number | undefined;
   let db: string | undefined;
   let mentionsOnly = false;
   let intervalSeconds = 5;
@@ -84,6 +87,9 @@ function parseArgs(argv: string[]): Args {
     if (flag === "--agent") agent = take();
     else if (flag === "--room") room = take();
     else if (flag === "--session") session = take();
+    else if (flag === "--owner-pid") {
+      ownerPid = parseInteger(take(), flag, 1, 2_147_483_647);
+    }
     else if (flag === "--db") db = take();
     else if (flag === "--interval") {
       intervalSeconds = parseInteger(take(), flag, 5, 3600);
@@ -115,6 +121,7 @@ function parseArgs(argv: string[]): Args {
     agent,
     room,
     session,
+    ownerPid,
     db,
     mentionsOnly,
     intervalSeconds,
@@ -173,6 +180,25 @@ function acquireLock(path: string, token: string): void {
 const sleep = (milliseconds: number) =>
   new Promise<void>((done) => setTimeout(done, milliseconds));
 
+async function sleepWhileOwnerAlive(
+  milliseconds: number,
+  ownerPid: number | undefined,
+): Promise<boolean> {
+  // Independent/manual pollers need no five-second owner heartbeat; let their
+  // single timer sleep for the requested interval without needless wakeups.
+  if (ownerPid === undefined) {
+    await sleep(milliseconds);
+    return true;
+  }
+  const deadline = Date.now() + milliseconds;
+  for (;;) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) return true;
+    await sleep(Math.min(5_000, remaining));
+    if (ownerPid !== undefined && !processIsAlive(ownerPid)) return false;
+  }
+}
+
 let database: Database.Database | null = null;
 let lockPath: string | null = null;
 let lockOwned = false;
@@ -194,9 +220,29 @@ function cleanup(): void {
   }
 }
 
+// Install lifecycle guards before argument parsing, database opening, and lock
+// acquisition. A SIGHUP or broken output pipe must not strand the fail-closed
+// watcher lock. Cleanup is synchronous/idempotent, so the exit hook also covers
+// ordinary process.exit() calls and exceptions outside the main try/finally.
+function terminate(code: number): never {
+  cleanup();
+  process.exit(code);
+}
+process.once("exit", cleanup);
+process.once("SIGHUP", () => terminate(129));
+process.once("SIGINT", () => terminate(130));
+process.once("SIGTERM", () => terminate(143));
+process.stdout.once("error", () => terminate(2));
+process.stderr.once("error", () => terminate(2));
+
 let exitCode = 2;
 try {
   const args = parseArgs(process.argv.slice(2));
+  if (args.ownerPid !== undefined && !processIsAlive(args.ownerPid)) {
+    argumentError(
+      `owner MCP process ${args.ownerPid} has ended; regenerate the poller command`,
+    );
+  }
   const requestedPath = dbPath(args.db);
   if (requestedPath === ":memory:" || !existsSync(requestedPath)) {
     argumentError(`database not found: ${requestedPath}`);
@@ -261,19 +307,34 @@ try {
     }
     params.room_id = resolvedRoom.id;
     const statement = database.prepare(
-      `SELECT g.room_id AS room_id, r.name AS room_name
-       FROM messages g
-       JOIN rooms r ON r.id = g.room_id
-       JOIN memberships mb ON mb.room_id = g.room_id AND mb.agent_id = @agent
-       LEFT JOIN session_markers sm ON sm.room_id = g.room_id
+      `SELECT r.name AS room_name,
+              EXISTS (
+                SELECT 1 FROM messages g
+                WHERE g.room_id = r.id
+                  AND g.seq > CASE WHEN @session = '' THEN mb.last_read_seq
+                                   ELSE COALESCE(sm.last_read_seq, mb.last_read_seq) END
+                  AND g.agent_id != @agent${directed}
+                LIMIT 1
+              ) AS has_updates
+       FROM rooms r
+       JOIN memberships mb ON mb.room_id = r.id AND mb.agent_id = @agent
+       LEFT JOIN session_markers sm ON sm.room_id = r.id
             AND sm.agent_id = mb.agent_id AND sm.session_id = @session
-       WHERE g.room_id = @room_id
-         AND g.seq > CASE WHEN @session = '' THEN mb.last_read_seq
-                          ELSE COALESCE(sm.last_read_seq, mb.last_read_seq) END
-         AND g.agent_id != @agent${directed}
-       LIMIT 1`,
+       WHERE r.id = @room_id`,
     );
-    probe = () => statement.get(params) as Hit | undefined;
+    probe = () => {
+      const row = statement.get(params) as
+        | { room_name: string; has_updates: number }
+        | undefined;
+      if (!row) {
+        argumentError(
+          `room ${resolvedRoom.id} was deleted or the membership disappeared while watching`,
+        );
+      }
+      return row.has_updates
+        ? { room_id: resolvedRoom.id, room_name: row.room_name }
+        : undefined;
+    };
   } else {
     const present = database
       .prepare(
@@ -306,32 +367,16 @@ try {
     probe = () => statement.get(params) as Hit | undefined;
   }
 
-  process.once("SIGINT", () => {
-    cleanup();
-    process.exit(130);
-  });
-  process.once("SIGTERM", () => {
-    cleanup();
-    process.exit(143);
-  });
-
   const deadline = Date.now() + args.timeoutSeconds * 1000;
   for (;;) {
-    if (Date.now() >= deadline) {
-      if (args.timeoutOk) {
-        await new Promise<void>((resolveWrite, rejectWrite) => {
-          process.stdout.write(
-            '{"has_updates":false,"timed_out":true}\n',
-            (error) => (error ? rejectWrite(error) : resolveWrite()),
-          );
-        });
-        exitCode = 0;
-      } else {
-        process.stderr.write('{"timed_out":true}\n');
-        exitCode = 124;
-      }
-      break;
+    if (args.ownerPid !== undefined && !processIsAlive(args.ownerPid)) {
+      argumentError(
+        `owner MCP process ${args.ownerPid} has ended; regenerate the poller command`,
+      );
     }
+    // Probe before deciding that the deadline is quiet. The final sleep lands
+    // on the deadline; checking time first discarded messages that arrived
+    // during that last interval and reported a false timeout.
     const hit = probe();
     if (hit) {
       await new Promise<void>((resolveWrite, rejectWrite) => {
@@ -349,8 +394,31 @@ try {
       exitCode = 0;
       break;
     }
+    if (Date.now() >= deadline) {
+      if (args.timeoutOk) {
+        await new Promise<void>((resolveWrite, rejectWrite) => {
+          process.stdout.write(
+            '{"has_updates":false,"timed_out":true}\n',
+            (error) => (error ? rejectWrite(error) : resolveWrite()),
+          );
+        });
+        exitCode = 0;
+      } else {
+        process.stderr.write('{"timed_out":true}\n');
+        exitCode = 124;
+      }
+      break;
+    }
     const remaining = deadline - Date.now();
-    await sleep(Math.min(args.intervalSeconds * 1000, remaining));
+    const ownerAlive = await sleepWhileOwnerAlive(
+      Math.min(args.intervalSeconds * 1000, remaining),
+      args.ownerPid,
+    );
+    if (!ownerAlive) {
+      argumentError(
+        `owner MCP process ${args.ownerPid} has ended; regenerate the poller command`,
+      );
+    }
   }
 } catch (error) {
   process.stderr.write(

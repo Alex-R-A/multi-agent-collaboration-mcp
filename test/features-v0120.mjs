@@ -308,6 +308,104 @@ function setup(name = "priority-room") {
   rmSync(dir, { recursive: true, force: true });
 }
 
+// D1: direct ChatStore callers get the same bounded/progress-safe behavior as
+// MCP-validated callers. These guards prevent a script from turning a lossy
+// limit edge into silent advancement or an offset walk into an infinite loop.
+{
+  const { s, room } = setup("direct-boundaries");
+  s.postMessage(room, "peer", "important", "text", null, null, null, null, {
+    priority: true,
+  });
+  const zeroLimit = s.catchUp(room, "me", 0, undefined, 100_000, null, {
+    sessionId: null,
+    priorityOnly: true,
+  });
+  check(
+    "D1 priority catch_up clamps a direct zero limit before advancing",
+    zeroLimit.messages.length === 1 &&
+      zeroLimit.messages[0].content === "important" &&
+      zeroLimit.new_last_read_seq === 1,
+    zeroLimit,
+  );
+
+  const emoji = s.postMessage(room, "peer", "😀z", "text", null, null);
+  const tinyPage = s.getMessage(room, emoji.seq, 0, 1);
+  check(
+    "D1 tiny get_message pages always advance across an astral codepoint",
+    tinyPage?.content === "😀" && tinyPage.next_offset === 1,
+    tinyPage,
+  );
+  const ascii = s.postMessage(room, "peer", "ab", "text", null, null);
+  const tinyAscii = s.getMessage(room, ascii.seq, 0, 1);
+  check(
+    "D1 tiny get_message still honors a one-codepoint ASCII window",
+    tinyAscii?.content === "a" && tinyAscii.next_offset === 1,
+    tinyAscii,
+  );
+  let nonfiniteReadError = "";
+  try {
+    s.getMessage(room, ascii.seq, 0, Number.POSITIVE_INFINITY);
+  } catch (error) {
+    nonfiniteReadError = String(error?.message ?? error);
+  }
+  check(
+    "D1 direct get_message rejects a non-finite allocation bound",
+    /max_chars must be finite/.test(nonfiniteReadError),
+    nonfiniteReadError,
+  );
+
+  let oversizedCatchUpError = "";
+  try {
+    s.catchUp(room, "me", 50, undefined, 400_001);
+  } catch (error) {
+    oversizedCatchUpError = String(error?.message ?? error);
+  }
+  check(
+    "D1 direct catch_up cannot exceed the MCP allocation budget",
+    /to 400000/.test(oversizedCatchUpError),
+    oversizedCatchUpError,
+  );
+
+  let nanCasError = "";
+  try {
+    s.postMessage(room, "me", "unsafe NaN decision", "text", null, null, null, null, {
+      ifLastReadSeq: Number.NaN,
+    });
+  } catch (error) {
+    nanCasError = String(error?.message ?? error);
+  }
+  check(
+    "D1 a direct NaN CAS token is rejected instead of disabling the guard",
+    /non-negative safe integer/.test(nanCasError) &&
+      !s.readHistory(room, 50).messages.some(
+        (message) => message.content === "unsafe NaN decision",
+      ),
+    nanCasError,
+  );
+
+  s.markRead(room, "me");
+  s.postMessage(room, "peer", "x".repeat(5000), "text", null, null);
+  const boundedCrossing = s.postMessage(
+    room,
+    "me",
+    "response",
+    "text",
+    null,
+    null,
+    null,
+    null,
+    { crossedPreviewChars: 1_000_000 },
+  );
+  check(
+    "D1 direct crossed previews respect the public cap",
+    boundedCrossing.posted === true &&
+      boundedCrossing.crossed_messages?.[0]?.content.length === 2000 &&
+      boundedCrossing.crossed_messages[0].truncated === true,
+    boundedCrossing,
+  );
+  s.close();
+}
+
 // S6: pending_work is byte-bounded and keyset-pageable, including ties where
 // one agent has pending rows in several rooms in the same second.
 {

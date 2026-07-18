@@ -26,6 +26,8 @@ const files = [
   "features-v0100.mjs",
   "features-v0110.mjs",
   "features-v0120.mjs",
+  "mcp-lifecycle-v0121.mjs",
+  "poller-lifecycle-v0121.mjs",
   "web-participate.mjs",
 ];
 
@@ -79,6 +81,8 @@ async function stopFromSignal(code) {
 }
 process.once("SIGINT", () => void stopFromSignal(130));
 process.once("SIGTERM", () => void stopFromSignal(143));
+process.once("SIGHUP", () => void stopFromSignal(129));
+process.once("exit", () => killActive());
 
 let failed = false;
 for (const file of files) {

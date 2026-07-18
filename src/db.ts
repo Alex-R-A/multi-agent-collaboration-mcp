@@ -32,6 +32,11 @@ export const MAX_MESSAGE_BODY_BYTES = 10_000_000;
 /** Crossed-message previews ride inside a post response rather than a paged
  * read, so keep each body small and the aggregate response separately capped. */
 export const MAX_CROSSED_PREVIEW_CHARS = 2_000;
+/** Public MCP/store caps used to keep direct callers from bypassing bounded
+ * reads with values the tool schemas would reject. */
+const MAX_BULK_RESULT_CHARS = 400_000;
+const MAX_CATCH_UP_ROWS = 500;
+const MAX_GET_MESSAGE_CHARS = 400_000;
 /** Caller-supplied post idempotency keys are opaque, room/author scoped, and
  * intentionally small enough to keep the sparse unique index cheap. */
 export const MAX_CLIENT_MESSAGE_ID_CHARS = 200;
@@ -486,11 +491,12 @@ export class ChatStore {
       } catch {}
     }
     this.db = new Database(path);
-    if (path !== ":memory:") {
-      try {
-        chmodSync(path, 0o600);
-      } catch {}
-    }
+    try {
+      if (path !== ":memory:") {
+        try {
+          chmodSync(path, 0o600);
+        } catch {}
+      }
     // Converting a legacy rollback-journal file to WAL needs an exclusive
     // lock, and SQLite can return SQLITE_BUSY here WITHOUT consulting the
     // busy handler (better-sqlite3's default 5s timeout does not cover this
@@ -521,12 +527,13 @@ export class ChatStore {
     // One process performs versioned data maintenance at a time. Without an
     // IMMEDIATE transaction, concurrent MCP startups could all observe the
     // old version and then repeat full-corpus backfills/FTS rebuilds.
-    try {
       this.db.transaction(() => this.migrate()).immediate();
     } catch (error) {
       // A constructor that throws has no caller-visible instance on which to
-      // call close(); release the native handle here instead of waiting for GC.
-      this.db.close();
+      // call close(); cover pragma/setup failures as well as migration errors.
+      try {
+        this.db.close();
+      } catch {}
       throw error;
     }
   }
@@ -605,15 +612,11 @@ export class ChatStore {
         WHERE id = NEW.id;
       END;
 
-      -- The former messages_body_len_ai trigger stamped length(NEW.body), which
-      -- counts CODEPOINTS. For astral text that under-counts vs the UTF-16
-      -- body_len the web viewer reports, and the value was never repaired (the
-      -- JS backfill only visits NULLs), so a mixed-version astral insert
-      -- reported a permanently wrong length. Dropped: an old build's insert now
-      -- leaves body_len NULL, the web viewer falls back to length(body), and the
-      -- next new-build startup backfills the exact UTF-16 value. (MCP reads no
-      -- longer use body_len at all -- they report length(body) codepoints.)
-      DROP TRIGGER IF EXISTS messages_body_len_ai;
+      -- Routine current-build inserts provide body_len and occupy no entry.
+      -- This makes the recurring mixed-version repair an empty-index probe on a
+      -- healthy file instead of a corpus scan.
+      CREATE INDEX IF NOT EXISTS idx_messages_body_len_missing
+        ON messages(id) WHERE body_len IS NULL;
 
       -- Reject an embedded NUL at the DATABASE level: SQLite's substr()/length()
       -- stop at U+0000, so a NUL body reads back truncated with the marker
@@ -626,13 +629,65 @@ export class ChatStore {
       WHEN instr(NEW.body, char(0)) > 0 BEGIN
         SELECT RAISE(ABORT, 'message body contains a NUL character (U+0000), which SQLite cannot store without silently truncating');
       END;
+
+      -- Metadata listings also use SQLite substr()/length(), so old/direct
+      -- writers must not be able to introduce a new silently truncated value.
+      -- UPDATE guards are per-column: a v3 heal can repair two malformed room
+      -- fields one at a time without the other field blocking it.
+      CREATE TRIGGER IF NOT EXISTS rooms_reject_nul_insert BEFORE INSERT ON rooms
+      WHEN instr(NEW.description, char(0)) > 0 OR instr(NEW.pinned, char(0)) > 0 BEGIN
+        SELECT RAISE(ABORT, 'room metadata contains a NUL character (U+0000)');
+      END;
+      CREATE TRIGGER IF NOT EXISTS rooms_description_reject_nul_update
+      BEFORE UPDATE OF description ON rooms
+      WHEN instr(NEW.description, char(0)) > 0 BEGIN
+        SELECT RAISE(ABORT, 'room description contains a NUL character (U+0000)');
+      END;
+      CREATE TRIGGER IF NOT EXISTS rooms_pinned_reject_nul_update
+      BEFORE UPDATE OF pinned ON rooms
+      WHEN instr(NEW.pinned, char(0)) > 0 BEGIN
+        SELECT RAISE(ABORT, 'room pinned intro contains a NUL character (U+0000)');
+      END;
+      CREATE TRIGGER IF NOT EXISTS agents_reject_nul_insert BEFORE INSERT ON agents
+      WHEN instr(NEW.description, char(0)) > 0 BEGIN
+        SELECT RAISE(ABORT, 'agent description contains a NUL character (U+0000)');
+      END;
+      CREATE TRIGGER IF NOT EXISTS agents_description_reject_nul_update
+      BEFORE UPDATE OF description ON agents
+      WHEN instr(NEW.description, char(0)) > 0 BEGIN
+        SELECT RAISE(ABORT, 'agent description contains a NUL character (U+0000)');
+      END;
     `);
-    const SCHEMA_VERSION = 2;
+    // The former messages_body_len_ai trigger stamped SQLite length(NEW.body),
+    // which under-counts astral text versus the web viewer's UTF-16 body_len.
+    // Keep a harmless blocker UNDER THE LEGACY NAME so a restarted old build's
+    // CREATE TRIGGER IF NOT EXISTS cannot resurrect that stamper. Inspect the
+    // stored definition first: unconditional DROP/CREATE caused schema churn,
+    // WAL writes, and an exclusive schema lock on every healthy MCP startup.
+    const bodyLenBlockerMarker = "agent-chat-body-len-blocker-v3";
+    const existingBodyLenTrigger = this.db
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'messages_body_len_ai'",
+      )
+      .get() as { sql: string | null } | undefined;
+    if (!existingBodyLenTrigger?.sql?.includes(bodyLenBlockerMarker)) {
+      this.db.exec(`
+        DROP TRIGGER IF EXISTS messages_body_len_ai;
+        CREATE TRIGGER messages_body_len_ai AFTER INSERT ON messages
+        WHEN NEW.body_len IS NULL BEGIN
+          SELECT '${bodyLenBlockerMarker}';
+        END;
+      `);
+    }
+    const SCHEMA_VERSION = 3;
     const currentVersion = this.db.pragma("user_version", {
       simple: true,
     }) as number;
-    const needsMaintenance = currentVersion < SCHEMA_VERSION;
-    const needsHeal = currentVersion < 1;
+    // Keep version gates narrow. Advancing v2 -> v3 for bounded metadata repair
+    // must not repeat the older full-message maintenance pass.
+    const needsV2Maintenance = currentVersion < 2;
+    const needsMetadataV3 = currentVersion < 3;
+    const needsBodyNulHeal = currentVersion < 1;
 
     // Backfill the denormalized reply author AFTER the old-writer trigger above
     // exists, closing a rolling-upgrade gap: with the backfill running FIRST, an
@@ -643,7 +698,7 @@ export class ChatStore {
     // trigger is caught here; one inserted after is stamped by the trigger.
     // Rows whose parent is already gone stay NULL (unrecoverable) and are
     // re-examined harmlessly.
-    if (needsMaintenance) {
+    if (needsV2Maintenance) {
       this.db.exec(`
         UPDATE messages SET reply_to_agent =
           (SELECT p.agent_id FROM messages p
@@ -657,8 +712,8 @@ export class ChatStore {
     // every startup) and pointless once done: the reject trigger blocks any new
     // NUL row, so a migrated file cannot acquire one. The gate is set at the END
     // of migrate(), so a crash mid-scan just re-runs. Everything else
-    // (schema/index/trigger creation, the cheap body_len backfill and small
-    // metadata heals) stays ungated.
+    // Schema/index/trigger creation and the sparse body_len repair stay
+    // recurring; each later migration has its own narrowly-scoped gate.
     // Heal existing rows that already hold a NUL (written by a pre-guard build):
     // a plain SELECT is NOT NUL-terminated, so the full body is recoverable;
     // replace each NUL with U+FFFD so substr()/length() readers see it whole,
@@ -670,7 +725,7 @@ export class ChatStore {
     // NUL, so the predicate never revisits it and the id cursor moves strictly
     // forward.
     let healedMessageBody = false;
-    if (needsHeal) {
+    if (needsBodyNulHeal) {
       const nextNul = this.db.prepare(
         `SELECT id, length(CAST(body AS BLOB)) AS bytes
          FROM messages
@@ -708,29 +763,32 @@ export class ChatStore {
     // count via SQL (a low-but-nonzero bound; the web viewer's COALESCE still
     // shows a length and its total>shown guard tolerates the codepoint skew).
     // Cursored by id so the whole sweep is one table pass, one body resident.
-    // Version-gated: new inserts stamp body_len. A mixed-version legacy row can
-    // use the viewer's SQL-length fallback until explicit maintenance.
-    if (needsMaintenance) {
-      const BACKFILL_MAX_CHARS = 1_000_000;
-      this.db
-        .prepare(
-          `UPDATE messages SET body_len = length(body)
-           WHERE body_len IS NULL AND length(body) > ?`,
-        )
-        .run(BACKFILL_MAX_CHARS);
-      const next = this.db.prepare(
-        "SELECT id, body FROM messages WHERE body_len IS NULL AND id > ? ORDER BY id LIMIT 1",
-      );
-      const set = this.db.prepare(
-        "UPDATE messages SET body_len = ? WHERE id = ?",
-      );
-      let cursor = 0;
-      for (;;) {
-        const row = next.get(cursor) as { id: number; body: string } | undefined;
-        if (!row) break;
-        set.run(row.body.length, row.id);
-        cursor = row.id;
-      }
+    // Always repair the sparse set of mixed-version NULL rows. On a healthy
+    // file idx_messages_body_len_missing is empty, so this is O(1); it avoids a
+    // full startup scan while keeping the documented next-reopen guarantee.
+    const BACKFILL_MAX_CHARS = 1_000_000;
+    this.db
+      .prepare(
+        `UPDATE messages INDEXED BY idx_messages_body_len_missing
+         SET body_len = length(body)
+         WHERE body_len IS NULL AND length(body) > ?`,
+      )
+      .run(BACKFILL_MAX_CHARS);
+    const nextMissingBodyLen = this.db.prepare(
+      `SELECT id, body FROM messages INDEXED BY idx_messages_body_len_missing
+       WHERE body_len IS NULL AND id > ? ORDER BY id LIMIT 1`,
+    );
+    const setBodyLen = this.db.prepare(
+      "UPDATE messages SET body_len = ? WHERE id = ?",
+    );
+    let bodyLenCursor = 0;
+    for (;;) {
+      const row = nextMissingBodyLen.get(bodyLenCursor) as
+        | { id: number; body: string }
+        | undefined;
+      if (!row) break;
+      setBodyLen.run(row.body.length, row.id);
+      bodyLenCursor = row.id;
     }
 
     this.db.exec(`
@@ -837,6 +895,19 @@ export class ChatStore {
     // became session-aware (the CREATE TABLE above already has it for fresh
     // files). Runs after the table exists, so ensureColumn's ALTER is valid.
     this.ensureColumn("session_markers", "left_at", "TEXT");
+    // claims is created in the block above, later than rooms/agents, so install
+    // its old/direct-writer NUL guards here before the one-time v3 heal.
+    this.db.exec(`
+      CREATE TRIGGER IF NOT EXISTS claims_reject_nul_insert BEFORE INSERT ON claims
+      WHEN instr(NEW.note, char(0)) > 0 BEGIN
+        SELECT RAISE(ABORT, 'claim note contains a NUL character (U+0000)');
+      END;
+      CREATE TRIGGER IF NOT EXISTS claims_note_reject_nul_update
+      BEFORE UPDATE OF note ON claims
+      WHEN instr(NEW.note, char(0)) > 0 BEGIN
+        SELECT RAISE(ABORT, 'claim note contains a NUL character (U+0000)');
+      END;
+    `);
 
     // Heal legacy embedded NULs in metadata columns too (message bodies are
     // healed above, with their body_len reset). Listing SQL uses substr(), which
@@ -844,7 +915,7 @@ export class ChatStore {
     // value. Runs after every table exists; new writes are already rejected.
     // Run once with the versioned maintenance pass. Even small full-table
     // scans become expensive when multiplied across many MCP processes.
-    if (needsMaintenance) {
+    if (needsMetadataV3) {
       this.healNulColumn("rooms", "description");
       this.healNulColumn("rooms", "pinned");
       this.healNulColumn("agents", "description");
@@ -869,7 +940,8 @@ export class ChatStore {
     // dying between the CREATE above and the rebuild below used to leave a
     // database where every later start saw the table and skipped the rebuild
     // forever -- all pre-FTS messages permanently invisible to search. A row
-    // count mismatch also repairs databases already damaged by that window.
+    // A steady-state empty/nonempty mismatch repairs the crash window without
+    // a corpus scan; the pre-v2 migration additionally performs exact counts.
     // The index row count MUST come from the messages_fts_docsize shadow
     // table: with external content, COUNT(*) on the virtual table itself
     // reads the content table and always matches. BOTH counts are read in ONE
@@ -879,23 +951,36 @@ export class ChatStore {
     // and skip the rebuild it actually needed. A legacy NUL repair changes a
     // body before these triggers exist; row counts still match in that case,
     // so the repair flag must force a rebuild to replace stale tokens.
-    if (needsMaintenance) {
+    const { hasMessages, hasFtsRows } = this.db
+      .prepare(
+        `SELECT EXISTS(SELECT 1 FROM messages LIMIT 1) AS hasMessages,
+                EXISTS(SELECT 1 FROM messages_fts_docsize LIMIT 1) AS hasFtsRows`,
+      )
+      .get() as { hasMessages: number; hasFtsRows: number };
+    let rebuildFts = healedMessageBody || hasMessages !== hasFtsRows;
+    // The steady-state sentinel above catches the historical empty-index crash
+    // class in O(1). A full consistency count remains appropriate during the
+    // one-time pre-v2 migration, but not on every MCP process startup.
+    if (!rebuildFts && needsV2Maintenance) {
       const { msgCount, ftsCount } = this.db
         .prepare(
           `SELECT (SELECT COUNT(*) FROM messages) AS msgCount,
                   (SELECT COUNT(*) FROM messages_fts_docsize) AS ftsCount`,
         )
         .get() as { msgCount: number; ftsCount: number };
-      if (healedMessageBody || ftsCount !== msgCount) {
-        this.db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
-      }
+      rebuildFts = ftsCount !== msgCount;
+    }
+    if (rebuildFts) {
+      this.db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
     }
 
     // Mark this file migrated so the message-body NUL scan above is skipped on
     // future startups (one-time work; the reject trigger keeps new rows clean).
     // Set LAST, only after the scan ran, so a crash mid-scan leaves user_version
     // unchanged and it re-runs.
-    if (needsMaintenance) this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    if (currentVersion < SCHEMA_VERSION) {
+      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
+    }
   }
 
   private ensureColumn(table: string, column: string, type: string): void {
@@ -955,12 +1040,12 @@ export class ChatStore {
     assertMaxLen(description, "room description", 2000);
     assertStorable(pinned, "room pinned intro");
     assertMaxLen(pinned, "room pinned intro", 10_000);
-    const info = this.db
-      .prepare("INSERT INTO rooms (name, description, pinned) VALUES (?, ?, ?)")
-      .run(name, description, pinned);
     return this.db
-      .prepare("SELECT * FROM rooms WHERE id = ?")
-      .get(info.lastInsertRowid) as RoomRow;
+      .prepare(
+        `INSERT INTO rooms (name, description, pinned) VALUES (?, ?, ?)
+         RETURNING *`,
+      )
+      .get(name, description, pinned) as RoomRow;
   }
 
   setPinned(roomId: number, pinned: string | null): void {
@@ -1403,15 +1488,19 @@ export class ChatStore {
         // blindly evicting via the identity-level leave below (which would defeat
         // the redesign's no-twin-eviction guarantee). Only an identity with NO
         // presence rows at all (web viewer, tests, pre-redesign) takes that path.
-        const any = this.db
-          .prepare(
-            "SELECT 1 FROM session_presence WHERE room_id = ? AND agent_id = ? LIMIT 1",
-          )
-          .get(roomId, agentId);
-        if (any) {
-          this.recomputeMembershipPresence(roomId, agentId);
-          return false;
-        }
+      }
+      // The same protection is required for a legacy/sessionless leave. During
+      // a rolling upgrade it may share an identity with current session-aware
+      // twins; an unconditional identity leave must not evict those live rows.
+      const anyLive = this.db
+        .prepare(
+          `SELECT 1 FROM session_presence
+           WHERE room_id = ? AND agent_id = ? AND left_at IS NULL LIMIT 1`,
+        )
+        .get(roomId, agentId);
+      if (anyLive) {
+        this.recomputeMembershipPresence(roomId, agentId);
+        return false;
       }
       const info = this.db
         .prepare(
@@ -1857,7 +1946,14 @@ export class ChatStore {
     const CROSSED_BYTES = 20_000;
     // Fetch one codepoint beyond the public cap so truncation is known without
     // loading a large body; body_cp still carries the full length.
-    const pc = previewChars ?? 300;
+    // MCP validates this range, but ChatStore is also a public boundary used
+    // directly by tests and scripts. Clamp here so a direct caller cannot make
+    // an otherwise bounded post response materialize an arbitrarily large
+    // preview.
+    const pc = Math.min(
+      MAX_CROSSED_PREVIEW_CHARS,
+      Math.max(1, Math.floor(previewChars ?? 300)),
+    );
     const fetched = this.db
       .prepare(
         `SELECT ${messageCols(MAX_CROSSED_PREVIEW_CHARS + 1)}, (${directedAt("g")}) AS directed
@@ -1943,6 +2039,13 @@ export class ChatStore {
       }
     | {
         posted: false;
+        rejected: "evidence_pruned";
+        oldest_retained_seq: number;
+        pruned_through_seq: number;
+      }
+    | {
+        posted: false;
+        rejected: "stale_read";
         crossed: number;
         crossed_directed: number;
         crossed_range: { from_seq: number; to_seq: number } | null;
@@ -2055,6 +2158,16 @@ export class ChatStore {
       // validation error can mask the staleness (the caller reassesses and
       // retries with the same payload either way). In-transaction, so no
       // message can land between this check and the insert below.
+      // Keep this after client_message_id lookup: an exact lost-response retry
+      // must recover its committed row even if the caller also supplied a bad
+      // fresh-attempt token. NaN is especially dangerous here because SQLite
+      // binds it as NULL, turning `seq > ?` into an empty predicate.
+      if (
+        ifToken !== null &&
+        (!Number.isSafeInteger(ifToken) || ifToken < 0)
+      ) {
+        throw new Error("if_last_read_seq must be a non-negative safe integer");
+      }
       const cursor = this.getCursor(roomId, agentId, sessionId);
       const from = cursor?.last_read_seq ?? 0;
       if (ifToken !== null) {
@@ -2068,6 +2181,27 @@ export class ChatStore {
             `if_last_read_seq ${ifToken} is ahead of the current read marker ${from}; ` +
               "call catch_up for this room and use its new_last_read_seq",
           );
+        }
+        // A conditional post promises to reject when ANY peer message landed
+        // after the token. Once pruning removes the oldest rows, scanning only
+        // the retained tail cannot prove that promise for a token below the
+        // gap. Seqs are dense and pruneMessages keeps at least one newest row,
+        // so MIN(seq)-1 is the exact pruned-through watermark without another
+        // column or write-side bookkeeping. Reject conservatively: the missing
+        // rows may all have been authored by this caller, but accepting would
+        // silently disable the safety guard when one was not.
+        const { oldest } = this.db
+          .prepare(
+            "SELECT MIN(seq) AS oldest FROM messages WHERE room_id = ?",
+          )
+          .get(roomId) as { oldest: number | null };
+        if (oldest !== null && ifToken < oldest - 1) {
+          return {
+            posted: false as const,
+            rejected: "evidence_pruned" as const,
+            oldest_retained_seq: oldest,
+            pruned_through_seq: oldest - 1,
+          };
         }
         const stale = this.db
           .prepare(
@@ -2092,6 +2226,7 @@ export class ChatStore {
           );
           return {
             posted: false as const,
+            rejected: "stale_read" as const,
             crossed: stale.c,
             crossed_directed: stale.d ?? 0,
             crossed_range: { from_seq: stale.mn!, to_seq: stale.mx! },
@@ -2474,8 +2609,17 @@ export class ChatStore {
     offset = 0,
     maxChars = DEFAULT_MAX_BYTES,
   ): (MessageRow & { next_offset?: number }) | undefined {
+    if (!Number.isFinite(offset) || Math.abs(offset) > Number.MAX_SAFE_INTEGER) {
+      throw new Error("get_message offset must be a finite safe number");
+    }
+    if (!Number.isFinite(maxChars)) {
+      throw new Error("get_message max_chars must be finite");
+    }
     const off = Math.max(0, Math.floor(offset));
-    const cap = Math.max(1, Math.floor(maxChars));
+    const cap = Math.min(
+      MAX_GET_MESSAGE_CHARS,
+      Math.max(1, Math.floor(maxChars)),
+    );
     // Envelope (author, reply preview, flags) with a 1-char body: cheap and
     // independent of body size.
     const env = this.getRawMessage(roomId, seq, 1);
@@ -2499,7 +2643,15 @@ export class ChatStore {
     // would serialize past 600k -- though NUL is now rejected at write). Shrink
     // until the serialized slice fits ~maxChars; next_offset is recomputed from
     // the ACTUAL returned chunk, so the walk stays exact.
-    while (chunk.length > 1 && JSON.stringify(chunk).length - 2 > cap) {
+    // Never shrink away the first complete codepoint. With maxChars=1 an
+    // astral character necessarily occupies two UTF-16 units on the JSON wire,
+    // but returning it is the only progress-safe interpretation of SQLite's
+    // one-CODEPOINT window; shrinking it to "" made next_offset repeat forever.
+    const firstCodepointUnits = (chunk.codePointAt(0) ?? 0) > 0xffff ? 2 : 1;
+    while (
+      chunk.length > firstCodepointUnits &&
+      JSON.stringify(chunk).length - 2 > cap
+    ) {
       const ratio = cap / (JSON.stringify(chunk).length - 2);
       chunk = safeCut(
         chunk,
@@ -2997,11 +3149,25 @@ export class ChatStore {
     }[];
     rooms_with_unread_truncated?: boolean;
   } {
-    if (maxBytes < MIN_CATCH_UP_RESULT_BUDGET) {
+    if (
+      !Number.isSafeInteger(maxBytes) ||
+      maxBytes < MIN_CATCH_UP_RESULT_BUDGET ||
+      maxBytes > MAX_BULK_RESULT_CHARS
+    ) {
       throw new Error(
-        `catch_up result budget must be at least ${MIN_CATCH_UP_RESULT_BUDGET} serialized characters`,
+        `catch_up result budget must be an integer from ${MIN_CATCH_UP_RESULT_BUDGET} to ${MAX_BULK_RESULT_CHARS} serialized characters`,
       );
     }
+    // MCP validates a positive limit, but protect direct ChatStore callers as
+    // well. In priority-only mode LIMIT 0 plus the lossy cutoff would otherwise
+    // advance the marker without returning the qualifying message.
+    if (!Number.isFinite(limit)) {
+      throw new Error("catch_up limit must be finite");
+    }
+    const pageLimit = Math.min(
+      MAX_CATCH_UP_ROWS,
+      Math.max(1, Math.floor(limit)),
+    );
     // Advancing path: read the cursor, fetch, and advance inside one IMMEDIATE
     // transaction so a concurrent same-identity call serializes behind it and
     // reads the updated cursor instead of returning overlapping messages.
@@ -3035,8 +3201,8 @@ export class ChatStore {
            WHERE g.room_id = ? AND g.seq > ? AND g.agent_id != ?
            ORDER BY g.seq ASC LIMIT ?`;
       const pageParams = priorityOnly
-        ? [roomId, from, agentId, agentId, agentId, limit]
-        : [roomId, from, agentId, limit];
+        ? [roomId, from, agentId, agentId, agentId, pageLimit]
+        : [roomId, from, agentId, pageLimit];
       const { rows, exhausted } = this.fetchBounded<RawMessage>(
         this.db.prepare(pageSql),
         pageParams,
@@ -3748,6 +3914,7 @@ export class ChatStore {
     | { released: true; key: string }
     | { released: false; key: string; reason: string } {
     const tx = this.db.transaction(() => {
+      this.requireRoom(roomId);
       const row = this.db
         .prepare(
           `SELECT agent_id,
@@ -3800,6 +3967,7 @@ export class ChatStore {
     const PREVIEW = 300;
     const lim = Math.max(1, Math.floor(limit));
     const tx = this.db.transaction(() => {
+      this.requireRoom(roomId);
       this.db
         .prepare(
           "DELETE FROM claims WHERE room_id = ? AND expires_at <= datetime('now')",

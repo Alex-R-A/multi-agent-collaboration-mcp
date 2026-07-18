@@ -1301,6 +1301,9 @@
         // tab renaming would otherwise graft the old identity's marker onto
         // the new name).
         markerIdent: null,
+        markerLoading: false,
+        markerRetryKey: "",
+        markerRetryAt: 0,
         gap: false,
         drafts: {}, // per-room compose drafts, in memory only
         // Incremented on every openRoom: async completions capture it so a
@@ -2237,6 +2240,10 @@
               updateJump();
             }
           }
+          // A transient /api/me failure must not freeze this visit's read
+          // receipt forever. Retry only while the baseline is unknown;
+          // fetchMarker supplies an in-flight guard and five-second backoff.
+          if (state.marker < 0 || state.markerIdent !== identity()) fetchMarker();
           maybeMarkRead();
         } catch {
           if (initial) state.pendingInitial = true; // retry with initial semantics
@@ -2706,10 +2713,20 @@
         const epoch = state.roomEpoch;
         const name = identity();
         if (!room || !name || !joinedHere()) return;
+        const retryKey = `${room.id}:${epoch}:${name}`;
+        if (state.markerLoading) return;
+        if (
+          state.markerRetryKey === retryKey &&
+          Date.now() < state.markerRetryAt
+        ) {
+          return;
+        }
+        state.markerLoading = true;
         try {
           const me = await fetchJson(
             `/api/me?room=${room.id}&name=${encodeURIComponent(name)}`,
           );
+          if (me.error) throw new Error(me.error);
           if (!sameView(room, epoch)) return;
           // The identity may have moved (another tab renaming) between the
           // request and this completion; the epoch bump from the storage
@@ -2726,9 +2743,18 @@
               : me.last_read_seq
             : -1;
           state.markerIdent = name;
+          state.markerRetryKey = "";
+          state.markerRetryAt = 0;
           computeGap();
           maybeMarkRead();
-        } catch {}
+        } catch {
+          if (sameView(room, epoch) && identity() === name) {
+            state.markerRetryKey = retryKey;
+            state.markerRetryAt = Date.now() + 5_000;
+          }
+        } finally {
+          state.markerLoading = false;
+        }
       }
 
       function maybeMarkRead() {

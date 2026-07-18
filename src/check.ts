@@ -11,12 +11,11 @@
 // The bare --agent baseline is the IDENTITY-level marker
 // (memberships.last_read_seq, the MAX across that identity's sessions), which
 // can hide a lagging private session's backlog. --session (the process nonce
-// the server bakes into poller_cmd) fixes that for the all-rooms watch: each
-// room then baselines off that session's OWN private cursor where one exists.
-// The manual fallback remains --room with --since = the session's own
-// last_read_seq.
+// the server bakes into poller_cmd) fixes that for both all-rooms and scoped
+// watches: each room baselines off that session's OWN private cursor where one
+// exists.
 import Database from "better-sqlite3";
-import { existsSync } from "node:fs";
+import { existsSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
 import { directedAt } from "./db.js";
@@ -32,20 +31,22 @@ type Args = {
 };
 
 function fail(msg: string): never {
-  process.stderr.write(`agent-chat-check: ${msg}\n`);
+  // This CLI exits immediately after one small status line. A synchronous fd
+  // write prevents piped output from being truncated by process.exit().
+  writeFileSync(2, `agent-chat-check: ${msg}\n`);
   process.exit(2);
 }
 
 const USAGE = `agent-chat-check: one-shot, read-only unread probe.
 Usage:
   check.js --agent <agent_id> [--session <nonce>] [--mentions-only]   # all rooms
-  check.js --room <id|name> --agent <agent_id> [--since <seq>]        # one room
+  check.js --room <id|name> --agent <agent_id> [--session <nonce>] [--since <seq>]
 Flags:
   --agent <id>        identity to check; baselines are its read markers
   --room <id|name>    scope to one room (default: every room the agent is in)
   --since <seq>       explicit baseline instead of the read marker (needs --room)
-  --session <nonce>   session-aware all-rooms probe: mutes rooms that session
-                      left, baselines off its private cursors where they exist
+  --session <nonce>   baseline off this session's private cursor where it exists;
+                      all-rooms mode also mutes rooms that session left
   --mentions-only     count only messages that mention --agent or reply to it
   --help, -h          print this and exit 0
 Exit codes: 0 = updates exist (JSON status on stdout; rooms_with_updates names
@@ -104,18 +105,19 @@ function parseArgs(argv: string[]): Args {
     } else if (a === "--db") {
       out.db = take(a);
     } else if (a === "--session") {
-      // A process nonce that makes the ALL-ROOMS watch session-aware, twice
-      // over: rooms the owning session soft-left (a session_presence row with
+      // A process nonce that makes the watch session-aware. In all-rooms mode,
+      // rooms the owning session soft-left (a session_presence row with
       // left_at set) are excluded, matching my_mentions, and each room
       // baselines off that session's OWN private cursor where one exists
       // (session_markers is keyed by the same nonce). Without the cursor
       // baseline a private session whose twin read ahead was never woken: the
       // identity marker is the MAX across sessions, so its own unread was
-      // invisible here while its catch_up still had messages. Only meaningful
-      // with the all-rooms (no --room) path; ignored otherwise.
+      // invisible here while its catch_up still had messages. Scoped mode uses
+      // the same cursor baseline but deliberately remains readable after a
+      // soft leave, matching catch_up({room}) and poller.ts.
       out.session = take(a);
     } else if (a === "--help" || a === "-h") {
-      process.stdout.write(USAGE);
+      writeFileSync(1, USAGE);
       process.exit(0);
     } else {
       fail(`unknown argument: ${a}`);
@@ -306,7 +308,8 @@ try {
     if (counts === null) fail(`agent "${agent}" is not a member of any room`);
     if ("wakeOnlyQuiet" in counts && counts.wakeOnlyQuiet) {
       db.close();
-      process.stdout.write(
+      writeFileSync(
+        1,
         JSON.stringify({
           agent,
           rooms: counts.rooms,
@@ -335,7 +338,8 @@ try {
     };
     db.close();
     const hasUpdates = args.mentionsOnly ? unreadMentions > 0 : unread > 0;
-    process.stdout.write(
+    writeFileSync(
+      1,
       JSON.stringify({
         agent,
         rooms,
@@ -383,9 +387,15 @@ try {
       } else {
         const m = db
           .prepare(
-            "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
+            `SELECT COALESCE(sm.last_read_seq, mb.last_read_seq) AS last_read_seq
+             FROM memberships mb
+             LEFT JOIN session_markers sm ON sm.room_id = mb.room_id
+                  AND sm.agent_id = mb.agent_id AND sm.session_id = ?
+             WHERE mb.room_id = ? AND mb.agent_id = ?`,
           )
-          .get(roomId, args.agent) as { last_read_seq: number } | undefined;
+          .get(args.session ?? "", roomId, args.agent) as
+          | { last_read_seq: number }
+          | undefined;
         if (!m) return null;
         baseline = m.last_read_seq;
       }
@@ -459,7 +469,8 @@ try {
   }
   if ("wakeOnlyQuiet" in snap && snap.wakeOnlyQuiet) {
     db.close();
-    process.stdout.write(
+    writeFileSync(
+      1,
       JSON.stringify({
         room_id: roomId,
         agent: args.agent ?? null,
@@ -481,7 +492,8 @@ try {
   db.close();
 
   const hasUpdates = args.mentionsOnly ? unreadMentions > 0 : unread > 0;
-  process.stdout.write(
+  writeFileSync(
+    1,
     JSON.stringify({
       room_id: roomId,
       agent: args.agent ?? null,

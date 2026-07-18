@@ -290,10 +290,20 @@ function mcpClient(env) {
   // Simulate an OLD build inserting a reply: no reply_to_agent, no body_len.
   {
     const raw = new Database(DB);
+    // A restarted old build attempts to recreate its historical, codepoint-
+    // counting trigger. The current build keeps a harmless trigger under this
+    // name so CREATE IF NOT EXISTS cannot resurrect the bad definition.
+    raw.exec(`
+      CREATE TRIGGER IF NOT EXISTS messages_body_len_ai AFTER INSERT ON messages
+      WHEN NEW.body_len IS NULL BEGIN
+        UPDATE messages SET body_len = length(NEW.body) WHERE id = NEW.id;
+      END;
+    `);
+    const oldBody = "old 😀";
     raw.prepare(
       `INSERT INTO messages (room_id, seq, agent_id, format, body, mentions, reply_to_seq)
-       VALUES (?, 3, 'old-build', 'text', 'old reply', NULL, 1)`,
-    ).run(roomId);
+       VALUES (?, 3, 'old-build', 'text', ?, NULL, 1)`,
+    ).run(roomId, oldBody);
     const row = raw
       .prepare("SELECT reply_to_agent, body_len FROM messages WHERE room_id = ? AND seq = 3")
       .get(roomId);
@@ -316,8 +326,28 @@ function mcpClient(env) {
     const { body_len } = raw
       .prepare("SELECT body_len FROM messages WHERE room_id = ? AND seq = 3")
       .get(roomId);
-    check("reopen backfills the old-build row's body_len exactly", body_len === 9, body_len);
+    const triggerSql = raw
+      .prepare(
+        "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='messages_body_len_ai'",
+      )
+      .get()?.sql;
+    const schemaVersionBefore = raw.pragma("schema_version", { simple: true });
+    check("reopen backfills the old-build row's body_len exactly", body_len === "old 😀".length, body_len);
+    check(
+      "current build replaces the legacy body_len trigger with its harmless blocker",
+      /agent-chat-body-len-blocker-v3/.test(triggerSql ?? ""),
+      triggerSql,
+    );
     raw.close();
+    new ChatStore(DB).close();
+    const after = new Database(DB);
+    const schemaVersionAfter = after.pragma("schema_version", { simple: true });
+    after.close();
+    check(
+      "healthy reopen does not churn the body_len trigger schema",
+      schemaVersionAfter === schemaVersionBefore,
+      { schemaVersionBefore, schemaVersionAfter },
+    );
   }
   // Prune the parent, restart: the reply must STILL be directed at the
   // parent's author (before the trigger, this was permanently lost).
@@ -509,6 +539,8 @@ function mcpClient(env) {
   expectClean("postMessage", () => s.postMessage(r, "a", "x", "text", null, null));
   expectClean("joinRoom", () => s.joinRoom(r, "a"));
   expectClean("claimResource", () => s.claimResource(r, "k", "a", 900, null));
+  expectClean("releaseClaim", () => s.releaseClaim(r, "k", "a"));
+  expectClean("listClaims", () => s.listClaims(r));
   expectClean("setPinned", () => s.setPinned(r, "pin"));
   expectClean("pruneMessages", () => s.pruneMessages(r, 1, true));
   s.close();

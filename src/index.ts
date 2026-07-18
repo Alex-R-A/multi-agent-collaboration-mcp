@@ -1,7 +1,16 @@
 #!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
+import type {
+  CallToolRequest,
+  ServerNotification,
+  ServerRequest,
+  ServerResult,
+} from "@modelcontextprotocol/sdk/types.js";
+import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
 import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { readFileSync } from "node:fs";
@@ -20,12 +29,18 @@ import {
 } from "./bounded-lines.js";
 import { stringifyWellFormedJson } from "./unicode.js";
 
-const store = new ChatStore();
-
-// The watcher is another compiled entry beside dist/index.js. Generated
-// commands execute it directly with this server's exact Node binary: one
-// process, no shell polling loop or per-tick child process.
-const POLLER = join(dirname(fileURLToPath(import.meta.url)), "poller.js");
+// The watcher is a sibling entry. Production executes compiled poller.js;
+// `npm run dev` executes the TypeScript sibling through the already-installed
+// tsx CLI instead of returning the nonexistent src/poller.js path.
+const THIS_MODULE = fileURLToPath(import.meta.url);
+const MODULE_DIR = dirname(THIS_MODULE);
+const POLLER_COMMAND = THIS_MODULE.endsWith(".ts")
+  ? [
+      process.execPath,
+      createRequire(import.meta.url).resolve("tsx/cli"),
+      join(MODULE_DIR, "poller.ts"),
+    ]
+  : [process.execPath, join(MODULE_DIR, "poller.js")];
 
 // Single-quote paths for the copy-pasteable poller command: double quotes
 // would let a path containing $() or backticks execute when pasted into a
@@ -53,7 +68,12 @@ function pollerCmd(
     intervalSec?: number;
   } = {},
 ): string {
-  let cmd = `${shq(process.execPath)} ${shq(POLLER)} --agent ${shq(agentId)}`;
+  let cmd = `${POLLER_COMMAND.map(shq).join(" ")} --agent ${shq(agentId)}`;
+  // Generated commands belong to this MCP session. If the client reconnects
+  // and this server exits, its old session-nonce watcher retires within five
+  // seconds instead of accumulating until a long timeout. Direct CLI commands
+  // can omit --owner-pid when independent lifetime is intentional.
+  cmd += ` --owner-pid ${shq(String(process.pid))}`;
   if (opts.room !== undefined) cmd += ` --room ${shq(opts.room)}`;
   // Both scoped and all-room watches resolve this session's CURRENT cursor on
   // every probe. Never bake a point-in-time --since value into a restartable
@@ -99,8 +119,11 @@ function configuredWaitCapSeconds(): number {
   return value;
 }
 const WAIT_CAP_SECONDS = configuredWaitCapSeconds();
+// Validate process-level configuration before opening or migrating the shared
+// database. A typo must fail without mutating production state first.
+const store = new ChatStore();
 
-const INSTRUCTIONS = `Agent Chat is a local SQLite ledger. Start list_rooms -> join_room -> catch_up. catch_up advances one room; my_mentions peeks across rooms. priority_only is explicitly lossy. server_info holds routing/shared budgets; each tool schema states its cap.`;
+const INSTRUCTIONS = `Agent Chat is a local SQLite ledger. Start list_rooms -> join_room -> catch_up. catch_up advances one room; my_mentions peeks across rooms. priority_only is explicitly lossy. For out-of-turn watching, wait_for_messages returns the background poller command. server_info holds routing/shared budgets; each tool schema states its cap.`;
 
 // The layered operating manual, served by server_info: stable reference
 // detail that would otherwise bloat every tools/list. Tool descriptions keep
@@ -108,8 +131,8 @@ const INSTRUCTIONS = `Agent Chat is a local SQLite ledger. Start list_rooms -> j
 const MANUAL = `OPERATING MANUAL
 
 ROUTING
-- catch_up reads ONE room and ADVANCES your read marker; ordinary calls are lossless and never advance past an undelivered message from another author. Because own posts are never returned, the marker may normalize across an own-only suffix before the next peer row (so an empty page can still say advanced:true). room:<id|name> reads another joined room without changing the active room. Explicit priority_only:true is LOSSY backlog triage: it returns priority:true rows plus every directed mention/reply, advances over lower-priority rows through cutoff_seq, and reports skipped_count + qualifying_remaining. It cannot be combined with wait_seconds. An empty read includes rooms_with_unread: every OTHER room holding unread from others.
-- my_mentions: cross-room inbox of unread directed at you (mentions + replies to your messages); never moves markers; entries clear when you read their room; page with after_id = next_after_id; by_room reports each room's TOTAL unread.
+- catch_up reads ONE room and ADVANCES your read marker; ordinary calls are lossless and never advance past an undelivered message from another author. Because own posts are never returned, the marker may normalize across an own-only suffix before the next peer row (so an empty page can still say advanced:true). room:<id|name> reads another joined room without changing the active room. Explicit priority_only:true is LOSSY backlog triage: it returns priority:true rows plus every directed mention/reply, advances over lower-priority rows through cutoff_seq, and reports skipped_count + qualifying_remaining. It cannot be combined with wait_seconds. An empty read includes a bounded rooms_with_unread list; inspect rooms_with_unread_truncated before treating it as exhaustive.
+- my_mentions: cross-room inbox of unread directed at you (mentions + replies to your messages); never moves markers; entries clear when you read their room; page with after_id = next_after_id; by_room reports each returned room's TOTAL unread; inspect by_room_truncated before treating it as exhaustive.
 - read_history browses without moving markers. mark_read moves the marker without reading (omit seq to jump to latest; a LOWER seq re-exposes messages to catch_up).
 
 IN-CALL WAIT
@@ -124,7 +147,7 @@ SIZE AND PAGING
 
 POSTING
 - crossed counts ALL unread from others past your marker at post time (old backlog included, not only mid-composition arrivals); crossed_directed says how many are aimed at you; crossed_range gives the seq span. If crossed > 0, catch_up before acting on replies. crossed_preview_chars opts into bounded previews of the crossed messages in the same response.
-- Dispositive posts (verdicts, commissions, dispositions): if_last_read_seq is a conditional post -- rejected (posted:false) if ANYTHING from others landed past your token, with bounded crossed previews returned; call catch_up for the complete delta before retrying. A token ahead of the target room's effective cursor is invalid and fails before posting. client_message_id makes an exact lost-response retry return the original seq instead of inserting twice; its guarantee lasts while that message is retained. Repeat the same explicit room or expected_room on retry so active-room drift cannot create a post in another room; a deduplicated response does not replay the original crossed/recipient snapshot, so catch_up for current state. room: posts to a named joined room without switching the active room; expected_room asserts which room is active. Never use the CAS on routine traffic: crossing is normal, the CAS is for posts whose validity depends on having read everything.
+- Dispositive posts (verdicts, commissions, dispositions): if_last_read_seq is a conditional post -- rejected (posted:false) if ANYTHING from others landed past your token, with bounded crossed previews returned; call catch_up for the complete delta before retrying. If pruning removed evidence after the token, it rejects conservatively with rejected:evidence_pruned and no invented previews. A token ahead of the target room's effective cursor is invalid and fails before posting. client_message_id makes an exact lost-response retry return the original seq instead of inserting twice; its guarantee lasts while that message is retained. Repeat the same explicit room or expected_room on retry so active-room drift cannot create a post in another room; a deduplicated response does not replay the original crossed/recipient snapshot, so catch_up for current state. room: posts to a named joined room without switching the active room; expected_room asserts which room is active. Never use the CAS on routine traffic: crossing is normal, the CAS is for posts whose validity depends on having read everything.
 - recipients reports factual room-local state: status, idle_seconds, last_read_seq, marker_behind. A new unread tag normally adds one to marker_behind. delivery_warnings is definitive for never-joined/left recipients; a long-idle warning is emitted only for pre-existing lag and states observed facts, never a responsiveness prediction.
 - supersedes_seq corrects YOUR OWN earlier message; readers see superseded_by on it. reply_to_seq threads; the log stays flat and globally ordered.
 - priority:true marks an immutable high-signal checkpoint for priority-only catch-up. Use it sparingly; correct a priority post with a new priority post + supersedes_seq rather than mutating history.
@@ -414,6 +437,108 @@ const server = new McpServer(
   },
   { instructions: INSTRUCTIONS },
 );
+
+// The SDK dispatches every JSON-RPC frame concurrently, then awaits
+// safeParseAsync independently for each tool. A later small schema could reach
+// its callback before an earlier larger one, scrambling this connection's
+// implicit identity/active-room state. Gate only HANDLER STARTS in arrival
+// order: release the next ticket immediately after a callback is invoked (its
+// synchronous prefix captures all session state), never after a long wait
+// resolves. Invalid/unknown/cancelled requests release from the outer finally.
+type ToolStartTicket = { before: Promise<void>; release(): void };
+type CallToolExtra = RequestHandlerExtra<ServerRequest, ServerNotification>;
+type CallToolHandler = (
+  request: CallToolRequest,
+  extra: CallToolExtra,
+) => ServerResult | Promise<ServerResult>;
+
+let toolStartTail = Promise.resolve();
+const toolStartTickets = new WeakMap<AbortSignal, ToolStartTicket>();
+const activeToolRequests = new Set<Promise<ServerResult>>();
+
+function issueToolStartTicket(): ToolStartTicket {
+  const before = toolStartTail;
+  let resolveNext!: () => void;
+  toolStartTail = new Promise<void>((resolve) => {
+    resolveNext = resolve;
+  });
+  let released = false;
+  return {
+    before,
+    release() {
+      if (released) return;
+      released = true;
+      resolveNext();
+    },
+  };
+}
+
+const sdkSetRequestHandler = server.server.setRequestHandler.bind(server.server);
+server.server.setRequestHandler = ((
+  requestSchema: unknown,
+  handler: unknown,
+): void => {
+  if (requestSchema !== CallToolRequestSchema) {
+    Reflect.apply(sdkSetRequestHandler, server.server, [requestSchema, handler]);
+    return;
+  }
+  const sdkHandler = handler as CallToolHandler;
+  const orderedOuter: CallToolHandler = (request, extra) => {
+    const ticket = issueToolStartTicket();
+    toolStartTickets.set(extra.signal, ticket);
+    const pending = (async () => {
+      try {
+        return await sdkHandler(request, extra);
+      } finally {
+        ticket.release();
+        toolStartTickets.delete(extra.signal);
+      }
+    })();
+    activeToolRequests.add(pending);
+    void pending.then(
+      () => activeToolRequests.delete(pending),
+      () => activeToolRequests.delete(pending),
+    );
+    return pending;
+  };
+  Reflect.apply(sdkSetRequestHandler, server.server, [
+    CallToolRequestSchema,
+    orderedOuter,
+  ]);
+}) as typeof server.server.setRequestHandler;
+
+const sdkRegisterTool = server.registerTool.bind(server);
+server.registerTool = ((
+  name: string,
+  config: unknown,
+  callback: unknown,
+) => {
+  if (typeof callback !== "function") {
+    return Reflect.apply(sdkRegisterTool, server, [name, config, callback]);
+  }
+  const orderedCallback = (...handlerArgs: unknown[]) => {
+    const extra = handlerArgs[handlerArgs.length - 1] as CallToolExtra;
+    const ticket = toolStartTickets.get(extra.signal);
+    if (!ticket) return Reflect.apply(callback, undefined, handlerArgs);
+    return (async () => {
+      await ticket.before;
+      if (extra.signal.aborted) {
+        ticket.release();
+        return fail("request cancelled before execution");
+      }
+      let result: unknown;
+      try {
+        // Every tool handler executes its state-binding prefix synchronously.
+        // catch_up's first await comes only after it captures identity/room.
+        result = Reflect.apply(callback, undefined, handlerArgs);
+      } finally {
+        ticket.release();
+      }
+      return await result;
+    })();
+  };
+  return Reflect.apply(sdkRegisterTool, server, [name, config, orderedCallback]);
+}) as typeof server.registerTool;
 
 // Every inputSchema below is z.object(...).strict(): UNKNOWN keys are
 // rejected, not silently stripped. Stripping turned typos into different
@@ -1154,6 +1279,20 @@ server.registerTool(
         },
       );
       if (!res.posted) {
+        if (res.rejected === "evidence_pruned") {
+          return ok({
+            posted: false,
+            rejected: "evidence_pruned",
+            room_id: roomId,
+            room_name: roomName,
+            oldest_retained_seq: res.oldest_retained_seq,
+            pruned_through_seq: res.pruned_through_seq,
+            retry:
+              "messages after that token were pruned, so the server cannot prove the post is still current. " +
+              "Call catch_up for this room, then re-send the SAME content with if_last_read_seq set to that " +
+              "call's new_last_read_seq (nothing was stored)",
+          });
+        }
         // CAS reject: a structured non-error result (like claim's
         // granted:false). Nothing was stored; the caller's payload is its
         // own to re-send, so the reject carries the delta, not a draft.
@@ -1200,7 +1339,9 @@ server.registerTool(
         }
         if (r.status === "left") {
           return [
-            `${r.id}: left this room; the message waits unread unless they return`,
+            r.watching
+              ? `${r.id}: left this room; a wait lease is still recorded but may be stale`
+              : `${r.id}: left this room; the message waits unread unless they return`,
           ];
         }
         if (r.watching) return [];
@@ -1318,7 +1459,8 @@ server.registerTool(
         .optional()
         .describe(
           "Serialized-size budget for the complete response (default 100000). " +
-            "Normal mode advances only over returned messages; priority-only " +
+            "Normal mode advances only over returned peer messages and any " +
+            "following own-only suffix; priority-only " +
             "mode may also advance over disclosed skipped_count rows. " +
             "byte_limited:true = more remain, call again. An unusually " +
             "escape-heavy room name may require a larger value so the fixed " +
@@ -1747,7 +1889,7 @@ server.registerTool(
   {
     title: "Wait for new messages (background poller)",
     description:
-      "Return (do not run) one childless background watcher command. It watches " +
+      "Return (do not run) one childless background poller command. It watches " +
       "all joined rooms or one `room`; `mentions_only` narrows it. Generated " +
       "commands exit 0 on hit or quiet deadline: parse stdout `has_updates`. " +
       "Use catch_up({wait_seconds}) for an in-turn blocking read.",
@@ -2446,6 +2588,31 @@ function asMessage(e: unknown): string {
   return e instanceof Error ? e.message : String(e);
 }
 
+let shutdownPromise: Promise<void> | null = null;
+function shutdown(code: number, message?: string): Promise<void> {
+  if (shutdownPromise) return shutdownPromise;
+  process.exitCode = code;
+  if (message) process.stderr.write(`${message}\n`);
+  shutdownPromise = (async () => {
+    // Keep a hard bound even if a third-party transport stops honoring close.
+    const forcedExit = setTimeout(() => process.exit(code), 3_000);
+    try {
+      // Transport close synchronously aborts every SDK request signal. Wait for
+      // their finally blocks (notably wait-lease deletion) before closing the
+      // shared store, so EOF cannot leave a wait alive or advance afterward.
+      await server.close().catch(() => undefined);
+      await Promise.allSettled([...activeToolRequests]);
+      try {
+        store.close();
+      } catch {}
+    } finally {
+      clearTimeout(forcedExit);
+      process.exit(code);
+    }
+  })();
+  return shutdownPromise;
+}
+
 async function main(): Promise<void> {
   // The SDK's stock ReadBuffer has no frame cap and repeatedly concatenates a
   // growing partial line. Feed it complete, size-bounded lines instead: its
@@ -2457,17 +2624,15 @@ async function main(): Promise<void> {
     // A frame this large cannot be parsed safely enough to recover its request
     // id. Close the owned transport and terminate instead of leaving the MCP
     // client waiting on a half-open connection.
-    process.exitCode = 1;
-    process.stderr.write(`fatal: ${asMessage(error)}\n`);
-    const forcedExit = setTimeout(() => process.exit(1), 2_000);
-    void server
-      .close()
-      .catch(() => undefined)
-      .then(() => {
-        clearTimeout(forcedExit);
-        process.exit(1);
-      });
+    void shutdown(1, `fatal: ${asMessage(error)}`);
   });
+  // The SDK's stdio transport does not observe EOF. Closing it here aborts
+  // in-flight waits before they can consume a message for a dead client.
+  boundedInput.once("end", () => void shutdown(0));
+  process.stdout.once("error", (error) => {
+    void shutdown(1, `fatal: stdout disconnected: ${asMessage(error)}`);
+  });
+  process.stderr.once("error", () => void shutdown(1));
   const transport = new StdioServerTransport(boundedInput, process.stdout);
   await server.connect(transport);
   process.stdin.once("error", (error) => boundedInput.destroy(error));
@@ -2477,6 +2642,5 @@ async function main(): Promise<void> {
 }
 
 main().catch((e) => {
-  process.stderr.write(`fatal: ${asMessage(e)}\n`);
-  process.exit(1);
+  void shutdown(1, `fatal: ${asMessage(e)}`);
 });

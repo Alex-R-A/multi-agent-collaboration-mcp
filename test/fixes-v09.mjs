@@ -312,7 +312,7 @@ const NUL = String.fromCharCode(0);
   const DB = join(dir, "t.db");
   {
     const s = new ChatStore(DB);
-    s.createRoom("r", "desc", null);
+    s.createRoom("r", "desc", "pin");
     s.upsertAgent("a", null, null, "adesc");
     s.joinRoom(1, "a");
     s.claimResource(1, "k", "a", 900, "cnote");
@@ -320,7 +320,18 @@ const NUL = String.fromCharCode(0);
   }
   {
     const raw = new Database(DB);
+    raw.exec(`
+      DROP TRIGGER rooms_reject_nul_insert;
+      DROP TRIGGER rooms_description_reject_nul_update;
+      DROP TRIGGER rooms_pinned_reject_nul_update;
+      DROP TRIGGER agents_reject_nul_insert;
+      DROP TRIGGER agents_description_reject_nul_update;
+      DROP TRIGGER claims_reject_nul_insert;
+      DROP TRIGGER claims_note_reject_nul_update;
+      PRAGMA user_version = 2;
+    `);
     raw.prepare("UPDATE rooms SET description = 'x'||char(0)||'y' WHERE id=1").run();
+    raw.prepare("UPDATE rooms SET pinned = 'p'||char(0)||'q' WHERE id=1").run();
     raw.prepare("UPDATE agents SET description = 'a'||char(0)||'b' WHERE id='a'").run();
     raw.prepare("UPDATE claims SET note = 'n'||char(0)||'m' WHERE room_id=1 AND key='k'").run();
     raw.close();
@@ -330,9 +341,28 @@ const NUL = String.fromCharCode(0);
   const agent = s.listAgents(1, 5).agents.find((a) => a.id === "a");
   const claim = s.listClaims(1).claims[0];
   check("room description NUL healed (listing substr reads it whole)", room.description === "x�y", room.description);
+  check("room pinned NUL healed", room.pinned === "p�q", room.pinned);
   check("agent description NUL healed", agent && agent.description === "a�b", agent && agent.description);
   check("claim note NUL healed", claim && claim.note === "n�m", claim && claim.note);
   s.close();
+  {
+    const raw = new Database(DB);
+    let rejected = 0;
+    for (const sql of [
+      "UPDATE rooms SET description = 'x'||char(0)||'y' WHERE id=1",
+      "UPDATE rooms SET pinned = 'p'||char(0)||'q' WHERE id=1",
+      "UPDATE agents SET description = 'a'||char(0)||'b' WHERE id='a'",
+      "UPDATE claims SET note = 'n'||char(0)||'m' WHERE room_id=1 AND key='k'",
+    ]) {
+      try {
+        raw.exec(sql);
+      } catch {
+        rejected++;
+      }
+    }
+    check("database guards reject new metadata NULs", rejected === 4, rejected);
+    raw.close();
+  }
   rmSync(dir, { recursive: true, force: true });
 }
 
@@ -345,6 +375,12 @@ const NUL = String.fromCharCode(0);
   s.upsertAgent("x", null, null, null);
   s.joinRoom(r, "x", "sessA", "sessA"); // session A (cursor + presence)
   s.joinRoom(r, "x", "sessB", "sessB"); // session B
+  const legacyLeave = s.leaveRoom(r, "x");
+  check(
+    "legacy/sessionless leave cannot evict live current-session twins",
+    legacyLeave === false && s.getMembership(r, "x").left_at === null,
+    { legacyLeave, membership: s.getMembership(r, "x") },
+  );
   const leftA = s.leaveRoom(r, "x", "sessA");
   const afterA = s.getMembership(r, "x");
   check("session A leave returns true (it left)", leftA === true, leftA);
@@ -359,6 +395,17 @@ const NUL = String.fromCharCode(0);
     "identity leaves once the LAST twin leaves",
     leftB === true && afterB.left_at !== null && s.presentRoomCount("x") === 0,
     { left_at: afterB.left_at, present: s.presentRoomCount("x") },
+  );
+  // Fresh left tombstones are historical state, not live twins. A legacy/web
+  // join has no presence row; its subsequent identity-level leave must still
+  // report the present -> left transition truthfully.
+  s.joinRoom(r, "x");
+  const sessionlessAfterTombstones = s.leaveRoom(r, "x");
+  check(
+    "sessionless leave ignores tombstones when no live twin remains",
+    sessionlessAfterTombstones === true &&
+      s.getMembership(r, "x").left_at !== null,
+    { sessionlessAfterTombstones, membership: s.getMembership(r, "x") },
   );
   s.joinRoom(r, "x", "sessA", "sessA"); // rejoin clears this session's left flag
   check(
