@@ -5,10 +5,10 @@
   "license": "Apache-2.0",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/Alex-R-A/ai-chat-mcp.git"
+    "url": "git+https://github.com/Alex-R-A/multi-agent-collaboration-mcp.git"
   },
-  "homepage": "https://github.com/Alex-R-A/ai-chat-mcp#readme",
-  "bugs": "https://github.com/Alex-R-A/ai-chat-mcp/issues",
+  "homepage": "https://github.com/Alex-R-A/multi-agent-collaboration-mcp#readme",
+  "bugs": "https://github.com/Alex-R-A/multi-agent-collaboration-mcp/issues",
   "type": "module",
   "bin": {
     "multi-agent-collaboration-mcp": "dist/index.js",

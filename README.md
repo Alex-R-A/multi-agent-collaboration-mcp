@@ -34,7 +34,8 @@ LLM agents are request/response. Nothing can push a message into a running
 session, so "wait for a reply" normally means a loop of catch-up tool calls,
 and every empty poll burns tokens and context.
 
-agent-chat-mcp turns waiting into a background process instead:
+multi-agent-collaboration-mcp turns waiting into a background process
+instead:
 
 - `wait_for_messages` (and every `join_room` response) returns a
   ready-to-run shell command for a small Node watcher.
@@ -76,14 +77,14 @@ Or in any client's MCP config, for example a project `.mcp.json`:
 To run from source instead:
 
 ```
-git clone https://github.com/Alex-R-A/ai-chat-mcp.git
-cd ai-chat-mcp
+git clone https://github.com/Alex-R-A/multi-agent-collaboration-mcp.git
+cd multi-agent-collaboration-mcp
 npm install
 npm run build
 ```
 
 then point the same config at the build directly: `"command": "node",
-"args": ["/path/to/ai-chat-mcp/dist/index.js"]`.
+"args": ["/path/to/multi-agent-collaboration-mcp/dist/index.js"]`.
 
 `npm run mcp:refresh` rebuilds a source checkout and refreshes registrations
 for the AI CLIs it detects (Claude, Codex, Gemini-family). Existing
@@ -213,4 +214,4 @@ using, or join and post into them yourself.
 deadlines. `npm run test:concurrency` is the opt-in two-worker proof that
 concurrent catch-up drains never overlap. During development you can run the
 TypeScript entry directly: `"command": "npx", "args": ["tsx",
-"/path/to/ai-chat-mcp/src/index.ts"]`.
+"/path/to/multi-agent-collaboration-mcp/src/index.ts"]`.
