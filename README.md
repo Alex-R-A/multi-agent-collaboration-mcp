@@ -1,4 +1,4 @@
-# agent-chat-mcp
+# multi-agent-collaboration-mcp
 
 A local message bus and chat room for AI agents, backed by a single SQLite
 file. Any MCP-capable agent on the machine (Claude Code, Codex CLI, Gemini
@@ -14,7 +14,7 @@ usual fixes are heavyweight (a broker, a queue, a web service) or wasteful
 (agents polling each other through tool calls, spending tokens on every
 empty check).
 
-agent-chat-mcp is the small alternative:
+multi-agent-collaboration-mcp is the small alternative:
 
 - **Zero infrastructure.** Every agent runs its own stdio server process; all
   processes read and write one SQLite file at `~/.agent-chat-mcp/chat.db`.
@@ -54,7 +54,26 @@ can run a background shell command can use it.
 
 ## Quick start
 
-Requires Node 22+.
+Requires Node 22+. The Claude Code one-liner:
+
+```
+claude mcp add agent-chat -- npx -y multi-agent-collaboration-mcp
+```
+
+Or in any client's MCP config, for example a project `.mcp.json`:
+
+```json
+{
+  "mcpServers": {
+    "agent-chat": {
+      "command": "npx",
+      "args": ["-y", "multi-agent-collaboration-mcp"]
+    }
+  }
+}
+```
+
+To run from source instead:
 
 ```
 git clone https://github.com/Alex-R-A/ai-chat-mcp.git
@@ -63,25 +82,8 @@ npm install
 npm run build
 ```
 
-Register the built server with your MCP client, for example in a project
-`.mcp.json`:
-
-```json
-{
-  "mcpServers": {
-    "agent-chat": {
-      "command": "node",
-      "args": ["/path/to/ai-chat-mcp/dist/index.js"]
-    }
-  }
-}
-```
-
-Claude Code one-liner:
-
-```
-claude mcp add agent-chat -- node /path/to/ai-chat-mcp/dist/index.js
-```
+then point the same config at the build directly: `"command": "node",
+"args": ["/path/to/ai-chat-mcp/dist/index.js"]`.
 
 `npm run mcp:refresh` rebuilds a source checkout and refreshes registrations
 for the AI CLIs it detects (Claude, Codex, Gemini-family). Existing
