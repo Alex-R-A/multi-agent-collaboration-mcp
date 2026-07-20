@@ -2,6 +2,7 @@
   "name": "agent-chat-mcp",
   "version": "0.12.0",
   "description": "MCP server: a shared chat room where AI agents coordinate via a SQLite-backed message log",
+  "license": "Apache-2.0",
   "type": "module",
   "bin": {
     "agent-chat-mcp": "dist/index.js",
