@@ -539,15 +539,7 @@ await (async () => {
     { released: released.data, unjoined: unjoined.data },
   );
 
-  // --- P3b: the LEFT boundary as an MCP caller actually sees it ------------
-  //
-  // post_message/catch_up/set_role/claim lost their handler-level membership
-  // checks; the store's transactional check is now the only one. Consolidating
-  // two predicates into one is only an improvement if what reaches the caller
-  // survives the move, and the risk is specific: the handler knew the room NAME
-  // the caller typed, and the store historically knew only an integer id. An
-  // error saying "you have LEFT room 7" to someone who wrote room: "left-behind"
-  // makes them resolve the id themselves to find out if it even means their room.
+  // --- P3b: the LEFT boundary as an MCP caller sees it ---------------------
   const leftRoom = mkRoom(store, "left-behind", null, null).id;
   await call("join_room", { room: "left-behind" });
   const beforeLeaving = await call("post_message", { content: "before I go" });
@@ -568,11 +560,7 @@ await (async () => {
       ),
     leftPost.data,
   );
-  // The other half of the boundary: what stays OPEN while absent. These four
-  // still route through resolveJoinedRoom, which deliberately has no left
-  // check, and they are the entire reason that wrapper still exists. If someone
-  // "simplifies" them onto resolveTargetRoom the store will not stop them --
-  // none of these four is present-only -- so the proof has to live here.
+  // These non-advancing reads and claim cleanup remain open while absent.
   const readWhileGone = await call("get_message", {
     room: "left-behind",
     seq: beforeLeaving.data.seq,
@@ -603,11 +591,7 @@ await (async () => {
       release: releaseWhileGone.data,
     },
   );
-  // Open while ABSENT is not open to ANYONE. resolveJoinedRoom's membership
-  // check is the only thing separating those two, and deleting it outright left
-  // the whole suite green -- so the check the store cannot make (none of these
-  // four is present-only, so requirePresent never runs for them) had no proof
-  // at all. Without it, naming a room you never joined reads its history.
+  // Soft-left access still requires an existing membership.
   const strangerRead = await call("get_message", {
     room: "claims-unjoined",
     seq: 1,
@@ -620,6 +604,20 @@ await (async () => {
       strangerList.isError === true &&
       /never joined/.test(strangerList.data.error),
     { read: strangerRead.data, list: strangerList.data },
+  );
+
+  const deletedActive = mkRoom(store, "deleted-active", null, null).id;
+  await call("join_room", { room: "deleted-active" });
+  store.deleteRoom(deletedActive, "me", store.currentEpoch("me"));
+  const identityAfterDelete = await call("whoami", {});
+  check(
+    "P3b whoami gives a possible recovery after the active room is deleted",
+    identityAfterDelete.isError !== true &&
+      identityAfterDelete.data.joined === false &&
+      /list_rooms/.test(identityAfterDelete.data.note) &&
+      /create_room/.test(identityAfterDelete.data.note) &&
+      !/rejoin/.test(identityAfterDelete.data.note),
+    identityAfterDelete.data,
   );
   await call("join_room", { room: "mcp-priority" });
 

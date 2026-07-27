@@ -114,10 +114,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     ).run(r);
     raw.close();
   }
-  // touch() is VOID (it replaced touchJoinedRoom, whose boolean nobody used),
-  // so these assert the STATE it exists to change, not a return value. A
-  // returned boolean was always the weaker claim anyway: it says what the
-  // method believed, while last_seen says what the next reader will see.
+  // touch() is void, so assert its persisted liveness effect.
   const lastSeen = () => {
     const raw = new Database(DB);
     const row = raw
@@ -136,9 +133,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     { before: staleSeen, after: lastSeen(), status: s.recipientStatus(r, ["w"], 5)[0] },
   );
   s.leaveRoom(r, "w", EPOCH1);
-  // Backdate AFTER the leave: leaveRoom stamps last_seen itself, so touching a
-  // just-left room would leave a fresh value either way and the assertion could
-  // not fail. Backdating first makes any write by touch() visible.
+  // Backdate after leave so any forbidden touch write is observable.
   {
     const raw = new Database(DB);
     raw.prepare(

@@ -142,6 +142,7 @@ const throws = (fn, re) => {
     mkRoom(s, "joined-room", null, null);
     mkRoom(s, "other-room", null, null);
     mkAgent(s, "u");
+    mkAgent(s, "never-joined");
     s.close();
   }
   // MCP client.
@@ -177,6 +178,14 @@ const throws = (fn, re) => {
 
   await call("resume_persona", bindArgs("u"));
 
+  const noMemberships = await call("wait_for_messages", {});
+  check(
+    "wait_for_messages distinguishes no memberships from rooms left",
+    noMemberships.isErr &&
+      /no_room_memberships/.test(noMemberships.data.error) &&
+      /join_room/.test(noMemberships.data.error),
+    noMemberships,
+  );
   await call("join_room", { room: "joined-room" });
   // Scoping to a room the identity never joined -> refuse.
   const notJoined = await call("wait_for_messages", { room: "other-room" });
@@ -187,7 +196,13 @@ const throws = (fn, re) => {
   // Leave the only room, then unscoped watch -> refuse (would exit 2).
   await call("leave_room", {});
   const noRooms = await call("wait_for_messages", {});
-  check("wait_for_messages refuses an all-rooms watch when in no room", noRooms.isErr && /not present in any room/.test(noRooms.data.error), noRooms);
+  check(
+    "wait_for_messages reports when every joined room was left",
+    noRooms.isErr &&
+      /left_all_rooms/.test(noRooms.data.error) &&
+      /join_room/.test(noRooms.data.error),
+    noRooms,
+  );
   child.kill();
 
   // Poller: zero-padded value accepted, huge value rejected.
@@ -198,6 +213,51 @@ const throws = (fn, re) => {
     setup.close();
   }
   const POLLER = join(ROOT, "dist", "poller.js");
+  const CHECK = join(ROOT, "dist", "check.js");
+  const noMembershipPoller = spawnSync(
+    "node",
+    [POLLER, "--agent", "never-joined", "--timeout", "1"],
+    { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20_000 },
+  );
+  check(
+    "poller arm distinguishes a persona with no memberships",
+    noMembershipPoller.status === 2 &&
+      /no_room_memberships/.test(noMembershipPoller.stderr),
+    { status: noMembershipPoller.status, stderr: noMembershipPoller.stderr },
+  );
+  const leftAllPoller = spawnSync(
+    "node",
+    [POLLER, "--agent", "u", "--timeout", "1"],
+    { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20_000 },
+  );
+  check(
+    "poller arm distinguishes a persona that left every room",
+    leftAllPoller.status === 2 &&
+      /left_all_rooms/.test(leftAllPoller.stderr),
+    { status: leftAllPoller.status, stderr: leftAllPoller.stderr },
+  );
+  const noMembershipCheck = spawnSync(
+    "node",
+    [CHECK, "--agent", "never-joined", "--db", DB],
+    { encoding: "utf8", timeout: 20_000 },
+  );
+  check(
+    "diagnostic distinguishes a persona with no memberships",
+    noMembershipCheck.status === 2 &&
+      /no_room_memberships/.test(noMembershipCheck.stderr),
+    { status: noMembershipCheck.status, stderr: noMembershipCheck.stderr },
+  );
+  const leftAllCheck = spawnSync(
+    "node",
+    [CHECK, "--agent", "u", "--db", DB],
+    { encoding: "utf8", timeout: 20_000 },
+  );
+  check(
+    "diagnostic distinguishes a persona that left every room",
+    leftAllCheck.status === 2 &&
+      /left_all_rooms/.test(leftAllCheck.stderr),
+    { status: leftAllCheck.status, stderr: leftAllCheck.stderr },
+  );
   const padded = spawnSync("node", [POLLER, "--agent", "w", "--interval", "0000000005", "--timeout", "1"], { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20_000 });
   check("poller accepts a zero-padded --interval (times out cleanly)", padded.status === 124, { status: padded.status, stderr: padded.stderr });
   const huge = spawnSync("node", [POLLER, "--agent", "w", "--interval", "99999999999", "--timeout", "1"], { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20_000 });

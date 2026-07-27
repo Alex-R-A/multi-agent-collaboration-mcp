@@ -228,11 +228,12 @@ at, the owning process id, the exact Node executable running the MCP, and
 - Exit `0` means either a hit or, with `--ok-on-timeout`, a quiet deadline;
   parse stdout `has_updates: true/false` to distinguish. Without the flag a
   quiet deadline exits `124`.
-- Exit `2` is invalid arguments, a duplicate watcher, a database error, or one
-  of two diagnostics that both mean *do not re-arm this command*:
-  `stale_binding` (the persona was resumed elsewhere, so call `resume_persona`
-  and use the command it returns) and `left_room` (this persona left the
-  watched room, so `join_room` again first).
+- Exit `2` is invalid arguments, a duplicate watcher, a database error, or a
+  terminal watcher state. Inspect stderr before re-arming:
+  `stale_binding` means the persona was resumed elsewhere; `left_room` means
+  it left the scoped room; `left_all_rooms` means an all-room watcher lost its
+  last present room; `no_room_memberships` means none of its joined-room rows
+  remain. Resume or rejoin as directed, then use the newly generated command.
 - `--epoch` binds the watcher to one runtime tenure. Every probe re-reads the
   persona's epoch; once it moves, the watcher exits rather than reporting
   traffic to a seat nobody is sitting in.

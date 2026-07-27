@@ -216,8 +216,6 @@ try {
       release_claim: () => store.releaseClaim(room, "k", id, A),
       prune: () => store.pruneMessages(room, id, A, 1, true),
       join: () => store.joinRoom(room, id, A, {}),
-      // One entry, not two: the captured-room heartbeat used to call a separate
-      // touchJoinedRoom whose SQL was identical, and that method is gone.
       liveness_touch: () => store.touch(room, id, A),
       wait_lease: () => store.beginWaitLease(room, id, A, 30),
       // Room administration is GLOBAL and unscoped by membership, which is
@@ -394,9 +392,6 @@ try {
       "set_role by an existing persona that never joined the room is refused",
       notMember.threw && !notMember.personaLost &&
         /never joined/.test(notMember.message) &&
-        // The room NAME, not just the id: this error is now the store's alone
-        // (the handler check in front of it is gone), and an id on its own
-        // makes the caller go look up which room refused it.
         notMember.message.includes(`"one" (${r1})`) &&
         /join_room/.test(notMember.message),
       notMember,
@@ -475,9 +470,6 @@ try {
       check(
         `${name} is refused while LEFT, and the error names rejoin and the room`,
         r.threw && !r.personaLost && /join_room/.test(r.message) && /LEFT/.test(r.message) &&
-          // The room NAME and id. These errors now travel to MCP callers that
-          // named an explicit room, and "you have LEFT room 4" makes the caller
-          // resolve the id itself to find out whether it even meant that room.
           r.message.includes(`"boundary" (${room})`),
         { name, ...r },
       );
@@ -1236,6 +1228,143 @@ try {
       "a watcher armed BEFORE the leave exits with a left_room diagnostic",
       result.code === 2 && /left_room/.test(result.err) && !result.timedOut,
       { code: result.code, err: result.err.slice(0, 200), timedOut: result.timedOut },
+    );
+  }
+
+  {
+    const { store, path } = freshStore();
+    const first = mkRoom(store, "all-watch-first", null, null).id;
+    const second = mkRoom(store, "all-watch-second", null, null).id;
+    const { id } = seedPersona(store);
+    const peer = seedPersona(store, "all-watch-peer");
+    store.joinRoom(first, id, 1, {});
+    store.joinRoom(second, id, 1, {});
+    store.joinRoom(second, peer.id, 1, {});
+    store.close();
+    const armed = runPoller([
+      "--agent", id, "--epoch", "1",
+      "--interval", "5", "--timeout", "20", "--ok-on-timeout", "--db", path,
+    ]);
+    const ready = await waitForArmed(
+      pollerLockPath(path, id, null, 1),
+      armed.child,
+    );
+    check("the all-room watcher armed across two rooms", ready, "not armed");
+    const writer = new ChatStore(path);
+    writer.leaveRoom(first, id, 1);
+    writer.postMessage(
+      second,
+      peer.id,
+      "still watched",
+      "text",
+      null,
+      null,
+      null,
+      1,
+    );
+    writer.close();
+    const result = await armed.done;
+    check(
+      "leaving one room keeps an all-room watcher on the other",
+      result.code === 0 &&
+        /"has_updates":true/.test(result.out) &&
+        result.out.includes(`"room_id":${second}`),
+      { code: result.code, out: result.out, err: result.err },
+    );
+  }
+
+  {
+    const { store, path } = freshStore();
+    const room = mkRoom(store, "all-watch-left", null, null).id;
+    const { id } = seedPersona(store);
+    store.joinRoom(room, id, 1, {});
+    store.close();
+    const armed = runPoller([
+      "--agent", id, "--epoch", "1",
+      "--interval", "5", "--timeout", "20", "--ok-on-timeout", "--db", path,
+    ]);
+    const ready = await waitForArmed(
+      pollerLockPath(path, id, null, 1),
+      armed.child,
+    );
+    check("the last-room leave watcher armed", ready, "not armed");
+    const writer = new ChatStore(path);
+    writer.leaveRoom(room, id, 1);
+    writer.close();
+    const result = await armed.done;
+    check(
+      "leaving the last room exits with left_all_rooms",
+      result.code === 2 &&
+        /left_all_rooms/.test(result.err) &&
+        !/no_room_memberships/.test(result.err),
+      { code: result.code, err: result.err, timedOut: result.timedOut },
+    );
+  }
+
+  {
+    const { store, path } = freshStore();
+    const room = mkRoom(store, "all-watch-deleted", null, null).id;
+    const { id } = seedPersona(store);
+    store.joinRoom(room, id, 1, {});
+    store.close();
+    const armed = runPoller([
+      "--agent", id, "--epoch", "1",
+      "--interval", "5", "--timeout", "20", "--ok-on-timeout", "--db", path,
+    ]);
+    const ready = await waitForArmed(
+      pollerLockPath(path, id, null, 1),
+      armed.child,
+    );
+    check("the deleted-membership watcher armed", ready, "not armed");
+    const writer = new ChatStore(path);
+    writer.deleteRoom(room, id, 1);
+    writer.close();
+    const result = await armed.done;
+    check(
+      "deleting the last joined room exits with no_room_memberships",
+      result.code === 2 &&
+        /no_room_memberships/.test(result.err) &&
+        !/left_all_rooms/.test(result.err),
+      { code: result.code, err: result.err, timedOut: result.timedOut },
+    );
+  }
+
+  {
+    const { store, path } = freshStore();
+    const room = mkRoom(store, "all-watch-rejoin", null, null).id;
+    const { id } = seedPersona(store);
+    const peer = seedPersona(store, "all-rejoin-peer");
+    store.joinRoom(room, id, 1, {});
+    store.joinRoom(room, peer.id, 1, {});
+    store.close();
+    const armed = runPoller([
+      "--agent", id, "--epoch", "1",
+      "--interval", "5", "--timeout", "20", "--ok-on-timeout", "--db", path,
+    ]);
+    const ready = await waitForArmed(
+      pollerLockPath(path, id, null, 1),
+      armed.child,
+    );
+    check("the rejoin-before-probe watcher armed", ready, "not armed");
+    const writer = new ChatStore(path);
+    writer.leaveRoom(room, id, 1);
+    writer.joinRoom(room, id, 1, {});
+    writer.postMessage(
+      room,
+      peer.id,
+      "present again",
+      "text",
+      null,
+      null,
+      null,
+      1,
+    );
+    writer.close();
+    const result = await armed.done;
+    check(
+      "rejoining before the next probe keeps the watcher alive",
+      result.code === 0 && /"has_updates":true/.test(result.out),
+      { code: result.code, out: result.out, err: result.err },
     );
   }
 

@@ -82,7 +82,7 @@ function parseArgs(argv: string[]): Args {
     } else if (a === "--agent") {
       out.agent = take(a);
     } else if (a === "--since") {
-      const v = take(a).trim();
+      const v = take(a);
       // Digits only: Number() would also admit "0x10" and "1e3".
       if (!/^\d+$/.test(v)) fail("--since must be a non-negative integer");
       out.since = Number(v);
@@ -147,22 +147,23 @@ try {
   db.pragma("query_only = ON");
 
   if (!args.room) {
-    // All-rooms watch: unread relative to each present membership's marker.
-    // All three reads run in one DEFERRED transaction so they see a single
-    // snapshot; separate autocommit reads can disagree under concurrent
-    // marker updates (e.g. unread=0 alongside nonzero unread_mentions).
+    // All-rooms watch: state and unread counts share one snapshot.
     const agent = args.agent;
     if (!agent) fail("--agent is required when watching all rooms");
     const counts = db
       .transaction(() => {
-        // Rooms count distinguishes a doomed watch (persona in no room -> fail)
-        // from a live one.
-        const { n: rooms } = db
+        const memberships = db
           .prepare(
-            "SELECT COUNT(*) AS n FROM memberships WHERE agent_id = ? AND left_at IS NULL",
+            `SELECT COUNT(*) AS total,
+                    COALESCE(
+                      SUM(CASE WHEN left_at IS NULL THEN 1 ELSE 0 END),
+                      0
+                    ) AS present
+             FROM memberships WHERE agent_id = ?`,
           )
-          .get(agent) as { n: number };
-        if (rooms === 0) return null;
+          .get(agent) as { total: number; present: number };
+        if (memberships.total === 0) return "no_memberships" as const;
+        if (memberships.present === 0) return "left_all" as const;
         const { c: unread } = db
           .prepare(
             `SELECT COUNT(*) AS c FROM messages g
@@ -226,7 +227,7 @@ try {
             : grouped;
         }
         return {
-          rooms,
+          rooms: memberships.present,
           unread,
           unreadMentions,
           roomsWithUpdates,
@@ -234,7 +235,18 @@ try {
         };
       })
       .deferred();
-    if (counts === null) fail(`agent "${agent}" is not a member of any room`);
+    if (counts === "no_memberships") {
+      fail(
+        `no_room_memberships: agent "${agent}" has no room memberships; ` +
+          "join a room first",
+      );
+    }
+    if (counts === "left_all") {
+      fail(
+        `left_all_rooms: agent "${agent}" has LEFT every joined room; ` +
+          "rejoin one with join_room -- its read position and role are preserved",
+      );
+    }
     const {
       rooms,
       unread,
@@ -272,29 +284,30 @@ try {
     process.exit(hasUpdates ? 0 : 1);
   }
 
-  // Number.isSafeInteger gate: a numeric ref past 2^53 rounds to a different
-  // integer, so a huge --room could watch a neighbouring room's id. Only try
-  // the id lookup for exactly-representable integers; else fall to name lookup.
-  let room =
-    /^\d+$/.test(args.room) && Number.isSafeInteger(Number(args.room))
-      ? (db.prepare("SELECT id FROM rooms WHERE id = ?").get(Number(args.room)) as
-          | { id: number }
-          | undefined)
-      : undefined;
-  if (!room) {
-    room = db.prepare("SELECT id FROM rooms WHERE name = ?").get(args.room) as
-      | { id: number }
-      | undefined;
-  }
-  if (!room) fail(`no room "${args.room}"`);
-  const roomId = room.id;
-
   if (args.since === undefined && !args.agent) {
     fail("--agent is required unless --since is given");
   }
-  // One DEFERRED transaction = one snapshot for baseline + counts + latest.
+  const roomRef = args.room;
+  if (!roomRef) fail("--room is required for a scoped probe");
+  // Room resolution, baseline, and counts share one snapshot. Resolving before
+  // the transaction let a concurrent delete turn --since into a false quiet.
   const snap = db
     .transaction(() => {
+      // Only treat a numeric ref as an id when it is exactly representable.
+      let room =
+        /^\d+$/.test(roomRef) && Number.isSafeInteger(Number(roomRef))
+          ? (db
+              .prepare("SELECT id FROM rooms WHERE id = ?")
+              .get(Number(roomRef)) as { id: number } | undefined)
+          : undefined;
+      if (!room) {
+        room = db
+          .prepare("SELECT id FROM rooms WHERE name = ?")
+          .get(roomRef) as { id: number } | undefined;
+      }
+      if (!room) return { state: "missing" as const };
+      const roomId = room.id;
+
       let baseline: number;
       if (args.since !== undefined) {
         baseline = args.since;
@@ -314,8 +327,8 @@ try {
           .get(roomId, args.agent) as
           | { last_read_seq: number; left_at: string | null }
           | undefined;
-        if (!m) return null;
-        if (m.left_at !== null) return "left";
+        if (!m) return { state: "not_joined" as const, roomId };
+        if (m.left_at !== null) return { state: "left" as const, roomId };
         baseline = m.last_read_seq;
       }
 
@@ -355,28 +368,34 @@ try {
           )
           .get(roomId) as { s: number }
       ).s;
-      return { baseline, unread, unreadMentions, latest };
+      return {
+        state: "ok" as const,
+        roomId,
+        baseline,
+        unread,
+        unreadMentions,
+        latest,
+      };
     })
     .deferred();
-  if (snap === null) {
+  if (snap.state === "missing") {
+    fail(`no room "${roomRef}"`);
+  }
+  if (snap.state === "not_joined") {
     fail(
-      `agent "${args.agent}" is not a member of room ${roomId}; join first or pass --since`,
+      `agent "${args.agent}" is not a member of room ${snap.roomId}; ` +
+        "join first or pass --since",
     );
   }
-  if (snap === "left") {
+  if (snap.state === "left") {
     fail(
-      `agent "${args.agent}" has LEFT room ${roomId}, so its unread there is not ` +
+      `agent "${args.agent}" has LEFT room ${snap.roomId}, so its unread there is not ` +
         `actionable: catch_up refuses the room and a scoped watcher will not arm. ` +
         `Rejoin with join_room -- the read position is preserved -- or pass ` +
         `--since to read the room's traffic without a membership.`,
     );
   }
-  const { baseline, unread, unreadMentions, latest } = snap as {
-    baseline: number;
-    unread: number;
-    unreadMentions: number;
-    latest: number;
-  };
+  const { roomId, baseline, unread, unreadMentions, latest } = snap;
   db.close();
 
   const hasUpdates = args.mentionsOnly ? unreadMentions > 0 : unread > 0;

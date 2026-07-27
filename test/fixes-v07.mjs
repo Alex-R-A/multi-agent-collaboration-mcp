@@ -150,11 +150,7 @@ function mcpClient(env) {
   );
   const legit = await c.call("mark_read", { seq: 2 });
   check("valid mark_read still works under strict schemas", legit.new === 2, legit);
-  // `previous` and `latest` were asserted NOWHERE in the suite: hardcoding
-  // previous to 0 left 764 tests green. It is the field a caller uses to tell
-  // "I just consumed two messages" from "I was already here", and mark_read is
-  // the one tool whose whole job is moving that number, so an unchecked
-  // `previous` is the response's most load-bearing unverified field.
+  // `previous` must report the actual marker moved from.
   const rewound = await c.call("mark_read", { seq: 1 });
   check(
     "mark_read reports the marker it MOVED FROM, not a constant",
@@ -368,12 +364,7 @@ function mcpClient(env) {
       const m = String(e.message);
       check(
         `${name} on a deleted room fails cleanly`,
-        // "no longer exists" AND a remedy that can actually be carried out.
-        // These used to end in "rejoin with join_room", which is advice no
-        // caller can take: the room is gone, so join_room fails the same way
-        // and the caller loops. A membership diagnosis is equally wrong here --
-        // the delete cascaded the membership away, so "you have never joined"
-        // would blame the caller for the room's absence.
+        // Deleted-room errors must offer a possible remedy.
         /no longer exists/.test(m) &&
           /list_rooms/.test(m) &&
           /create_room/.test(m) &&
@@ -391,10 +382,6 @@ function mcpClient(env) {
   expectClean("listClaims", () => s.listClaims(r));
   expectClean("setPinned", () => s.setPinned(r, "a", EPOCH1, "pin"));
   expectClean("pruneMessages", () => s.pruneMessages(r, "a", EPOCH1, 1, true));
-  // Added with the single-membership-authority change: these three lost their
-  // own requireRoom and now depend entirely on requirePresent's failure path to
-  // tell a deleted room apart from a non-membership. Without them, that path
-  // could regress for three of its callers with the suite still green.
   expectClean("setRole", () => s.setRole(r, "a", EPOCH1, "x"));
   expectClean("markRead", () => s.markRead(r, "a", EPOCH1));
   expectClean("beginWaitLease", () => s.beginWaitLease(r, "a", EPOCH1, 30));

@@ -558,14 +558,7 @@ function messageCols(bodyCap: number): string {
 const MESSAGE_FROM = `messages g
                       LEFT JOIN messages p ON p.room_id = g.room_id AND p.seq = g.reply_to_seq`;
 
-/**
- * The one deleted-room diagnosis, with a remedy that actually exists. This
- * used to end in "rejoin with join_room", which is advice no caller can take:
- * the room is GONE, and join_room on a missing id fails the same way again.
- * A remedy that cannot work reads as a transient error and invites a retry
- * loop, so name the two calls that can: look at what remains, or make a new
- * room.
- */
+/** Deleted rooms cannot be rejoined; point callers to valid recovery paths. */
 function deletedRoomMessage(roomId: number): string {
   return (
     `room ${roomId} no longer exists (it was deleted); it cannot be rejoined -- ` +
@@ -972,19 +965,13 @@ export class ChatStore {
     assertMaxLen(pinned, "room pinned intro", 10_000);
     const tx = this.db.transaction(() => {
       this.requireEpoch(agentId, epoch);
-      // The pinned intro is authored room content -- the first thing every
-      // joiner reads -- so writing it is participation, not administration.
-      // This also settles the room's existence: it reports a deleted room as
-      // deleted, so there is nothing left for a separate requireRoom to catch.
+      // Writing the pinned intro is room participation.
       this.requirePresent(roomId, agentId);
       const info = this.db
         .prepare("UPDATE rooms SET pinned = ? WHERE id = ?")
         .run(pinned, roomId);
-      // UNREACHABLE by construction, kept as a corruption assertion: the live
-      // membership proven above holds a foreign key to this room row inside
-      // this same transaction. Reaching it means the FK is not being enforced
-      // or the file is damaged -- neither of which is the caller's doing, so do
-      // not hand back a membership or room remedy for it.
+      // A present membership has a foreign key to this row in the same
+      // transaction, so zero changes means the invariant is broken.
       if (info.changes === 0) {
         throw new Error(
           `internal invariant violated: room ${roomId} has a live membership ` +
@@ -1001,15 +988,8 @@ export class ChatStore {
       | undefined;
   }
 
-  /** Throw a clean, recoverable error when the room no longer exists. Called
-   *  INSIDE write transactions whose room reference was resolved earlier, so
-   *  a cross-process delete_room in the window yields this message instead of
-   *  a raw FK constraint failure or a false no-op success.
-   *
-   *  Kept only where membership is NOT the gate (joinRoom, deleteRoom,
-   *  releaseClaim, listClaims). Present-only operations get the same guarantee
-   *  from requirePresent for free, because a membership row cannot outlive its
-   *  room. */
+  /** Recheck room existence inside transactions where membership is not the
+   *  gate, so a concurrent deletion returns a useful error. */
   private requireRoom(roomId: number): void {
     const row = this.db
       .prepare("SELECT 1 FROM rooms WHERE id = ?")
@@ -1136,15 +1116,16 @@ export class ChatStore {
     return c;
   }
 
-  /** How many rooms an identity is currently present in (for wait_for_messages
-   *  to refuse a doomed all-rooms watch when the agent is in none). */
-  presentRoomCount(agentId: string): number {
-    const { c } = this.db
+  /** Total and present room memberships for watcher arm-time diagnostics. */
+  roomMembershipCounts(agentId: string): { total: number; present: number } {
+    return this.db
       .prepare(
-        "SELECT COUNT(*) AS c FROM memberships WHERE agent_id = ? AND left_at IS NULL",
+        `SELECT COUNT(*) AS total,
+                COALESCE(SUM(CASE WHEN left_at IS NULL THEN 1 ELSE 0 END), 0)
+                  AS present
+         FROM memberships WHERE agent_id = ?`,
       )
-      .get(agentId) as { c: number };
-    return c;
+      .get(agentId) as { total: number; present: number };
   }
 
   /** Names of the rooms this persona is present in. Bounded: this feeds an
@@ -1206,36 +1187,11 @@ export class ChatStore {
   }
 
   /**
-   * THE membership authority for present-only operations: prove this persona
-   * is present in the room and hand back the membership state the caller needs,
-   * in ONE read.
-   *
-   * Like requireEpoch, this MUST run inside the transaction that performs the
-   * guarded write. Checking first and writing afterwards leaves a leave_room
-   * committing in the gap, and the write then lands from a persona every peer
-   * has already been told is absent.
-   *
-   * Participation is what this guards: authoring, advancing a read marker,
-   * changing a role, taking a new claim, and opening a wait. It deliberately
-   * does NOT guard non-advancing history reads or releasing a claim you already
-   * hold -- both are useful while absent and neither claims presence.
-   *
-   * The SUCCESS path is one indexed lookup and asks nothing about the room.
-   * memberships.room_id is a foreign key and foreign_keys is ON, so a live
-   * membership row is itself proof the room exists; a requireRoom before this
-   * was a second query buying a fact the first one already established. Callers
-   * that then re-read the cursor were paying a THIRD time for the same row,
-   * which is why the cursor comes back from here.
-   *
-   * Only the FAILURE path pays for the room lookup, and there it is mandatory:
-   * delete_room cascades the membership away, so "you are not a member" would
-   * be a false diagnosis of a room that is simply gone. Same reason the name is
-   * resolved here -- an explicitly-routed call must be told WHICH room refused
-   * it, not an id the caller has to go look up.
-   *
-   * The soft-left membership row survives, so the remedy is always the same and
-   * the error says it: rejoin. join_room keeps the read marker and the role, so
-   * recovery costs one call and loses nothing.
+   * Transactional gate for present-only operations. It returns the cursor from
+   * the same membership read. On failure, a room lookup distinguishes a
+   * cascaded deletion from never-joined and soft-left membership states.
+   * It must run inside the transaction that performs the guarded write.
+   * Non-advancing reads and claim release intentionally bypass this gate.
    */
   private requirePresent(
     roomId: number,
@@ -1258,12 +1214,6 @@ export class ChatStore {
     if (!room) throw new Error(deletedRoomMessage(roomId));
     const where = `room "${room.name}" (${roomId})`;
     if (row === undefined) {
-      // "never joined", not "not a member": this text is now the ONLY source of
-      // the diagnosis three MCP tools used to produce in their own handlers, and
-      // absorbing a check must not silently reword what callers see. It also
-      // reads as a different situation from the LEFT case below, which is the
-      // distinction the caller acts on -- one has a preserved read position
-      // waiting, the other does not.
       throw new Error(`you have never joined ${where}; join_room it first`);
     }
     throw new Error(
@@ -1475,8 +1425,7 @@ export class ChatStore {
     assertRole(role);
     const tx = this.db.transaction(() => {
       this.requireEpoch(agentId, epoch);
-      // A role describes what you are IN THIS ROOM; you cannot hold one while
-      // absent. Also the deleted-room guard: see requirePresent.
+      // A role describes participation in this room.
       this.requirePresent(roomId, agentId);
       // Refresh last_seen in the SAME statement. A role change is a deliberate
       // act in THIS room, so the seat is demonstrably attended here; leaving
@@ -1488,10 +1437,7 @@ export class ChatStore {
            WHERE room_id = ? AND agent_id = ?`,
         )
         .run(role, roomId, agentId);
-      // UNREACHABLE by construction, kept as a corruption assertion. It used to
-      // read "you are not a member", which requirePresent has already disproved
-      // one statement earlier in this same transaction -- so if it ever did
-      // fire, it named the one cause that cannot be true.
+      // requirePresent proved this row exists in the same transaction.
       if (info.changes === 0) {
         throw new Error(
           `internal invariant violated: membership for room ${roomId} passed ` +
@@ -1532,15 +1478,8 @@ export class ChatStore {
    * Mark a persona alive in a room it is PRESENT in. Liveness only: a room this
    * persona explicitly left stays left, because rejoining is a state transition
    * join_room owns and an incidental heartbeat must not perform it silently.
-   * A room with no present membership is simply not refreshed.
-   *
-   * VOID on purpose. This replaced a second method, touchJoinedRoom, whose SQL
-   * was character-for-character identical and whose only difference was a
-   * boolean "did it land" return. Nothing consumed that boolean except tests
-   * asserting the boolean, so it was a second name for one behaviour and a
-   * standing invitation for the two copies to drift apart. A heartbeat has no
-   * result a caller can act on -- every call site already swallowed its
-   * failures -- so there is nothing honest to return.
+   * A room with no present membership is simply not refreshed. The method is
+   * void because heartbeat callers do not act on whether an update matched.
    *
    * EPOCH-FENCED like any other write. A liveness touch looks harmless, but it
    * is what makes a persona read as present/active to every other agent and to
@@ -1583,10 +1522,7 @@ export class ChatStore {
   ): void {
     const tx = this.db.transaction(() => {
       this.requireEpoch(agentId, epoch);
-      // A lease ADVERTISES this persona as watching the room. An absent
-      // persona advertising a live watch is the exact contradiction the
-      // present-membership rule exists to remove. Also the deleted-room guard:
-      // see requirePresent.
+      // A lease must not advertise an absent persona as watching.
       this.requirePresent(roomId, agentId);
       this.db
         .prepare(
@@ -1893,9 +1829,8 @@ export class ChatStore {
    * the guard). The reject baseline is the TOKEN, unlike the accept path's
    * cursor-relative crossed. opts.crossedPreviewChars additionally returns
    * crossed previews on an ACCEPTED post. A post never consumes an unseen peer
-   * message. After an accepted post, the posting cursor and sibling cursors at
-   * the proven safe peer floor are normalized through the new own row so their
-   * recurring probes do not rescan that suffix.
+   * message. After an accepted post, the persona cursor is normalized through
+   * the new own row when it is already at the proven safe peer floor.
    */
   postMessage(
     roomId: number,
@@ -2005,13 +1940,7 @@ export class ChatStore {
       // told the seq of a message it posted in a previous tenure, and must
       // certainly not insert a new one.
       this.requireEpoch(agentId, epoch);
-      // Authoring is the loudest form of participation. A persona every peer
-      // has been told is absent must not appear in the transcript.
-      //
-      // Also the deleted-room guard: the caller's room reference predates this
-      // transaction, and a concurrent delete_room would otherwise surface as a
-      // raw FK failure on the INSERT. And also the read cursor, used by the CAS
-      // gate and the crossing report below.
+      // Presence, room existence, and the cursor share one membership read.
       const membership = this.requirePresent(roomId, agentId);
       // Lost-response retry: one indexed lookup only when the caller opted in.
       // It precedes CAS/reference validation so a committed first attempt is
@@ -3089,13 +3018,7 @@ export class ChatStore {
       // marker. A stale runtime whose catch_up committed would consume messages
       // the current runtime has not seen and can no longer reach.
       this.requireEpoch(agentId, epoch);
-      // Consuming messages while absent is invisible consumption: peers see a
-      // left persona and cannot tell their traffic is being read. read_history
-      // stays open for exactly this reason -- it consumes nothing.
-      //
-      // One read serves all three jobs this used to spend three on: the read
-      // position, the presence proof, and (on the error path only) telling a
-      // deleted room apart from a non-membership.
+      // Advancing reads require presence; read_history remains non-advancing.
       const from = this.requirePresent(roomId, agentId).last_read_seq;
       const priorityOnly = unreadSummary?.priorityOnly === true;
       // Captured under the same IMMEDIATE snapshot as the filtered scan. Own
@@ -3502,10 +3425,7 @@ export class ChatStore {
   ): { previous: number; new: number; latest: number } {
     const tx = this.db.transaction(() => {
       this.requireEpoch(agentId, epoch);
-      // Advancing a marker is participation: it consumes messages peers can
-      // see you have not read. The same single read returns the previous
-      // position reported below, and names a deleted room as deleted rather
-      // than reporting its vanished membership as a non-membership.
+      // Advancing a marker requires presence and reports the prior cursor.
       const previous = this.requirePresent(roomId, agentId).last_read_seq;
       const { latest } = this.db
         .prepare(
@@ -3603,10 +3523,7 @@ export class ChatStore {
     keepLast = Math.max(1, Math.floor(keepLast));
     const tx = this.db.transaction(() => {
       this.requireEpoch(agentId, epoch);
-      // Pruning is the room's most destructive scoped write. A persona peers
-      // can see is absent must not be able to delete the history it left
-      // behind, force included. It also keeps a deleted room from reporting a
-      // successful no-op prune: see requirePresent.
+      // Pruning requires presence, including when force skips unread checks.
       this.requirePresent(roomId, agentId);
       const { c: total } = this.db
         .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = ?")
@@ -3736,12 +3653,7 @@ export class ChatStore {
     assertMaxLen(note, "claim note", 2000);
     const tx = this.db.transaction(() => {
       this.requireEpoch(agentId, epoch);
-      // Taking (or renewing) a claim asserts coordination inside a room this
-      // persona is not in. release_claim stays open: dropping a claim you
-      // already hold is cleanup, not participation.
-      //
-      // Same deleted-room window as postMessage, closed by the same check: fail
-      // cleanly, not with a raw FK error from the claims INSERT.
+      // Taking a claim requires presence; releasing one remains cleanup.
       this.requirePresent(roomId, agentId);
       const row = this.db
         .prepare(

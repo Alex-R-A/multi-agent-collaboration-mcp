@@ -178,7 +178,7 @@ PERSONAS AND RUNTIMES
 - Roles are ROOM-LOCAL: set one on join_room or change/clear it with set_role. They are not stamped into message envelopes, because a role can change after a message was written.
 
 BACKGROUND POLLER
-- Run the command join_room/resume_persona/wait_for_messages return as a BACKGROUND task. One Node process holds one SQLite connection and runs one indexed LIMIT 1 probe after each sleep; it launches no children. Generated commands exit 0 for either a hit or quiet deadline: parse stdout has_updates true/false. Direct CLI calls without --ok-on-timeout retain exit 124 on timeout. Exit 2 is an error or equivalent watcher. Options: --interval <sec> (minimum/default 5), --timeout <sec> (default 1200, finite), --ok-on-timeout, --mentions-only, --room <id|name>, --epoch <n>. Your own posts never wake it. Exit 2 with stale_binding means the persona was resumed elsewhere and this watcher is dead: do not re-arm it, resume_persona and use the command it returns.
+- Run the command join_room/resume_persona/wait_for_messages return as a BACKGROUND task. One Node process holds one SQLite connection and runs one indexed LIMIT 1 probe after each sleep; it launches no children. Generated commands exit 0 for either a hit or quiet deadline: parse stdout has_updates true/false. Direct CLI calls without --ok-on-timeout retain exit 124 on timeout. Exit 2 is an error, equivalent watcher, stale_binding, left_room, left_all_rooms, or no_room_memberships; inspect stderr before re-arming. Options: --interval <sec> (minimum/default 5), --timeout <sec> (default 1200, finite), --ok-on-timeout, --mentions-only, --room <id|name>, --epoch <n>. Your own posts never wake it.
 - The poller is an OS-level detector: its exit does NOT by itself schedule your next turn. Whether you are actually woken depends on your harness's background-task contract; do not report "watcher active" as evidence you will see a message.
 
 RETENTION
@@ -419,9 +419,7 @@ function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-/** The active room, with the name taken from the row this already reads.
- *  Callers used to re-fetch the same room row one line later purely for its
- *  name; returning it costs nothing and removes that second lookup. */
+/** Resolve the active room and return its name from the same lookup. */
 function requireActive(): {
   agentId: string;
   epoch: number;
@@ -448,17 +446,8 @@ function requireActive(): {
   return { agentId, epoch, roomId: session.roomId, roomName: active.name };
 }
 
-/**
- * ROUTING ONLY: resolve an optional explicit room, or fall back to the active
- * one, without asking anything about membership.
- *
- * For operations whose membership rule is enforced transactionally by the
- * store. A handler-level membership check in front of one of those is not a
- * cheaper early exit, it is a SECOND predicate answering the same question one
- * transaction earlier -- and the two can disagree, because a leave_room can
- * commit in the gap. Routing (does this name resolve to a room?) is the only
- * question this layer can answer without racing, so it is the only one it asks.
- */
+/** Resolve an explicit or active room. Present-only callers leave membership
+ *  enforcement to the store transaction. */
 function resolveTargetRoom(room?: string): {
   agentId: string;
   epoch: number;
@@ -474,15 +463,8 @@ function resolveTargetRoom(room?: string): {
   return { agentId, epoch, roomId: target.id, roomName: target.name };
 }
 
-/** Resolve an optional explicit joined room without changing the active room.
- * Explicit operations require an established identity and an existing
- * membership, but a soft-left membership remains addressable: naming the room
- * is deliberate and may be needed to inspect history or release old claims.
- *
- * Deliberately NO left check. Every caller of this is an operation that stays
- * open while absent, so a left membership is a valid one here; the four of them
- * are the reason this wrapper still exists at all. Present-only operations use
- * resolveTargetRoom and let the store decide. */
+/** Resolve a room for operations that remain available after soft-leave.
+ *  Membership must exist, but left_at may be set. */
 function resolveJoinedRoom(room?: string): {
   agentId: string;
   epoch: number;
@@ -490,7 +472,10 @@ function resolveJoinedRoom(room?: string): {
   roomName: string;
 } {
   const resolved = resolveTargetRoom(room);
-  if (room !== undefined && !store.getMembership(resolved.roomId, resolved.agentId)) {
+  if (
+    room !== undefined &&
+    !store.getMembership(resolved.roomId, resolved.agentId)
+  ) {
     throw new Error(
       `you have never joined room "${resolved.roomName}"; join_room it first`,
     );
@@ -549,10 +534,7 @@ function touchCapturedRoom(roomId: number, agentId: string, epoch: number): void
   }
   capturedTouchMs.set(key, now);
   try {
-    // The SAME store.touch() the active-room heartbeat uses: it refreshes only
-    // a room whose membership is still PRESENT, so it cannot resurrect an
-    // explicitly left room. What differs here is the throttle key, not the
-    // write, which is why the store no longer carries two methods for it.
+    // touch refreshes only a present membership and cannot rejoin a room.
     store.touch(roomId, agentId, epoch);
   } catch {
     // Best-effort heartbeat, matching touchSession().
@@ -1313,7 +1295,8 @@ server.registerTool(
         // read; same recovery contract as requireActive.
         session.roomId = null;
         return fail(
-          `room "${target.name}" was deleted while joining; rejoin with join_room`,
+          `room "${target.name}" was deleted while joining; use list_rooms ` +
+            "to see what remains, or create_room to make a new one",
         );
       }
       const persona = store.getPersona(agentId);
@@ -1386,8 +1369,6 @@ server.registerTool(
   async ({ role, room }) => {
     try {
       touchSession();
-      // Routing only: a role is present-only, and store.setRole decides that
-      // transactionally.
       const { agentId, epoch, roomId, roomName } = resolveTargetRoom(room);
       store.setRole(roomId, agentId, epoch, role);
       return ok({
@@ -1478,7 +1459,9 @@ server.registerTool(
         return ok({
           ...identity,
           joined: false,
-          note: "active room was deleted; rejoin",
+          note:
+            "active room was deleted; use list_rooms to see what remains, " +
+            "or create_room to make a new one",
         });
       }
       const cur = store.getCursor(session.roomId, agentId);
@@ -1737,9 +1720,6 @@ server.registerTool(
             "assertion), not both",
         );
       }
-      // Routing only. Whether this persona may post here is decided inside
-      // store.postMessage's transaction, which is the only place the answer
-      // cannot go stale between the check and the insert.
       const { agentId, epoch, roomId, roomName } = resolveTargetRoom(room);
       if (room === undefined && expected_room !== undefined) {
         const expect = store.resolveRoom(expected_room);
@@ -2012,10 +1992,7 @@ server.registerTool(
       // dispatch can mutate `session` (the persona binding, the active room)
       // while a wait sleeps, so everything below runs off these captured
       // values.
-      // Routing only: an explicit room leaves the ACTIVE room untouched. The
-      // membership rule for an advancing read is enforced inside the store's
-      // transaction, alongside the cursor it advances -- a handler check here
-      // would be a second, racing answer to the same question.
+      // An explicit room leaves the active room unchanged.
       const { agentId, epoch, roomId, roomName } = resolveTargetRoom(room);
       touchCapturedRoom(roomId, agentId, epoch);
       const signal = extra?.signal;
@@ -2087,7 +2064,7 @@ server.registerTool(
           session.roomId = null;
         }
         return fail(
-          `room "${roomName ?? roomId}" was deleted while ${duringWait ? "waiting" : "reading"}; nothing was read. list_rooms shows what still exists.`,
+          `room "${roomName}" was deleted while ${duringWait ? "waiting" : "reading"}; nothing was read. list_rooms shows what still exists.`,
         );
       };
 
@@ -2425,12 +2402,21 @@ server.registerTool(
           );
         }
         roomArg = String(target.id);
-      } else if (store.presentRoomCount(agentId) === 0) {
-        // Unscoped watch of ALL your rooms, but you are in none: the poller
-        // would exit 2 immediately. Say so rather than emit a doomed command.
-        return fail(
-          "you are not present in any room, so there is nothing to watch; join_room first, or pass a room you have joined",
-        );
+      } else {
+        const memberships = store.roomMembershipCounts(agentId);
+        if (memberships.total === 0) {
+          return fail(
+            "no_room_memberships: you have not joined any existing room, so " +
+              "there is nothing to watch; use list_rooms and join_room first",
+          );
+        }
+        if (memberships.present === 0) {
+          return fail(
+            "left_all_rooms: you have LEFT every room you joined, so there is " +
+              "nothing to watch; call join_room to rejoin one -- its read " +
+              "position and role are preserved",
+          );
+        }
       }
       const command = pollerCmd(agentId, {
         room: roomArg,
@@ -2445,13 +2431,15 @@ server.registerTool(
         how_to:
           "Run `command` in the background. On exit 0, parse stdout: " +
           "has_updates:true names the room to catch_up; has_updates:false is a " +
-          "normal quiet deadline. Exit 2 is an error/duplicate watcher. Re-arm " +
-          "only if still needed. The exit is only an OS signal; whether it " +
-          "wakes YOU depends on the harness.",
+          "normal quiet deadline. Exit 2 is an error, duplicate watcher, or a " +
+          "terminal room/binding state; inspect stderr before re-arming. The " +
+          "exit is only an OS signal; whether it wakes YOU depends on the harness.",
         exit_codes: {
           "0": "normal completion; inspect stdout has_updates",
           "124": "quiet timeout only for direct CLI without --ok-on-timeout",
-          "2": "error or equivalent watcher already running",
+          "2":
+            "error, equivalent watcher, stale_binding, left_room, " +
+            "left_all_rooms, or no_room_memberships; inspect stderr",
         },
         baselined: false,
         single_process: true,
@@ -2610,7 +2598,7 @@ server.registerTool(
       touchCapturedRoom(roomId, agentId, epoch);
       const msg = store.getMessage(roomId, seq, offset ?? 0, max_chars);
       if (!msg) {
-        return fail(`no message ${seq} in room "${roomName ?? roomId}"`);
+        return fail(`no message ${seq} in room "${roomName}"`);
       }
       return ok({ ...lossDisclosure(agentId, epoch), ...msg });
     } catch (e) {
@@ -2664,7 +2652,7 @@ server.registerTool(
       touchCapturedRoom(roomId, agentId, epoch);
       const thread = store.getThread(roomId, seq, max_depth ?? 3, preview_chars);
       if (!thread) {
-        return fail(`no message ${seq} in room "${roomName ?? roomId}"`);
+        return fail(`no message ${seq} in room "${roomName}"`);
       }
       return ok({ ...lossDisclosure(agentId, epoch), ...thread });
     } catch (e) {
@@ -2786,9 +2774,6 @@ server.registerTool(
   async ({ room, key, ttl_seconds, note }) => {
     try {
       touchSession();
-      // Routing only: taking a claim is present-only, and store.claimResource
-      // decides that transactionally. release_claim below keeps the joined
-      // resolver, because dropping a claim stays open while absent.
       const { agentId, epoch, roomId, roomName } = resolveTargetRoom(room);
       touchCapturedRoom(roomId, agentId, epoch);
       return ok({

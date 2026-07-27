@@ -43,7 +43,11 @@ The interval must be 5..3600 seconds (default 5). The timeout must be
 1..86400 seconds (default 1200). Exit 0 = work exists; with --ok-on-timeout,
 exit 0 also reports a quiet deadline as has_updates:false. Without it,
 timeout exits 124. Exit 2 = invalid arguments, duplicate watcher, DB error, or
-a stale binding (the persona was resumed by a newer runtime).
+a terminal watcher state. Inspect stderr before re-arming:
+  stale_binding         persona resumed by a newer runtime
+  left_room             persona left the scoped room
+  left_all_rooms        persona left every joined room
+  no_room_memberships   persona has no remaining room memberships
 
 --epoch binds this watcher to one runtime tenure of the persona. Every probe
 reads the persona's current epoch; once it moves, this watcher is speaking for
@@ -333,13 +337,8 @@ try {
   /**
    * A watcher bound to an epoch stops the moment the persona moves on.
    *
-   * The epoch is carried as returned DATA, never as a WHERE predicate. As a
-   * predicate it would simply remove the row, and the two probes read a missing
-   * row very differently: the scoped one reports "the room was deleted or the
-   * membership disappeared", which is a false and actively misleading
-   * diagnosis, while the all-rooms one reads it as an ordinary quiet interval
-   * and never exits at all. Comparing in JS keeps the true reason attached to
-   * the exit.
+   * The epoch is returned as data, never filtered in SQL, so a takeover remains
+   * distinguishable from room and membership state changes.
    */
   const checkEpoch = (current: number | null): void => {
     if (args.epoch === undefined) return;
@@ -441,20 +440,39 @@ try {
         : undefined;
     };
   } else {
-    const present = database
+    const membershipCounts = database
       .prepare(
-        "SELECT 1 FROM memberships WHERE agent_id = ? AND left_at IS NULL LIMIT 1",
+        `SELECT COUNT(*) AS total,
+                COALESCE(SUM(CASE WHEN left_at IS NULL THEN 1 ELSE 0 END), 0)
+                  AS present
+         FROM memberships WHERE agent_id = ?`,
       )
-      .get(args.agent);
-    if (!present) argumentError(`agent "${args.agent}" is not present in any room`);
-    // ANCHORED on the persona row, not on memberships. The unread test alone
-    // returns ZERO rows on a quiet interval -- the normal case -- so there is no
-    // row to hang an epoch column on. Selecting FROM agents makes the result
-    // exactly one row whenever the persona exists, carrying the epoch every
-    // time and the hit only when there is one. A vanished persona yields no row,
-    // which checkEpoch reads as a dead binding rather than as silence.
+      .get(args.agent) as { total: number; present: number };
+    if (membershipCounts.total === 0) {
+      argumentError(
+        `no_room_memberships: agent "${args.agent}" has no room memberships; ` +
+          "join a room and generate a fresh poller command",
+      );
+    }
+    if (membershipCounts.present === 0) {
+      argumentError(
+        `left_all_rooms: agent "${args.agent}" has left every joined room; ` +
+          "rejoin one with join_room and use the new poller command",
+      );
+    }
+    // Anchor on the persona so every quiet probe still returns epoch and
+    // membership state. A vanished persona yields no row.
     const statement = database.prepare(
       `SELECT a.runtime_epoch AS current_epoch,
+              EXISTS (
+                SELECT 1 FROM memberships all_mb
+                WHERE all_mb.agent_id = @agent
+              ) AS has_membership,
+              EXISTS (
+                SELECT 1 FROM memberships present_mb
+                WHERE present_mb.agent_id = @agent
+                  AND present_mb.left_at IS NULL
+              ) AS has_present,
               (SELECT mb.room_id FROM memberships mb
                 WHERE mb.agent_id = @agent AND mb.left_at IS NULL
                   AND EXISTS (
@@ -470,10 +488,32 @@ try {
     const roomName = database.prepare("SELECT name FROM rooms WHERE id = ?");
     probe = () => {
       const row = statement.get(params) as
-        | { current_epoch: number; room_id: number | null }
+        | {
+            current_epoch: number;
+            has_membership: number;
+            has_present: number;
+            room_id: number | null;
+          }
         | undefined;
-      checkEpoch(row ? row.current_epoch : null);
-      if (!row || row.room_id === null) return undefined;
+      if (!row) {
+        checkEpoch(null);
+        return undefined;
+      }
+      checkEpoch(row.current_epoch);
+      if (!row.has_membership) {
+        argumentError(
+          `no_room_memberships: agent "${args.agent}" has no remaining room ` +
+            "memberships; join a room and generate a fresh poller command",
+        );
+      }
+      if (!row.has_present) {
+        argumentError(
+          `left_all_rooms: agent "${args.agent}" left every joined room while ` +
+            "this watcher was armed; rejoin one with join_room and use the new " +
+            "poller command",
+        );
+      }
+      if (row.room_id === null) return undefined;
       // Name lookup only on a HIT, so the quiet path stays one statement.
       const named = roomName.get(row.room_id) as { name: string } | undefined;
       if (!named) return undefined; // deleted between the two reads
