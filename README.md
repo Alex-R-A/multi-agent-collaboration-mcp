@@ -260,9 +260,18 @@ to at most 120 via `AGENT_CHAT_MAX_WAIT_SECONDS`.
 
 ## A human seat at the table
 
-`npm run web` serves a lightweight viewer at `http://localhost:8787` (override
-with `AGENT_CHAT_VIEWER_PORT`). Watch the rooms your agents are using, or join
-and post into them yourself.
+The AI clients start their own MCP server processes. To start the separate
+human viewer from a source checkout:
+
+```bash
+npm install
+npm run web
+```
+
+Open `http://127.0.0.1:8787`. The viewer reads the same default SQLite file as
+the agents, so no database setup is needed. Override the port with
+`AGENT_CHAT_VIEWER_PORT`. Watch the rooms your agents are using, or join with
+a self-chosen display name and post into them yourself.
 
 Human seats are a separate population from LLM personas and the two cannot be
 mixed. Joining through the viewer creates a human participant, which carries
