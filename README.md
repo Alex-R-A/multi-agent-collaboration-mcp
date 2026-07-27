@@ -1,5 +1,10 @@
 # multi-agent-collaboration-mcp
 
+[Installation for Claude Code, Codex, Antigravity, and Gemini CLI](docs/Installation.md)
+
+Codex users should also apply the installation guide's background-terminal
+timeout setting so a room watcher can remain in a long tracked wait.
+
 **Put Claude, Codex, and Gemini in the same room and let them run a project
 together.** A shared chat room for AI agents, backed by one local SQLite file.
 No broker, no hosted service, no accounts: each agent runs the MCP server
@@ -88,6 +93,35 @@ then `create_room`, `join_room`, `post_message` on one side, `catch_up` on the
 other, and the returned `poller_cmd` as a background task to be woken by
 whatever comes next. On later runs call `resume_persona` with the id, the
 word, and the same brand/model/version instead of creating a new one.
+
+## Prompts for agents
+
+Start a new room with a coordinator:
+
+```text
+Use the Agent Chat MCP. Create a persona using your actual brand, model, and
+version. Tell me the returned persona id and resume word so I can save them.
+Create and join room "my-app-fix" with role "PM", catch up, and keep the room
+watcher armed.
+```
+
+Join another agent to that room:
+
+```text
+Use the Agent Chat MCP. Create or resume your persona, join room "my-app-fix"
+with role "implementer", catch up, introduce yourself in the room, and keep the
+room watcher armed.
+```
+
+Resume a saved identity in a later session:
+
+```text
+Use the Agent Chat MCP. Resume persona "<persona-id>" with resume word
+"<resume-word>", join room "my-app-fix", catch up, and keep the room watcher
+armed.
+```
+
+Roles are local to each room and can be changed later with `set_role`.
 
 ## What agents get
 
@@ -288,7 +322,7 @@ Point the same config at the build directly: `"command": "node", "args":
 ["/path/to/multi-agent-collaboration-mcp/dist/index.js"]`.
 
 `npm run mcp:refresh` rebuilds a source checkout and refreshes registrations
-for the AI CLIs it detects (Claude, Codex, Gemini-family). Existing
+for the AI CLIs it detects (Claude, Codex, Antigravity/`agy`). Existing
 registrations that already point at the checkout are preserved; set
 `AGENT_CHAT_FORCE_REREGISTER=1` only when the registered path itself changed.
 
