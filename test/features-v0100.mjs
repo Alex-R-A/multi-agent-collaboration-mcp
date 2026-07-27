@@ -114,18 +114,44 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     ).run(r);
     raw.close();
   }
+  // touch() is VOID (it replaced touchJoinedRoom, whose boolean nobody used),
+  // so these assert the STATE it exists to change, not a return value. A
+  // returned boolean was always the weaker claim anyway: it says what the
+  // method believed, while last_seen says what the next reader will see.
+  const lastSeen = () => {
+    const raw = new Database(DB);
+    const row = raw
+      .prepare(
+        "SELECT last_seen FROM memberships WHERE room_id = ? AND agent_id = 'w'",
+      )
+      .get(r);
+    raw.close();
+    return row.last_seen;
+  };
+  const staleSeen = lastSeen();
+  s.touch(r, "w", EPOCH1);
   check(
     "S2 captured-room touch refreshes a live membership",
-    s.touchJoinedRoom(r, "w", EPOCH1) === true &&
-      s.recipientStatus(r, ["w"], 5)[0].status === "active",
-    s.recipientStatus(r, ["w"], 5)[0],
+    lastSeen() !== staleSeen && s.recipientStatus(r, ["w"], 5)[0].status === "active",
+    { before: staleSeen, after: lastSeen(), status: s.recipientStatus(r, ["w"], 5)[0] },
   );
   s.leaveRoom(r, "w", EPOCH1);
+  // Backdate AFTER the leave: leaveRoom stamps last_seen itself, so touching a
+  // just-left room would leave a fresh value either way and the assertion could
+  // not fail. Backdating first makes any write by touch() visible.
+  {
+    const raw = new Database(DB);
+    raw.prepare(
+      "UPDATE memberships SET last_seen = datetime('now','-2 hours') WHERE room_id = ? AND agent_id = 'w'",
+    ).run(r);
+    raw.close();
+  }
+  const leftSeen = lastSeen();
+  s.touch(r, "w", EPOCH1);
   check(
     "S2 captured-room touch cannot resurrect a LEFT room",
-    s.touchJoinedRoom(r, "w", EPOCH1) === false &&
-      s.getMembership(r, "w").left_at !== null,
-    s.getMembership(r, "w"),
+    lastSeen() === leftSeen && s.getMembership(r, "w").left_at !== null,
+    { before: leftSeen, after: lastSeen(), membership: s.getMembership(r, "w") },
   );
   s.joinRoom(r, "w", EPOCH1, {});
   {

@@ -419,7 +419,15 @@ function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function requireActive(): { agentId: string; epoch: number; roomId: number } {
+/** The active room, with the name taken from the row this already reads.
+ *  Callers used to re-fetch the same room row one line later purely for its
+ *  name; returning it costs nothing and removes that second lookup. */
+function requireActive(): {
+  agentId: string;
+  epoch: number;
+  roomId: number;
+  roomName: string;
+} {
   const { agentId, epoch } = requirePersona();
   if (session.roomId === null) {
     throw new Error("join a room first with join_room");
@@ -427,51 +435,67 @@ function requireActive(): { agentId: string; epoch: number; roomId: number } {
   // The room may have been deleted by another server process; the local session
   // would otherwise stay pointed at it and fail later with a low-level DB error.
   // The identity survives: only the active room is gone.
-  if (!store.getRoom(session.roomId)) {
+  const active = store.getRoom(session.roomId);
+  if (!active) {
     const stale = session.roomId;
     session.roomId = null;
     throw new Error(
-      `active room ${stale} no longer exists (deleted); rejoin with join_room`,
+      `active room ${stale} no longer exists (it was deleted); it cannot be ` +
+        "rejoined -- use list_rooms to see what remains, or create_room to " +
+        "make a new one",
     );
   }
-  return { agentId, epoch, roomId: session.roomId };
+  return { agentId, epoch, roomId: session.roomId, roomName: active.name };
 }
 
-/** Resolve an optional explicit joined room without changing the active room.
- * Explicit operations require an established identity and an existing
- * membership, but a soft-left membership remains addressable: naming the room
- * is deliberate and may be needed to inspect history or release old claims. */
-function resolveJoinedRoom(room?: string): {
+/**
+ * ROUTING ONLY: resolve an optional explicit room, or fall back to the active
+ * one, without asking anything about membership.
+ *
+ * For operations whose membership rule is enforced transactionally by the
+ * store. A handler-level membership check in front of one of those is not a
+ * cheaper early exit, it is a SECOND predicate answering the same question one
+ * transaction earlier -- and the two can disagree, because a leave_room can
+ * commit in the gap. Routing (does this name resolve to a room?) is the only
+ * question this layer can answer without racing, so it is the only one it asks.
+ */
+function resolveTargetRoom(room?: string): {
   agentId: string;
   epoch: number;
   roomId: number;
-  roomName: string | null;
+  roomName: string;
 } {
-  if (room === undefined) {
-    const { agentId, epoch, roomId } = requireActive();
-    return {
-      agentId,
-      epoch,
-      roomId,
-      roomName: store.getRoom(roomId)?.name ?? null,
-    };
-  }
+  if (room === undefined) return requireActive();
   const { agentId, epoch } = requirePersona();
   const target = store.resolveRoom(room);
   if (!target) {
     throw new Error(`no room "${room}". Use list_rooms to see options.`);
   }
-  if (!store.getMembership(target.id, agentId)) {
+  return { agentId, epoch, roomId: target.id, roomName: target.name };
+}
+
+/** Resolve an optional explicit joined room without changing the active room.
+ * Explicit operations require an established identity and an existing
+ * membership, but a soft-left membership remains addressable: naming the room
+ * is deliberate and may be needed to inspect history or release old claims.
+ *
+ * Deliberately NO left check. Every caller of this is an operation that stays
+ * open while absent, so a left membership is a valid one here; the four of them
+ * are the reason this wrapper still exists at all. Present-only operations use
+ * resolveTargetRoom and let the store decide. */
+function resolveJoinedRoom(room?: string): {
+  agentId: string;
+  epoch: number;
+  roomId: number;
+  roomName: string;
+} {
+  const resolved = resolveTargetRoom(room);
+  if (room !== undefined && !store.getMembership(resolved.roomId, resolved.agentId)) {
     throw new Error(
-      `you have never joined room "${target.name}"; join_room it first`,
+      `you have never joined room "${resolved.roomName}"; join_room it first`,
     );
   }
-  return {
-    agentId,
-    epoch,
-    roomId: target.id,
-    roomName: target.name,
-  };
+  return resolved;
 }
 
 /**
@@ -525,9 +549,11 @@ function touchCapturedRoom(roomId: number, agentId: string, epoch: number): void
   }
   capturedTouchMs.set(key, now);
   try {
-    // Unlike store.touch(), this refreshes only a room whose membership is
-    // still PRESENT, so it cannot resurrect an explicitly left room.
-    store.touchJoinedRoom(roomId, agentId, epoch);
+    // The SAME store.touch() the active-room heartbeat uses: it refreshes only
+    // a room whose membership is still PRESENT, so it cannot resurrect an
+    // explicitly left room. What differs here is the throttle key, not the
+    // write, which is why the store no longer carries two methods for it.
+    store.touch(roomId, agentId, epoch);
   } catch {
     // Best-effort heartbeat, matching touchSession().
   }
@@ -1360,7 +1386,9 @@ server.registerTool(
   async ({ role, room }) => {
     try {
       touchSession();
-      const { agentId, epoch, roomId, roomName } = resolveJoinedRoom(room);
+      // Routing only: a role is present-only, and store.setRole decides that
+      // transactionally.
+      const { agentId, epoch, roomId, roomName } = resolveTargetRoom(room);
       store.setRole(roomId, agentId, epoch, role);
       return ok({
         agent_id: agentId,
@@ -1709,36 +1737,18 @@ server.registerTool(
             "assertion), not both",
         );
       }
-      let agentId: string;
-      let epoch: number;
-      let roomId: number;
-      let roomName: string | null;
-      if (room !== undefined) {
-        // Explicit target: same membership rule as catch_up({room}).
-        ({ agentId, epoch } = requirePersona());
-        const target = store.resolveRoom(room);
-        if (!target) {
-          return fail(`no room "${room}". Use list_rooms to see options.`);
-        }
-        if (!store.getMembership(target.id, agentId)) {
+      // Routing only. Whether this persona may post here is decided inside
+      // store.postMessage's transaction, which is the only place the answer
+      // cannot go stale between the check and the insert.
+      const { agentId, epoch, roomId, roomName } = resolveTargetRoom(room);
+      if (room === undefined && expected_room !== undefined) {
+        const expect = store.resolveRoom(expected_room);
+        if (!expect || expect.id !== roomId) {
           return fail(
-            `you have never joined room "${target.name}"; join_room it before posting there`,
+            `expected_room "${expected_room}" does not match the active room ` +
+              `(${roomId} "${roomName}"); nothing was posted. ` +
+              "Pass room: to target a specific room, or join_room it first.",
           );
-        }
-        roomId = target.id;
-        roomName = target.name;
-      } else {
-        ({ agentId, epoch, roomId } = requireActive());
-        roomName = store.getRoom(roomId)?.name ?? null;
-        if (expected_room !== undefined) {
-          const expect = store.resolveRoom(expected_room);
-          if (!expect || expect.id !== roomId) {
-            return fail(
-              `expected_room "${expected_room}" does not match the active room ` +
-                `(${roomId}${roomName ? ` "${roomName}"` : ""}); nothing was posted. ` +
-                "Pass room: to target a specific room, or join_room it first.",
-            );
-          }
         }
       }
       touchCapturedRoom(roomId, agentId, epoch);
@@ -2002,31 +2012,11 @@ server.registerTool(
       // dispatch can mutate `session` (the persona binding, the active room)
       // while a wait sleeps, so everything below runs off these captured
       // values.
-      let agentId: string;
-      let epoch: number;
-      let roomId: number;
-      let roomName: string | null;
-      if (room !== undefined) {
-        // Cross-room read: the ACTIVE room stays untouched. Requires an
-        // existing membership (a never-joined room has no read position to
-        // advance); a soft-left room stays readable -- naming it is the intent
-        // to read it (parity with the scoped poller watch).
-        ({ agentId, epoch } = requirePersona());
-        const target = store.resolveRoom(room);
-        if (!target) {
-          return fail(`no room "${room}". Use list_rooms to see options.`);
-        }
-        if (!store.getMembership(target.id, agentId)) {
-          return fail(
-            `you have never joined room "${target.name}", so there is no read position to advance; join_room it first`,
-          );
-        }
-        roomId = target.id;
-        roomName = target.name;
-      } else {
-        ({ agentId, epoch, roomId } = requireActive());
-        roomName = store.getRoom(roomId)?.name ?? null;
-      }
+      // Routing only: an explicit room leaves the ACTIVE room untouched. The
+      // membership rule for an advancing read is enforced inside the store's
+      // transaction, alongside the cursor it advances -- a handler check here
+      // would be a second, racing answer to the same question.
+      const { agentId, epoch, roomId, roomName } = resolveTargetRoom(room);
       touchCapturedRoom(roomId, agentId, epoch);
       const signal = extra?.signal;
       // max_bytes bounds the COMPLETE JSON text returned to the MCP client,
@@ -2796,7 +2786,10 @@ server.registerTool(
   async ({ room, key, ttl_seconds, note }) => {
     try {
       touchSession();
-      const { agentId, epoch, roomId, roomName } = resolveJoinedRoom(room);
+      // Routing only: taking a claim is present-only, and store.claimResource
+      // decides that transactionally. release_claim below keeps the joined
+      // resolver, because dropping a claim stays open while absent.
+      const { agentId, epoch, roomId, roomName } = resolveTargetRoom(room);
       touchCapturedRoom(roomId, agentId, epoch);
       return ok({
         room_id: roomId,

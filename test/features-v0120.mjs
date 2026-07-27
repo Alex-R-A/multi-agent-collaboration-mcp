@@ -539,6 +539,90 @@ await (async () => {
     { released: released.data, unjoined: unjoined.data },
   );
 
+  // --- P3b: the LEFT boundary as an MCP caller actually sees it ------------
+  //
+  // post_message/catch_up/set_role/claim lost their handler-level membership
+  // checks; the store's transactional check is now the only one. Consolidating
+  // two predicates into one is only an improvement if what reaches the caller
+  // survives the move, and the risk is specific: the handler knew the room NAME
+  // the caller typed, and the store historically knew only an integer id. An
+  // error saying "you have LEFT room 7" to someone who wrote room: "left-behind"
+  // makes them resolve the id themselves to find out if it even means their room.
+  const leftRoom = mkRoom(store, "left-behind", null, null).id;
+  await call("join_room", { room: "left-behind" });
+  const beforeLeaving = await call("post_message", { content: "before I go" });
+  await call("claim", { key: "kept:across-leave", note: "still mine while away" });
+  await call("leave_room", {});
+  const leftPost = await call("post_message", {
+    room: "left-behind",
+    content: "from an empty seat",
+  });
+  check(
+    "P3b an explicit-room LEFT refusal names the room and its id, not a bare id",
+    leftPost.isError === true &&
+      /LEFT/.test(leftPost.data.error) &&
+      /join_room/.test(leftPost.data.error) &&
+      leftPost.data.error.includes(`"left-behind" (${leftRoom})`) &&
+      store.readHistory(leftRoom, 50).messages.every(
+        (m) => m.content !== "from an empty seat",
+      ),
+    leftPost.data,
+  );
+  // The other half of the boundary: what stays OPEN while absent. These four
+  // still route through resolveJoinedRoom, which deliberately has no left
+  // check, and they are the entire reason that wrapper still exists. If someone
+  // "simplifies" them onto resolveTargetRoom the store will not stop them --
+  // none of these four is present-only -- so the proof has to live here.
+  const readWhileGone = await call("get_message", {
+    room: "left-behind",
+    seq: beforeLeaving.data.seq,
+  });
+  const threadWhileGone = await call("get_thread", {
+    room: "left-behind",
+    seq: beforeLeaving.data.seq,
+  });
+  const listWhileGone = await call("list_claims", { room: "left-behind" });
+  const releaseWhileGone = await call("release_claim", {
+    room: "left-behind",
+    key: "kept:across-leave",
+  });
+  check(
+    "P3b reading history and releasing a held claim stay open after leaving",
+    readWhileGone.isError !== true &&
+      readWhileGone.data.content === "before I go" &&
+      threadWhileGone.isError !== true &&
+      threadWhileGone.data.message.seq === beforeLeaving.data.seq &&
+      listWhileGone.isError !== true &&
+      listWhileGone.data.claims.some((c) => c.key === "kept:across-leave") &&
+      releaseWhileGone.isError !== true &&
+      releaseWhileGone.data.released === true,
+    {
+      read: readWhileGone.data,
+      thread: threadWhileGone.data,
+      list: listWhileGone.data,
+      release: releaseWhileGone.data,
+    },
+  );
+  // Open while ABSENT is not open to ANYONE. resolveJoinedRoom's membership
+  // check is the only thing separating those two, and deleting it outright left
+  // the whole suite green -- so the check the store cannot make (none of these
+  // four is present-only, so requirePresent never runs for them) had no proof
+  // at all. Without it, naming a room you never joined reads its history.
+  const strangerRead = await call("get_message", {
+    room: "claims-unjoined",
+    seq: 1,
+  });
+  const strangerList = await call("list_claims", { room: "claims-unjoined" });
+  check(
+    "P3b left-safe reads are open to a LEFT member but not to a never-joined one",
+    strangerRead.isError === true &&
+      /never joined/.test(strangerRead.data.error) &&
+      strangerList.isError === true &&
+      /never joined/.test(strangerList.data.error),
+    { read: strangerRead.data, list: strangerList.data },
+  );
+  await call("join_room", { room: "mcp-priority" });
+
   mkAgent(store, "todo-a");
   mkAgent(store, "todo-b");
   store.joinRoom(otherRoom, "peer", EPOCH1, {});

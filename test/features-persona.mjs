@@ -216,8 +216,9 @@ try {
       release_claim: () => store.releaseClaim(room, "k", id, A),
       prune: () => store.pruneMessages(room, id, A, 1, true),
       join: () => store.joinRoom(room, id, A, {}),
+      // One entry, not two: the captured-room heartbeat used to call a separate
+      // touchJoinedRoom whose SQL was identical, and that method is gone.
       liveness_touch: () => store.touch(room, id, A),
-      captured_room_touch: () => store.touchJoinedRoom(room, id, A),
       wait_lease: () => store.beginWaitLease(room, id, A, 30),
       // Room administration is GLOBAL and unscoped by membership, which is
       // exactly why it must be fenced: delete_room is the one irreversible
@@ -391,7 +392,13 @@ try {
     const notMember = fenced(() => store.setRole(r1, outsider.id, 1, "x"));
     check(
       "set_role by an existing persona that never joined the room is refused",
-      notMember.threw && !notMember.personaLost && /not a member/.test(notMember.message),
+      notMember.threw && !notMember.personaLost &&
+        /never joined/.test(notMember.message) &&
+        // The room NAME, not just the id: this error is now the store's alone
+        // (the handler check in front of it is gone), and an id on its own
+        // makes the caller go look up which room refused it.
+        notMember.message.includes(`"one" (${r1})`) &&
+        /join_room/.test(notMember.message),
       notMember,
     );
     check(
@@ -466,8 +473,12 @@ try {
     for (const [name, fn] of Object.entries(gated)) {
       const r = fenced(fn);
       check(
-        `${name} is refused while LEFT, and the error names rejoin`,
-        r.threw && !r.personaLost && /join_room/.test(r.message) && /LEFT/.test(r.message),
+        `${name} is refused while LEFT, and the error names rejoin and the room`,
+        r.threw && !r.personaLost && /join_room/.test(r.message) && /LEFT/.test(r.message) &&
+          // The room NAME and id. These errors now travel to MCP callers that
+          // named an explicit room, and "you have LEFT room 4" makes the caller
+          // resolve the id itself to find out whether it even meant that room.
+          r.message.includes(`"boundary" (${room})`),
         { name, ...r },
       );
     }
