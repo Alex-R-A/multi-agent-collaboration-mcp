@@ -10,7 +10,7 @@
 //
 // Every test uses an isolated temporary AGENT_CHAT_DB. Nothing here opens the
 // production database.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import {
   existsSync,
@@ -440,6 +440,10 @@ try {
     store.joinRoom(room, id, 1, { role: "writer" });
     store.joinRoom(room, peer.id, 1, {});
     store.postMessage(room, peer.id, "before the leave", "text", null, null, null, 1, {});
+    // A SECOND message, so keepLast:1 gives an unguarded prune something real to
+    // delete. With one message the early `total <= keepLast` return would make
+    // the prune tests pass without ever reaching the guard.
+    store.postMessage(room, peer.id, "also before the leave", "text", null, null, null, 1, {});
     store.claimResource(room, "held-across-leave", id, 1, 600, null);
     const markerBefore = store.getCursor(room, id).last_read_seq;
     store.leaveRoom(room, id, 1);
@@ -451,6 +455,13 @@ try {
       set_role: () => store.setRole(room, id, 1, "ghost"),
       claim: () => store.claimResource(room, "new-lock", id, 1, 60, null),
       wait_lease: () => store.beginWaitLease(room, id, 1, 30),
+      // The pinned intro is authored room content, read by every joiner.
+      set_room_intro: () =>
+        store.setPinned(room, id, 1, "hijacked by a departed member"),
+      // The room's most destructive scoped write, in both modes: force skips
+      // the unread refusal, so it must be stopped by the boundary instead.
+      prune: () => store.pruneMessages(room, id, 1, 1, false),
+      prune_force: () => store.pruneMessages(room, id, 1, 1, true),
     };
     for (const [name, fn] of Object.entries(gated)) {
       const r = fenced(fn);
@@ -478,6 +489,29 @@ try {
         .readHistory(room, 50, undefined, undefined, 100000)
         .messages.some((m) => m.content === "from an empty seat"),
       null,
+    );
+    check(
+      "the refused set_room_intro did not rewrite the pinned intro",
+      store.getRoom(room).pinned === null,
+      store.getRoom(room).pinned,
+    );
+    // The destructive one. Both prune modes ran above; if either had reached
+    // the DELETE, keepLast:1 would have taken the older message with it.
+    check(
+      "the refused prunes destroyed no history",
+      store.readHistory(room, 50, undefined, undefined, 100000).messages.length === 2,
+      store.readHistory(room, 50, undefined, undefined, 100000).messages.map((m) => m.content),
+    );
+    // A liveness heartbeat must not perform a state transition join_room owns.
+    // touch() is a silent no-op here rather than a throw: it is best-effort and
+    // its caller swallows errors, so the assertion is on the ROW, not on a
+    // thrown error that would never surface anyway.
+    const leftBefore = store.getCursor(room, id).left_at;
+    store.touch(room, id, 1);
+    check(
+      "touch on a LEFT membership does not silently rejoin it",
+      typeof leftBefore === "string" && store.getCursor(room, id).left_at === leftBefore,
+      { before: leftBefore, after: store.getCursor(room, id).left_at },
     );
 
     // What a left member KEEPS. Auditing costs the room nothing, and a lock
@@ -511,6 +545,72 @@ try {
       { marker: store.getCursor(room, id).last_read_seq, role: store.getRole(room, id) },
     );
     store.close();
+  }
+
+  // --- agent-chat-check agrees with the boundary, and normalizes its flags --
+  //
+  // The diagnostic and the watcher take the same flags from the same generated
+  // commands, so they must answer the same question the same way. Two ways they
+  // did not: check trimmed nothing while the poller trimmed everything, and
+  // check reported actionable unread for a room whose catch_up now refuses and
+  // whose scoped watcher will not arm.
+  {
+    const { store, path } = freshStore();
+    const room = mkRoom(store, "check-cli", null, null).id;
+    const { id } = seedPersona(store);
+    const peer = seedPersona(store, "check-peer-9");
+    store.joinRoom(room, id, 1, {});
+    store.joinRoom(room, peer.id, 1, {});
+    store.postMessage(room, peer.id, "unread one", "text", null, null, null, 1, {});
+    store.postMessage(room, peer.id, "unread two", "text", null, null, null, 1, {});
+    store.close();
+
+    const CHECK = join(ROOT, "dist", "check.js");
+    const runCheck = (args) =>
+      spawnSync(process.execPath, [CHECK, ...args, "--db", path], {
+        encoding: "utf8",
+      });
+
+    // A padded value must name the SAME persona the poller would watch.
+    // Untrimmed, "  <id>  " matches no membership and the probe exits 2.
+    const padded = runCheck(["--agent", `  ${id}  `, "--room", String(room)]);
+    let paddedOut = null;
+    try {
+      paddedOut = JSON.parse(padded.stdout);
+    } catch {}
+    check(
+      "check.js trims a padded --agent and finds the real unread work",
+      padded.status === 0 && paddedOut?.unread === 2 && paddedOut?.agent === id,
+      { status: padded.status, out: padded.stdout.slice(0, 200), err: padded.stderr.slice(0, 200) },
+    );
+
+    const store2 = new ChatStore(path);
+    store2.leaveRoom(room, id, 1);
+    store2.close();
+
+    // The unread is still REAL -- two peer messages past the marker -- so this
+    // cannot pass by the room being empty.
+    const afterLeave = runCheck(["--agent", id, "--room", String(room)]);
+    check(
+      "check.js refuses a scoped agent-marker probe on a room the persona LEFT",
+      afterLeave.status === 2 &&
+        /has LEFT room/.test(afterLeave.stderr) &&
+        /join_room/.test(afterLeave.stderr),
+      { status: afterLeave.status, err: afterLeave.stderr.slice(0, 300) },
+    );
+
+    // --since is membership-independent by contract and must stay that way:
+    // the refusal above is about an unusable READ MARKER, not about the room.
+    const since = runCheck(["--room", String(room), "--since", "0"]);
+    let sinceOut = null;
+    try {
+      sinceOut = JSON.parse(since.stdout);
+    } catch {}
+    check(
+      "explicit --since still probes the room without a usable membership",
+      since.status === 0 && sinceOut?.unread === 2,
+      { status: since.status, out: since.stdout.slice(0, 200), err: since.stderr.slice(0, 200) },
+    );
   }
 
   // --- role is NOT stamped into message envelopes --------------------------

@@ -70,7 +70,9 @@ function parseArgs(argv: string[]): Args {
       const v = inline !== undefined ? inline : argv[++i];
       if (v === undefined) fail(`${flag} requires a value`);
       if (v.trim().length === 0) fail(`${flag} requires a non-empty value`);
-      return v;
+      // Match poller.ts: both CLIs receive the same generated flags, so they
+      // must normalize `--agent ' bob '` to the same persona.
+      return v.trim();
     };
     if (a === "--mentions-only") {
       if (inline !== undefined) fail("--mentions-only takes no value");
@@ -297,16 +299,23 @@ try {
       if (args.since !== undefined) {
         baseline = args.since;
       } else {
+        // left_at rides as DATA, not as a WHERE predicate: filtering it out
+        // would collapse "left" into "never joined", and those need different
+        // remedies (rejoin vs join). The all-rooms path above already excludes
+        // left memberships; reporting actionable unread here for a room whose
+        // catch_up now refuses to read, and whose scoped watcher refuses to
+        // arm, made one room give three different answers.
         const m = db
           .prepare(
-            `SELECT mb.last_read_seq AS last_read_seq
+            `SELECT mb.last_read_seq AS last_read_seq, mb.left_at AS left_at
              FROM memberships mb
              WHERE mb.room_id = ? AND mb.agent_id = ?`,
           )
           .get(roomId, args.agent) as
-          | { last_read_seq: number }
+          | { last_read_seq: number; left_at: string | null }
           | undefined;
         if (!m) return null;
+        if (m.left_at !== null) return "left";
         baseline = m.last_read_seq;
       }
 
@@ -352,6 +361,14 @@ try {
   if (snap === null) {
     fail(
       `agent "${args.agent}" is not a member of room ${roomId}; join first or pass --since`,
+    );
+  }
+  if (snap === "left") {
+    fail(
+      `agent "${args.agent}" has LEFT room ${roomId}, so its unread there is not ` +
+        `actionable: catch_up refuses the room and a scoped watcher will not arm. ` +
+        `Rejoin with join_room -- the read position is preserved -- or pass ` +
+        `--since to read the room's traffic without a membership.`,
     );
   }
   const { baseline, unread, unreadMentions, latest } = snap as {

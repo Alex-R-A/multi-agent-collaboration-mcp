@@ -957,6 +957,13 @@ export class ChatStore {
     assertMaxLen(pinned, "room pinned intro", 10_000);
     const tx = this.db.transaction(() => {
       this.requireEpoch(agentId, epoch);
+      // Room BEFORE presence: a delete cascades the membership away, and
+      // "you are not a member" would be a false diagnosis of a room that no
+      // longer exists.
+      this.requireRoom(roomId);
+      // The pinned intro is authored room content -- the first thing every
+      // joiner reads -- so writing it is participation, not administration.
+      this.requirePresent(roomId, agentId);
       const info = this.db
         .prepare("UPDATE rooms SET pinned = ? WHERE id = ?")
         .run(pinned, roomId);
@@ -1469,8 +1476,9 @@ export class ChatStore {
   }
 
   /**
-   * Mark a persona alive in a room, clearing that room's left_at (an actively
-   * acting runtime re-asserts presence there).
+   * Mark a persona alive in a room it is PRESENT in. Liveness only: a room this
+   * persona explicitly left stays left, because rejoining is a state transition
+   * join_room owns and an incidental heartbeat must not perform it silently.
    *
    * EPOCH-FENCED like any other write. A liveness touch looks harmless, but it
    * is what makes a persona read as present/active to every other agent and to
@@ -1485,8 +1493,8 @@ export class ChatStore {
       this.requireEpoch(agentId, epoch);
       this.db
         .prepare(
-          `UPDATE memberships SET last_seen = datetime('now'), left_at = NULL
-           WHERE room_id = ? AND agent_id = ?`,
+          `UPDATE memberships SET last_seen = datetime('now')
+           WHERE room_id = ? AND agent_id = ? AND left_at IS NULL`,
         )
         .run(roomId, agentId);
     });
@@ -3564,6 +3572,10 @@ export class ChatStore {
       this.requireEpoch(agentId, epoch);
       // A deleted room must not report a successful no-op prune.
       this.requireRoom(roomId);
+      // Pruning is the room's most destructive scoped write. A persona peers
+      // can see is absent must not be able to delete the history it left
+      // behind, force included.
+      this.requirePresent(roomId, agentId);
       const { c: total } = this.db
         .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = ?")
         .get(roomId) as { c: number };
