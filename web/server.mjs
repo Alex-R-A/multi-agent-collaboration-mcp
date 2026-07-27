@@ -39,7 +39,7 @@ if (rawPort !== undefined && rawPort.trim() !== "") {
 }
 
 // Same resolution the server uses (kept in sync deliberately, not imported, so
-// the viewer needs no build output and never runs migrations against the file).
+// the viewer needs no build output and never creates or alters the schema).
 // Absolute always: a relative override means a different file per cwd.
 function resolveDbPath() {
   const override = process.env.AGENT_CHAT_DB;
@@ -62,63 +62,22 @@ if (DB_PATH === ":memory:") {
   process.exit(1);
 }
 
-// Structures this viewer's queries depend on. The viewer never migrates the
-// shared file (that is the MCP server's job); on an older-schema database its
-// queries used to fail as a mix of opaque 400/500s, so check ONCE per open
-// attempt and report the real remedy instead.
-function schemaGaps(d) {
-  const gaps = [];
-  const col = (t, c) =>
-    !!d
-      .prepare(`SELECT 1 FROM pragma_table_info('${t}') WHERE name = '${c}'`)
-      .get();
-  const table = (t) =>
-    !!d
-      .prepare("SELECT 1 FROM sqlite_master WHERE type IN ('table','trigger') AND name = ?")
-      .get(t);
-  for (const t of ["rooms", "agents", "memberships", "messages", "session_markers", "session_presence", "claims", "wait_leases"]) {
-    if (!table(t)) gaps.push(`table ${t}`);
-  }
-  if (gaps.length) return gaps; // column checks would all fail anyway
-  for (const [t, c] of [
-    ["rooms", "pinned"],
-    ["memberships", "left_at"],
-    ["messages", "supersedes_seq"],
-    ["messages", "reply_to_agent"],
-    ["messages", "body_len"],
-    ["messages", "priority"],
-  ]) {
-    if (!col(t, c)) gaps.push(`${t}.${c}`);
-  }
-  if (!table("messages_fts")) gaps.push("table messages_fts");
-  return gaps;
-}
-let schemaError = null; // sticky reason string when the file is too old
-
 // Open lazily so the server still starts (and says why it is empty) when no
 // agent has created the database yet. Opened writable but pinned query_only: a
 // read-only OPEN of a WAL database is fragile (it needs the -shm file), whereas
 // a writable handle with query_only reads WAL cleanly and still rejects writes.
+//
+// There is no schema preflight. This viewer reads ONE schema, the current one,
+// and a database written by an older server is not upgraded, detected, or
+// explained: its queries fail raw. Replacing the database is a deployment step,
+// not something the running code negotiates.
 let db = null;
 function getDb() {
   if (db) return db;
   if (!existsSync(DB_PATH)) return null;
-  const candidate = new Database(DB_PATH, { fileMustExist: true });
-  candidate.pragma("busy_timeout = 5000");
-  candidate.pragma("query_only = ON");
-  const gaps = schemaGaps(candidate);
-  if (gaps.length) {
-    // Re-checked on every request (cheap PRAGMAs, no cached handle): an MCP
-    // server may migrate the file at any moment, after which the viewer
-    // starts working without a restart.
-    candidate.close();
-    schemaError =
-      `database schema predates this viewer (missing ${gaps.join(", ")}); ` +
-      "start the current agent-chat MCP server once to migrate it";
-    return null;
-  }
-  schemaError = null;
-  db = candidate;
+  db = new Database(DB_PATH, { fileMustExist: true });
+  db.pragma("busy_timeout = 5000");
+  db.pragma("query_only = ON");
   return db;
 }
 
@@ -178,16 +137,17 @@ function roomExists(roomId) {
 // Message columns for the JSON endpoints. Bodies are capped in SQL (substr
 // is codepoint-aware, no surrogate splitting): agents can legally post up to
 // SQLITE_MAX_LENGTH, and one such message must not balloon a page into
-// gigabytes. The full length rides along (body_len when stamped: exact UTF-16,
-// the same unit as the JS-side shown length) so the client can label the cut.
+// gigabytes. The full length rides along (body_len: exact UTF-16, the same
+// unit as the JS-side shown length) so the client can label the cut.
 // reply_to_agent lets the client style replies-to-me without needing the
 // parent row loaded.
 const MAX_BODY_CHARS = 100_000; // matches the agents' per-page read budget
 
-const MSG_COLS = `g.seq, g.agent_id AS "from", a.role, a.type,
+const MSG_COLS = `g.seq, g.agent_id AS "from",
+              a.brand, a.model, a.version, a.is_human,
               substr(g.body, 1, ${MAX_BODY_CHARS}) AS body,
               CASE WHEN length(g.body) > ${MAX_BODY_CHARS}
-                   THEN COALESCE(g.body_len, length(g.body)) ELSE NULL END AS body_length,
+                   THEN g.body_len ELSE NULL END AS body_length,
               g.format, g.priority,
               g.mentions, g.reply_to_seq, g.reply_to_agent, g.supersedes_seq,
               g.created_at AS at,
@@ -296,13 +256,11 @@ function finishBodyCap(r) {
 }
 
 // Writable handle for participation endpoints only. Kept separate from the
-// query_only read handle so a bug in a read path can never write. The schema
-// preflight in getDb() has already gated this: the write paths can assume
-// every current column exists.
+// query_only read handle so a bug in a read path can never write.
 let wdb = null;
 function getWriteDb() {
   if (wdb) return wdb;
-  if (!getDb()) return null; // absent file or stale schema (schemaError set)
+  if (!getDb()) return null; // no database file yet
   wdb = new Database(DB_PATH, { fileMustExist: true });
   wdb.pragma("busy_timeout = 5000");
   // Enforce foreign keys on the write handle, matching the MCP store. The
@@ -317,24 +275,10 @@ function getWriteDb() {
 
 /** Why the database is unusable right now (message for a 503). */
 function dbUnavailableError() {
-  return (
-    schemaError ??
-    `No database at ${DB_PATH}. Start an agent-chat MCP server first.`
-  );
+  return `No database at ${DB_PATH}. Start an agent-chat MCP server first.`;
 }
 
 const NAME_RE = /^[\w][\w.-]{0,199}$/; // sane self-asserted ids, no whitespace
-
-// session_presence id for a web participant. Derived from the name (the
-// browser has no process nonce, and all tabs share the localStorage identity
-// anyway); the "web:" prefix cannot collide with the MCP servers' UUID nonces.
-// Web joins MUST register presence: recomputeMembershipPresence treats an
-// identity with ANY presence rows as session-managed, so a web join without a
-// row was evicted (memberships.left_at set) as soon as an MCP session of the
-// same name left or aged out of the GC window.
-function webSession(name) {
-  return "web:" + name;
-}
 
 // Return a human reason if `s` holds text SQLite cannot round-trip (an
 // embedded NUL -- substr/length truncate at it -- or a lone surrogate), else
@@ -382,24 +326,22 @@ function membership(d, roomId, name) {
     .get(roomId, name);
 }
 
-// A web session is joined only when the identity's membership is present AND
-// THIS web session's presence row exists and is live. Deliberately NO
-// fallback for a missing row: treating "no web row" as joined would let any
-// MCP-joined identity post or mark read through the web API without ever
-// joining here, and a left web session could act again the moment an MCP
-// twin held the membership present (advancing the monotonic read marker over
-// unseen messages, or resurrecting the left presence). Web participation
-// from before presence rows existed (pre-v0.8.4) fails this check once and
-// is fixed by rejoining. Gates /api/post, /api/read, and /api/me.
+// A web actor must be a HUMAN participant with a present membership.
+//
+// The is_human check is load-bearing, not decoration: the web API takes the
+// participant name from the request body, so without it anyone could type an
+// LLM persona's id and post, mark read, or advance that persona's durable read
+// marker over messages it has never seen. Membership alone is not enough,
+// because an LLM persona joined through MCP has exactly that. The two
+// populations are disjoint (this file's joinRoom refuses a human join onto an
+// existing LLM id, and create_persona/resume_persona refuse a human id), so
+// "is this row human" is a complete and stable answer.
+// Gates /api/post, /api/read, and /api/me.
 function webJoined(d, roomId, name) {
+  const who = d.prepare("SELECT is_human FROM agents WHERE id = ?").get(name);
+  if (!who || who.is_human !== 1) return false;
   const m = membership(d, roomId, name);
-  if (!m || m.left_at !== null) return false;
-  const row = d
-    .prepare(
-      "SELECT left_at FROM session_presence WHERE room_id = ? AND agent_id = ? AND session_id = ?",
-    )
-    .get(roomId, name, webSession(name));
-  return !!row && row.left_at === null;
+  return !!m && m.left_at === null;
 }
 
 // { error } results become 400s; { status: ... } results become 200s.
@@ -410,24 +352,43 @@ function joinRoom(d, roomId, name) {
   const tx = d.transaction(() => {
   const room = d.prepare("SELECT id FROM rooms WHERE id = ?").get(roomId);
   if (!room) return { error: `no room ${roomId}` };
-  // Never overwrite an existing agent's type/role: identity is self-asserted,
-  // and a human deliberately resuming an agent id keeps that id's metadata.
-  d.prepare(
-    "INSERT INTO agents (id, type) VALUES (?, 'human') ON CONFLICT(id) DO NOTHING",
-  ).run(name);
+  // A human joins under a self-chosen name and carries no LLM metadata and no
+  // resume word. Create the row only if the name is free; if it is taken,
+  // REJECT unless it is already a human. Silently reusing an existing row would
+  // let a human typing a plausible name adopt an LLM persona wholesale -- its
+  // rooms, read position, and claims -- and post under it. There is no
+  // authentication here by design, so this collision check is the only thing
+  // standing between the two populations.
+  const existing = d
+    .prepare("SELECT is_human FROM agents WHERE id = ?")
+    .get(name);
+  if (existing && existing.is_human !== 1) {
+    return {
+      error: `"${name}" is an LLM persona, not a human participant; choose a different name`,
+    };
+  }
+  if (!existing) {
+    d.prepare(
+      "INSERT INTO agents (id, is_human) VALUES (?, 1) ON CONFLICT(id) DO NOTHING",
+    ).run(name);
+    // Re-read inside the same transaction: a concurrent MCP create_persona
+    // could have taken the name between the check and the insert, in which
+    // case DO NOTHING left THAT row in place and this join must still refuse.
+    const after = d
+      .prepare("SELECT is_human FROM agents WHERE id = ?")
+      .get(name);
+    if (!after || after.is_human !== 1) {
+      return {
+        error: `"${name}" was just taken by an LLM persona; choose a different name`,
+      };
+    }
+  }
   d.prepare(
     "INSERT OR IGNORE INTO memberships (room_id, agent_id) VALUES (?, ?)",
   ).run(roomId, name);
   d.prepare(
     "UPDATE memberships SET left_at = NULL, last_seen = datetime('now') WHERE room_id = ? AND agent_id = ?",
   ).run(roomId, name);
-  // Register/refresh this web participant's presence row (see webSession).
-  d.prepare(
-    `INSERT INTO session_presence (room_id, agent_id, session_id)
-     VALUES (?, ?, ?)
-     ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
-       updated_at = datetime('now'), left_at = NULL`,
-  ).run(roomId, name, webSession(name));
   const m = d
     .prepare(
       "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
@@ -478,8 +439,8 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
     // followed by a growing self tail: every post re-walks that tail. Probe
     // forward instead, stopping at the first peer. If one exists, conservatively
     // normalize no cursor here; catch_up will deliver it and repair own gaps. If
-    // none exists, `from` is a safe floor for the shared cursor and private
-    // siblings at or beyond it. One history probe, never one per sibling.
+    // none exists, `from` is a safe floor for this participant's cursor. One
+    // history probe.
     const unreadPeer = d
       .prepare(
         `SELECT 1 FROM messages
@@ -494,7 +455,8 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
       )
       .get(roomId);
     // body_len is the exact UTF-16 length (same stamp ChatStore.postMessage
-    // writes); the schema preflight guarantees both columns exist.
+    // writes). The column is NOT NULL in the current schema, so stamping it is
+    // required, not optional.
     d.prepare(
       `INSERT INTO messages (room_id, seq, agent_id, format, body, body_len, mentions, reply_to_seq, reply_to_agent)
        VALUES (?, ?, ?, 'text', ?, ?, ?, ?, ?)`,
@@ -508,21 +470,6 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
            last_seen = datetime('now')
        WHERE room_id = ? AND agent_id = ?`,
     ).run(canNormalize, from, next, roomId, name);
-    if (canNormalize === 1) {
-      d.prepare(
-        `UPDATE session_markers
-         SET last_read_seq = max(last_read_seq, ?)
-         WHERE room_id = ? AND agent_id = ? AND last_read_seq >= ?`,
-      ).run(next, roomId, name, from);
-    }
-    // Posting is active participation: re-assert this web session's presence
-    // (recreating a row the 7-day GC reaped), matching the MCP store's touch().
-    d.prepare(
-      `INSERT INTO session_presence (room_id, agent_id, session_id)
-       VALUES (?, ?, ?)
-       ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
-         updated_at = datetime('now'), left_at = NULL`,
-    ).run(roomId, name, webSession(name));
     return next;
   });
   try {
@@ -558,13 +505,6 @@ function markRead(d, roomId, name, seq) {
       `UPDATE memberships SET last_read_seq = max(last_read_seq, ?), last_seen = datetime('now')
        WHERE room_id = ? AND agent_id = ?`,
     ).run(eff, roomId, name);
-    // Keep a live web session's presence row fresh against the 7-day GC.
-    // REFRESH only (no upsert): the browser auto-marks read, and that must
-    // not resurrect a presence row for a room the participant left.
-    d.prepare(
-      `UPDATE session_presence SET updated_at = datetime('now')
-       WHERE room_id = ? AND agent_id = ? AND session_id = ? AND left_at IS NULL`,
-    ).run(roomId, name, webSession(name));
     const row = d
       .prepare(
         "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
@@ -580,8 +520,8 @@ function markRead(d, roomId, name, seq) {
 }
 
 // Full room deletion, mirroring ChatStore.deleteRoom: messages first (so the
-// FTS delete-trigger fires), then memberships, session markers/presence,
-// wait leases, claims, and the room row, in one IMMEDIATE transaction.
+// FTS delete-trigger fires), then memberships, wait leases, claims, and the
+// room row, in one IMMEDIATE transaction.
 // Unauthenticated by design, exactly like the MCP delete_room tool.
 function deleteRoomFull(d, roomId) {
   const tx = d.transaction(() => {
@@ -595,11 +535,9 @@ function deleteRoomFull(d, roomId) {
       .get(roomId);
     d.prepare("DELETE FROM messages WHERE room_id = ?").run(roomId);
     d.prepare("DELETE FROM memberships WHERE room_id = ?").run(roomId);
-    d.prepare("DELETE FROM session_markers WHERE room_id = ?").run(roomId);
-    d.prepare("DELETE FROM session_presence WHERE room_id = ?").run(roomId);
-    // v0.10 added a rooms(id) FK from wait_leases. Omitting it made a live or
-    // lingering blocking wait turn confirmed web deletion into a rolled-back
-    // FOREIGN KEY failure; the store's deleteRoom already clears this table.
+    // wait_leases carries a rooms(id) FK. Omitting it made a live or lingering
+    // blocking wait turn confirmed web deletion into a rolled-back FOREIGN KEY
+    // failure; the store's deleteRoom already clears this table.
     d.prepare("DELETE FROM wait_leases WHERE room_id = ?").run(roomId);
     d.prepare("DELETE FROM claims WHERE room_id = ?").run(roomId);
     d.prepare("DELETE FROM rooms WHERE id = ?").run(roomId);
@@ -608,39 +546,19 @@ function deleteRoomFull(d, roomId) {
   return tx.immediate();
 }
 
-// Session-aware leave, mirroring ChatStore.leaveRoom: mark THIS web session's
-// presence row left, then recompute the identity flag from the surviving live
-// rows -- present iff any session (web or MCP) is still live. Unconditionally
-// setting memberships.left_at evicted a live MCP twin running under the same
-// name. The '-7 days' liveness window matches the store's SESSION_GC_AGE.
+// Soft leave, mirroring ChatStore.leaveRoom: the membership row (and its read
+// position) survives so rejoining resumes it. No twin reconciliation is needed
+// any more -- a human name cannot be shared with an LLM persona, so the only
+// participant behind this row is this one.
 function leaveRoom(d, roomId, name) {
   const tx = d.transaction(() => {
-    const s = d
+    const info = d
       .prepare(
-        `UPDATE session_presence SET left_at = datetime('now')
-         WHERE room_id = ? AND agent_id = ? AND session_id = ? AND left_at IS NULL`,
+        `UPDATE memberships SET left_at = datetime('now'), last_seen = datetime('now')
+         WHERE room_id = ? AND agent_id = ? AND left_at IS NULL`,
       )
-      .run(roomId, name, webSession(name));
-    const live = d
-      .prepare(
-        `SELECT 1 FROM session_presence
-         WHERE room_id = ? AND agent_id = ? AND left_at IS NULL
-           AND updated_at >= datetime('now', '-7 days') LIMIT 1`,
-      )
-      .get(roomId, name);
-    // `left` matches the store's semantics: true iff THIS session went
-    // present -> left (or, with no presence rows at all, the identity did).
-    let left = s.changes > 0;
-    if (!live) {
-      const info = d
-        .prepare(
-          `UPDATE memberships SET left_at = datetime('now'), last_seen = datetime('now')
-           WHERE room_id = ? AND agent_id = ? AND left_at IS NULL`,
-        )
-        .run(roomId, name);
-      left = left || info.changes > 0;
-    }
-    return { left, room_id: roomId };
+      .run(roomId, name);
+    return { left: info.changes > 0, room_id: roomId };
   });
   try {
     return tx.immediate();
@@ -950,9 +868,8 @@ const server = createServer(async (req, res) => {
         return sendJson(res, 400, { error: "room (id) and name are required" });
       const d = getDb();
       if (!d)
-        // Distinguish "database not ready" (absent file / stale schema) from a
-        // genuine not-joined: reporting joined:false on a stale schema hid the
-        // real remedy and made gap logic silently wrong.
+        // Distinguish "no database yet" from a genuine not-joined: a bare
+        // joined:false hid the real remedy and made gap logic silently wrong.
         return sendJson(res, 200, { joined: false, error: dbUnavailableError() });
       const m = d
         .prepare(

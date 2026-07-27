@@ -7,6 +7,7 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { ChatStore } from "../dist/db.js";
+import { EPOCH1, mkAgent, bindArgs, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -98,11 +99,12 @@ let store;
 let client;
 try {
   store = new ChatStore(DB);
-  const roomA = store.createRoom("order-a", null, null).id;
-  const roomB = store.createRoom("order-b", null, null).id;
-  store.upsertAgent("peer", null, null, null);
-  store.joinRoom(roomA, "peer");
-  store.joinRoom(roomB, "peer");
+  const roomA = mkRoom(store, "order-a", null, null).id;
+  const roomB = mkRoom(store, "order-b", null, null).id;
+  mkAgent(store, "peer");
+  mkAgent(store, "ordered");
+  store.joinRoom(roomA, "peer", EPOCH1, {});
+  store.joinRoom(roomB, "peer", EPOCH1, {});
 
   client = startMcp(DB);
   client.sendBatch([
@@ -120,9 +122,14 @@ try {
   await client.waitFor(1);
   client.sendBatch([{ jsonrpc: "2.0", method: "notifications/initialized" }]);
 
+  // Bind the persona before the pipelining cases: join_room now requires one,
+  // and this file is about REQUEST ORDER, not identity, so the binding is setup.
+  client.sendBatch([client.tool(9, "resume_persona", bindArgs("ordered"))]);
+  await client.waitFor(9);
+
   // One write is important: both requests reach the SDK in one input chunk.
   client.sendBatch([
-    client.tool(10, "join_room", { room: "order-a", agent_id: "ordered" }),
+    client.tool(10, "join_room", { room: "order-a" }),
     client.tool(11, "whoami", {}),
   ]);
   const [joinedReply, whoReply] = await Promise.all([
@@ -162,7 +169,7 @@ try {
   ]);
   const moved = client.data(await client.waitFor(21, 1_500));
   const joinElapsed = Date.now() - joinStarted;
-  store.postMessage(roomA, "peer", "wake-a", "text", null, null);
+  store.postMessage(roomA, "peer", "wake-a", "text", null, null, null, EPOCH1);
   const waited = client.data(await client.waitFor(20, 3_500));
   check(
     "state FIFO does not serialize a blocking wait",
@@ -196,12 +203,16 @@ try {
   const leasesAfter = raw.prepare("SELECT COUNT(*) AS c FROM wait_leases").get().c;
   raw.close();
   const markerAfter = store.getMembership(roomB, "ordered").last_read_seq;
-  const peerPost = store.postMessage(roomB, "peer", "after-eof", "text", null, null);
+  const peerPost = store.postMessage(roomB, "peer", "after-eof", "text", null, null, null, EPOCH1);
   check("EOF test established an active wait lease", leases > 0, leases);
   check(
     "EOF aborts waits, removes leases, and preserves the unread peer post",
     exitCode === 0 && leasesAfter === 0 && markerAfter === markerBefore &&
-      markerAfter < peerPost.seq && store.unreadProbe(roomB, "ordered", null) === 1,
+      // The probe is epoch-fenced now, and "ordered" is at epoch 2: the MCP
+      // runtime resumed it at line 127. Passing EPOCH1 here would raise
+      // persona_lost, which is the fence working, not the unread state.
+      markerAfter < peerPost.seq &&
+      store.unreadProbe(roomB, "ordered", store.currentEpoch("ordered")) === 1,
     { exitCode, leasesAfter, markerBefore, markerAfter, peerSeq: peerPost.seq },
   );
 } catch (error) {

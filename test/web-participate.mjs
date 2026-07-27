@@ -10,6 +10,7 @@ import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import { ChatStore } from "../dist/db.js";
+import { EPOCH1, mkAgent, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
@@ -34,17 +35,42 @@ check(
   null,
 );
 
+// Three fallbacks the viewer must NOT carry. Each existed for a state the
+// current schema or the supported runtime says cannot occur, and each one hid
+// the impossible case instead of showing it. Source contracts because these are
+// absences, and an absence is exactly what an endpoint test cannot observe.
+check(
+  "membership mutations serialize on Web Locks with no same-tab-only fallback",
+  /function withMembershipLock\(fn\) \{\s*return navigator\.locks\.request\("agent-chat\.membership", fn\);\s*\}/.test(
+    viewerSource,
+  ) && !viewerSource.includes("membershipChain"),
+  null,
+);
+check(
+  "directedness reads the stored reply author only, with no parent-row fallback",
+  /function directedAtMe\(m\) \{[\s\S]{0,400}?return m\.reply_to_agent === me;\s*\}/.test(
+    viewerSource,
+  ),
+  null,
+);
+check(
+  "an LLM label is its model, with no brand-or-id substitution",
+  /return m\.is_human \? m\.from : m\.model;/.test(viewerSource) &&
+    !viewerSource.includes("m.model || m.brand"),
+  null,
+);
+
 const dir = mkdtempSync(join(tmpdir(), "aichat-web-"));
 const DB = join(dir, "web.db");
 
 // Seed: one room, one agent with two messages so seq starts at 3 for the web user.
 {
   const s = new ChatStore(DB);
-  s.createRoom("r", null, null);
-  s.upsertAgent("bot", "claude", null, null);
-  s.joinRoom(1, "bot");
-  s.postMessage(1, "bot", "first", "text", null, null);
-  s.postMessage(1, "bot", "second", "text", null, null, null, null, {
+  mkRoom(s, "r", null, null);
+  mkAgent(s, "bot");
+  s.joinRoom(1, "bot", EPOCH1, {});
+  s.postMessage(1, "bot", "first", "text", null, null, null, EPOCH1);
+  s.postMessage(1, "bot", "second", "text", null, null, null, EPOCH1, {
     priority: true,
   });
   s.close();
@@ -140,12 +166,13 @@ try {
   const lonePost = await post("/api/post", { room: 1, name: "alex", body: "x\ud800y" });
   check("web rejects a lone-surrogate body", lonePost.status === 400 && /surrogate/.test(lonePost.data.error), lonePost);
 
-  // the message reads back with human type, parsed mentions, reply ref
+  // the message reads back flagged as human, with parsed mentions and reply ref
   const list = await (await fetch(`${base}/api/messages?room=1`)).json();
   const msg = list.messages.find((m) => m.seq === 3);
   check(
-    "message readable with type/mentions/reply",
-    msg && msg.from === "alex" && msg.type === "human" &&
+    "message readable with is_human/mentions/reply",
+    msg && msg.from === "alex" && msg.is_human === 1 &&
+      msg.brand === null && msg.model === null &&
       Array.isArray(msg.mentions) && msg.mentions[0] === "bot" && msg.reply_to_seq === 1,
     msg,
   );
@@ -164,7 +191,7 @@ try {
   // interop: the agent's catch_up sees the web post as a directed message
   {
     const s = new ChatStore(DB);
-    const got = s.catchUp(1, "bot", 50);
+    const got = s.catchUp(1, "bot", 50, undefined, 100000, EPOCH1);
     const m = got.messages.find((x) => x.seq === 3);
     check(
       "agent catch_up receives the web post with its mention",
@@ -246,8 +273,8 @@ try {
   // supersession annotations surface in the viewer API
   {
     const s = new ChatStore(DB);
-    const wrong = s.postMessage(1, "bot", "wrong figure", "text", null, null).seq;
-    s.postMessage(1, "bot", "corrected figure", "text", null, null, wrong);
+    const wrong = s.postMessage(1, "bot", "wrong figure", "text", null, null, null, EPOCH1).seq;
+    s.postMessage(1, "bot", "corrected figure", "text", null, null, wrong, EPOCH1);
     s.close();
     const list = await (await fetch(`${base}/api/messages?room=1`)).json();
     const old = list.messages.find((m) => m.seq === wrong);
@@ -282,10 +309,10 @@ try {
   // full room deletion cascades to every related table
   {
     const s = new ChatStore(DB);
-    const rid = s.createRoom("waiting-doomed", null, null).id;
-    s.upsertAgent("waiter", null, null, null);
-    s.joinRoom(rid, "waiter", null, "WAIT-PRESENCE");
-    s.beginWaitLease(rid, "waiter", "WAIT-CALL", 300);
+    const rid = mkRoom(s, "waiting-doomed", null, null).id;
+    mkAgent(s, "waiter");
+    s.joinRoom(rid, "waiter", EPOCH1, {});
+    s.beginWaitLease(rid, "waiter", EPOCH1, 300);
     s.close();
 
     const del = await post("/api/delete-room", { room: rid, confirm: true });
@@ -304,11 +331,11 @@ try {
 
   {
     const s = new ChatStore(DB);
-    const rid = s.createRoom("doomed", null, null).id;
-    s.upsertAgent("ghost", null, null, null);
-    s.joinRoom(rid, "ghost", "SX"); // membership + session marker
-    s.postMessage(rid, "ghost", "to be erased", "text", null, null);
-    s.claimResource(rid, "file:x", "ghost", 900, null);
+    const rid = mkRoom(s, "doomed", null, null).id;
+    mkAgent(s, "ghost");
+    s.joinRoom(rid, "ghost", EPOCH1, {});
+    s.postMessage(rid, "ghost", "to be erased", "text", null, null, null, EPOCH1);
+    s.claimResource(rid, "file:x", "ghost", EPOCH1, 900, null);
     s.close();
 
     const noConfirm = await post("/api/delete-room", { room: rid, confirm: false });
@@ -324,11 +351,11 @@ try {
       room: raw.prepare("SELECT COUNT(*) AS c FROM rooms WHERE id = ?").get(rid).c,
       msgs: raw.prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = ?").get(rid).c,
       members: raw.prepare("SELECT COUNT(*) AS c FROM memberships WHERE room_id = ?").get(rid).c,
-      markers: raw.prepare("SELECT COUNT(*) AS c FROM session_markers WHERE room_id = ?").get(rid).c,
+      leases: raw.prepare("SELECT COUNT(*) AS c FROM wait_leases WHERE room_id = ?").get(rid).c,
       claims: raw.prepare("SELECT COUNT(*) AS c FROM claims WHERE room_id = ?").get(rid).c,
     };
     raw.close();
-    check("messages/memberships/markers/claims/room all cascaded", Object.values(remains).every((v) => v === 0), remains);
+    check("messages/memberships/leases/claims/room all cascaded", Object.values(remains).every((v) => v === 0), remains);
     const missing = await post("/api/delete-room", { room: rid, confirm: true });
     check("deleting a missing room is a 400", missing.status === 400, missing);
   }
@@ -403,7 +430,7 @@ try {
     // Body cap: a >100k body arrives cut with an honest flag.
     {
       const s = new ChatStore(DB);
-      s.postMessage(1, "bot", "capped " + "y".repeat(150_000), "text", null, null);
+      s.postMessage(1, "bot", "capped " + "y".repeat(150_000), "text", null, null, null, EPOCH1);
       s.close();
       const r = await fetch(base + "/api/messages?room=1");
       const data = await r.json();
@@ -431,53 +458,44 @@ try {
     }
   }
 
-  // web joins register a presence row, so a web participant sharing a name
-  // with MCP sessions is never evicted by the presence recompute (v0.8.3)
+  // Humans and LLM personas can no longer SHARE a name, which is what the old
+  // twin-eviction machinery existed to survive. The two populations are now
+  // disjoint by construction, and the web enforces that on the way in.
   {
     const s = new ChatStore(DB);
-    const rid = s.createRoom("shared-name", null, null).id;
+    const rid = mkRoom(s, "shared-name", null, null).id;
+    mkAgent(s, "pat-llm");
     s.close();
+    // A human name that collides with an LLM persona is refused outright.
+    const collide = await post("/api/join", { room: rid, name: "pat-llm" });
+    check(
+      "a human web join cannot adopt an LLM persona id",
+      collide.status === 400 && /LLM persona/.test(collide.data.error || ""),
+      collide,
+    );
+    // A free name works, and the human's own lifecycle is unaffected.
     const wj = await post("/api/join", { room: rid, name: "pat" });
-    // An MCP session joins and leaves under the SAME name; the recompute must
-    // see the web participant's live presence row and keep the membership.
+    check("a human joins under a free name", wj.status === 200, wj);
+    const posted = await post("/api/post", { room: rid, name: "pat", body: "hello" });
+    check("the human can post", posted.status === 200, posted);
+    const wl = await post("/api/leave", { room: rid, name: "pat" });
     const s2 = new ChatStore(DB);
-    s2.joinRoom(rid, "pat", null, "MCPNONCE");
-    s2.leaveRoom(rid, "pat", "MCPNONCE");
     const m = s2.getMembership(rid, "pat");
     s2.close();
     check(
-      "MCP twin leave does not evict the web participant",
-      wj.status === 200 && m.left_at === null,
-      m,
+      "a human leave marks the membership left",
+      wl.status === 200 && wl.data.left === true && m.left_at !== null,
+      { wl: wl.data, m },
     );
-    const still = await post("/api/post", { room: rid, name: "pat", body: "still here" });
-    check("web participant can still post after the twin left", still.status === 200, still);
-    // The inverse: a web leave with a live MCP twin must not evict the twin.
+    // Rejoining resumes the same membership row, not a fresh one.
+    const rejoin = await post("/api/join", { room: rid, name: "pat" });
     const s3 = new ChatStore(DB);
-    s3.joinRoom(rid, "pat", null, "MCPNONCE2");
+    const m2 = s3.getMembership(rid, "pat");
     s3.close();
-    const wl = await post("/api/leave", { room: rid, name: "pat" });
-    const s4 = new ChatStore(DB);
-    const m2 = s4.getMembership(rid, "pat");
-    s4.close();
     check(
-      "web leave with a live MCP twin keeps the identity present",
-      wl.status === 200 && wl.data.left === true && m2.left_at === null,
-      { wl: wl.data, m2 },
-    );
-    // With no live sessions anywhere, a web leave marks the membership left.
-    const s5 = new ChatStore(DB);
-    s5.leaveRoom(rid, "pat", "MCPNONCE2");
-    s5.close();
-    const rejoinW = await post("/api/join", { room: rid, name: "pat" });
-    const wl2 = await post("/api/leave", { room: rid, name: "pat" });
-    const s6 = new ChatStore(DB);
-    const m3 = s6.getMembership(rid, "pat");
-    s6.close();
-    check(
-      "web leave with no live twins marks the membership left",
-      rejoinW.status === 200 && wl2.data.left === true && m3.left_at !== null,
-      { wl2: wl2.data, m3 },
+      "a human rejoin resumes the membership and its read position",
+      rejoin.status === 200 && m2.left_at === null && m2.last_read_seq === m.last_read_seq,
+      { rejoin: rejoin.data, m2 },
     );
   }
 
@@ -500,26 +518,39 @@ try {
     );
   }
 
-  // web gating requires a LIVE web presence row (v0.8.4): an MCP-only
-  // identity cannot act through the web API without a web join, and a left
-  // web session cannot post or advance the durable read marker even while an
-  // MCP twin keeps the membership present.
+  // Web gating: acting through the web API requires a web JOIN. An LLM persona
+  // is not reachable through it at all (a human cannot name it), and a human who
+  // has left cannot post or advance the durable read marker until it rejoins.
   {
     const s = new ChatStore(DB);
-    const rid = s.createRoom("gating", null, null).id;
-    s.joinRoom(rid, "bot"); // MCP-style membership, no web presence row
+    const rid = mkRoom(s, "gating", null, null).id;
+    mkAgent(s, "gate-bot");
+    s.joinRoom(rid, "gate-bot", EPOCH1, {}); // an LLM persona, joined via MCP
     s.close();
-    const meBot = await (await fetch(`${base}/api/me?room=${rid}&name=bot`)).json();
-    const postBot = await post("/api/post", { room: rid, name: "bot", body: "via web" });
-    const readBot = await post("/api/read", { room: rid, name: "bot", seq: 1 });
-    check("MCP-only identity is not web-joined", meBot.joined === false, meBot);
-    check("MCP-only identity cannot post via the web API", postBot.status === 400, postBot);
-    check("MCP-only identity cannot mark read via the web API", readBot.status === 400, readBot);
+    const meBot = await (await fetch(`${base}/api/me?room=${rid}&name=gate-bot`)).json();
+    const postBot = await post("/api/post", { room: rid, name: "gate-bot", body: "via web" });
+    const readBot = await post("/api/read", { room: rid, name: "gate-bot", seq: 1 });
+    // /api/me answers for the WEB seat, not for the room. The persona genuinely
+    // has a membership (it joined over MCP), so a membership-shaped answer would
+    // say joined:true and let the client believe it may act. It must say false,
+    // and the join that would make it true must be refused.
+    check(
+      "/api/me reports an LLM persona as NOT web-joined despite its membership",
+      meBot.joined === false,
+      meBot,
+    );
+    check(
+      "an LLM persona cannot be web-joined",
+      (await post("/api/join", { room: rid, name: "gate-bot" })).status === 400,
+      meBot,
+    );
+    check("posting as an LLM persona through the web is refused", postBot.status === 400, postBot);
+    check("marking read as an LLM persona through the web is refused", readBot.status === 400, readBot);
 
+    // A human who left cannot act until it rejoins.
     await post("/api/join", { room: rid, name: "meg" });
     const s2 = new ChatStore(DB);
-    s2.joinRoom(rid, "meg", null, "TWIN"); // live MCP twin, same name
-    s2.postMessage(rid, "bot", "unseen", "text", null, null);
+    s2.postMessage(rid, "gate-bot", "unseen", "text", null, null, null, EPOCH1);
     s2.close();
     await post("/api/leave", { room: rid, name: "meg" });
     const meMeg = await (await fetch(`${base}/api/me?room=${rid}&name=meg`)).json();
@@ -528,22 +559,13 @@ try {
     const s3 = new ChatStore(DB);
     const megRow = s3.getMembership(rid, "meg");
     s3.close();
+    check("a left web session reports not joined", meMeg.joined === false, meMeg);
+    check("a left web session cannot post", postMeg.status === 400, postMeg);
     check(
-      "left web session reports not joined despite a live MCP twin",
-      meMeg.joined === false,
-      meMeg,
-    );
-    check(
-      "left web session cannot post (no presence resurrection)",
-      postMeg.status === 400,
-      postMeg,
-    );
-    check(
-      "left web session cannot advance the durable marker",
+      "a left web session cannot advance the durable marker",
       readMeg.status === 400 && megRow.last_read_seq === 0,
       { status: readMeg.status, marker: megRow.last_read_seq },
     );
-    check("the MCP twin is still present after the web leave", megRow.left_at === null, megRow);
   }
 } finally {
   child.kill();

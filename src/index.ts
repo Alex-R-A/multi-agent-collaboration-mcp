@@ -9,7 +9,7 @@ import type {
   ServerResult,
 } from "@modelcontextprotocol/sdk/types.js";
 import type { RequestHandlerExtra } from "@modelcontextprotocol/sdk/shared/protocol.js";
-import { randomUUID } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { createRequire } from "node:module";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -17,7 +17,10 @@ import { readFileSync } from "node:fs";
 import { z } from "zod";
 import {
   ChatStore,
+  ModelTupleMismatchError,
+  PersonaLostError,
   DEFAULT_MAX_BYTES,
+  MAX_AGENT_ID_CHARS,
   MAX_CLIENT_MESSAGE_ID_CHARS,
   MAX_CROSSED_PREVIEW_CHARS,
   MAX_MESSAGE_BODY_BYTES,
@@ -63,23 +66,32 @@ function pollerCmd(
   opts: {
     room?: string;
     mentionsOnly?: boolean;
-    session?: string;
+    epoch?: number;
     timeoutSec?: number;
     intervalSec?: number;
   } = {},
 ): string {
   let cmd = `${POLLER_COMMAND.map(shq).join(" ")} --agent ${shq(agentId)}`;
-  // Generated commands belong to this MCP session. If the client reconnects
-  // and this server exits, its old session-nonce watcher retires within five
-  // seconds instead of accumulating until a long timeout. Direct CLI commands
-  // can omit --owner-pid when independent lifetime is intentional.
+  // Generated commands belong to this MCP runtime. If the client reconnects
+  // and this server exits, the watcher retires within five seconds instead of
+  // accumulating until a long timeout. Direct CLI commands can omit
+  // --owner-pid when independent lifetime is intentional.
+  //
+  // --owner-pid together with --epoch is also what marks a watcher as GENERATED
+  // rather than hand-run, and only a generated watcher refreshes last_seen.
   cmd += ` --owner-pid ${shq(String(process.pid))}`;
   if (opts.room !== undefined) cmd += ` --room ${shq(opts.room)}`;
-  // Both scoped and all-room watches resolve this session's CURRENT cursor on
-  // every probe. Never bake a point-in-time --since value into a restartable
-  // command: once crossed, that stale baseline fires forever.
-  if (opts.session !== undefined) {
-    cmd += ` --session ${shq(opts.session)}`;
+  // Bind the watcher to the epoch that was current when it was generated. This
+  // is a SECOND, independent retirement condition, not a restatement of
+  // --owner-pid: the runtime that armed the watcher can stay alive and still
+  // lose the persona to a later resume, and from that moment the command speaks
+  // for a runtime that no longer holds it. The epoch is what lets the watcher
+  // notice and exit instead of reporting traffic to a seat nobody is sitting
+  // in. Every probe still resolves the CURRENT read cursor:
+  // never bake a point-in-time --since baseline into a restartable command,
+  // because once crossed it fires forever.
+  if (opts.epoch !== undefined) {
+    cmd += ` --epoch ${shq(String(opts.epoch))}`;
   }
   // Baked-in loop knobs, so callers stop hand-editing the command string
   // (the historical -32602 friction: the values LOOK like tool params).
@@ -91,7 +103,7 @@ function pollerCmd(
   }
   // Generated commands treat an expected quiet deadline as successful
   // completion. `has_updates` in stdout distinguishes timeout from a hit;
-  // direct legacy CLI invocations without this flag retain exit 124.
+  // direct CLI invocations without this flag retain exit 124.
   cmd += ` --ok-on-timeout`;
   if (opts.mentionsOnly) cmd += ` --mentions-only`;
   return cmd;
@@ -119,11 +131,11 @@ function configuredWaitCapSeconds(): number {
   return value;
 }
 const WAIT_CAP_SECONDS = configuredWaitCapSeconds();
-// Validate process-level configuration before opening or migrating the shared
+// Validate process-level configuration before opening the shared
 // database. A typo must fail without mutating production state first.
 const store = new ChatStore();
 
-const INSTRUCTIONS = `Agent Chat is a local SQLite ledger. Start list_rooms -> join_room -> catch_up. catch_up advances one room; my_mentions peeks across rooms. priority_only is explicitly lossy. For out-of-turn watching, wait_for_messages returns the background poller command. server_info holds routing/shared budgets; each tool schema states its cap.`;
+const INSTRUCTIONS = `Agent Chat is a local SQLite ledger. Start create_persona (first time; SAVE the returned resume_word) or resume_persona -> list_rooms -> join_room -> catch_up. One runtime holds one persona; the latest valid resume takes it over and fences the old runtime, whose next write returns persona_lost. catch_up advances one room; my_mentions peeks across rooms. priority_only is explicitly lossy. For out-of-turn watching, wait_for_messages returns the background poller command. server_info holds routing/shared budgets; each tool schema states its cap.`;
 
 // The layered operating manual, served by server_info: stable reference
 // detail that would otherwise bloat every tools/list. Tool descriptions keep
@@ -138,7 +150,8 @@ ROUTING
 IN-CALL WAIT
 - catch_up wait_seconds (0..${WAIT_CAP_SECONDS} effective max) blocks that one call until a message from another agent lands in the target room, then returns it and advances. The safe default max is 25s; an operator may set AGENT_CHAT_MAX_WAIT_SECONDS up to 120 only after measuring end-to-end behavior on that host. wait_seconds bounds the polling deadline, not total RPC wall time: SQLite contention, lease cleanup, and serialization can add several bounded busy-timeout windows. On timeout: timed_out:true, call_again:true, rooms_with_unread. Normal hit/timeout responses carry waited_ms; cancellation/deletion errors may not.
 - The best-effort watching lease expires wait_seconds+5s after it begins. Raising the cap therefore also lengthens the maximum stale watching:true window after a hard-killed host; this is part of the operator opt-in.
-- While your wait is open and its lease write succeeds, peers see watching:true for you (list_agents, post_message recipients): evidence that a blocking call was open, not a delivery guarantee. It drops on normal return/cancellation; TTL bounds a hard-kill ghost. A detached poller never produces it.
+- While your wait is open and its lease write succeeds, peers see watching:true for you (list_agents, post_message recipients): evidence that a blocking call was open, not a delivery guarantee. It drops on normal return/cancellation; TTL bounds a hard-kill ghost. A detached poller never produces it -- an armed watcher refreshes last_seen only, which is the weaker signal.
+- A wait is fenced: every 500ms probe re-reads your epoch, so a takeover ends the wait with terminal persona_lost within one probe rather than at the deadline.
 - The wait holds your turn open, so it fits "I am waiting for a reply and have nothing else to do". To be notified while doing other work, or for watches longer than the cap, use the background poller.
 
 SIZE AND PAGING
@@ -149,56 +162,60 @@ POSTING
 - crossed counts ALL unread from others past your marker at post time (old backlog included, not only mid-composition arrivals); crossed_directed says how many are aimed at you; crossed_range gives the seq span. If crossed > 0, catch_up before acting on replies. crossed_preview_chars opts into bounded previews of the crossed messages in the same response.
 - Dispositive posts (verdicts, commissions, dispositions): if_last_read_seq is a conditional post -- rejected (posted:false) if ANYTHING from others landed past your token, with bounded crossed previews returned; call catch_up for the complete delta before retrying. If pruning removed evidence after the token, it rejects conservatively with rejected:evidence_pruned and no invented previews. A token ahead of the target room's effective cursor is invalid and fails before posting. client_message_id makes an exact lost-response retry return the original seq instead of inserting twice; its guarantee lasts while that message is retained. Repeat the same explicit room or expected_room on retry so active-room drift cannot create a post in another room; a deduplicated response does not replay the original crossed/recipient snapshot, so catch_up for current state. room: posts to a named joined room without switching the active room; expected_room asserts which room is active. Never use the CAS on routine traffic: crossing is normal, the CAS is for posts whose validity depends on having read everything.
 - recipients reports factual room-local state: status, idle_seconds, last_read_seq, marker_behind. A new unread tag normally adds one to marker_behind. delivery_warnings is definitive for never-joined/left recipients; a long-idle warning is emitted only for pre-existing lag and states observed facts, never a responsiveness prediction.
+- status/idle_seconds/last_seen measure LISTENER recency: an MCP call from the bound runtime, or the two-minute heartbeat of a watcher it armed. active therefore means a runtime is reachable, not that the model is reading, reasoning, or able to wake, and an armed seat stays active no matter how long its model has been silent. The absence of a long-idle warning is not evidence anyone is listening; watching:true (an open blocking call) is the stronger claim.
 - supersedes_seq corrects YOUR OWN earlier message; readers see superseded_by on it. reply_to_seq threads; the log stays flat and globally ordered.
 - priority:true marks an immutable high-signal checkpoint for priority-only catch-up. Use it sparingly; correct a priority post with a new priority post + supersedes_seq rather than mutating history.
 - claim/release_claim: atomic single-winner advisory locks with TTL expiry (a crashed holder cannot block forever). Claims are mutual exclusion between live writers; they do not verify content.
 
-MULTIPLE SESSIONS, ONE IDENTITY
-- The default shared cursor splits the backlog across concurrent sessions (work-queue style). join_room cursor:'private' gives THIS session an independent read position. The poller command carries --session and resolves that session's current cursor on each probe; it never freezes a --since baseline.
+PERSONAS AND RUNTIMES
+- A PERSONA is the durable identity: its brand/model/version, rooms, read positions, room-local roles, and claims. A RUNTIME is one MCP server process. One runtime holds one persona, and a persona has one runtime at a time.
+- create_persona mints a persona and returns its id and resume_word. MCP returns the word ONCE and never again; it is the only way a later runtime can take the persona back. Losing it costs RESUMING that persona (its memberships, read markers, roles, claims), not access to any room's history. It exists to stop an operator pasting a wrong id from adopting someone else's persona -- it is not authentication, and it is stored in the database in plain text.
+- resume_persona binds an existing persona to this runtime and increments its runtime_epoch. The LATEST valid resume wins: any older runtime is fenced out at once, its background watchers exit, and its next write or advancing read fails with persona_lost (terminal -- retrying cannot help). Re-resuming from the runtime that already holds the persona is a no-op.
+- Every persona-authored write and every marker-advancing read re-verifies the runtime's epoch inside its own transaction, so a fenced-out runtime cannot commit anything.
+- Non-advancing reads (whoami, list_agents, my_mentions, read_history, get_message, get_thread, search_messages, list_claims) still return their normal data and DISCLOSE the loss instead of failing: the response carries persona_lost:true, your_epoch, and current_epoch at top level, the same three fields the persona_lost error uses. current_epoch:null means the persona row is gone. Reads keep working on purpose -- a fenced-out runtime needs to see what happened -- but nothing it reads can be written back until it resumes.
+- The poller command carries --epoch. A watcher whose epoch has moved on exits 2 with stale_binding instead of reporting traffic to a seat nobody is sitting in; resume_persona hands back a fresh command. Every probe resolves the CURRENT read cursor and never freezes a --since baseline.
+- brand/model/version are IMMUTABLE and describe what is actually running. Before resuming, check them against the model you actually are right now. If your provider, model, or version has changed, do NOT resume the old persona: create_persona with your real tuple, join the rooms the old persona was in, and tell them the seat changed model and has a new id. Resuming a tuple that no longer describes you posts under a false identifier, and peers read brand/model/version as who is speaking. A correct resume word with a changed tuple is refused with code new_persona_required and lists those rooms; a wrong word is a separate rejection.
+- Roles are ROOM-LOCAL: set one on join_room or change/clear it with set_role. They are not stamped into message envelopes, because a role can change after a message was written.
 
 BACKGROUND POLLER
-- Run the command join_room/wait_for_messages return as a BACKGROUND task. One Node process holds one SQLite connection and runs one indexed LIMIT 1 probe after each sleep; it launches no children. Generated commands exit 0 for either a hit or quiet deadline: parse stdout has_updates true/false. Direct CLI calls without --ok-on-timeout retain exit 124 on timeout. Exit 2 is an error or equivalent watcher. Options: --interval <sec> (minimum/default 5), --timeout <sec> (default 1200, finite), --ok-on-timeout, --mentions-only, --room <id|name>. Your own posts never wake it.
+- Run the command join_room/resume_persona/wait_for_messages return as a BACKGROUND task. One Node process holds one SQLite connection and runs one indexed LIMIT 1 probe after each sleep; it launches no children. Generated commands exit 0 for either a hit or quiet deadline: parse stdout has_updates true/false. Direct CLI calls without --ok-on-timeout retain exit 124 on timeout. Exit 2 is an error or equivalent watcher. Options: --interval <sec> (minimum/default 5), --timeout <sec> (default 1200, finite), --ok-on-timeout, --mentions-only, --room <id|name>, --epoch <n>. Your own posts never wake it. Exit 2 with stale_binding means the persona was resumed elsewhere and this watcher is dead: do not re-arm it, resume_persona and use the command it returns.
 - The poller is an OS-level detector: its exit does NOT by itself schedule your next turn. Whether you are actually woken depends on your harness's background-task contract; do not report "watcher active" as evidence you will see a message.
 
 RETENTION
 - prune_messages deletes old messages (refuses while any non-author member has them unread; force overrides). A room seq you cite in a document is durable only as long as nobody prunes past it.`;
 
-// One stdio server process serves one agent. We remember its identity and
-// active room for the session so the agent need not repeat them on every call.
+// One stdio server process is ONE RUNTIME, and a runtime holds at most one
+// persona. The binding lives here, in process memory, and is deliberately not
+// persisted: durability across a restart is the resume word's job, and a second
+// persisted holder token would be a second source of truth about who holds the
+// persona. `epoch` is the value captured when this runtime bound; every write
+// re-verifies it against the stored one inside the write's own transaction.
 const session: {
   agentId: string | null;
+  epoch: number | null;
   roomId: number | null;
-  // Cursor mode is PER (ROOM, IDENTITY), not per room: a session can switch
-  // identities, and a room-only key let identity B's shared join silently
-  // clear identity A's private mode -- A's next omitted-cursor rejoin then
-  // deleted A's private cursor row and jumped it to the identity marker,
-  // making its unread backlog unrecoverable.
-  privateRooms: Set<string>;
 } = {
   agentId: null,
+  epoch: null,
   roomId: null,
-  privateRooms: new Set(),
 };
 
-/** Key for the per-(room, identity) private-cursor mode set. \u0000 cannot
+/** Stable key for a (room, identity) pair in process-local maps. \u0000 cannot
  *  appear in an agent id (control chars are rejected), so keys never collide. */
-function privKey(roomId: number, agentId: string): string {
+function roomKey(roomId: number, agentId: string): string {
   return `${roomId}\u0000${agentId}`;
 }
 
-// Distinguishes this process's private read cursor (join_room cursor:'private')
-// from other sessions running under the same agent_id.
-const SESSION_NONCE = randomUUID();
-
-/** The session-cursor key for ACTIVE-room store calls: the nonce when the
- *  active room was joined with a private cursor UNDER THE CURRENT IDENTITY,
- *  else null. */
-function cursorId(): string | null {
-  return session.roomId !== null &&
-    session.agentId !== null &&
-    session.privateRooms.has(privKey(session.roomId, session.agentId))
-    ? SESSION_NONCE
-    : null;
+/** The bound persona, or a clean "bind first" error. Every persona-scoped tool
+ *  goes through this or requireActive(). */
+function requirePersona(): { agentId: string; epoch: number } {
+  if (session.agentId === null || session.epoch === null) {
+    throw new Error(
+      "no persona bound to this runtime; call create_persona for a new one, " +
+        "or resume_persona with an existing id, resume word, and brand/model/version",
+    );
+  }
+  return { agentId: session.agentId, epoch: session.epoch };
 }
 
 type ToolResult = {
@@ -219,6 +236,130 @@ function fail(message: string): ToolResult {
   };
 }
 
+/**
+ * Render an error, tagging the one class callers must treat as TERMINAL.
+ *
+ * persona_lost is not a retryable failure: another runtime holds the persona
+ * now, and every future call under this binding fails the same way. The tag
+ * exists so a caller can distinguish it from a transient DB error without
+ * matching on message text, and `terminal:true` says explicitly not to loop.
+ * The binding is cleared here as well: continuing to hold a dead epoch would
+ * make every later call re-derive the same answer more slowly.
+ */
+function failFrom(e: unknown): ToolResult {
+  if (e instanceof PersonaLostError) {
+    // Clear ONLY the binding that actually died: same persona AND same epoch.
+    // Matching on the id alone let a late error from a superseded epoch wipe a
+    // binding this runtime had already re-established. That happens whenever a
+    // slow call started before a resume_persona lands after it -- the runtime
+    // holds a live epoch, and the stale error tore it down, forcing a
+    // pointless second resume.
+    if (session.agentId === e.agentId && session.epoch === e.expectedEpoch) {
+      session.agentId = null;
+      session.epoch = null;
+      session.roomId = null;
+    }
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              error: e.message,
+              code: "persona_lost",
+              terminal: true,
+              agent_id: e.agentId,
+              your_epoch: e.expectedEpoch,
+              current_epoch: e.currentEpoch,
+              recover:
+                "resume_persona with the id, resume word, and brand/model/version " +
+                "to take it back, or create_persona for a new identity",
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+  if (e instanceof ModelTupleMismatchError) {
+    // A DISTINCT code from a wrong word, because the remedy is distinct. A
+    // wrong word means "find the word"; this means "you are not that
+    // participant any more". Rendering both as a generic rejection sent an
+    // agent whose model had been upgraded hunting for a credential that was
+    // never the problem.
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(
+            {
+              error: e.message,
+              code: "new_persona_required",
+              agent_id: e.agentId,
+              persona_model: e.stored,
+              your_model: e.offered,
+              // The caller has no binding, so it cannot look these up itself.
+              // Guidance to notify rooms it cannot name is not guidance.
+              persona_rooms: e.rooms,
+              recover:
+                "call create_persona with your ACTUAL brand/model/version, " +
+                "join the rooms listed in persona_rooms, and post there that " +
+                "the seat changed model and carries a new persona id. Do NOT " +
+                "resume the old tuple: peers read brand/model/version as who " +
+                "is speaking, and it would now be wrong.",
+            },
+            null,
+            2,
+          ),
+        },
+      ],
+      isError: true,
+    };
+  }
+  return fail(asMessage(e));
+}
+
+/**
+ * Loss disclosure for a NON-advancing read.
+ *
+ * A fenced-out runtime's reads keep WORKING. Failing them would blind the
+ * operator at exactly the moment they need to see what happened, and a read
+ * carries no authority worth protecting. What such a response must not do is
+ * look ordinary, so every persona-scoped tool that advances no marker and
+ * writes nothing splices these THREE keys in at top level -- always the same
+ * three, under the same names the persona_lost ERROR already uses, so a
+ * consumer has one shape to recognize instead of a differently-buried tag per
+ * tool. Derivable-but-implicit disclosure does not reach an LLM consumer.
+ *
+ * A MISSING persona row discloses too. current_epoch:null is loss (the identity
+ * was deleted out from under this runtime and every later write will fail), not
+ * absence of news.
+ *
+ * Returns null when the binding is live, so the caller spreads nothing.
+ */
+type LossDisclosure = {
+  persona_lost: true;
+  your_epoch: number;
+  current_epoch: number | null;
+};
+
+function lossDisclosure(agentId: string, epoch: number): LossDisclosure | null {
+  const current = store.currentEpoch(agentId);
+  return current === epoch
+    ? null
+    : { persona_lost: true, your_epoch: epoch, current_epoch: current };
+}
+
+/** Serialized cost of splicing a disclosure into a response object, charged
+ *  against a byte budget exactly the way catch_up reserves its routing
+ *  metadata: merging two non-empty objects replaces `}{` with `,`. Disclosure
+ *  must not push a bounded read past the budget its caller asked for. */
+function disclosureReserve(d: LossDisclosure | null): number {
+  return d === null ? 0 : JSON.stringify(d).length - 1;
+}
+
 /** Cadence of the non-advancing unread probe during a blocking wait. */
 const WAIT_PROBE_INTERVAL_MS = 500;
 /** Bound aggregate timer/SQLite pressure when a client accidentally dispatches
@@ -228,6 +369,29 @@ let activeBlockingWaits = 0;
 /** Wait-lease TTL grace past the deadline, covering the final advancing
  *  read; a hard-killed process's lease self-expires this soon after. */
 const WAIT_LEASE_GRACE_SECONDS = 5;
+
+/**
+ * How many blocking waits THIS runtime currently has open per (room, persona,
+ * epoch).
+ *
+ * The lease row is keyed (room_id, agent_id) because one persona has one
+ * runtime and a takeover must REPLACE the row rather than sit beside it. That
+ * keying alone would let two concurrent waits from this same runtime share one
+ * row, so whichever finished first would delete it and report the other as not
+ * watching. The row means "this persona has at least one wait open here", and
+ * only this process knows how many, so the count lives here: the last waiter
+ * out closes the lease.
+ *
+ * The EPOCH is part of this key even though it is not part of the row's key.
+ * One process can hold a wait from an old epoch and a wait from a new one at
+ * the same time (resume_persona is a tool call, so it can land while an earlier
+ * wait sleeps). Sharing a counter across them makes the old wait's exit
+ * decrement the new wait's count, and the new wait then closes a lease it does
+ * not own -- or, worse, does not close its own. Separate counters keep the two
+ * tenures independent; each closes with the epoch it captured, and
+ * endWaitLease's epoch guard makes the loser's close a no-op.
+ */
+const openWaits = new Map<string, number>();
 
 /** Sleep that wakes EARLY on abort (never rejects; callers re-check
  *  signal.aborted, which is also the correct behavior for an already-aborted
@@ -255,8 +419,9 @@ function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
   });
 }
 
-function requireActive(): { agentId: string; roomId: number } {
-  if (session.agentId === null || session.roomId === null) {
+function requireActive(): { agentId: string; epoch: number; roomId: number } {
+  const { agentId, epoch } = requirePersona();
+  if (session.roomId === null) {
     throw new Error("join a room first with join_room");
   }
   // The room may have been deleted by another server process; the local session
@@ -269,7 +434,7 @@ function requireActive(): { agentId: string; roomId: number } {
       `active room ${stale} no longer exists (deleted); rejoin with join_room`,
     );
   }
-  return { agentId: session.agentId, roomId: session.roomId };
+  return { agentId, epoch, roomId: session.roomId };
 }
 
 /** Resolve an optional explicit joined room without changing the active room.
@@ -278,65 +443,64 @@ function requireActive(): { agentId: string; roomId: number } {
  * is deliberate and may be needed to inspect history or release old claims. */
 function resolveJoinedRoom(room?: string): {
   agentId: string;
+  epoch: number;
   roomId: number;
   roomName: string | null;
 } {
   if (room === undefined) {
-    const { agentId, roomId } = requireActive();
+    const { agentId, epoch, roomId } = requireActive();
     return {
       agentId,
+      epoch,
       roomId,
       roomName: store.getRoom(roomId)?.name ?? null,
     };
   }
-  if (session.agentId === null) {
-    throw new Error("join a room first with join_room to establish your identity");
-  }
+  const { agentId, epoch } = requirePersona();
   const target = store.resolveRoom(room);
   if (!target) {
     throw new Error(`no room "${room}". Use list_rooms to see options.`);
   }
-  if (!store.getMembership(target.id, session.agentId)) {
+  if (!store.getMembership(target.id, agentId)) {
     throw new Error(
       `you have never joined room "${target.name}"; join_room it first`,
     );
   }
   return {
-    agentId: session.agentId,
+    agentId,
+    epoch,
     roomId: target.id,
     roomName: target.name,
   };
 }
 
 /**
- * Mark the active agent (and its private cursor, if any) alive on tool
- * invocations. Throttled: every tool call otherwise costs a write transaction
- * on the shared file (cross-process lock contention for pure reads like
- * list_rooms). 30s granularity is far inside both consumers' tolerances: the
- * `active` liveness window is minutes and the session GC is days.
+ * Mark the bound persona alive in its active room on tool invocations.
+ * Throttled: every tool call otherwise costs a write transaction on the shared
+ * file (cross-process lock contention for pure reads like list_rooms). 30s
+ * granularity is far inside the `active` liveness window, which is minutes.
+ *
+ * EPOCH-FENCED through store.touch(), which is what keeps a fenced-out runtime
+ * from refreshing liveness: its PersonaLostError lands in the catch below and
+ * the write never happened. A stale read therefore leaves last_seen alone.
  */
 let lastTouchMs = 0;
 const TOUCH_INTERVAL_MS = 30_000;
 function touchSession(): void {
-  if (session.agentId === null) return;
+  if (session.agentId === null || session.epoch === null) return;
+  if (session.roomId === null) return;
   const now = Date.now();
   if (now - lastTouchMs < TOUCH_INTERVAL_MS) return;
   lastTouchMs = now;
-  // Always pass the nonce (not cursorId()): the ACTIVE room may be shared
-  // while this session holds private cursors in other rooms, and those rows
-  // must stay refreshed against the 7-day GC too.
   try {
-    if (session.roomId !== null) {
-      store.touch(session.roomId, session.agentId, SESSION_NONCE);
-    } else {
-      // Identity without an active room (post-leave my_mentions polling):
-      // still shield this session's cursors AND live presence rows from the GC.
-      store.touchSessionAlive(SESSION_NONCE, session.agentId);
-    }
+    store.touch(session.roomId, session.agentId, session.epoch);
   } catch {
     // Liveness is best-effort: a briefly-locked database must not fail the
     // tool call this touch piggybacks on (pure reads included). lastTouchMs
-    // already advanced, so failures back off to the next interval.
+    // already advanced, so failures back off to the next interval. A
+    // PersonaLostError lands here too and is CORRECTLY swallowed: the write it
+    // guards did not happen, which is the point, and the next real operation
+    // reports persona_lost to the caller.
   }
 }
 
@@ -344,8 +508,8 @@ function touchSession(): void {
 // session state. Throttle each captured (room, identity) independently: using
 // touchSession() in a named-room wait kept refreshing the active room instead.
 const capturedTouchMs = new Map<string, number>();
-function touchCapturedRoom(roomId: number, agentId: string): void {
-  const key = privKey(roomId, agentId);
+function touchCapturedRoom(roomId: number, agentId: string, epoch: number): void {
+  const key = roomKey(roomId, agentId);
   const now = Date.now();
   if (now - (capturedTouchMs.get(key) ?? 0) < TOUCH_INTERVAL_MS) return;
   if (!capturedTouchMs.has(key) && capturedTouchMs.size >= 1024) {
@@ -361,9 +525,9 @@ function touchCapturedRoom(roomId: number, agentId: string): void {
   }
   capturedTouchMs.set(key, now);
   try {
-    // Unlike store.touch(), this requires this exact session's presence row
-    // to remain live and therefore cannot resurrect an explicitly left room.
-    store.touchSessionRoom(roomId, agentId, SESSION_NONCE);
+    // Unlike store.touch(), this refreshes only a room whose membership is
+    // still PRESENT, so it cannot resurrect an explicitly left room.
+    store.touchJoinedRoom(roomId, agentId, epoch);
   } catch {
     // Best-effort heartbeat, matching touchSession().
   }
@@ -372,12 +536,22 @@ function touchCapturedRoom(roomId: number, agentId: string): void {
 // Build identity, stamped into dist/build-info.json by scripts/stamp-build.mjs at
 // build time so server_info pins the exact deployed binary. Reading git at runtime
 // would report the source HEAD instead, masking an edited-but-not-rebuilt dist,
-// which is precisely the skew this exists to surface. Falls back when absent.
+// which is precisely the skew this exists to surface.
+//
+// artifact_hash is part of the CURRENT stamp contract: every stamp this build
+// pipeline writes carries one. The only stamp without a hash is no stamp at
+// all, which is the unstamped-development case below.
 type BuildInfo = {
   version: string;
   commit: string;
   built_at: string;
-  artifact_hash?: string;
+  artifact_hash: string;
+};
+const DEV_BUILD: BuildInfo = {
+  version: "0.0.0-dev",
+  commit: "unknown",
+  built_at: "",
+  artifact_hash: "",
 };
 const BUILD: BuildInfo = (() => {
   try {
@@ -385,18 +559,25 @@ const BUILD: BuildInfo = (() => {
       readFileSync(new URL("./build-info.json", import.meta.url), "utf8"),
     );
   } catch {
-    return { version: "0.0.0-dev", commit: "unknown", built_at: "" };
+    // Running from an unstamped tree (tsx on src/, or dist copied without the
+    // stamp). Not a stale deployment, just an unknown one.
+    return DEV_BUILD;
   }
 })();
 
 /**
- * Re-read the on-disk build stamp and report whether a NEWER build has been
+ * Re-read the on-disk build stamp and report whether a DIFFERENT build has been
  * deployed since this process started. If so, this server is stale: the client
  * should reconnect the MCP to load the new code (a stdio server never
- * hot-reloads). Modern stamps compare an executable-artifact hash so rebuilding
- * identical code does not emit a false warning; timestamps remain the fallback
- * for old stamps. No client UI surfaces serverInfo.version, so this in-band
- * flag is the only way an agent learns it is running old code.
+ * hot-reloads). No client UI surfaces serverInfo.version, so this in-band flag
+ * is the only way an agent learns it is running old code.
+ *
+ * The comparison is HASH-ONLY. built_at exists for human diagnostics and
+ * ordering and is deliberately not consulted: a timestamp comparison called
+ * every no-change rebuild a new deployment, and a timestamp FALLBACK for
+ * hashless stamps only ever fired for stamps this pipeline no longer writes.
+ * If either side has no hash, the honest answer is "not stale", because what is
+ * actually known is that the deployment cannot be compared.
  */
 function buildStatus(): {
   stale: boolean;
@@ -414,19 +595,65 @@ function buildStatus(): {
   }
   const runningHash = BUILD.artifact_hash ?? "";
   const latestHash = latest?.artifact_hash ?? "";
-  const comparableHashes = runningHash.length > 0 && latestHash.length > 0;
-  const stale = comparableHashes
-    ? latestHash !== runningHash &&
-      latest !== null &&
-      latest.built_at > BUILD.built_at
-    : latest !== null &&
-      latest.built_at !== "" &&
-      latest.built_at > BUILD.built_at;
+  const stale =
+    runningHash.length > 0 && latestHash.length > 0 && latestHash !== runningHash;
   return {
     stale,
     latest_commit: latest?.commit ?? null,
     latest_built_at: latest?.built_at ?? null,
     latest_artifact_hash: latest?.artifact_hash ?? null,
+  };
+}
+
+/**
+ * Build identity for a WATCHER HANDOFF.
+ *
+ * A poller command is unlike every other response this server produces: the
+ * caller takes it OUT of the MCP session and runs it as a separate process
+ * against the same database, for up to a day. That process is `dist/poller.js`
+ * as it exists ON DISK at launch, not the code this server loaded at startup, so
+ * the two can be different builds -- and the handoff is the only moment where
+ * saying so costs nothing. Every response carrying a poller_cmd states which
+ * build minted it and, when a newer one is on disk, what that one is.
+ *
+ * The command is returned REGARDLESS of staleness, and nothing here fails on it.
+ * Withholding the only out-of-turn watching mechanism because a rebuild landed
+ * would trade a working watcher for a warning; the caller is told, and decides.
+ *
+ * Deliberately NOT a poller protocol version: a version number would be a second
+ * compatibility surface to maintain, and the artifact hash already answers the
+ * only question anyone can act on -- is the disk the same code I am.
+ */
+function handoffBuild(): Record<string, unknown> {
+  const status = buildStatus();
+  return {
+    server_build: {
+      version: BUILD.version,
+      commit: BUILD.commit,
+      built_at: BUILD.built_at,
+      artifact_hash: BUILD.artifact_hash,
+    },
+    server_stale: status.stale,
+    // Only when there IS a readable stamp to compare against. An absent block
+    // means "no newer build is known", which is different from "identical".
+    ...(status.latest_artifact_hash !== null
+      ? {
+          latest_build: {
+            commit: status.latest_commit,
+            built_at: status.latest_built_at,
+            artifact_hash: status.latest_artifact_hash,
+          },
+        }
+      : {}),
+    ...(status.stale
+      ? {
+          reconnect_guidance:
+            "a newer build is on disk than this server is running. The command " +
+            "above still works -- use it. Reconnect the MCP when convenient so " +
+            "the tools and the watcher come from one build (stdio servers do " +
+            "not hot-reload).",
+        }
+      : {}),
   };
 }
 
@@ -572,9 +799,12 @@ const LIMITS = {
     room_name: 200,
     room_description: 2000,
     pinned_intro: 10_000,
-    agent_id: 200,
-    agent_type: 100,
-    agent_role: 200,
+    agent_id: MAX_AGENT_ID_CHARS,
+    persona_brand: 100,
+    persona_model: 100,
+    persona_version: 100,
+    resume_word: 200,
+    room_role: 200,
     agent_description: 2000,
     claim_key: 500,
     claim_note: 2000,
@@ -589,7 +819,7 @@ server.registerTool(
     description:
       `Version ${BUILD.version}: Report this server's version/build identity, ` +
       "shared size/response budgets (`limits`), and the full operating " +
-      "manual (`manual`: routing, paging, poller, multi-session cursors). " +
+      "manual (`manual`: routing, paging, poller, personas and runtimes). " +
       "Call this once when caps or exact semantics matter. `stale:true` = a " +
       "newer build was deployed since this process started; reconnect the " +
       "MCP to load it (stdio servers do not hot-reload).",
@@ -613,7 +843,7 @@ server.registerTool(
         manual: MANUAL,
       });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -640,7 +870,7 @@ server.registerTool(
         timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
       });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -678,6 +908,7 @@ server.registerTool(
   async ({ name, description, pinned }) => {
     try {
       touchSession();
+      const { agentId, epoch } = requirePersona();
       // Room references are resolved id-first (resolveRoom), so an all-digit
       // name would be shadowed by any room with that numeric id -- and
       // delete_room resolves the same way, making the ambiguity destructive.
@@ -690,7 +921,13 @@ server.registerTool(
       if (store.getRoomByName(name)) {
         return fail(`a room named "${name}" already exists`);
       }
-      const room = store.createRoom(name, description ?? null, pinned ?? null);
+      const room = store.createRoom(
+        name,
+        description ?? null,
+        pinned ?? null,
+        agentId,
+        epoch,
+      );
       return ok({ room_id: room.id, name: room.name });
     } catch (e) {
       // Two processes can pass the pre-check together; the loser's INSERT
@@ -699,7 +936,7 @@ server.registerTool(
       if (/UNIQUE constraint failed: rooms\.name/.test(msg)) {
         return fail(`a room named "${name}" already exists`);
       }
-      return fail(msg);
+      return failFrom(e);
     }
   },
 );
@@ -750,7 +987,239 @@ server.registerTool(
         ...(size_trimmed ? { size_trimmed: true } : {}),
       });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
+    }
+  },
+);
+
+server.registerTool(
+  "create_persona",
+  {
+    title: "Create persona",
+    description:
+      "Create a NEW persona and bind it to this runtime. brand/model/version " +
+      "are immutable and identify what you are (e.g. 'anthropic'/'claude-opus'/" +
+      "'5'); the server derives the canonical id from them. Returns `agent_id` " +
+      "and `resume_word`: SAVE BOTH. The resume word is the only way a later " +
+      "runtime can take this persona back with its rooms, read positions, " +
+      "roles, and claims intact, and MCP returns it ONCE and never again. " +
+      "Losing it does not hide any room's history, which any persona can " +
+      "still read; what it costs is RESUMING this persona -- its memberships, " +
+      "read markers, roles, and claims -- so the only remedy is a new persona " +
+      "starting from scratch. If you already have an id and word, call " +
+      "resume_persona instead.",
+    inputSchema: z.object({
+      brand: z
+        .string()
+        .min(1)
+        .max(100)
+        .describe("Who makes you, e.g. 'anthropic', 'openai'"),
+      model: z
+        .string()
+        .min(1)
+        .max(100)
+        .describe("Model family, e.g. 'claude-opus', 'gpt'"),
+      version: z
+        .string()
+        .min(1)
+        .max(100)
+        .describe("Model version, e.g. '5', '4.5'"),
+      description: z
+        .string()
+        .max(2000)
+        .optional()
+        .describe("Short description of who you are / what you do"),
+    }).strict(),
+  },
+  async ({ brand, model, version, description }) => {
+    try {
+      if (session.agentId !== null) {
+        return fail(
+          `this runtime already holds persona "${session.agentId}"; one runtime ` +
+            "holds one persona. Reconnect the MCP to start a fresh runtime.",
+        );
+      }
+      const { id, resumeWord } = createPersona(
+        brand,
+        model,
+        version,
+        description ?? null,
+      );
+      // A freshly created persona is at epoch 1 by construction (the column
+      // default), and this runtime created it, so it is the holder.
+      session.agentId = id;
+      session.epoch = 1;
+      return ok({
+        agent_id: id,
+        resume_word: resumeWord,
+        brand,
+        model,
+        version,
+        // persona_description, never a bare `description`: every persona
+        // response uses one name for this string so it can never be read as
+        // the room's.
+        persona_description: description ?? null,
+        runtime_epoch: 1,
+        save_this:
+          "Store agent_id and resume_word now. resume_word is shown only here " +
+          "and cannot be recovered or reset; without it this persona's history " +
+          "is unreachable from any future runtime.",
+        next: "join_room to enter a room.",
+        server_stale: buildStatus().stale,
+      });
+    } catch (e) {
+      return failFrom(e);
+    }
+  },
+);
+
+server.registerTool(
+  "resume_persona",
+  {
+    title: "Resume persona",
+    description:
+      "Bind an EXISTING persona to this runtime, recovering its rooms, read " +
+      "positions, room-local roles, and claims. Requires the agent_id, its " +
+      "resume_word, and brand/model/version matching what it was created with. " +
+      "The latest valid resume WINS: any older runtime still holding this " +
+      "persona is fenced out immediately and its next write fails with " +
+      "persona_lost. Re-calling this from the runtime that already holds the " +
+      "persona is a no-op and does not fence anything.",
+    inputSchema: z.object({
+      agent_id: z
+        .string()
+        .min(1)
+        .max(200)
+        .describe("The persona id returned by create_persona"),
+      resume_word: z
+        .string()
+        .min(1)
+        .max(200)
+        .describe("The resume word returned by create_persona"),
+      brand: z.string().min(1).max(100).describe("Must match the persona's brand"),
+      model: z.string().min(1).max(100).describe("Must match the persona's model"),
+      version: z
+        .string()
+        .min(1)
+        .max(100)
+        .describe("Must match the persona's version"),
+    }).strict(),
+  },
+  async ({ agent_id, resume_word, brand, model, version }) => {
+    try {
+      // A runtime may not silently switch personas: binding a second one would
+      // leave the first still bound in every caller's mental model while this
+      // process quietly acted as someone else.
+      if (session.agentId !== null && session.agentId !== agent_id) {
+        return fail(
+          `this runtime already holds persona "${session.agentId}"; it cannot ` +
+            `switch to "${agent_id}". Reconnect the MCP to start a fresh runtime.`,
+        );
+      }
+      // IDEMPOTENT re-attach: this runtime already holds the persona AND its
+      // epoch is still current, so there is nothing to take over. Skipping the
+      // increment matters -- incrementing here would invalidate this runtime's
+      // OWN outstanding pollers and open waits for no reason.
+      //
+      // ONE row read decides both questions. Asking currentEpoch() and then
+      // getPersona() in separate autocommits leaves a window where a takeover
+      // lands between them, and the "still current" branch would then answer
+      // with this runtime's dead epoch while another runtime already holds the
+      // persona -- a false all-clear at the one moment the caller needed the
+      // truth. Reading epoch and credentials from the same snapshot removes the
+      // window: if the epoch on THIS row is ours, these credentials are the ones
+      // that were current when the epoch was.
+      const held =
+        session.agentId === agent_id && session.epoch !== null
+          ? store.getPersona(agent_id)
+          : undefined;
+      if (held && held.runtime_epoch === session.epoch) {
+        // Validate the credentials even though nothing is being taken over. The
+        // obvious use of this call is a holder CHECKING that the word it wrote
+        // down still works, and returning success without looking would confirm
+        // a mistranscribed word -- discovered only after a crash, when it is the
+        // one thing that cannot be recovered. Validation here never increments,
+        // so a holder can re-verify as often as it likes without fencing itself.
+        // Same split as attachPersona: the word is the credential, the tuple is
+        // identity. A holder re-verifying with a changed model must get the
+        // new_persona_required answer here too, not a credential rejection --
+        // this branch is the one a long-running runtime hits most.
+        if (held.resume_word !== resume_word) {
+          return fail(
+            `resume rejected for persona "${agent_id}": the resume word does ` +
+              `not match the one it was created with. This runtime still holds ` +
+              `the persona -- nothing was fenced -- but this word would NOT ` +
+              `recover it later.`,
+          );
+        }
+        if (
+          held.brand !== brand ||
+          held.model !== model ||
+          held.version !== version
+        ) {
+          return failFrom(
+            new ModelTupleMismatchError(
+              agent_id,
+              {
+                brand: held.brand!,
+                model: held.model!,
+                version: held.version!,
+              },
+              { brand, model, version },
+              store.presentRoomNames(agent_id),
+            ),
+          );
+        }
+        return ok({
+          agent_id,
+          runtime_epoch: session.epoch,
+          brand: held.brand,
+          model: held.model,
+          version: held.version,
+          persona_description: held.description,
+          reattached: true,
+          note:
+            "already bound to this runtime; nothing was fenced. The resume " +
+            "word and metadata were validated: they will recover this persona.",
+          poller_cmd: pollerCmd(agent_id, { epoch: session.epoch }),
+          ...handoffBuild(),
+        });
+      }
+      const { epoch, persona } = store.attachPersona({
+        id: agent_id,
+        resumeWord: resume_word,
+        brand,
+        model,
+        version,
+      });
+      const previous = session.agentId === agent_id ? session.epoch : null;
+      session.agentId = agent_id;
+      session.epoch = epoch;
+      // The active room does NOT survive a takeover: room membership is durable
+      // but "which room am I looking at" is runtime-local state this runtime
+      // never had. Rejoin explicitly.
+      session.roomId = null;
+      return ok({
+        agent_id,
+        runtime_epoch: epoch,
+        brand: persona.brand,
+        model: persona.model,
+        version: persona.version,
+        persona_description: persona.description,
+        reattached: false,
+        ...(previous !== null ? { previous_epoch: previous } : {}),
+        fenced:
+          "any runtime holding this persona at an earlier epoch is now fenced " +
+          "out; its pollers exit and its next write fails with persona_lost",
+        // Old poller commands carry the OLD epoch and will exit as stale. Hand
+        // back a live one in the same response so the caller is never left
+        // silently deaf holding a command that can no longer fire.
+        poller_cmd: pollerCmd(agent_id, { epoch }),
+        next: "join_room to enter a room; memberships and read positions are intact.",
+        ...handoffBuild(),
+      });
+    } catch (e) {
+      return failFrom(e);
     }
   },
 );
@@ -760,117 +1229,59 @@ server.registerTool(
   {
     title: "Join room",
     description:
-      "Join a room (id or name) under an identity; sets it active for the " +
-      "session. Omit agent_id to keep the session's current identity (on the " +
-      "FIRST join a generated readable id is assigned and returned; reuse it " +
-      "later to resume the same identity and read position). " +
-      "type/role/description tell other agents who you are. Read the returned " +
-      "`pinned` intro. `server_stale:true` = this server runs outdated code; " +
-      "tell the user to reconnect the MCP. `cursor` (for several sessions " +
-      "sharing one agent_id): 'shared' (default) = one marker per identity, " +
-      "concurrent sessions SPLIT the backlog (work-queue style); 'private' = " +
-      "this session keeps its own cursor (starting from the shared marker) " +
-      "and sees the full stream independently.",
+      "Join a room (id or name) and make it active for this runtime. Requires " +
+      "a bound persona (create_persona or resume_persona first). Returns your " +
+      "persona (brand/model/version, persona_description) alongside the room " +
+      "(room_name, room_description, pinned) and your room-local `role`. " +
+      "Rejoining RESUMES your read position; `cursor_start` only applies the " +
+      "first time you join a given room. `role` is ROOM-LOCAL: it describes " +
+      "what you are in this room and does not follow you to others (change or " +
+      "clear it later with set_role). Read the returned `pinned` intro. " +
+      "`server_stale:true` = this server runs outdated code; tell the user to " +
+      "reconnect the MCP.",
     inputSchema: z.object({
       room: z.string().min(1).max(500).describe("Room id or name to join"),
-      agent_id: z
-        .string()
-        .max(200)
-        .refine((s) => !/[\u0000-\u001f\u007f]/.test(s), {
-          message: "control characters are not allowed in agent ids",
-        })
-        // Reject an empty/whitespace-only id when PROVIDED: the handler trims
-        // and treats a blank as "omitted" (keep/generate identity), so passing
-        // "   " silently did something other than set that id. Omit the field
-        // to get that behaviour deliberately; a blank string is an error.
-        .refine((s) => s.trim().length > 0, {
-          message:
-            "agent_id cannot be empty or whitespace-only; omit it to keep or auto-assign an identity",
-        })
-        .optional()
-        .describe(
-          "Your stable identity/nickname. Omit to keep the session identity " +
-            "(first join: a readable id is generated and returned).",
-        ),
-      type: z
-        .string()
-        .max(100)
-        .optional()
-        .describe("Agent type, e.g. 'claude', 'codex', 'gpt'"),
       role: z
         .string()
+        .min(1)
         .max(200)
         .optional()
-        .describe("Your role in the room, e.g. 'reviewer', 'planner'"),
-      description: z
-        .string()
-        .max(2000)
-        .optional()
-        .describe("Short description of who you are / what you do"),
-      cursor: z
-        .enum(["shared", "private"])
+        .describe(
+          "Your role IN THIS ROOM, e.g. 'reviewer', 'planner'. Omitted: leave " +
+            "any existing role unchanged. Use set_role to change or clear it. " +
+            "Must be non-blank; null (via set_role) is the only way to say " +
+            "'no role'.",
+        ),
+      cursor_start: z
+        .enum(["beginning", "latest"])
         .optional()
         .describe(
-          "'shared': one read marker per identity, concurrent sessions split " +
-            "the backlog. 'private': this session keeps its own read " +
-            "position. Omitted: keeps this session's current mode for the " +
-            "room (shared on first join); only an explicit 'shared' discards " +
-            "an existing private cursor.",
+          "Where to start reading when this call CREATES the membership: " +
+            "'beginning' (default) delivers the room's whole history, 'latest' " +
+            "starts from now and skips the backlog. Ignored on a rejoin, which " +
+            "always resumes your saved position.",
         ),
     }).strict(),
   },
-  async ({ room, agent_id, type, role, description, cursor }) => {
+  async ({ room, role, cursor_start }) => {
     try {
       touchSession();
+      const { agentId, epoch } = requirePersona();
       const target = store.resolveRoom(room);
       if (!target) {
         return fail(
           `no room "${room}". Use list_rooms to see options or create_room to make one.`,
         );
       }
-      let id: string;
-      if (agent_id && agent_id.trim().length > 0) {
-        id = agent_id.trim();
-        store.upsertAgent(id, type ?? null, role ?? null, description ?? null);
-      } else if (session.agentId !== null) {
-        // STICKY identity: a session that already established who it is
-        // keeps that identity on later joins. Generating a fresh id here
-        // forked the session into a second identity whose twin kept its own
-        // markers and memberships -- silent state the caller never asked for.
-        id = session.agentId;
-        store.upsertAgent(id, type ?? null, role ?? null, description ?? null);
-      } else {
-        // Generated ids are claimed atomically inside assignReadableId, so no
-        // separate upsert here (it would risk clobbering a racing assigner).
-        id = assignReadableId(type ?? null, role ?? null, description ?? null);
-      }
-      // Session state mutates only AFTER the join succeeds: flipping cursor
-      // mode first would leave a failed join having silently changed the mode
-      // for the still-active previous room.
-      // Cursor mode is STICKY per (room, identity): an omitted `cursor` keeps
-      // this session's existing mode FOR THIS IDENTITY. Treating omission as
-      // an explicit 'shared' used to DELETE the session's private cursor on
-      // any rejoin, and a room-only key let ANOTHER identity's shared join
-      // clear this identity's mode with the same silent-loss outcome. Only an
-      // explicit 'shared' downgrades, and only for the identity that joins.
-      const key = privKey(target.id, id);
-      const priv =
-        cursor === "private" ||
-        (cursor === undefined && session.privateRooms.has(key));
-      store.joinRoom(target.id, id, priv ? SESSION_NONCE : null, SESSION_NONCE);
-      if (priv) {
-        session.privateRooms.add(key);
-      } else {
-        session.privateRooms.delete(key);
-        // Mode switch hygiene: drop any leftover private row so my_mentions'
-        // per-room COALESCE stops using a baseline this session abandoned.
-        // (Reached on explicit 'shared', or on omitted-cursor joins where the
-        // session held no private mode -- a no-op there.)
-        store.clearSessionCursor(target.id, id, SESSION_NONCE);
-      }
-      session.agentId = id;
+      const { created } = store.joinRoom(target.id, agentId, epoch, {
+        cursorStart: cursor_start,
+        role,
+      });
+      // Session state mutates only AFTER the join commits: setting it first
+      // would leave a failed join having repointed the still-valid previous
+      // active room.
       session.roomId = target.id;
-      const cur = store.getCursor(target.id, id, cursorId());
+      const cur = store.getCursor(target.id, agentId);
       if (!cur) {
         // The room was deleted by another process between our join and this
         // read; same recovery contract as requireActive.
@@ -879,26 +1290,87 @@ server.registerTool(
           `room "${target.name}" was deleted while joining; rejoin with join_room`,
         );
       }
+      const persona = store.getPersona(agentId);
       return ok({
-        agent_id: id,
+        agent_id: agentId,
+        // The persona tuple rides on the JOIN response: the room now has a new
+        // participant and the first thing everyone (including this runtime)
+        // needs is WHICH model just walked in. Same field names as whoami.
+        brand: persona?.brand ?? null,
+        model: persona?.model ?? null,
+        version: persona?.version ?? null,
+        persona_description: persona?.description ?? null,
         room_id: target.id,
         room_name: target.name,
-        description: target.description,
+        // Named room_description, not `description`: a bare `description` next
+        // to persona fields reads as the PERSONA's, and the two are different
+        // strings owned by different things.
+        room_description: target.description,
         pinned: target.pinned,
-        cursor: priv ? "private" : "shared",
+        role: store.getRole(target.id, agentId),
+        new_membership: created,
+        ...(created && cursor_start === "latest"
+          ? { cursor_start: "latest", note: "starting from now; backlog skipped" }
+          : {}),
         last_read_seq: cur.last_read_seq,
-        unread: store.unreadCount(target.id, cur.last_read_seq, id),
+        unread: store.unreadCount(target.id, cur.last_read_seq, agentId),
         members: store.presentCount(target.id),
         // Ready-to-run background poller invocation, shell-quoted for THIS
-        // id (see the server instructions for its options and semantics).
-        poller_cmd: pollerCmd(id, { session: SESSION_NONCE }),
-        // Surface staleness at the session-start checkpoint, where it is seen
-        // once without per-call noise. True => this server is running old code;
-        // reconnect the MCP. See server_info for the latest commit.
-        server_stale: buildStatus().stale,
+        // persona and bound to the current epoch (see the server instructions).
+        poller_cmd: pollerCmd(agentId, { epoch }),
+        // Build identity rides with the command, at the session-start
+        // checkpoint where it is seen once without per-call noise.
+        ...handoffBuild(),
       });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
+    }
+  },
+);
+
+server.registerTool(
+  "set_role",
+  {
+    title: "Set room role",
+    description:
+      "Set or CLEAR your role in a room. `role` is required: pass a NON-BLANK " +
+      "string to set it, or null to clear it. Roles are room-local, so this " +
+      "never touches your role in any other room. Omitting the field is " +
+      "rejected rather than treated as a clear, because 'no change' and 'no " +
+      "role' are different; an empty string is rejected for the same reason, " +
+      "since null is the only way to say 'no role'.",
+    inputSchema: z.object({
+      role: z
+        .string()
+        .min(1)
+        .max(200)
+        .nullable()
+        .describe("The new non-blank role, or null to clear it"),
+      room: z
+        .string()
+        .min(1)
+        .max(500)
+        .optional()
+        .describe(
+          "Set your role in a room you have JOINED (id or name) without " +
+            "changing the active room. Omitted: the active room.",
+        ),
+    }).strict(),
+  },
+  async ({ role, room }) => {
+    try {
+      touchSession();
+      const { agentId, epoch, roomId, roomName } = resolveJoinedRoom(room);
+      store.setRole(roomId, agentId, epoch, role);
+      return ok({
+        agent_id: agentId,
+        room_id: roomId,
+        room_name: roomName,
+        role,
+        cleared: role === null,
+      });
+    } catch (e) {
+      return failFrom(e);
     }
   },
 );
@@ -916,20 +1388,16 @@ server.registerTool(
   async () => {
     try {
       touchSession();
-      const { agentId, roomId } = requireActive();
-      // Pass the process nonce so the leave is SESSION-scoped: it marks THIS
-      // session's presence row left and recomputes identity presence, so a live
-      // twin (shared or private) is never evicted. Presence is per-session for
-      // every mode now, independent of the cursor nonce.
-      const left = store.leaveRoom(roomId, agentId, SESSION_NONCE);
-      // Keep the identity: the session is still this agent, and my_mentions
-      // (memberships elsewhere) must keep working after leaving one room. The
-      // room's cursor-mode entry also stays: its private position is preserved
-      // for resume (matching leaveRoom keeping the session_markers row).
+      const { agentId, epoch, roomId } = requireActive();
+      const left = store.leaveRoom(roomId, agentId, epoch);
+      // Keep the persona bound: the runtime is still this persona, and
+      // my_mentions (memberships elsewhere) must keep working after leaving one
+      // room. The membership row survives too, so its read position and role
+      // are intact for a rejoin.
       session.roomId = null;
       return ok({ left, room_id: roomId, agent_id: agentId });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -938,17 +1406,41 @@ server.registerTool(
   "whoami",
   {
     title: "Who am I",
-    description: "Report the current session identity, active room and unread count.",
+    description:
+      "Report this runtime's bound persona (agent_id, brand/model/version, " +
+      "persona_description, runtime_epoch), its active room if any, and " +
+      "`persona_lost` when a newer runtime has taken the persona over. The " +
+      "PERSONA fields are reported whether or not a room is active, because " +
+      "'which identity am I' is the question this tool exists to answer; the " +
+      "room fields (room_id, room_name, room_description, role, last_read_seq, " +
+      "unread) appear only while a room is active.",
     inputSchema: z.object({}).strict(),
   },
   async () => {
     try {
       touchSession();
-      if (session.agentId === null || session.roomId === null) {
-        return ok({
-          joined: false,
-          ...(session.agentId !== null ? { agent_id: session.agentId } : {}),
-        });
+      if (session.agentId === null || session.epoch === null) {
+        return ok({ bound: false, joined: false });
+      }
+      const agentId = session.agentId;
+      const epoch = session.epoch;
+      const persona = store.getPersona(agentId);
+      // The persona block is UNCONDITIONAL once a persona is bound. Reporting
+      // only joined:false and an id when no room is active hid the brand,
+      // model, version, epoch and the loss state -- exactly the facts a runtime
+      // that has just been fenced, or has just left a room, needs to see.
+      const identity = {
+        bound: true,
+        agent_id: agentId,
+        brand: persona?.brand ?? null,
+        model: persona?.model ?? null,
+        version: persona?.version ?? null,
+        persona_description: persona?.description ?? null,
+        runtime_epoch: epoch,
+        ...lossDisclosure(agentId, epoch),
+      };
+      if (session.roomId === null) {
+        return ok({ ...identity, joined: false });
       }
       const roomRow = store.getRoom(session.roomId);
       if (!roomRow) {
@@ -956,30 +1448,28 @@ server.registerTool(
         // The identity survives.
         session.roomId = null;
         return ok({
+          ...identity,
           joined: false,
-          agent_id: session.agentId,
           note: "active room was deleted; rejoin",
         });
       }
-      const cur = store.getCursor(session.roomId, session.agentId, cursorId());
+      const cur = store.getCursor(session.roomId, agentId);
       return ok({
+        ...identity,
         joined: true,
-        agent_id: session.agentId,
         room_id: session.roomId,
-        room_name: roomRow?.name ?? null,
-        cursor:
-          session.privateRooms.has(privKey(session.roomId, session.agentId))
-            ? "private"
-            : "shared",
+        room_name: roomRow.name,
+        room_description: roomRow.description,
+        role: store.getRole(session.roomId, agentId),
         last_read_seq: cur?.last_read_seq ?? 0,
         unread: store.unreadCount(
           session.roomId,
           cur?.last_read_seq ?? 0,
-          session.agentId,
+          agentId,
         ),
       });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -990,11 +1480,15 @@ server.registerTool(
     title: "List agents in room",
     description:
       "List agents in the active room (up to `limit`; `total` rides along): " +
-      "type/role/description, `last_read_seq` (read receipt: compare to a " +
+      "brand/model/version, room-local `role`, `is_human`, description, " +
+      "`last_read_seq` (read receipt: compare to a " +
       "message seq), `last_seen`, `idle_seconds`, `present` (has not left), " +
       "`active` (present and recently seen or carrying an unexpired wait lease), " +
       "`watching` (an unexpired best-effort blocking catch_up wait lease; " +
-      "not an acknowledgement or delivery guarantee). Long " +
+      "not an acknowledgement or delivery guarantee). `last_seen`/`idle_seconds`/" +
+      "`active` measure LISTENER recency -- an MCP call or an armed watcher's " +
+      "two-minute heartbeat -- so they say a runtime is reachable, NOT that the " +
+      "model is reading or able to wake; `watching` is the stronger claim. Long " +
       "descriptions are listing previews (description_truncated). " +
       "`next_after` present = more rows exist; page by passing it back as " +
       "`after` (keyset paging, so a concurrent join cannot make you skip or " +
@@ -1004,7 +1498,9 @@ server.registerTool(
         .string()
         .max(500)
         .optional()
-        .describe("Substring to match against id/type/role/description"),
+        .describe(
+          "Substring to match against id/brand/model/version/role/description",
+        ),
       active_within_minutes: z
         .number()
         .positive()
@@ -1032,7 +1528,7 @@ server.registerTool(
   async ({ filter, active_within_minutes, limit, after }) => {
     try {
       touchSession();
-      const { roomId } = requireActive();
+      const { agentId, epoch, roomId } = requireActive();
       const { agents, total, next_after, size_trimmed } = store.listAgents(
         roomId,
         active_within_minutes ?? 5,
@@ -1041,13 +1537,14 @@ server.registerTool(
         after,
       );
       return ok({
+        ...lossDisclosure(agentId, epoch),
         agents,
         total,
         ...(next_after !== undefined ? { next_after, truncated: true } : {}),
         ...(size_trimmed ? { size_trimmed: true } : {}),
       });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -1213,17 +1710,12 @@ server.registerTool(
         );
       }
       let agentId: string;
+      let epoch: number;
       let roomId: number;
       let roomName: string | null;
-      let selector: string | null;
       if (room !== undefined) {
         // Explicit target: same membership rule as catch_up({room}).
-        if (session.agentId === null) {
-          return fail(
-            "join a room first with join_room to establish your identity",
-          );
-        }
-        agentId = session.agentId;
+        ({ agentId, epoch } = requirePersona());
         const target = store.resolveRoom(room);
         if (!target) {
           return fail(`no room "${room}". Use list_rooms to see options.`);
@@ -1235,13 +1727,9 @@ server.registerTool(
         }
         roomId = target.id;
         roomName = target.name;
-        selector = session.privateRooms.has(privKey(target.id, agentId))
-          ? SESSION_NONCE
-          : null;
       } else {
-        ({ agentId, roomId } = requireActive());
+        ({ agentId, epoch, roomId } = requireActive());
         roomName = store.getRoom(roomId)?.name ?? null;
-        selector = cursorId();
         if (expected_room !== undefined) {
           const expect = store.resolveRoom(expected_room);
           if (!expect || expect.id !== roomId) {
@@ -1253,7 +1741,7 @@ server.registerTool(
           }
         }
       }
-      touchCapturedRoom(roomId, agentId);
+      touchCapturedRoom(roomId, agentId, epoch);
       const isText = typeof content === "string";
       // Validate structured strings DURING serialization, before JSON.stringify
       // escapes lone surrogates to harmless-looking ASCII. The store validates
@@ -1275,7 +1763,7 @@ server.registerTool(
         mentions,
         reply_to_seq ?? null,
         supersedes_seq ?? null,
-        selector,
+        epoch,
         {
           ifLastReadSeq: if_last_read_seq ?? null,
           crossedPreviewChars: crossed_preview_chars,
@@ -1339,6 +1827,12 @@ server.registerTool(
       // facts. Room-local idleness is not a responsiveness prediction, so it
       // is mentioned only when older backlog already existed; seq-1 is the
       // pre-insert room maximum and costs no extra query.
+      //
+      // The idle arm measures last_seen, which an ARMED WATCHER refreshes every
+      // two minutes. So this warning cannot fire for a seat with a live
+      // watcher, however long the model behind it has been silent, and its
+      // ABSENCE is not evidence anyone is reading. It is a one-directional
+      // signal: when it fires, nothing has touched that seat at all.
       const delivery_warnings = recipients.flatMap((r) => {
         if (r.status === "unknown") {
           return [`${r.id}: never joined this room; the tag reaches no one`];
@@ -1359,8 +1853,9 @@ server.registerTool(
           priorMarkerBehind > 0
         ) {
           return [
-            `${r.id}: no observed activity in this room for ${fmtIdle(r.idle_seconds ?? 0)}; ` +
-              `marker was ${priorMarkerBehind} seq behind before this post`,
+            `${r.id}: no MCP call or watcher heartbeat in this room for ` +
+              `${fmtIdle(r.idle_seconds ?? 0)}; marker was ${priorMarkerBehind} ` +
+              `seq behind before this post`,
           ];
         }
         return [];
@@ -1391,7 +1886,7 @@ server.registerTool(
         recipients,
       });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -1472,45 +1967,16 @@ server.registerTool(
             "escape-heavy room name may require a larger value so the fixed " +
             "routing metadata plus one recoverable message stub can fit.",
         ),
-      mentions_me: z
-        .boolean()
-        .optional()
-        .describe("REMOVED in v0.6.0; use my_mentions. Passing it is an error."),
-      after_seq: z
-        .number()
-        .optional()
-        .describe("REMOVED in v0.6.0; my_mentions pages with after_id."),
     }).strict(),
   },
   async (
-    {
-      room,
-      wait_seconds,
-      priority_only,
-      limit,
-      preview_chars,
-      max_bytes,
-      mentions_me,
-      after_seq,
-    },
+    { room, wait_seconds, priority_only, limit, preview_chars, max_bytes },
     extra,
   ) => {
     const startedMs = Date.now();
     let heldWaitSlot = false;
     try {
       touchSession();
-      // Reject, never strip: a v0.5 caller sending mentions_me expected a
-      // non-advancing filtered peek; silently running an ADVANCING full sync
-      // instead would eat its unread backlog.
-      if (mentions_me !== undefined || after_seq !== undefined) {
-        return fail(
-          "mentions_me/after_seq were removed in v0.6.0: catch_up is now " +
-            "a full room sync by default and ADVANCES your marker. For messages " +
-            "directed at you use my_mentions (cross-room inbox, never advances " +
-            "markers, pages with after_id). This call was rejected instead of " +
-            "silently changing semantics.",
-        );
-      }
       if (priority_only === true && (wait_seconds ?? 0) > 0) {
         return fail(
           "priority_only is lossy backlog triage and cannot be combined with " +
@@ -1533,25 +1999,19 @@ server.registerTool(
         heldWaitSlot = true;
       }
       // --- Resolve and CAPTURE, all before the first await. Concurrent
-      // dispatch can mutate `session` (identity, active room, cursor modes)
+      // dispatch can mutate `session` (the persona binding, the active room)
       // while a wait sleeps, so everything below runs off these captured
-      // values; the only deliberate re-read of session state is the
-      // cursor-mode epoch check (modeFlipped).
+      // values.
       let agentId: string;
+      let epoch: number;
       let roomId: number;
       let roomName: string | null;
-      let selector: string | null;
       if (room !== undefined) {
-        // Cross-room read: the ACTIVE room and its cursor mode stay untouched.
-        // Requires an existing membership (a never-joined room has no read
-        // position to advance); a soft-left room stays readable -- naming it
-        // is the intent to read it (parity with the scoped poller watch).
-        if (session.agentId === null) {
-          return fail(
-            "join a room first with join_room to establish your identity",
-          );
-        }
-        agentId = session.agentId;
+        // Cross-room read: the ACTIVE room stays untouched. Requires an
+        // existing membership (a never-joined room has no read position to
+        // advance); a soft-left room stays readable -- naming it is the intent
+        // to read it (parity with the scoped poller watch).
+        ({ agentId, epoch } = requirePersona());
         const target = store.resolveRoom(room);
         if (!target) {
           return fail(`no room "${room}". Use list_rooms to see options.`);
@@ -1563,17 +2023,11 @@ server.registerTool(
         }
         roomId = target.id;
         roomName = target.name;
-        // Cursor selector for the TARGET room. cursorId() answers only for
-        // the active room, so it must not be used here.
-        selector = session.privateRooms.has(privKey(target.id, agentId))
-          ? SESSION_NONCE
-          : null;
       } else {
-        ({ agentId, roomId } = requireActive());
+        ({ agentId, epoch, roomId } = requireActive());
         roomName = store.getRoom(roomId)?.name ?? null;
-        selector = cursorId();
       }
-      touchCapturedRoom(roomId, agentId);
+      touchCapturedRoom(roomId, agentId, epoch);
       const signal = extra?.signal;
       // max_bytes bounds the COMPLETE JSON text returned to the MCP client,
       // not merely ChatStore.catchUp's inner object. v0.9 added routing fields
@@ -1625,35 +2079,16 @@ server.registerTool(
           limit ?? 50,
           preview_chars,
           storeMaxBytes,
-          selector,
-          // rooms_with_unread on an empty read; the RAW nonce, my_mentions
-          // style, so every room baselines off its own cursor mode.
+          epoch,
+          // rooms_with_unread on an empty read.
           includeUnreadSummary
-            ? {
-                sessionId: SESSION_NONCE,
-                priorityOnly: priority_only === true,
-              }
+            ? { priorityOnly: priority_only === true }
             : null,
         );
-      // Cursor-mode epoch check: a private<->shared rejoin mid-wait re-bases
-      // the cursor (an explicit shared rejoin even deletes the private row),
-      // so an advancing read after a flip would consume from a DIFFERENT
-      // position than this call captured. Abort loudly instead.
-      const modeFlipped = (): boolean =>
-        (session.privateRooms.has(privKey(roomId, agentId))
-          ? SESSION_NONCE
-          : null) !== selector;
-      const sessionChangedResult = (): ToolResult =>
-        respond({
-          messages: [],
-          session_changed: true,
-          call_again: true,
-          waited_ms: Date.now() - startedMs,
-          note:
-            "this room's cursor mode flipped (private/shared rejoin) " +
-            "mid-wait; nothing was read or advanced -- call catch_up again " +
-            "to read from the current cursor",
-        });
+      // A takeover is the only way this call's authority can change under it.
+      // Every advancingRead re-verifies the captured epoch inside its own
+      // transaction, so a fenced read throws persona_lost rather than consuming
+      // from a position this call did not capture.
       const roomDeletedResult = (duringWait = false): ToolResult => {
         // A delete racing the active-room read invalidates that active route.
         // Do not clear a different room selected by a concurrent join, nor the
@@ -1689,17 +2124,19 @@ server.registerTool(
       // --- Blocking wait: abort-aware timer, non-advancing read-only probe
       // with catchUp's exact predicate, advancing read only on a hit.
       const deadlineMs = startedMs + waitSeconds * 1000;
-      // One lease token per CALL, not per process. Concurrent waits from one
-      // MCP process must not overwrite and then delete each other's row.
-      const waitLeaseId = `${SESSION_NONCE}:${randomUUID()}`;
       // Presence lease: when its best-effort write succeeds, `watching`
       // records that this call was open. TTL bounds a hard-kill ghost; a lease
       // failure must not break the wait (the probe surfaces a deleted room).
+      // The lease is keyed by persona and carries the epoch CAPTURED here, so
+      // the cleanup in the finally below can only ever delete this call's own
+      // row -- never one a takeover wrote after fencing this call out.
+      const leaseKey = `${roomKey(roomId, agentId)}\u0000${epoch}`;
+      openWaits.set(leaseKey, (openWaits.get(leaseKey) ?? 0) + 1);
       try {
         store.beginWaitLease(
           roomId,
           agentId,
-          waitLeaseId,
+          epoch,
           waitSeconds + WAIT_LEASE_GRACE_SECONDS,
         );
       } catch {}
@@ -1716,17 +2153,22 @@ server.registerTool(
           if (Date.now() >= deadlineMs) break;
           // Self-throttled heartbeat: a genuinely-waiting agent reads as
           // `active` to peers instead of indistinguishable from a dormant one.
-          touchCapturedRoom(roomId, agentId);
+          touchCapturedRoom(roomId, agentId, epoch);
           let unread: number;
           try {
-            unread = store.unreadProbe(roomId, agentId, selector);
+            // Epoch-fenced: a takeover surfaces here, within one probe
+            // interval, instead of waiting for traffic or the deadline.
+            unread = store.unreadProbe(roomId, agentId, epoch);
           } catch (e) {
+            // A lost persona is NOT a deleted room. Rethrow it before the
+            // room-existence fallback, or a takeover would be reported as
+            // "the room was deleted".
+            if (e instanceof PersonaLostError) throw e;
             if (!store.getRoom(roomId)) return roomDeletedResult(true);
             throw e;
           }
           if (unread === 0) continue;
           if (signal?.aborted) return respond({ aborted: true });
-          if (modeFlipped()) return sessionChangedResult();
           let hit;
           try {
             // A probe/read race may make this empty too; its result is discarded,
@@ -1741,11 +2183,10 @@ server.registerTool(
           if (hit.messages.length > 0) {
             return respond(hit, { waited_ms: Date.now() - startedMs });
           }
-          // A shared twin consumed the page between probe and read: keep
-          // waiting on the (now advanced) cursor, never refire stale rows.
+          // The cursor advanced between probe and read (an own-only
+          // normalization): keep waiting, never refire stale rows.
         }
         if (signal?.aborted) return respond({ aborted: true });
-        if (modeFlipped()) return sessionChangedResult();
         let last;
         try {
           last = advancingRead(true);
@@ -1760,12 +2201,18 @@ server.registerTool(
             : {}),
         });
       } finally {
-        try {
-          store.endWaitLease(roomId, agentId, waitLeaseId);
-        } catch {}
+        const remaining = (openWaits.get(leaseKey) ?? 1) - 1;
+        if (remaining > 0) {
+          openWaits.set(leaseKey, remaining);
+        } else {
+          openWaits.delete(leaseKey);
+          try {
+            store.endWaitLease(roomId, agentId, epoch);
+          } catch {}
+        }
       }
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     } finally {
       if (heldWaitSlot) activeBlockingWaits--;
     }
@@ -1825,26 +2272,27 @@ server.registerTool(
   async ({ limit, preview_chars, max_bytes, after_id }) => {
     try {
       touchSession();
-      if (session.agentId === null) {
-        return fail(
-          "join a room first with join_room to establish your identity",
-        );
-      }
-      // Always pass the nonce: the store's per-room COALESCE uses this
-      // session's private cursor exactly where one exists (shared joins clear
-      // theirs), so each room gets ITS OWN mode rather than the active room's.
-      return ok(
-        store.myMentions(
-          session.agentId,
+      // my_mentions needs a PERSONA but no active room: it reads across every
+      // room the persona is present in, which is exactly what makes it usable
+      // after a leave. So the remedy is binding, not joining.
+      const { agentId, epoch } = requirePersona();
+      // Reserve the disclosure's exact serialized cost BEFORE the bounded read,
+      // so a caller's max_bytes still holds on the fenced path.
+      const lost = lossDisclosure(agentId, epoch);
+      const requested = max_bytes ?? DEFAULT_MAX_BYTES;
+      const reserve = disclosureReserve(lost);
+      return ok({
+        ...lost,
+        ...store.myMentions(
+          agentId,
           limit ?? 50,
           preview_chars,
-          max_bytes,
-          SESSION_NONCE,
+          Math.max(MIN_CATCH_UP_RESULT_BUDGET, requested - reserve),
           after_id ?? 0,
         ),
-      );
+      });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -1858,8 +2306,7 @@ server.registerTool(
       "at them (mentions or replies), one row per agent+room, oldest pending " +
       "first with `oldest_seq`/`oldest_unix` and per-room `idle_seconds`. " +
       "For a supervisor deciding whom to wake or nudge; my_mentions answers " +
-      "this only for yourself. Read markers are identity-level, so a lagging " +
-      "private session can be further behind than shown. `next_after` means " +
+      "this only for yourself. `next_after` means " +
       "more rows exist; pass it back as `after`. Pending rows are live, so " +
       "dedupe agent_id+room_id during a paged sweep.",
     inputSchema: z.object({
@@ -1898,7 +2345,7 @@ server.registerTool(
         ...(size_trimmed ? { size_trimmed: true } : {}),
       });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -1951,22 +2398,22 @@ server.registerTool(
   async ({ room, mentions_only, timeout, interval }) => {
     try {
       touchSession();
-      const agentId = session.agentId;
-      if (agentId === null) {
-        return fail(
-          "join a room first with join_room to establish your identity, then call this again",
-        );
+      const { agentId, epoch } = requirePersona();
+      // Check the binding BEFORE handing out a command. The poller keeps its
+      // own per-probe epoch check for a takeover that lands after generation,
+      // but a command minted for an already-dead epoch is a command that can
+      // only ever exit stale_binding, and returning one sends the caller off to
+      // arm a watcher instead of telling it the thing it needs to know.
+      const current = store.currentEpoch(agentId);
+      if (current !== epoch) {
+        return failFrom(new PersonaLostError(agentId, epoch, current));
       }
       let roomArg: string | undefined;
       if (room !== undefined) {
-        // Resolve to an id and require only that a membership row EXISTS -- not
-        // that it is still present. A scoped --room probe (check.ts) baselines
-        // off the room's preserved read marker regardless of left_at, and the
-        // poller contract deliberately supports watching a room after
-        // soft-leaving it ("naming the room is the intent to watch it").
-        // Rejecting soft-left here contradicted that and blocked a valid watch.
-        // A never-joined room has no marker to baseline from, so that still
-        // fails with the real remedy.
+        // PRESENT membership required, not merely an existing row. A watcher on
+        // a room this persona has left would deliver traffic peers can see it
+        // is not receiving -- delivery and visibility must read the same
+        // membership state. A never-joined room fails with its own remedy.
         const target = store.resolveRoom(room);
         if (!target) {
           return fail(
@@ -1977,6 +2424,14 @@ server.registerTool(
         if (!m) {
           return fail(
             `you have never joined room "${target.name}", so there is no read position to watch from; join_room it first, then call wait_for_messages`,
+          );
+        }
+        if (m.left_at !== null) {
+          return fail(
+            `you have LEFT room "${target.name}", so a watcher on it would ` +
+              `report traffic to a seat peers can see is empty. Call join_room ` +
+              `to rejoin -- your read position and role are preserved -- then ` +
+              `use the poller command it returns.`,
           );
         }
         roomArg = String(target.id);
@@ -1990,7 +2445,7 @@ server.registerTool(
       const command = pollerCmd(agentId, {
         room: roomArg,
         mentionsOnly: mentions_only,
-        session: SESSION_NONCE,
+        epoch,
         timeoutSec: timeout,
         intervalSec: interval,
       });
@@ -2010,9 +2465,10 @@ server.registerTool(
         },
         baselined: false,
         single_process: true,
+        ...handoffBuild(),
       });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -2041,10 +2497,6 @@ server.registerTool(
         .positive()
         .optional()
         .describe("Return messages older than this seq (for pagination)"),
-      mentions_me: z
-        .boolean()
-        .optional()
-        .describe("REMOVED in v0.6.0; use my_mentions. Passing it is an error."),
       preview_chars: z
         .number()
         .int()
@@ -2067,22 +2519,27 @@ server.registerTool(
         ),
     }).strict(),
   },
-  async ({ limit, before_seq, mentions_me, preview_chars, max_bytes }) => {
+  async ({ limit, before_seq, preview_chars, max_bytes }) => {
     try {
       touchSession();
-      if (mentions_me !== undefined) {
-        return fail(
-          "mentions_me was removed from read_history in v0.6.0; use " +
-            "my_mentions for the cross-room directed inbox or search_messages " +
-            "to find topics.",
-        );
-      }
-      const { roomId } = requireActive();
-      return ok(
-        store.readHistory(roomId, limit ?? 50, before_seq, preview_chars, max_bytes),
-      );
+      const { agentId, epoch, roomId } = requireActive();
+      const lost = lossDisclosure(agentId, epoch);
+      const requested = max_bytes ?? DEFAULT_MAX_BYTES;
+      return ok({
+        ...lost,
+        ...store.readHistory(
+          roomId,
+          limit ?? 50,
+          before_seq,
+          preview_chars,
+          Math.max(
+            MIN_CATCH_UP_RESULT_BUDGET,
+            requested - disclosureReserve(lost),
+          ),
+        ),
+      });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -2108,10 +2565,10 @@ server.registerTool(
   async ({ seq }) => {
     try {
       touchSession();
-      const { agentId, roomId } = requireActive();
-      return ok(store.markRead(roomId, agentId, seq, cursorId()));
+      const { agentId, epoch, roomId } = requireActive();
+      return ok(store.markRead(roomId, agentId, epoch, seq));
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -2159,17 +2616,15 @@ server.registerTool(
   async ({ room, seq, offset, max_chars }) => {
     try {
       touchSession();
-      const { roomId, roomName } = resolveJoinedRoom(room);
-      if (session.agentId !== null) {
-        touchCapturedRoom(roomId, session.agentId);
-      }
+      const { agentId, epoch, roomId, roomName } = resolveJoinedRoom(room);
+      touchCapturedRoom(roomId, agentId, epoch);
       const msg = store.getMessage(roomId, seq, offset ?? 0, max_chars);
       if (!msg) {
         return fail(`no message ${seq} in room "${roomName ?? roomId}"`);
       }
-      return ok(msg);
+      return ok({ ...lossDisclosure(agentId, epoch), ...msg });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -2215,17 +2670,15 @@ server.registerTool(
   async ({ room, seq, max_depth, preview_chars }) => {
     try {
       touchSession();
-      const { roomId, roomName } = resolveJoinedRoom(room);
-      if (session.agentId !== null) {
-        touchCapturedRoom(roomId, session.agentId);
-      }
+      const { agentId, epoch, roomId, roomName } = resolveJoinedRoom(room);
+      touchCapturedRoom(roomId, agentId, epoch);
       const thread = store.getThread(roomId, seq, max_depth ?? 3, preview_chars);
       if (!thread) {
         return fail(`no message ${seq} in room "${roomName ?? roomId}"`);
       }
-      return ok(thread);
+      return ok({ ...lossDisclosure(agentId, epoch), ...thread });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -2247,12 +2700,12 @@ server.registerTool(
   async ({ text }) => {
     try {
       touchSession();
-      const { roomId } = requireActive();
+      const { agentId, epoch, roomId } = requireActive();
       const value = text.length > 0 ? text : null;
-      store.setPinned(roomId, value);
+      store.setPinned(roomId, agentId, epoch, value);
       return ok({ room_id: roomId, pinned: value });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -2288,10 +2741,13 @@ server.registerTool(
   async ({ query, limit, offset }) => {
     try {
       touchSession();
-      const { roomId } = requireActive();
-      return ok(store.searchMessages(roomId, query, limit ?? 20, offset ?? 0));
+      const { agentId, epoch, roomId } = requireActive();
+      return ok({
+        ...lossDisclosure(agentId, epoch),
+        ...store.searchMessages(roomId, query, limit ?? 20, offset ?? 0),
+      });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -2340,8 +2796,8 @@ server.registerTool(
   async ({ room, key, ttl_seconds, note }) => {
     try {
       touchSession();
-      const { agentId, roomId, roomName } = resolveJoinedRoom(room);
-      touchCapturedRoom(roomId, agentId);
+      const { agentId, epoch, roomId, roomName } = resolveJoinedRoom(room);
+      touchCapturedRoom(roomId, agentId, epoch);
       return ok({
         room_id: roomId,
         room_name: roomName,
@@ -2349,12 +2805,13 @@ server.registerTool(
           roomId,
           key,
           agentId,
+          epoch,
           ttl_seconds ?? 900,
           note ?? null,
         ),
       });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -2382,15 +2839,15 @@ server.registerTool(
   async ({ room, key }) => {
     try {
       touchSession();
-      const { agentId, roomId, roomName } = resolveJoinedRoom(room);
-      touchCapturedRoom(roomId, agentId);
+      const { agentId, epoch, roomId, roomName } = resolveJoinedRoom(room);
+      touchCapturedRoom(roomId, agentId, epoch);
       return ok({
         room_id: roomId,
         room_name: roomName,
-        ...store.releaseClaim(roomId, key, agentId),
+        ...store.releaseClaim(roomId, key, agentId, epoch),
       });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -2439,14 +2896,15 @@ server.registerTool(
   async ({ room, limit, after_key }) => {
     try {
       touchSession();
-      const { agentId, roomId, roomName } = resolveJoinedRoom(room);
-      touchCapturedRoom(roomId, agentId);
+      const { agentId, epoch, roomId, roomName } = resolveJoinedRoom(room);
+      touchCapturedRoom(roomId, agentId, epoch);
       const { claims, total, next_key, size_trimmed } = store.listClaims(
         roomId,
         limit ?? 200,
         after_key ?? "",
       );
       return ok({
+        ...lossDisclosure(agentId, epoch),
         room_id: roomId,
         room_name: roomName,
         claims,
@@ -2455,7 +2913,7 @@ server.registerTool(
         ...(size_trimmed ? { size_trimmed: true } : {}),
       });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -2469,8 +2927,8 @@ server.registerTool(
       "`keep_last` (kept seqs and future numbering unchanged). Destructive, " +
       "not reversible. By default REFUSES (refused:true with " +
       "would_delete_unread/min_read_seq) if any non-author member has not " +
-      "read a doomed message yet, including members that left and lagging " +
-      "private session cursors; force=true prunes anyway.",
+      "read a doomed message yet, including members that left; force=true " +
+      "prunes anyway.",
     inputSchema: z.object({
       keep_last: z
         .number()
@@ -2488,13 +2946,13 @@ server.registerTool(
   async ({ keep_last, force }) => {
     try {
       touchSession();
-      const { roomId } = requireActive();
+      const { agentId, epoch, roomId } = requireActive();
       return ok({
         room_id: roomId,
-        ...store.pruneMessages(roomId, keep_last, force ?? false),
+        ...store.pruneMessages(roomId, agentId, epoch, keep_last, force ?? false),
       });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
@@ -2518,70 +2976,118 @@ server.registerTool(
   async ({ room, confirm }) => {
     try {
       touchSession();
+      const { agentId, epoch } = requirePersona();
       const target = store.resolveRoom(room);
       if (!target) return fail(`no room "${room}"`);
       if (confirm !== true) {
         return fail(`pass confirm:true to delete room ${target.id} ("${target.name}")`);
       }
-      const result = store.deleteRoom(target.id);
-      // Drop every identity's private-mode entry for the dead room.
-      // (Deleting the current element during Set iteration is well-defined.)
-      for (const k of session.privateRooms) {
-        if (k.startsWith(`${target.id}\u0000`)) session.privateRooms.delete(k);
-      }
+      const result = store.deleteRoom(target.id, agentId, epoch);
       if (session.roomId === target.id) {
         session.roomId = null; // identity survives; only the room is gone
       }
       return ok({ deleted_room: target.id, name: target.name, ...result });
     } catch (e) {
-      return fail(asMessage(e));
+      return failFrom(e);
     }
   },
 );
 
-// Readable identity generation for agents that omit agent_id. Two short word
-// lists give ~676 base combinations; a hex suffix (then a UUID fallback)
-// guarantees a free id even under collision. The id is claimed atomically via
-// tryCreateAgent so concurrent assigners cannot land on the same identity.
-const ID_ADJECTIVES = [
+// Resume-word vocabulary. Two 26-entry word lists plus a 16-bit number give
+// 26 * 26 * 65536 = ~44 million combinations, which is ample for the ONLY job
+// this word has: making it improbable that an operator who pastes a
+// wrong-but-plausible word lands on a persona that is not theirs. It is not a
+// secret, not a password, and is stored in plain text -- see create_persona's
+// description for the explicit threat model. Every part is drawn from
+// randomBytes (a CSPRNG) rather than Math.random, so two personas created in
+// the same millisecond do not collide.
+const WORD_ADJECTIVES = [
   "amber", "brisk", "calm", "clever", "cobalt", "copper", "deft", "eager",
   "fern", "gilded", "hardy", "ivory", "jade", "keen", "lucid", "mellow",
   "nimble", "olive", "prime", "quiet", "rapid", "sable", "teal", "umber",
   "vivid", "warm",
 ];
-const ID_NOUNS = [
+const WORD_NOUNS = [
   "otter", "falcon", "cedar", "harbor", "lynx", "maple", "comet", "delta",
   "ember", "fjord", "grove", "heron", "inlet", "kite", "larch", "mesa",
   "nimbus", "onyx", "pike", "quartz", "ridge", "summit", "tundra", "vale",
   "willow", "yarrow",
 ];
 
+/** Uniform index into xs, drawn from CSPRNG bytes with rejection sampling so a
+ *  non-multiple list length cannot bias the draw. */
 function pick<T>(xs: T[]): T {
-  return xs[Math.floor(Math.random() * xs.length)];
+  const limit = Math.floor(256 / xs.length) * xs.length;
+  for (;;) {
+    const b = randomBytes(1)[0];
+    if (b < limit) return xs[b % xs.length];
+  }
 }
 
-/** Assign and atomically claim a readable, collision-free agent id. */
-function assignReadableId(
-  type: string | null,
-  role: string | null,
+function makeResumeWord(): string {
+  return `${pick(WORD_ADJECTIVES)}-${pick(WORD_NOUNS)}-${randomBytes(2).readUInt16BE(0)}`;
+}
+
+/**
+ * Normalize one component of a canonical persona id: lowercase, non-alphanumeric
+ * runs collapsed to single hyphens, trimmed. "Claude Opus 4.5" -> "claude-opus-4-5".
+ * Returns "" when nothing survives, which the caller rejects.
+ */
+function slug(s: string): string {
+  return s
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "");
+}
+
+/**
+ * Build and atomically claim the canonical persona id
+ * `brand-model-vversion-shorttoken`.
+ *
+ * The short token is what makes two personas with the SAME brand/model/version
+ * distinguishable -- a common case, since two runtimes of one model routinely
+ * work in one room. The claim is atomic (INSERT ... ON CONFLICT DO NOTHING) so
+ * two processes drawing the same token cannot both believe they own it and
+ * collapse onto a single row, sharing its read marker, memberships, and claims.
+ */
+function createPersona(
+  brand: string,
+  model: string,
+  version: string,
   description: string | null,
-): string {
-  for (let i = 0; i < 30; i++) {
-    const base = `${pick(ID_ADJECTIVES)}-${pick(ID_NOUNS)}`;
-    // After a run of plain-name misses, widen the space with a short suffix.
-    const id = i < 12 ? base : `${base}-${randomUUID().slice(0, 4)}`;
-    if (store.tryCreateAgent(id, type, role, description)) return id;
+): { id: string; resumeWord: string } {
+  const parts = [slug(brand), slug(model), `v${slug(version)}`];
+  if (parts[0] === "" || parts[1] === "" || parts[2] === "v") {
+    throw new Error(
+      "brand, model, and version must each contain at least one letter or digit",
+    );
   }
-  // Last resort: keep drawing until an id is actually CLAIMED. Returning an
-  // unclaimed id here silently adopted an EXISTING identity (shared read
-  // markers and claims); ids are self-asserted, so a collision is improbable
-  // but not impossible.
-  for (let i = 0; i < 30; i++) {
-    const id = `agent-${randomUUID().slice(0, 8)}`;
-    if (store.tryCreateAgent(id, type, role, description)) return id;
+  const base = parts.join("-");
+  // One fixed token width, so a persona id has one shape and the length check
+  // below is exact rather than a bound that holds only while collisions stay
+  // rare.
+  const TOKEN_CHARS = 6;
+  if (base.length + 1 + TOKEN_CHARS > MAX_AGENT_ID_CHARS) {
+    throw new Error(
+      `brand/model/version are too long: the canonical persona id ` +
+        `"${base}-<token>" needs ${base.length + 1 + TOKEN_CHARS} characters ` +
+        `and the limit is ${MAX_AGENT_ID_CHARS}. Shorten them by at least ` +
+        `${base.length + 1 + TOKEN_CHARS - MAX_AGENT_ID_CHARS} characters ` +
+        `(punctuation collapses to single hyphens, so it still counts).`,
+    );
+  }
+  const resumeWord = makeResumeWord();
+  for (let i = 0; i < 40; i++) {
+    const token = randomBytes(TOKEN_CHARS / 2).toString("hex");
+    const id = `${base}-${token}`;
+    if (
+      store.tryCreatePersona({ id, brand, model, version, resumeWord, description })
+    ) {
+      return { id, resumeWord };
+    }
   }
   throw new Error(
-    "could not allocate a generated agent id; pass an explicit agent_id",
+    "could not allocate a persona id after 40 attempts; retry create_persona",
   );
 }
 
@@ -2590,7 +3096,9 @@ function dedupe(xs: string[]): string[] {
 }
 
 /** Room-local inactivity threshold for a factual pre-existing-backlog warning.
- * Chosen well past the 5-minute `active` window to avoid routine idle noise. */
+ * Chosen well past the 5-minute `active` window to avoid routine idle noise.
+ * Measures last_seen, so it detects an UNTOUCHED seat, not a silent model: an
+ * armed watcher's two-minute heartbeat keeps a seat below this forever. */
 const DELIVERY_STALL_SECONDS = 1800;
 
 /** Human-readable idle duration for delivery warnings ("2h05m", "45m", "90s"). */
@@ -2620,7 +3128,7 @@ function shutdown(code: number, message?: string): Promise<void> {
       // their finally blocks (notably wait-lease deletion) before closing the
       // shared store, so EOF cannot leave a wait alive or advance afterward.
       await server.close().catch(() => undefined);
-      await Promise.allSettled([...activeToolRequests]);
+      await Promise.allSettled(activeToolRequests);
       try {
         store.close();
       } catch {}

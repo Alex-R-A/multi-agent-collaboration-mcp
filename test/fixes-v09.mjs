@@ -3,10 +3,13 @@
 //   1  bulk reads silently omitted rows when preview_chars / a compact JSON
 //      reparse shrank them below their raw size: get_thread and search now flag
 //      byte_limited / next_offset via fetchBounded's `exhausted` signal.
-//   3  the NUL heal is cursored one row at a time (not .all()); many NUL rows
-//      all heal.
-//   8b wait_for_messages allows a SCOPED watch on a soft-left room (the poller
-//      supports it), while still refusing a never-joined room.
+//   (3 covered the cursored NUL heal, which repaired rows written by builds
+//    predating the write-time NUL rejection. The schema is fresh-only now, no
+//    such rows can exist, and the heal was deleted with them.)
+//   8b wait_for_messages REFUSES a scoped watch on a soft-left room and names
+//      rejoin as the remedy; rejoining restores it. (This reverses the original
+//      #8b, which allowed it: delivery and visibility have to read the same
+//      membership state.) A never-joined room is still refused, separately.
 //   11 structured JSON rejects lone surrogates in nested strings and keys
 //      before JSON.stringify can hide them as ASCII escapes.
 //   13 resolveRoom skips the id lookup for a numeric ref past 2^53 (would round
@@ -20,6 +23,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { EPOCH1, mkAgent, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
@@ -27,18 +31,17 @@ const check = (n, c, x) => {
   console.log(`${c ? "PASS" : "FAIL"}  ${n}${c ? "" : "  >> " + JSON.stringify(x)}`);
   if (!c) failures++;
 };
-const NUL = String.fromCharCode(0);
 
 // --- 1: get_thread + search flag omission after a shrink ----------------------
 {
   const dir = mkdtempSync(join(tmpdir(), "v09-omit-"));
   const s = new ChatStore(join(dir, "t.db"));
-  const r = s.createRoom("r", null, null).id;
-  s.upsertAgent("a", null, null, null); s.joinRoom(r, "a");
+  const r = mkRoom(s, "r", null, null).id;
+  mkAgent(s, "a"); s.joinRoom(r, "a", EPOCH1, {});
   // 10 large replies; preview_chars shrinks them so boundByBytes would fit all
   // it fetched -- but fetchBounded stopped on the raw budget with rows behind.
-  const root = s.postMessage(r, "a", "root", "text", null, null).seq;
-  for (let i = 0; i < 10; i++) s.postMessage(r, "a", "R" + i + ".".repeat(50000), "text", null, root);
+  const root = s.postMessage(r, "a", "root", "text", null, null, null, EPOCH1).seq;
+  for (let i = 0; i < 10; i++) s.postMessage(r, "a", "R" + i + ".".repeat(50000), "text", null, root, null, EPOCH1);
   const th = s.getThread(r, root, 3, 10);
   check(
     "get_thread flags byte_limited when a preview cut hides replies",
@@ -48,7 +51,7 @@ const NUL = String.fromCharCode(0);
   // 10 whitespace-heavy JSON matches: reparse compacts them below raw size.
   const gap = " ".repeat(60000);
   for (let i = 0; i < 10; i++) {
-    s.postMessage(r, "a", '["needle",' + gap + '"v' + i + '"]', "json", null, null);
+    s.postMessage(r, "a", '["needle",' + gap + '"v' + i + '"]', "json", null, null, null, EPOCH1);
   }
   const sr = s.searchMessages(r, "needle", 20, 0);
   check(
@@ -71,38 +74,10 @@ const NUL = String.fromCharCode(0);
   rmSync(dir, { recursive: true, force: true });
 }
 
-// --- 3: many NUL rows all heal (cursored, not .all()) -------------------------
-{
-  const dir = mkdtempSync(join(tmpdir(), "v09-heal-"));
-  const DB = join(dir, "t.db");
-  { const s = new ChatStore(DB); s.createRoom("r", null, null); s.upsertAgent("a", null, null, null); s.joinRoom(1, "a"); s.close(); }
-  {
-    const raw = new Database(DB);
-    raw.pragma("foreign_keys = ON");
-    raw.exec("DROP TRIGGER IF EXISTS messages_reject_nul");
-    const ins = raw.prepare("INSERT INTO messages (room_id,seq,agent_id,format,body) VALUES (1,?,'a','text',?)");
-    for (let i = 1; i <= 25; i++) ins.run(i, "a" + i + NUL + "b" + i);
-    // A build old enough to write NULs predates the migration marker, so clear
-    // user_version: the body NUL scan is now gated on it and must re-run here.
-    raw.pragma("user_version = 0");
-    raw.close();
-  }
-  const s = new ChatStore(DB); // migrate heal runs
-  let allHealed = true;
-  for (let i = 1; i <= 25; i++) {
-    const gm = s.getMessage(1, i, 0, 1000);
-    if (gm.content !== "a" + i + "�" + "b" + i) allHealed = false;
-  }
-  const leftover = new Database(DB).prepare("SELECT COUNT(*) c FROM messages WHERE instr(body, char(0)) > 0").get().c;
-  check("all 25 NUL rows healed (cursored heal, no .all())", allHealed && leftover === 0, { allHealed, leftover });
-  s.close();
-  rmSync(dir, { recursive: true, force: true });
-}
-
 // --- 13: resolveRoom skips an unsafe-integer id ref ---------------------------
 {
   const s = new ChatStore(":memory:");
-  const r = s.createRoom("real-room", null, null);
+  const r = mkRoom(s, "real-room", null, null);
   check("resolveRoom finds a normal id", s.resolveRoom(String(r.id))?.id === r.id, null);
   // 2^53+1 rounds to 2^53 in JS; must NOT resolve to any room by rounding.
   check(
@@ -117,7 +92,7 @@ const NUL = String.fromCharCode(0);
 {
   const dir = mkdtempSync(join(tmpdir(), "v09-mcp-"));
   const DB = join(dir, "t.db");
-  { const s = new ChatStore(DB); s.createRoom("watch-me", null, null); s.close(); }
+  { const s = new ChatStore(DB); mkRoom(s, "watch-me", null, null); s.close(); }
   const child = spawn("node", [join(ROOT, "dist", "index.js")], { env: { ...process.env, AGENT_CHAT_DB: DB }, stdio: ["pipe", "pipe", "ignore"] });
   const R = new Map();
   let buf = "";
@@ -148,30 +123,73 @@ const NUL = String.fromCharCode(0);
   await w(1);
   s({ jsonrpc: "2.0", method: "notifications/initialized" });
 
-  // #15: whitespace-only agent_id is rejected (not silently treated as omitted).
-  const ws = await call("join_room", { room: "watch-me", agent_id: "   " });
-  check("whitespace-only agent_id is rejected", ws.isErr && /whitespace|empty/.test(JSON.stringify(ws.data)), ws);
+  // #15's old subject (a whitespace-only agent_id treated as "omitted") cannot
+  // arise now: join_room takes no id at all. Its replacement is the gate that
+  // makes that impossible -- joining before any persona is bound is refused
+  // rather than auto-assigning one.
+  const unbound = await call("join_room", { room: "watch-me" });
+  check(
+    "join_room before binding a persona is refused, not auto-assigned",
+    unbound.isErr && /create_persona|resume_persona/.test(JSON.stringify(unbound.data)),
+    unbound,
+  );
+  await call("create_persona", { brand: "testbrand", model: "testmodel", version: "1" });
 
-  // Join normally, then SOFT-LEAVE, then a scoped wait_for_messages must succeed.
-  await call("join_room", { room: "watch-me", agent_id: "u" });
+  // A scoped watch requires PRESENT membership. Delivery and visibility have to
+  // read the same membership state: a watcher on a room this persona has left
+  // would deliver traffic every peer can see it is not receiving, and the
+  // heartbeat correctly refuses to refresh that room, so the two disagreed.
+  await call("join_room", { room: "watch-me" });
+  const present = await call("wait_for_messages", { room: "watch-me" });
+  check(
+    "wait_for_messages arms a scoped watch while present",
+    !present.isErr && typeof present.data.command === "string",
+    present,
+  );
   await call("leave_room", {});
   const softLeft = await call("wait_for_messages", { room: "watch-me" });
   check(
-    "wait_for_messages allows a scoped watch on a soft-left room",
-    !softLeft.isErr && typeof softLeft.data.command === "string",
+    "wait_for_messages REFUSES a scoped watch on a room the persona has left",
+    softLeft.isErr && /LEFT room/.test(JSON.stringify(softLeft.data)),
     softLeft,
+  );
+  check(
+    "and the refusal names rejoin as the remedy, since join_room keeps the marker",
+    /join_room/.test(JSON.stringify(softLeft.data)),
+    softLeft.data,
+  );
+  // Rejoining restores it, so the boundary costs one call and loses nothing.
+  await call("join_room", { room: "watch-me" });
+  const rejoined = await call("wait_for_messages", { room: "watch-me" });
+  check(
+    "rejoining restores the scoped watch",
+    !rejoined.isErr && typeof rejoined.data.command === "string",
+    rejoined,
   );
   // But a never-joined room is still refused.
   const never = await call("wait_for_messages", { room: "nope-never" });
   check("wait_for_messages still refuses a never-existent room", never.isErr, never);
 
-  // #5: scoped watches carry the live session, never a frozen --since value.
-  await call("join_room", { room: "watch-me", agent_id: "p", cursor: "private" });
-  const priv = await call("wait_for_messages", { room: "watch-me" });
-  check("private scoped watch emits --session, not --since", !priv.isErr && /--session /.test(priv.data.command || "") && !/--since /.test(priv.data.command || ""), priv.data.command);
-  await call("join_room", { room: "watch-me", agent_id: "p", cursor: "shared" });
-  const shared = await call("wait_for_messages", { room: "watch-me" });
-  check("shared scoped watch also omits --since", !shared.isErr && /--session /.test(shared.data.command || "") && !/--since /.test(shared.data.command || ""), shared.data.command);
+  // #5: scoped watches carry the live binding, never a frozen --since value. A
+  // baked-in --since re-fires forever once crossed; --epoch instead ties the
+  // watcher to a runtime tenure while every probe reads the CURRENT cursor.
+  await call("join_room", { room: "watch-me" });
+  const scoped = await call("wait_for_messages", { room: "watch-me" });
+  check(
+    "scoped watch emits --epoch, never --since",
+    !scoped.isErr &&
+      /--epoch /.test(scoped.data.command || "") &&
+      !/--since /.test(scoped.data.command || ""),
+    scoped.data.command,
+  );
+  const allRooms = await call("wait_for_messages", {});
+  check(
+    "all-rooms watch also carries --epoch and omits --since",
+    !allRooms.isErr &&
+      /--epoch /.test(allRooms.data.command || "") &&
+      !/--since /.test(allRooms.data.command || ""),
+    allRooms.data.command,
+  );
 
   // #11: JSON.stringify normally turns a semantic lone surrogate into the
   // ASCII escape "\\ud800", so the storage-level string guard cannot see it.
@@ -244,9 +262,9 @@ const NUL = String.fromCharCode(0);
 {
   const dir = mkdtempSync(join(tmpdir(), "v09-poll-"));
   const DB = join(dir, "t.db");
-  { const s = new ChatStore(DB); s.createRoom("r", null, null); s.upsertAgent("w", null, null, null); s.joinRoom(1, "w"); s.close(); }
-  const POLLER = join(ROOT, "scripts", "wait-for-updates.sh");
-  const run = (a) => spawnSync("bash", [POLLER, ...a], { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20000 });
+  { const s = new ChatStore(DB); mkRoom(s, "r", null, null); mkAgent(s, "w"); s.joinRoom(1, "w", EPOCH1, {}); s.close(); }
+  const POLLER = join(ROOT, "dist", "poller.js");
+  const run = (a) => spawnSync("node", [POLLER, ...a], { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20000 });
   const padded = run(["--agent", "w", "--interval", "00000000005", "--timeout", "1"]);
   check("poller accepts an 11-digit zero-padded value (times out cleanly)", padded.status === 124, { status: padded.status, stderr: padded.stderr });
   const huge = run(["--agent", "w", "--interval", "99999999999", "--timeout", "1"]);
@@ -259,9 +277,9 @@ const NUL = String.fromCharCode(0);
   const dir = mkdtempSync(join(tmpdir(), "v09-claims-"));
   const DB = join(dir, "t.db");
   const s = new ChatStore(DB);
-  const r = s.createRoom("claims", null, null).id;
-  s.upsertAgent("a", null, null, null); s.joinRoom(r, "a");
-  for (const k of ["k-a", "k-b", "k-c", "k-d"]) s.claimResource(r, k, "a", 900, null);
+  const r = mkRoom(s, "claims", null, null).id;
+  mkAgent(s, "a"); s.joinRoom(r, "a", EPOCH1, {});
+  for (const k of ["k-a", "k-b", "k-c", "k-d"]) s.claimResource(r, k, "a", EPOCH1, 900, null);
   const p1 = s.listClaims(r, 2, "");
   check(
     "claims page 1: first two by key, next_key set",
@@ -288,9 +306,9 @@ const NUL = String.fromCharCode(0);
 // --- 9: preview_chars cuts in CODEPOINTS (parity with get_message) -----------
 {
   const s = new ChatStore(":memory:");
-  const r = s.createRoom("r", null, null).id;
-  s.upsertAgent("a", null, null, null); s.joinRoom(r, "a");
-  s.postMessage(r, "a", "\u{1F600}".repeat(75), "text", null, null); // 75 emoji = 75 cp, 150 UTF-16
+  const r = mkRoom(s, "r", null, null).id;
+  mkAgent(s, "a"); s.joinRoom(r, "a", EPOCH1, {});
+  s.postMessage(r, "a", "\u{1F600}".repeat(75), "text", null, null, null, EPOCH1); // 75 emoji = 75 cp, 150 UTF-16
   const p50 = s.readHistory(r, 10, undefined, 50).messages[0];
   check(
     "preview_chars:50 keeps 50 codepoints (emoji), not 25 UTF-16 halves",
@@ -306,125 +324,15 @@ const NUL = String.fromCharCode(0);
   s.close();
 }
 
-// --- 10: legacy metadata NULs are healed (not just message bodies) -----------
-{
-  const dir = mkdtempSync(join(tmpdir(), "v09-meta-"));
-  const DB = join(dir, "t.db");
-  {
-    const s = new ChatStore(DB);
-    s.createRoom("r", "desc", "pin");
-    s.upsertAgent("a", null, null, "adesc");
-    s.joinRoom(1, "a");
-    s.claimResource(1, "k", "a", 900, "cnote");
-    s.close();
-  }
-  {
-    const raw = new Database(DB);
-    raw.exec(`
-      DROP TRIGGER rooms_reject_nul_insert;
-      DROP TRIGGER rooms_description_reject_nul_update;
-      DROP TRIGGER rooms_pinned_reject_nul_update;
-      DROP TRIGGER agents_reject_nul_insert;
-      DROP TRIGGER agents_description_reject_nul_update;
-      DROP TRIGGER claims_reject_nul_insert;
-      DROP TRIGGER claims_note_reject_nul_update;
-      PRAGMA user_version = 2;
-    `);
-    raw.prepare("UPDATE rooms SET description = 'x'||char(0)||'y' WHERE id=1").run();
-    raw.prepare("UPDATE rooms SET pinned = 'p'||char(0)||'q' WHERE id=1").run();
-    raw.prepare("UPDATE agents SET description = 'a'||char(0)||'b' WHERE id='a'").run();
-    raw.prepare("UPDATE claims SET note = 'n'||char(0)||'m' WHERE room_id=1 AND key='k'").run();
-    raw.close();
-  }
-  const s = new ChatStore(DB); // migrate heals metadata columns
-  const room = s.listRooms(10, 0).rooms[0];
-  const agent = s.listAgents(1, 5).agents.find((a) => a.id === "a");
-  const claim = s.listClaims(1).claims[0];
-  check("room description NUL healed (listing substr reads it whole)", room.description === "x�y", room.description);
-  check("room pinned NUL healed", room.pinned === "p�q", room.pinned);
-  check("agent description NUL healed", agent && agent.description === "a�b", agent && agent.description);
-  check("claim note NUL healed", claim && claim.note === "n�m", claim && claim.note);
-  s.close();
-  {
-    const raw = new Database(DB);
-    let rejected = 0;
-    for (const sql of [
-      "UPDATE rooms SET description = 'x'||char(0)||'y' WHERE id=1",
-      "UPDATE rooms SET pinned = 'p'||char(0)||'q' WHERE id=1",
-      "UPDATE agents SET description = 'a'||char(0)||'b' WHERE id='a'",
-      "UPDATE claims SET note = 'n'||char(0)||'m' WHERE room_id=1 AND key='k'",
-    ]) {
-      try {
-        raw.exec(sql);
-      } catch {
-        rejected++;
-      }
-    }
-    check("database guards reject new metadata NULs", rejected === 4, rejected);
-    raw.close();
-  }
-  rmSync(dir, { recursive: true, force: true });
-}
-
-// --- 6: session-aware presence -- one twin leaving does not evict a live twin -
-// The 4th joinRoom arg is the PRESENCE nonce (every session registers one now);
-// the 3rd is the cursor nonce. Here both twins are private (cursor + presence).
+// --- 6b: leave marks the persona's membership left --------------------------
 {
   const s = new ChatStore(":memory:");
-  const r = s.createRoom("r", null, null).id;
-  s.upsertAgent("x", null, null, null);
-  s.joinRoom(r, "x", "sessA", "sessA"); // session A (cursor + presence)
-  s.joinRoom(r, "x", "sessB", "sessB"); // session B
-  const legacyLeave = s.leaveRoom(r, "x");
+  const r = mkRoom(s, "r", null, null).id;
+  mkAgent(s, "y");
+  s.joinRoom(r, "y", EPOCH1, {});
+  const left = s.leaveRoom(r, "y", EPOCH1);
   check(
-    "legacy/sessionless leave cannot evict live current-session twins",
-    legacyLeave === false && s.getMembership(r, "x").left_at === null,
-    { legacyLeave, membership: s.getMembership(r, "x") },
-  );
-  const leftA = s.leaveRoom(r, "x", "sessA");
-  const afterA = s.getMembership(r, "x");
-  check("session A leave returns true (it left)", leftA === true, leftA);
-  check(
-    "identity STAYS present after one twin leaves (live twin B remains)",
-    afterA.left_at === null && s.presentRoomCount("x") === 1,
-    { left_at: afterA.left_at, present: s.presentRoomCount("x") },
-  );
-  const leftB = s.leaveRoom(r, "x", "sessB");
-  const afterB = s.getMembership(r, "x");
-  check(
-    "identity leaves once the LAST twin leaves",
-    leftB === true && afterB.left_at !== null && s.presentRoomCount("x") === 0,
-    { left_at: afterB.left_at, present: s.presentRoomCount("x") },
-  );
-  // Fresh left tombstones are historical state, not live twins. A legacy/web
-  // join has no presence row; its subsequent identity-level leave must still
-  // report the present -> left transition truthfully.
-  s.joinRoom(r, "x");
-  const sessionlessAfterTombstones = s.leaveRoom(r, "x");
-  check(
-    "sessionless leave ignores tombstones when no live twin remains",
-    sessionlessAfterTombstones === true &&
-      s.getMembership(r, "x").left_at !== null,
-    { sessionlessAfterTombstones, membership: s.getMembership(r, "x") },
-  );
-  s.joinRoom(r, "x", "sessA", "sessA"); // rejoin clears this session's left flag
-  check(
-    "rejoin restores identity presence",
-    s.getMembership(r, "x").left_at === null && s.presentRoomCount("x") === 1,
-    s.presentRoomCount("x"),
-  );
-  s.close();
-}
-
-// --- 6b: shared (no session) leave stays identity-level ----------------------
-{
-  const s = new ChatStore(":memory:");
-  const r = s.createRoom("r", null, null).id;
-  s.upsertAgent("y", null, null, null);
-  s.joinRoom(r, "y"); // shared, no sessionId
-  const left = s.leaveRoom(r, "y");
-  check(
-    "shared leave marks identity left (no session rows to keep it present)",
+    "leave marks the persona's membership left",
     left === true && s.getMembership(r, "y").left_at !== null,
     s.getMembership(r, "y").left_at,
   );

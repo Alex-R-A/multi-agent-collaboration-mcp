@@ -3,7 +3,6 @@
 // priority posts plus every directed post, reports what it skipped, and drains
 // trailing low-priority chatter only after every qualifying row was delivered.
 import { ChatStore } from "../dist/db.js";
-import Database from "better-sqlite3";
 import { spawn, spawnSync } from "node:child_process";
 import {
   chmodSync,
@@ -17,6 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { EPOCH1, mkAgent, bindArgs, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
@@ -29,10 +29,11 @@ const check = (name, condition, detail) => {
 
 function setup(name = "priority-room") {
   const s = new ChatStore(":memory:");
-  const room = s.createRoom(name, null, null).id;
+  const room = mkRoom(s, name, null, null).id;
+  mkAgent(s, "me");
   for (const id of ["me", "peer"]) {
-    s.upsertAgent(id, null, null, null);
-    s.joinRoom(room, id);
+    mkAgent(s, id);
+    s.joinRoom(room, id, EPOCH1, {});
   }
   return { s, room };
 }
@@ -41,15 +42,15 @@ function setup(name = "priority-room") {
 // It may cross own rows (which catch_up never returns), but never the next peer.
 {
   const { s, room } = setup("cursor-normalization");
-  const own1 = s.postMessage(room, "me", "own-1", "text", null, null);
+  const own1 = s.postMessage(room, "me", "own-1", "text", null, null, null, EPOCH1);
   check(
     "E1 an own-only post becomes the durable shared baseline",
     own1.seq === 1 && s.getMembership(room, "me").last_read_seq === 1 &&
-      s.unreadProbe(room, "me", null) === 0,
+      s.unreadProbe(room, "me", EPOCH1) === 0,
     s.getMembership(room, "me"),
   );
-  s.markRead(room, "me", 0);
-  const repaired = s.catchUp(room, "me", 50);
+  s.markRead(room, "me", EPOCH1, 0);
+  const repaired = s.catchUp(room, "me", 50, undefined, 100000, EPOCH1);
   check(
     "E1 an empty historical own tail is repaired once",
     repaired.messages.length === 0 && repaired.advanced === true &&
@@ -58,14 +59,14 @@ function setup(name = "priority-room") {
     repaired,
   );
 
-  s.postMessage(room, "peer", "peer-1", "text", null, null); // seq 2
-  const blind = s.postMessage(room, "me", "own-2", "text", null, null); // seq 3
+  s.postMessage(room, "peer", "peer-1", "text", null, null, null, EPOCH1); // seq 2
+  const blind = s.postMessage(room, "me", "own-2", "text", null, null, null, EPOCH1); // seq 3
   check(
     "E1 posting never normalizes across an unseen peer",
     blind.crossed === 1 && s.getMembership(room, "me").last_read_seq === 1,
     { blind, marker: s.getMembership(room, "me") },
   );
-  const caught = s.catchUp(room, "me", 50);
+  const caught = s.catchUp(room, "me", 50, undefined, 100000, EPOCH1);
   check(
     "E1 catch_up delivers the peer then absorbs its trailing own suffix",
     caught.messages.map((m) => m.seq).join(",") === "2" &&
@@ -73,17 +74,17 @@ function setup(name = "priority-room") {
     caught,
   );
 
-  s.postMessage(room, "peer", "peer-2", "text", null, null); // seq 4
-  s.postMessage(room, "me", "own-3", "text", null, null); // seq 5
-  s.postMessage(room, "peer", "peer-3", "text", null, null); // seq 6
-  const one = s.catchUp(room, "me", 1);
+  s.postMessage(room, "peer", "peer-2", "text", null, null, null, EPOCH1); // seq 4
+  s.postMessage(room, "me", "own-3", "text", null, null, null, EPOCH1); // seq 5
+  s.postMessage(room, "peer", "peer-3", "text", null, null, null, EPOCH1); // seq 6
+  const one = s.catchUp(room, "me", 1, undefined, 100000, EPOCH1);
   check(
     "E1 a limited page crosses own rows but stops before the next peer",
     one.messages[0]?.seq === 4 && one.new_last_read_seq === 5 &&
       one.remaining === 1 && s.getMembership(room, "me").last_read_seq === 5,
     one,
   );
-  const rest = s.catchUp(room, "me", 50);
+  const rest = s.catchUp(room, "me", 50, undefined, 100000, EPOCH1);
   check(
     "E1 the peer beyond the own suffix remains deliverable",
     rest.messages.map((m) => m.seq).join(",") === "6" && rest.remaining === 0,
@@ -92,64 +93,20 @@ function setup(name = "priority-room") {
   s.close();
 }
 
-// E2: one identity's post also normalizes caught-up private sibling cursors;
-// otherwise each sibling watcher would rescan the same own tail independently.
-{
-  const { s, room } = setup("private-cursor-normalization");
-  s.joinRoom(room, "me", "S1", "S1");
-  s.joinRoom(room, "me", "S2", "S2");
-  s.postMessage(room, "me", "own", "text", null, null, null, "S1");
-  check(
-    "E2 an own-only post advances caught-up private siblings",
-    s.getCursor(room, "me", "S1").last_read_seq === 1 &&
-      s.getCursor(room, "me", "S2").last_read_seq === 1,
-    {
-      s1: s.getCursor(room, "me", "S1"),
-      s2: s.getCursor(room, "me", "S2"),
-    },
-  );
-  s.postMessage(room, "peer", "unseen", "text", null, null);
-  s.postMessage(room, "me", "own-after-peer", "text", null, null, null, "S1");
-  check(
-    "E2 neither private sibling crosses an unseen peer",
-    s.getCursor(room, "me", "S1").last_read_seq === 1 &&
-      s.getCursor(room, "me", "S2").last_read_seq === 1,
-    {
-      s1: s.getCursor(room, "me", "S1"),
-      s2: s.getCursor(room, "me", "S2"),
-    },
-  );
-  const s1Read = s.catchUp(room, "me", 50, undefined, undefined, "S1");
-  s.postMessage(room, "me", "s1-is-current", "text", null, null, null, "S1");
-  check(
-    "E2 a current private poster advances while its lagging sibling stays put",
-    s1Read.messages.map((m) => m.seq).join(",") === "2" &&
-      s.getCursor(room, "me", "S1").last_read_seq === 4 &&
-      s.getCursor(room, "me", "S2").last_read_seq === 1,
-    {
-      read: s1Read,
-      s1: s.getCursor(room, "me", "S1"),
-      s2: s.getCursor(room, "me", "S2"),
-    },
-  );
-  s.close();
-}
-
 // S1/S2: qualifying rules, disclosed loss, trailing drain, and row paging.
 {
   const { s, room } = setup();
-  const root = s.postMessage(room, "me", "my root", "text", null, null);
-  s.postMessage(room, "peer", "low-1", "text", null, null);
-  s.postMessage(room, "peer", "checkpoint", "text", null, null, null, null, {
+  const root = s.postMessage(room, "me", "my root", "text", null, null, null, EPOCH1);
+  s.postMessage(room, "peer", "low-1", "text", null, null, null, EPOCH1);
+  s.postMessage(room, "peer", "checkpoint", "text", null, null, null, EPOCH1, {
     priority: true,
   });
-  s.postMessage(room, "peer", "low-2", "text", null, null);
-  s.postMessage(room, "peer", "mention", "text", ["me"], null);
-  s.postMessage(room, "peer", "reply", "text", null, root.seq);
-  s.postMessage(room, "peer", "low-3", "text", null, null);
+  s.postMessage(room, "peer", "low-2", "text", null, null, null, EPOCH1);
+  s.postMessage(room, "peer", "mention", "text", ["me"], null, null, EPOCH1);
+  s.postMessage(room, "peer", "reply", "text", null, root.seq, null, EPOCH1);
+  s.postMessage(room, "peer", "low-3", "text", null, null, null, EPOCH1);
 
-  const page = s.catchUp(room, "me", 50, undefined, 100_000, null, {
-    sessionId: null,
+  const page = s.catchUp(room, "me", 50, undefined, 100_000, EPOCH1, {
     priorityOnly: true,
   });
   check(
@@ -170,13 +127,12 @@ function setup(name = "priority-room") {
   );
   check(
     "S1 ordinary catch_up has no discarded backlog left",
-    s.catchUp(room, "me", 50).messages.length === 0,
+    s.catchUp(room, "me", 50, undefined, 100000, EPOCH1).messages.length === 0,
     null,
   );
 
-  s.markRead(room, "me", 0);
-  const first = s.catchUp(room, "me", 1, undefined, 100_000, null, {
-    sessionId: null,
+  s.markRead(room, "me", EPOCH1, 0);
+  const first = s.catchUp(room, "me", 1, undefined, 100_000, EPOCH1, {
     priorityOnly: true,
   });
   check(
@@ -186,8 +142,7 @@ function setup(name = "priority-room") {
       first.remaining === 4 && first.skipped_count === 1,
     first,
   );
-  const second = s.catchUp(room, "me", 2, undefined, 100_000, null, {
-    sessionId: null,
+  const second = s.catchUp(room, "me", 2, undefined, 100_000, EPOCH1, {
     priorityOnly: true,
   });
   check(
@@ -204,10 +159,9 @@ function setup(name = "priority-room") {
 {
   const { s, room } = setup("all-low");
   for (let i = 0; i < 25; i++) {
-    s.postMessage(room, "peer", `noise-${i}`, "text", null, null);
+    s.postMessage(room, "peer", `noise-${i}`, "text", null, null, null, EPOCH1);
   }
-  const page = s.catchUp(room, "me", 5, undefined, 100_000, null, {
-    sessionId: null,
+  const page = s.catchUp(room, "me", 5, undefined, 100_000, EPOCH1, {
     priorityOnly: true,
   });
   check(
@@ -223,20 +177,9 @@ function setup(name = "priority-room") {
 {
   const { s, room } = setup("priority-byte-cut");
   for (let i = 0; i < 2; i++) {
-    s.postMessage(
-      room,
-      "peer",
-      String.fromCharCode(3).repeat(5000),
-      "text",
-      null,
-      null,
-      null,
-      null,
-      { priority: true },
-    );
+    s.postMessage(room, "peer", String.fromCharCode(3).repeat(5000), "text", null, null, null, EPOCH1, { priority: true });
   }
-  const page = s.catchUp(room, "me", 50, undefined, 1000, null, {
-    sessionId: null,
+  const page = s.catchUp(room, "me", 50, undefined, 1000, EPOCH1, {
     priorityOnly: true,
   });
   check(
@@ -246,8 +189,7 @@ function setup(name = "priority-room") {
       page.remaining === 1,
     { size: JSON.stringify(page).length, page },
   );
-  const rest = s.catchUp(room, "me", 50, 20, 100_000, null, {
-    sessionId: null,
+  const rest = s.catchUp(room, "me", 50, 20, 100_000, EPOCH1, {
     priorityOnly: true,
   });
   check(
@@ -259,65 +201,18 @@ function setup(name = "priority-room") {
   s.close();
 }
 
-// S5: mixed-version migration gives old writers/readers a safe default.
-{
-  const dir = mkdtempSync(join(tmpdir(), "v0120-migrate-"));
-  const dbPath = join(dir, "t.db");
-  new ChatStore(dbPath).close();
-  const raw = new Database(dbPath);
-  raw.exec(`
-    DROP INDEX idx_messages_client_message_id;
-    ALTER TABLE messages DROP COLUMN client_message_id;
-    ALTER TABLE messages DROP COLUMN priority;
-  `);
-  raw.close();
-  const migrated = new ChatStore(dbPath);
-  const inspect = new Database(dbPath, { readonly: true });
-  const priorityCol = inspect
-    .prepare(
-      `SELECT dflt_value, "notnull" AS required
-       FROM pragma_table_info('messages') WHERE name = 'priority'`,
-    )
-    .get();
-  const idempotencyCol = inspect
-    .prepare(
-      `SELECT type FROM pragma_table_info('messages')
-       WHERE name = 'client_message_id'`,
-    )
-    .get();
-  const idempotencyIndex = inspect
-    .prepare(
-      `SELECT sql FROM sqlite_master
-       WHERE type = 'index' AND name = 'idx_messages_client_message_id'`,
-    )
-    .get();
-  inspect.close();
-  check(
-    "S5 legacy database gains NOT NULL priority default 0",
-    priorityCol?.required === 1 && String(priorityCol?.dflt_value) === "0",
-    priorityCol,
-  );
-  check(
-    "S5 legacy database gains sparse client-message idempotency index",
-    idempotencyCol?.type === "TEXT" &&
-      /UNIQUE INDEX/.test(idempotencyIndex?.sql ?? "") &&
-      /WHERE client_message_id IS NOT NULL/.test(idempotencyIndex?.sql ?? ""),
-    { idempotencyCol, idempotencyIndex },
-  );
-  migrated.close();
-  rmSync(dir, { recursive: true, force: true });
-}
-
 // D1: direct ChatStore callers get the same bounded/progress-safe behavior as
 // MCP-validated callers. These guards prevent a script from turning a lossy
 // limit edge into silent advancement or an offset walk into an infinite loop.
+// They are the ONLY coverage of these limits at the store boundary -- the MCP
+// schemas reject the same values earlier, so removing this block leaves every
+// direct-caller guard untested.
 {
   const { s, room } = setup("direct-boundaries");
-  s.postMessage(room, "peer", "important", "text", null, null, null, null, {
+  s.postMessage(room, "peer", "important", "text", null, null, null, EPOCH1, {
     priority: true,
   });
-  const zeroLimit = s.catchUp(room, "me", 0, undefined, 100_000, null, {
-    sessionId: null,
+  const zeroLimit = s.catchUp(room, "me", 0, undefined, 100_000, EPOCH1, {
     priorityOnly: true,
   });
   check(
@@ -328,14 +223,14 @@ function setup(name = "priority-room") {
     zeroLimit,
   );
 
-  const emoji = s.postMessage(room, "peer", "😀z", "text", null, null);
+  const emoji = s.postMessage(room, "peer", "\u{1f600}z", "text", null, null, null, EPOCH1);
   const tinyPage = s.getMessage(room, emoji.seq, 0, 1);
   check(
     "D1 tiny get_message pages always advance across an astral codepoint",
-    tinyPage?.content === "😀" && tinyPage.next_offset === 1,
+    tinyPage?.content === "\u{1f600}" && tinyPage.next_offset === 1,
     tinyPage,
   );
-  const ascii = s.postMessage(room, "peer", "ab", "text", null, null);
+  const ascii = s.postMessage(room, "peer", "ab", "text", null, null, null, EPOCH1);
   const tinyAscii = s.getMessage(room, ascii.seq, 0, 1);
   check(
     "D1 tiny get_message still honors a one-codepoint ASCII window",
@@ -356,7 +251,7 @@ function setup(name = "priority-room") {
 
   let oversizedCatchUpError = "";
   try {
-    s.catchUp(room, "me", 50, undefined, 400_001);
+    s.catchUp(room, "me", 50, undefined, 400_001, EPOCH1);
   } catch (error) {
     oversizedCatchUpError = String(error?.message ?? error);
   }
@@ -368,7 +263,7 @@ function setup(name = "priority-room") {
 
   let nanCasError = "";
   try {
-    s.postMessage(room, "me", "unsafe NaN decision", "text", null, null, null, null, {
+    s.postMessage(room, "me", "unsafe NaN decision", "text", null, null, null, EPOCH1, {
       ifLastReadSeq: Number.NaN,
     });
   } catch (error) {
@@ -383,8 +278,8 @@ function setup(name = "priority-room") {
     nanCasError,
   );
 
-  s.markRead(room, "me");
-  s.postMessage(room, "peer", "x".repeat(5000), "text", null, null);
+  s.markRead(room, "me", EPOCH1);
+  s.postMessage(room, "peer", "x".repeat(5000), "text", null, null, null, EPOCH1);
   const boundedCrossing = s.postMessage(
     room,
     "me",
@@ -393,7 +288,7 @@ function setup(name = "priority-room") {
     null,
     null,
     null,
-    null,
+    EPOCH1,
     { crossedPreviewChars: 1_000_000 },
   );
   check(
@@ -410,15 +305,15 @@ function setup(name = "priority-room") {
 // one agent has pending rows in several rooms in the same second.
 {
   const s = new ChatStore(":memory:");
-  s.upsertAgent("boss", null, null, null);
+  mkAgent(s, "boss");
   for (let i = 0; i < 60; i++) {
     const n = String(i).padStart(2, "0");
-    const room = s.createRoom(`${n}-${String.fromCharCode(1).repeat(190)}`, null, null).id;
+    const room = mkRoom(s, `${n}-${String.fromCharCode(1).repeat(190)}`, null, null).id;
     const worker = `worker-${n}-${"\\".repeat(180)}`;
-    s.upsertAgent(worker, null, null, null);
-    s.joinRoom(room, "boss");
-    s.joinRoom(room, worker);
-    s.postMessage(room, "boss", "work", "text", [worker], null);
+    mkAgent(s, worker);
+    s.joinRoom(room, "boss", EPOCH1, {});
+    s.joinRoom(room, worker, EPOCH1, {});
+    s.postMessage(room, "boss", "work", "text", [worker], null, null, EPOCH1);
   }
   const keys = [];
   let after;
@@ -448,13 +343,13 @@ function setup(name = "priority-room") {
 
 {
   const s = new ChatStore(":memory:");
-  s.upsertAgent("boss", null, null, null);
-  s.upsertAgent("same-target", null, null, null);
+  mkAgent(s, "boss");
+  mkAgent(s, "same-target");
   for (let i = 0; i < 3; i++) {
-    const room = s.createRoom(`tie-${i}`, null, null).id;
-    s.joinRoom(room, "boss");
-    s.joinRoom(room, "same-target");
-    s.postMessage(room, "boss", "work", "text", ["same-target"], null);
+    const room = mkRoom(s, `tie-${i}`, null, null).id;
+    s.joinRoom(room, "boss", EPOCH1, {});
+    s.joinRoom(room, "same-target", EPOCH1, {});
+    s.postMessage(room, "boss", "work", "text", ["same-target"], null, null, EPOCH1);
   }
   const rooms = [];
   let after;
@@ -553,10 +448,12 @@ await (async () => {
   };
 
   const store = new ChatStore(DB);
-  const room = store.createRoom("mcp-priority", null, null).id;
-  store.upsertAgent("peer", null, null, null);
-  store.joinRoom(room, "peer");
-  await call("join_room", { room: "mcp-priority", agent_id: "me" });
+  const room = mkRoom(store, "mcp-priority", null, null).id;
+  mkAgent(store, "peer");
+  store.joinRoom(room, "peer", EPOCH1, {});
+  mkAgent(store, "me");
+  await call("resume_persona", bindArgs("me"));
+  await call("join_room", { room: "mcp-priority" });
   const posted = await call("post_message", {
     content: "my checkpoint",
     priority: true,
@@ -567,12 +464,12 @@ await (async () => {
       store.readHistory(room, 10).messages[0].priority === true,
     posted.data,
   );
-  store.postMessage(room, "peer", "low", "text", null, null);
-  store.postMessage(room, "peer", "important", "text", null, null, null, null, {
+  store.postMessage(room, "peer", "low", "text", null, null, null, EPOCH1);
+  store.postMessage(room, "peer", "important", "text", null, null, null, EPOCH1, {
     priority: true,
   });
-  store.postMessage(room, "peer", "direct", "text", ["me"], null);
-  store.postMessage(room, "peer", "tail noise", "text", null, null);
+  store.postMessage(room, "peer", "direct", "text", ["me"], null, null, EPOCH1);
+  store.postMessage(room, "peer", "tail noise", "text", null, null, null, EPOCH1);
   const caught = await call("catch_up", { priority_only: true, max_bytes: 2000 });
   check(
     "P1 MCP priority catch-up is explicit, bounded, directed-safe, and draining",
@@ -583,7 +480,7 @@ await (async () => {
     caught.data,
   );
 
-  store.postMessage(room, "peer", "must remain", "text", null, null);
+  store.postMessage(room, "peer", "must remain", "text", null, null, null, EPOCH1);
   const markerBefore = store.getMembership(room, "me").last_read_seq;
   const incompatible = await call("catch_up", {
     priority_only: true,
@@ -602,10 +499,10 @@ await (async () => {
     recovered.data,
   );
 
-  const otherRoom = store.createRoom("claims-other", null, null).id;
-  const unjoinedRoom = store.createRoom("claims-unjoined", null, null).id;
-  await call("join_room", { room: "claims-other", agent_id: "me" });
-  await call("join_room", { room: "mcp-priority", agent_id: "me" });
+  const otherRoom = mkRoom(store, "claims-other", null, null).id;
+  const unjoinedRoom = mkRoom(store, "claims-unjoined", null, null).id;
+  await call("join_room", { room: "claims-other" });
+  await call("join_room", { room: "mcp-priority" });
   const claimed = await call("claim", {
     room: "claims-other",
     key: "probe:cross-room",
@@ -642,14 +539,14 @@ await (async () => {
     { released: released.data, unjoined: unjoined.data },
   );
 
-  store.upsertAgent("todo-a", null, null, null);
-  store.upsertAgent("todo-b", null, null, null);
-  store.joinRoom(otherRoom, "peer");
-  store.joinRoom(otherRoom, "todo-a");
-  store.joinRoom(unjoinedRoom, "peer");
-  store.joinRoom(unjoinedRoom, "todo-b");
-  store.postMessage(otherRoom, "peer", "task a", "text", ["todo-a"], null);
-  store.postMessage(unjoinedRoom, "peer", "task b", "text", ["todo-b"], null);
+  mkAgent(store, "todo-a");
+  mkAgent(store, "todo-b");
+  store.joinRoom(otherRoom, "peer", EPOCH1, {});
+  store.joinRoom(otherRoom, "todo-a", EPOCH1, {});
+  store.joinRoom(unjoinedRoom, "peer", EPOCH1, {});
+  store.joinRoom(unjoinedRoom, "todo-b", EPOCH1, {});
+  store.postMessage(otherRoom, "peer", "task a", "text", ["todo-a"], null, null, EPOCH1);
+  store.postMessage(unjoinedRoom, "peer", "task b", "text", ["todo-b"], null, null, EPOCH1);
   const pendingFirst = await call("pending_work", { limit: 1 });
   const pendingSecond = await call("pending_work", {
     limit: 1,
@@ -678,26 +575,37 @@ await (async () => {
   const originalBuildText = readFileSync(buildInfoPath, "utf8");
   const originalBuild = JSON.parse(originalBuildText);
   try {
+    check(
+      "P5 the current stamp carries an artifact hash (the stale contract needs it)",
+      typeof originalBuild.artifact_hash === "string" &&
+        originalBuild.artifact_hash.length === 64,
+      originalBuild,
+    );
     const baseTime = Date.parse(originalBuild.built_at) || Date.now();
+    // Staleness is HASH-ONLY. A rebuild that produces identical output must not
+    // be reported as a new deployment however much later it happened, so this
+    // stamp moves built_at forward by a full hour and keeps the hash.
     writeFileSync(
       buildInfoPath,
       JSON.stringify({
         ...originalBuild,
-        built_at: new Date(baseTime + 1000).toISOString(),
+        built_at: new Date(baseTime + 3_600_000).toISOString(),
       }) + "\n",
     );
     const sameArtifact = await call("server_info", {});
+    // And the converse: a different hash IS a new deployment even if built_at
+    // moves BACKWARD, which is what a timestamp comparison would have missed.
     writeFileSync(
       buildInfoPath,
       JSON.stringify({
         ...originalBuild,
-        built_at: new Date(baseTime + 2000).toISOString(),
+        built_at: new Date(baseTime - 3_600_000).toISOString(),
         artifact_hash: "0".repeat(64),
       }) + "\n",
     );
     const changedArtifact = await call("server_info", {});
     check(
-      "P5 identical rebuild is not stale; changed newer artifact is stale",
+      "P5 identical rebuild is not stale even much later; a changed artifact is stale even if older",
       sameArtifact.data.stale === false && changedArtifact.data.stale === true &&
         sameArtifact.data.artifact_hash === originalBuild.artifact_hash,
       { same: sameArtifact.data, changed: changedArtifact.data },

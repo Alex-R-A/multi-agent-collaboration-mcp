@@ -8,12 +8,12 @@ import {
   mkdtempSync,
   realpathSync,
   rmSync,
-  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ChatStore } from "../dist/db.js";
+import { EPOCH1, mkAgent, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const POLLER = join(ROOT, "dist", "poller.js");
@@ -83,10 +83,10 @@ const active = new Set();
 const remainingLocks = () => expectedLockPaths.filter((path) => existsSync(path));
 try {
   store = new ChatStore(DB);
-  const room = store.createRoom("poller-life", null, null).id;
+  const room = mkRoom(store, "poller-life", null, null).id;
   for (const id of ["me", "peer"]) {
-    store.upsertAgent(id, null, null, null);
-    store.joinRoom(room, id);
+    mkAgent(store, id);
+    store.joinRoom(room, id, EPOCH1, {});
   }
   const canonical = realpathSync(DB);
   const lockName =
@@ -100,10 +100,8 @@ try {
       : "agent-chat-pollers",
     lockName,
   );
-  expectedLockPaths = [
-    lockPath,
-    join(pollerTmp, "agent-chat-pollers", lockName),
-  ];
+  // ONE lock path. The watcher no longer double-locks a legacy directory.
+  expectedLockPaths = [lockPath];
   const base = [
     "--agent",
     "me",
@@ -122,7 +120,7 @@ try {
   const finalLock = await waitForLock(lockPath, finalProbe.child);
   await sleep(150);
   const postedAt = Date.now();
-  store.postMessage(room, "peer", "during-final-sleep", "text", null, null);
+  store.postMessage(room, "peer", "during-final-sleep", "text", null, null, null, EPOCH1);
   const finalResult = await finalProbe.wait(3_500);
   const finalDelay = Date.now() - postedAt;
   active.delete(finalProbe.child);
@@ -136,27 +134,7 @@ try {
     finalResult.code === 0 && finalJson?.has_updates === true && finalDelay >= 1_000,
     { finalResult, finalJson, finalDelay },
   );
-  store.markRead(room, "me");
-
-  // A pre-upgrade poller owns only the legacy path. The new build must honor
-  // that lock before touching its UID path, or a rolling deploy can create a
-  // duplicate watcher for the same scope.
-  const legacyLockPath = join(pollerTmp, "agent-chat-pollers", lockName);
-  writeFileSync(
-    legacyLockPath,
-    JSON.stringify({ pid: process.pid, token: "pre-upgrade-fixture" }),
-  );
-  const migrationBlocked = startPoller([...base, "--timeout", "1"]);
-  active.add(migrationBlocked.child);
-  const migrationResult = await migrationBlocked.wait(2_000);
-  active.delete(migrationBlocked.child);
-  check(
-    "a legacy-version lock still blocks a post-upgrade duplicate",
-    migrationResult.code === 2 && migrationResult.stderr.includes(legacyLockPath) &&
-      (lockPath === legacyLockPath || !existsSync(lockPath)),
-    { migrationResult, uidLockExists: existsSync(lockPath) },
-  );
-  rmSync(legacyLockPath, { force: true });
+  store.markRead(room, "me", EPOCH1);
 
   // A genuine duplicate remains fail-closed, but reports the exact lock so a
   // PID-reuse false positive is diagnosable. Both children are bounded and

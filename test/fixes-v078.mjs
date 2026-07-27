@@ -6,6 +6,7 @@
 //  #4  list_rooms is KEYSET-paged (after_id/next_id), so a room deleted between
 //      pages can no longer shift OFFSET and skip a still-live room.
 import { ChatStore } from "../dist/db.js";
+import { EPOCH1, mkAgent, mkRoom, rmRoom } from "./persona-helpers.mjs";
 
 let failures = 0;
 const check = (n, c, x) => {
@@ -16,15 +17,15 @@ const check = (n, c, x) => {
 // --- #2: my_mentions flags a ROW-limit cut, and after_id delivers the rest ----
 {
   const s = new ChatStore(":memory:");
-  const r = s.createRoom("room", null, null).id;
-  s.upsertAgent("w", null, null, null);
-  s.upsertAgent("p", null, null, null);
-  s.joinRoom(r, "w");
-  s.joinRoom(r, "p");
+  const r = mkRoom(s, "room", null, null).id;
+  mkAgent(s, "w");
+  mkAgent(s, "p");
+  s.joinRoom(r, "w", EPOCH1, {});
+  s.joinRoom(r, "p", EPOCH1, {});
   const N = 60; // > default limit 50, but all fit well inside 100k bytes
-  for (let i = 0; i < N; i++) s.postMessage(r, "p", "hi " + i, "text", ["w"], null);
+  for (let i = 0; i < N; i++) s.postMessage(r, "p", "hi " + i, "text", ["w"], null, null, EPOCH1);
 
-  const page = s.myMentions("w", 50, undefined, 100000, "nonce", 0);
+  const page = s.myMentions("w", 50, undefined, 100000, 0);
   check(
     "my_mentions returns exactly `limit` on an over-limit inbox",
     page.messages.length === 50,
@@ -41,7 +42,7 @@ const check = (n, c, x) => {
   let after = 0;
   let guard = 0;
   for (;;) {
-    const p = s.myMentions("w", 50, undefined, 100000, "nonce", after);
+    const p = s.myMentions("w", 50, undefined, 100000, after);
     for (const m of p.messages) seen.add(m.seq);
     if (!p.byte_limited) break; // stop exactly on the documented signal
     after = p.next_after_id;
@@ -58,13 +59,13 @@ const check = (n, c, x) => {
 
   // Boundary: exactly `limit` directed messages must NOT emit a false signal.
   const s2 = new ChatStore(":memory:");
-  const r2 = s2.createRoom("room", null, null).id;
-  s2.upsertAgent("w", null, null, null);
-  s2.upsertAgent("p", null, null, null);
-  s2.joinRoom(r2, "w");
-  s2.joinRoom(r2, "p");
-  for (let i = 0; i < 50; i++) s2.postMessage(r2, "p", "hi " + i, "text", ["w"], null);
-  const exact = s2.myMentions("w", 50, undefined, 100000, "nonce", 0);
+  const r2 = mkRoom(s2, "room", null, null).id;
+  mkAgent(s2, "w");
+  mkAgent(s2, "p");
+  s2.joinRoom(r2, "w", EPOCH1, {});
+  s2.joinRoom(r2, "p", EPOCH1, {});
+  for (let i = 0; i < 50; i++) s2.postMessage(r2, "p", "hi " + i, "text", ["w"], null, null, EPOCH1);
+  const exact = s2.myMentions("w", 50, undefined, 100000, 0);
   check(
     "exactly `limit` directed messages emits NO false byte_limited",
     exact.messages.length === 50 && exact.byte_limited === undefined,
@@ -78,14 +79,14 @@ const check = (n, c, x) => {
 {
   const s = new ChatStore(":memory:");
   const ids = [];
-  for (let i = 0; i < 6; i++) ids.push(s.createRoom("room-" + i, null, null).id);
+  for (let i = 0; i < 6; i++) ids.push(mkRoom(s, "room-" + i, null, null).id);
 
   const p1 = s.listRooms(3, 0);
   const seen = new Set(p1.rooms.map((r) => r.id));
   check("list_rooms first keyset page returns 3 with a next_id", p1.rooms.length === 3 && typeof p1.next_id === "number", p1.next_id);
 
   // A concurrent delete removes a room whose id is INSIDE page 1's range.
-  s.deleteRoom(ids[1]);
+  rmRoom(s, ids[1]);
 
   // Page 2 continues from the keyset cursor, not a shifted offset.
   const p2 = s.listRooms(3, p1.next_id);
@@ -101,7 +102,7 @@ const check = (n, c, x) => {
 
   // next_id must terminate: a full walk of an undisturbed listing ends cleanly.
   const s2 = new ChatStore(":memory:");
-  for (let i = 0; i < 5; i++) s2.createRoom("r-" + i, null, null);
+  for (let i = 0; i < 5; i++) mkRoom(s2, "r-" + i, null, null);
   const walked = new Set();
   let after = 0;
   let guard = 0;

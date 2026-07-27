@@ -41,6 +41,11 @@ const MAX_GET_MESSAGE_CHARS = 400_000;
  * intentionally small enough to keep the sparse unique index cheap. */
 export const MAX_CLIENT_MESSAGE_ID_CHARS = 200;
 
+/** Persona/human id cap. Exported because the server SIZES the canonical id it
+ * generates against it before allocating, rather than discovering the overflow
+ * as a store assertion after the fact. */
+export const MAX_AGENT_ID_CHARS = 200;
+
 /** Above this body length the store's json well-formedness re-validation is
  *  skipped: parsing a ~GB body into memory to walk it would defeat the
  *  memory-bounded read design, and such a caller owns validation (the MCP
@@ -159,10 +164,74 @@ const STUB_ALLOWANCE = 500;
 export const MIN_CATCH_UP_RESULT_BUDGET =
   Math.max(CATCH_UP_ENVELOPE, PRIORITY_CATCH_UP_ENVELOPE) + STUB_ALLOWANCE;
 
-/** Age (SQLite datetime modifier) past which a silent private session cursor
- *  is dead: reaped by the join-time GC and by prune (a dead cursor must not
- *  block retention forever). Live sessions refresh on every join/touch. */
-const SESSION_GC_AGE = "-7 days";
+/**
+ * A persona-authored operation was fenced out: the runtime that issued it no
+ * longer holds the persona, because a later valid resume took it over. Terminal
+ * by contract -- retrying cannot succeed, and the caller must create or resume a
+ * persona before acting again. A distinct class (not a bare Error) so the MCP
+ * layer can render it as `persona_lost` without string-matching a message.
+ */
+export class PersonaLostError extends Error {
+  readonly agentId: string;
+  readonly expectedEpoch: number;
+  readonly currentEpoch: number | null;
+  constructor(agentId: string, expectedEpoch: number, currentEpoch: number | null) {
+    super(
+      currentEpoch === null
+        ? `persona "${agentId}" no longer exists; create or resume a persona before acting`
+        : `persona "${agentId}" was taken over by a later runtime ` +
+          `(your epoch ${expectedEpoch}, current ${currentEpoch}); ` +
+          `this runtime's authority is gone and retrying cannot restore it`,
+    );
+    this.name = "PersonaLostError";
+    this.agentId = agentId;
+    this.expectedEpoch = expectedEpoch;
+    this.currentEpoch = currentEpoch;
+  }
+}
+
+/**
+ * A CORRECT resume word presented with a different brand/model/version.
+ *
+ * This is not a rejected credential. The word proves the caller is the
+ * persona's legitimate owner; what it reports is that the thing sitting behind
+ * the seat CHANGED. brand/model/version are immutable by construction, so a
+ * runtime whose actual model no longer matches them is a different participant
+ * asking to wear an old name, and letting it through would keep posting under a
+ * model identifier that is false to every peer reading the room -- the one
+ * thing the tuple exists to prevent.
+ *
+ * Distinct from a wrong word (a rejected credential, whose remedy is to find
+ * the right word) and from PersonaLostError (a takeover, whose remedy is to
+ * resume again). The remedy here is a NEW persona.
+ */
+export class ModelTupleMismatchError extends Error {
+  readonly agentId: string;
+  readonly stored: { brand: string; model: string; version: string };
+  readonly offered: { brand: string; model: string; version: string };
+  /** Rooms the persona is currently present in, so the caller can be told which
+   *  conversations to notify. It has no binding to look them up with itself. */
+  readonly rooms: string[];
+  constructor(
+    agentId: string,
+    stored: { brand: string; model: string; version: string },
+    offered: { brand: string; model: string; version: string },
+    rooms: string[],
+  ) {
+    super(
+      `persona "${agentId}" is ${stored.brand}/${stored.model}/${stored.version}, ` +
+        `but this runtime is ${offered.brand}/${offered.model}/${offered.version}. ` +
+        `The resume word is correct, so this is a MODEL CHANGE, not a bad ` +
+        `credential: brand/model/version are immutable and a persona cannot be ` +
+        `carried across them. Create a new persona instead.`,
+    );
+    this.name = "ModelTupleMismatchError";
+    this.agentId = agentId;
+    this.stored = stored;
+    this.offered = offered;
+    this.rooms = rooms;
+  }
+}
 
 /** Serialized-size budget for a metadata listing's row ARRAY, leaving room for
  *  the response envelope (total, truncated/size_trimmed flags) AND the keyset
@@ -244,6 +313,19 @@ function assertMaxLen(value: string | null, field: string, max: number): void {
 }
 
 /**
+ * NULL is the only way to say "no role". An empty or whitespace-only string is
+ * a third state that renders as no role while still being a set value, so the
+ * membership row would report a role that no listing can show and no filter can
+ * match. Rejected at the store, not just at the tool schema, so a direct-store
+ * caller cannot create the state either.
+ */
+function assertRole(role: string | null): void {
+  if (role !== null && role.trim() === "") {
+    throw new Error("role must be a non-blank string, or null to clear it");
+  }
+}
+
+/**
  * Trim a metadata listing to a serialized-size budget, dropping WHOLE rows off
  * the end (still reachable via offset paging). The per-row preview caps bound
  * one row, but control-heavy metadata serializes ~6x, so 200 rows could still
@@ -289,9 +371,28 @@ export type RoomSummary = RoomRow & {
   description_truncated?: boolean;
 };
 
+/** A row of the agents table: one PERSONA, LLM or human. */
+export type PersonaRow = {
+  id: string;
+  /** 1 for a web participant. Humans carry no LLM tuple and no resume word,
+   *  and the table CHECK enforces that both shapes stay whole. */
+  is_human: number;
+  brand: string | null;
+  model: string | null;
+  version: string | null;
+  resume_word: string | null;
+  runtime_epoch: number;
+  description: string | null;
+  created_at: string;
+};
+
 export type AgentRow = {
   id: string;
-  type: string | null;
+  brand: string | null;
+  model: string | null;
+  version: string | null;
+  is_human: boolean;
+  /** ROOM-LOCAL: this persona's role in the listed room, not a global one. */
   role: string | null;
   /** Listing preview (cut at 300 chars, flagged below). */
   description: string | null;
@@ -311,7 +412,14 @@ export type RecipientStatus = {
   id: string;
   /** unknown = never joined, left = joined then left, idle = present but not
    *  seen recently, active = present and recently seen OR carrying an
-   *  unexpired best-effort wait lease. */
+   *  unexpired best-effort wait lease.
+   *
+   *  "Seen recently" is LISTENER recency, not model activity: an MCP call from
+   *  the bound runtime sets it, and so does the two-minute heartbeat of an
+   *  armed watcher. So `active` means a runtime exists and is reachable. It is
+   *  not evidence that the model is reasoning, reading, or able to wake, and a
+   *  seat with a live watcher reads `active` no matter how long the model
+   *  behind it has been silent. `watching` is the stronger claim. */
   status: "active" | "idle" | "left" | "unknown";
   present: boolean;
   idle_seconds: number | null;
@@ -342,8 +450,6 @@ export type ReplyRef = {
 export type MessageRow = {
   seq: number;
   from: string;
-  from_type: string | null;
-  from_role: string | null;
   format: "text" | "json";
   /** Author-declared durable checkpoint for lossy priority catch-up. Omitted
    *  when false to keep ordinary pages compact. */
@@ -381,15 +487,14 @@ export type MentionRow = MessageRow & { room_id: number; room_name: string };
 type RawMessage = {
   seq: number;
   agent_id: string;
-  from_type: string | null;
-  from_role: string | null;
   format: "text" | "json";
   priority: number;
   body: string;
   /** Exact UTF-16 length of the FULL body (the fetched body may be capped).
-   *  NULL only for rows written by an old build during a mixed-version window
-   *  before this process's startup backfill ran; fall back to body.length. */
-  body_len: number | null;
+   *  NOT NULL: every supported writer stamps it, so no reader carries a
+   *  fallback. SQLite's length() under-counts astral text, which is why the
+   *  value is stamped at insert rather than computed at read time. */
+  body_len: number;
   /** Full body length in CODEPOINTS (length(body)); the reported `length`
    *  field's unit, consistent with get_message. Present on every fetched row.
    *  Absent (undefined) only on synthetic rows the code builds in-memory. */
@@ -433,7 +538,7 @@ function messageCols(bodyCap: number): string {
   // (which pages in codepoints) and the bulk reads used to disagree by the
   // astral factor (an emoji is 1 codepoint but 2 UTF-16 units). NUL is
   // rejected/sanitized, so length() is exact.
-  return `g.seq, g.agent_id, a.type AS from_type, a.role AS from_role,
+  return `g.seq, g.agent_id,
           g.format, g.priority, substr(g.body, 1, ${cap}) AS body, g.body_len,
           length(g.body) AS body_cp,
           g.mentions, g.reply_to_seq,
@@ -446,8 +551,11 @@ function messageCols(bodyCap: number): string {
           p.agent_id AS reply_from, substr(p.body, 1, 101) AS reply_preview`;
 }
 
+// No join to agents: a message envelope carries the author id and nothing else
+// about the author. Role is room-local and mutable, so stamping it into a read
+// of an old message reported that message as written in a role its author may
+// never have held when writing it.
 const MESSAGE_FROM = `messages g
-                      LEFT JOIN agents a ON a.id = g.agent_id
                       LEFT JOIN messages p ON p.room_id = g.room_id AND p.seq = g.reply_to_seq`;
 
 /**
@@ -498,14 +606,15 @@ export class ChatStore {
           chmodSync(path, 0o600);
         } catch {}
       }
-    // Converting a legacy rollback-journal file to WAL needs an exclusive
+    // Switching a brand-new rollback-journal file to WAL needs an exclusive
     // lock, and SQLite can return SQLITE_BUSY here WITHOUT consulting the
     // busy handler (better-sqlite3's default 5s timeout does not cover this
-    // path), so two fresh processes racing to convert the same legacy file
+    // path), so two fresh processes racing to convert the same file
     // intermittently crashed on startup (reproduced ~1 in 24 synchronized
-    // opens). Retry with a short synchronous backoff: the loser of the race
-    // finds the file already in WAL and succeeds immediately. A no-op on
-    // already-WAL files, i.e. every startup after the first.
+    // opens). This is a STARTUP RACE, not a compatibility path: retry with a
+    // short synchronous backoff and the loser finds the file already in WAL
+    // and succeeds immediately. A no-op on already-WAL files, i.e. every
+    // startup after the first.
     for (let attempt = 1; ; attempt++) {
       try {
         this.db.pragma("journal_mode = WAL");
@@ -525,13 +634,13 @@ export class ChatStore {
     }
     this.db.pragma("busy_timeout = 5000");
     this.db.pragma("foreign_keys = ON");
-    // One process performs versioned data maintenance at a time. Without an
-    // IMMEDIATE transaction, concurrent MCP startups could all observe the
-    // old version and then repeat full-corpus backfills/FTS rebuilds.
-      this.db.transaction(() => this.migrate()).immediate();
+    // One process initializes the schema at a time. Without an IMMEDIATE
+    // transaction, concurrent MCP startups could all find the FTS index
+    // missing and each repeat a full-corpus rebuild.
+      this.db.transaction(() => this.initializeSchema()).immediate();
     } catch (error) {
       // A constructor that throws has no caller-visible instance on which to
-      // call close(); cover pragma/setup failures as well as migration errors.
+      // call close(); cover pragma/setup failures as well as schema errors.
       try {
         this.db.close();
       } catch {}
@@ -539,7 +648,13 @@ export class ChatStore {
     }
   }
 
-  private migrate(): void {
+  /**
+   * Create the current schema. NOT a migration: there is exactly one schema,
+   * every statement is CREATE ... IF NOT EXISTS, and a database written by an
+   * older build is neither detected nor upgraded -- its queries fail raw.
+   * Replacing the file is a deployment step.
+   */
+  private initializeSchema(): void {
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS rooms (
         id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -549,14 +664,54 @@ export class ChatStore {
         created_at  TEXT NOT NULL DEFAULT (datetime('now'))
       );
 
+      -- One row per PERSONA. An LLM persona carries an immutable
+      -- brand/model/version tuple and a server-generated resume word; a human
+      -- web participant carries neither. The CHECK makes those the ONLY two
+      -- shapes any writer can create -- including direct ones (the web server,
+      -- sqlite3, a test) that never pass through this file's JS guards -- so a
+      -- half-persona (resumable without metadata, or metadata with no resume
+      -- path) cannot exist in the database.
       CREATE TABLE IF NOT EXISTS agents (
-        id          TEXT PRIMARY KEY,
-        type        TEXT,
-        role        TEXT,
-        description TEXT,
-        created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+        id            TEXT PRIMARY KEY,
+        is_human      INTEGER NOT NULL DEFAULT 0,
+        brand         TEXT,
+        model         TEXT,
+        version       TEXT,
+        resume_word   TEXT,
+        -- Monotonic, never reused. Creation binds runtime 1; every bindingless
+        -- attach increments. A runtime captures this value when it binds, and
+        -- an operation carrying a captured value below the current one is from
+        -- a superseded tenure. Monotonicity is what a reusable process nonce
+        -- lacked: a nonce can be handed back to the same runtime after it lost
+        -- and regained the persona, making a stale in-flight write look current.
+        runtime_epoch INTEGER NOT NULL DEFAULT 1,
+        description   TEXT,
+        created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        CHECK (
+          (is_human = 1
+             AND brand IS NULL AND model IS NULL
+             AND version IS NULL AND resume_word IS NULL)
+          OR
+          (is_human = 0
+             AND brand IS NOT NULL AND model IS NOT NULL
+             AND version IS NOT NULL AND resume_word IS NOT NULL)
+        )
       );
 
+      -- role is ROOM-LOCAL and nullable: one persona can be reviewer in one
+      -- room and writer in another, and "no role" is a real state distinct from
+      -- an empty string. It is deliberately NOT on agents, where a single value
+      -- had to be true everywhere at once.
+      --
+      -- last_seen means RECENT RUNTIME ACTIVITY, not model activity. Two things
+      -- set it: an MCP call from the bound runtime, and the two-minute heartbeat
+      -- of a generated watcher armed by wait_for_messages. So a fresh last_seen
+      -- proves a runtime exists and is reachable; it does NOT prove the model is
+      -- reasoning, reading, or able to wake. An armed seat therefore reads as
+      -- recently active for as long as its watcher lives, which is the point:
+      -- the alternative was a seat that looked offline every time the model went
+      -- quiet between turns. Code that needs the stronger claim wants
+      -- wait_leases ("watching"), which is an open blocking call.
       CREATE TABLE IF NOT EXISTS memberships (
         room_id       INTEGER NOT NULL REFERENCES rooms(id),
         agent_id      TEXT NOT NULL REFERENCES agents(id),
@@ -564,6 +719,7 @@ export class ChatStore {
         last_read_seq INTEGER NOT NULL DEFAULT 0,
         last_seen     TEXT,
         left_at       TEXT,
+        role          TEXT,
         PRIMARY KEY (room_id, agent_id)
       );
 
@@ -575,66 +731,41 @@ export class ChatStore {
         format       TEXT NOT NULL DEFAULT 'text',
         priority     INTEGER NOT NULL DEFAULT 0,
         body         TEXT NOT NULL,
+        -- The exact UTF-16 length the web viewer reports, stamped by every
+        -- insert (SQLite length() under-counts astral text). NOT NULL: both
+        -- supported writers stamp it, so read paths carry no fallback and a
+        -- direct SQL writer that omits it is rejected rather than producing a
+        -- row whose reported length is silently wrong for astral text.
+        body_len     INTEGER NOT NULL,
         mentions     TEXT,
         reply_to_seq INTEGER,
+        -- Denormalized reply author, so my_mentions finds a reply whose parent
+        -- was later pruned.
+        reply_to_agent TEXT,
+        supersedes_seq INTEGER,
         client_message_id TEXT,
         created_at   TEXT NOT NULL DEFAULT (datetime('now')),
         UNIQUE (room_id, seq)
       );
     `);
 
-    // Upgrade older database files that predate these columns. Run before
-    // creating any column-dependent index so the index never precedes its
-    // column on a legacy schema.
-    this.ensureColumn("rooms", "pinned", "TEXT");
-    this.ensureColumn("memberships", "last_seen", "TEXT");
-    this.ensureColumn("memberships", "left_at", "TEXT");
-    this.ensureColumn("messages", "format", "TEXT NOT NULL DEFAULT 'text'");
-    this.ensureColumn("messages", "priority", "INTEGER NOT NULL DEFAULT 0");
-    this.ensureColumn("messages", "reply_to_seq", "INTEGER");
-    this.ensureColumn("messages", "mentions", "TEXT");
-    this.ensureColumn("messages", "supersedes_seq", "INTEGER");
-    this.ensureColumn("messages", "reply_to_agent", "TEXT");
-    this.ensureColumn("messages", "body_len", "INTEGER");
-    this.ensureColumn("messages", "client_message_id", "TEXT");
-    // DB-level enforcement for MIXED-VERSION windows: a still-running old
-    // build inserts without these columns, and if the reply's parent is
-    // pruned before any new-build process restarts, the startup backfill
-    // below can never recover the author -- the reply is silently
-    // undirected forever. Triggers live in the database file, so they fire
-    // for the old build's inserts too. New builds stamp both columns
-    // explicitly, so the WHEN clauses skip their rows.
+    // Reject an embedded NUL at the DATABASE level: SQLite's substr()/length()
+    // stop at U+0000, so a NUL body reads back truncated with the read marker
+    // advancing past the lost tail. This file's writers already reject it in JS
+    // (assertStorable), but the web server holds its own handle and tests open
+    // the file directly; a trigger lives in the database and therefore covers
+    // every writer, which is the same reason the agents CHECK above is in SQL.
+    // (A trigger cannot SANITIZE the value -- replace() is itself
+    // NUL-terminated -- so it aborts instead.)
     this.db.exec(`
-      CREATE TRIGGER IF NOT EXISTS messages_reply_agent_ai AFTER INSERT ON messages
-      WHEN NEW.reply_to_seq IS NOT NULL AND NEW.reply_to_agent IS NULL BEGIN
-        UPDATE messages SET reply_to_agent =
-          (SELECT p.agent_id FROM messages p
-            WHERE p.room_id = NEW.room_id AND p.seq = NEW.reply_to_seq)
-        WHERE id = NEW.id;
-      END;
-
-      -- Routine current-build inserts provide body_len and occupy no entry.
-      -- This makes the recurring mixed-version repair an empty-index probe on a
-      -- healthy file instead of a corpus scan.
-      CREATE INDEX IF NOT EXISTS idx_messages_body_len_missing
-        ON messages(id) WHERE body_len IS NULL;
-
-      -- Reject an embedded NUL at the DATABASE level: SQLite's substr()/length()
-      -- stop at U+0000, so a NUL body reads back truncated with the marker
-      -- advancing past the lost tail. New builds already reject it in JS
-      -- (assertStorable), but an OLD build writing during a rolling upgrade
-      -- would not -- this trigger fires for its inserts too and aborts them,
-      -- closing that window. (A SQL trigger cannot SANITIZE the value: replace()
-      -- is itself NUL-terminated. Existing NUL rows are healed in JS below.)
       CREATE TRIGGER IF NOT EXISTS messages_reject_nul BEFORE INSERT ON messages
       WHEN instr(NEW.body, char(0)) > 0 BEGIN
         SELECT RAISE(ABORT, 'message body contains a NUL character (U+0000), which SQLite cannot store without silently truncating');
       END;
 
-      -- Metadata listings also use SQLite substr()/length(), so old/direct
-      -- writers must not be able to introduce a new silently truncated value.
-      -- UPDATE guards are per-column: a v3 heal can repair two malformed room
-      -- fields one at a time without the other field blocking it.
+      -- Metadata listings also use SQLite substr()/length(), so no writer may
+      -- introduce a silently truncated value. UPDATE guards are per-column so
+      -- one malformed room field never blocks repairing the other.
       CREATE TRIGGER IF NOT EXISTS rooms_reject_nul_insert BEFORE INSERT ON rooms
       WHEN instr(NEW.description, char(0)) > 0 OR instr(NEW.pinned, char(0)) > 0 BEGIN
         SELECT RAISE(ABORT, 'room metadata contains a NUL character (U+0000)');
@@ -659,144 +790,10 @@ export class ChatStore {
         SELECT RAISE(ABORT, 'agent description contains a NUL character (U+0000)');
       END;
     `);
-    // The former messages_body_len_ai trigger stamped SQLite length(NEW.body),
-    // which under-counts astral text versus the web viewer's UTF-16 body_len.
-    // Keep a harmless blocker UNDER THE LEGACY NAME so a restarted old build's
-    // CREATE TRIGGER IF NOT EXISTS cannot resurrect that stamper. Inspect the
-    // stored definition first: unconditional DROP/CREATE caused schema churn,
-    // WAL writes, and an exclusive schema lock on every healthy MCP startup.
-    const bodyLenBlockerMarker = "agent-chat-body-len-blocker-v3";
-    const existingBodyLenTrigger = this.db
-      .prepare(
-        "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'messages_body_len_ai'",
-      )
-      .get() as { sql: string | null } | undefined;
-    if (!existingBodyLenTrigger?.sql?.includes(bodyLenBlockerMarker)) {
-      this.db.exec(`
-        DROP TRIGGER IF EXISTS messages_body_len_ai;
-        CREATE TRIGGER messages_body_len_ai AFTER INSERT ON messages
-        WHEN NEW.body_len IS NULL BEGIN
-          SELECT '${bodyLenBlockerMarker}';
-        END;
-      `);
-    }
-    const SCHEMA_VERSION = 3;
-    const currentVersion = this.db.pragma("user_version", {
-      simple: true,
-    }) as number;
-    // Keep version gates narrow. Advancing v2 -> v3 for bounded metadata repair
-    // must not repeat the older full-message maintenance pass.
-    const needsV2Maintenance = currentVersion < 2;
-    const needsMetadataV3 = currentVersion < 3;
-    const needsBodyNulHeal = currentVersion < 1;
-
-    // Backfill the denormalized reply author AFTER the old-writer trigger above
-    // exists, closing a rolling-upgrade gap: with the backfill running FIRST, an
-    // old build inserting a reply in the window between the two steps hit
-    // neither (backfill already passed, trigger not yet created), and if the
-    // parent was pruned before any restart the author was unrecoverable and
-    // my_mentions missed the reply forever. Now a reply inserted before the
-    // trigger is caught here; one inserted after is stamped by the trigger.
-    // Rows whose parent is already gone stay NULL (unrecoverable) and are
-    // re-examined harmlessly.
-    if (needsV2Maintenance) {
-      this.db.exec(`
-        UPDATE messages SET reply_to_agent =
-          (SELECT p.agent_id FROM messages p
-            WHERE p.room_id = messages.room_id AND p.seq = messages.reply_to_seq)
-        WHERE reply_to_seq IS NOT NULL AND reply_to_agent IS NULL
-      `);
-    }
-    // The message-body NUL scan below runs ONLY until this file is marked
-    // migrated via PRAGMA user_version. It reads EVERY body to evaluate
-    // instr(body, char(0)) -- costly on a large corpus (a 1 GB body is read
-    // every startup) and pointless once done: the reject trigger blocks any new
-    // NUL row, so a migrated file cannot acquire one. The gate is set at the END
-    // of migrate(), so a crash mid-scan just re-runs. Everything else
-    // Schema/index/trigger creation and the sparse body_len repair stay
-    // recurring; each later migration has its own narrowly-scoped gate.
-    // Heal existing rows that already hold a NUL (written by a pre-guard build):
-    // a plain SELECT is NOT NUL-terminated, so the full body is recoverable;
-    // replace each NUL with U+FFFD so substr()/length() readers see it whole,
-    // and clear body_len so the backfill below re-stamps the corrected length.
-    // Cursored ONE ROW AT A TIME (not .all(), which materialized every
-    // malformed body at once and could OOM the process at startup on many/large
-    // NUL bodies), via a regex replace (not split/join, which builds a giant
-    // array on an all-NUL body). instr() detects them; healing a row clears its
-    // NUL, so the predicate never revisits it and the id cursor moves strictly
-    // forward.
-    let healedMessageBody = false;
-    if (needsBodyNulHeal) {
-      const nextNul = this.db.prepare(
-        `SELECT id, length(CAST(body AS BLOB)) AS bytes
-         FROM messages
-         WHERE instr(body, char(0)) > 0 AND id > ?
-         ORDER BY id LIMIT 1`,
-      );
-      const getBody = this.db.prepare("SELECT body FROM messages WHERE id = ?");
-      const fix = this.db.prepare(
-        "UPDATE messages SET body = ?, body_len = NULL WHERE id = ?",
-      );
-      let cursor = 0;
-      for (;;) {
-        const row = nextNul.get(cursor) as
-          | { id: number; bytes: number }
-          | undefined;
-        if (!row) break;
-        if (row.bytes > MAX_MESSAGE_BODY_BYTES) {
-          throw new Error(
-            `legacy message ${row.id} is ${row.bytes} bytes and contains NUL; ` +
-              `refusing to load it above the ${MAX_MESSAGE_BODY_BYTES}-byte safety limit`,
-          );
-        }
-        const { body } = getBody.get(row.id) as { body: string };
-        fix.run(body.replace(/\u0000/g, "\ufffd"), row.id);
-        healedMessageBody = true;
-        cursor = row.id;
-      }
-    }
-    // Backfill body_len (the exact UTF-16 length the WEB viewer reports) for
-    // rows that predate the column. It must be measured in JS, so we LOAD the
-    // body -- but only for rows small enough to be safe (length() is a cheap
-    // codepoint gate, an upper bound on UTF-16 units is 2x that, so <=
-    // BACKFILL_MAX_CHARS codepoints is at most ~2x that many UTF-16 units held
-    // at once). Giant legacy rows are stamped with the memory-safe codepoint
-    // count via SQL (a low-but-nonzero bound; the web viewer's COALESCE still
-    // shows a length and its total>shown guard tolerates the codepoint skew).
-    // Cursored by id so the whole sweep is one table pass, one body resident.
-    // Always repair the sparse set of mixed-version NULL rows. On a healthy
-    // file idx_messages_body_len_missing is empty, so this is O(1); it avoids a
-    // full startup scan while keeping the documented next-reopen guarantee.
-    const BACKFILL_MAX_CHARS = 1_000_000;
-    this.db
-      .prepare(
-        `UPDATE messages INDEXED BY idx_messages_body_len_missing
-         SET body_len = length(body)
-         WHERE body_len IS NULL AND length(body) > ?`,
-      )
-      .run(BACKFILL_MAX_CHARS);
-    const nextMissingBodyLen = this.db.prepare(
-      `SELECT id, body FROM messages INDEXED BY idx_messages_body_len_missing
-       WHERE body_len IS NULL AND id > ? ORDER BY id LIMIT 1`,
-    );
-    const setBodyLen = this.db.prepare(
-      "UPDATE messages SET body_len = ? WHERE id = ?",
-    );
-    let bodyLenCursor = 0;
-    for (;;) {
-      const row = nextMissingBodyLen.get(bodyLenCursor) as
-        | { id: number; body: string }
-        | undefined;
-      if (!row) break;
-      setBodyLen.run(row.body.length, row.id);
-      bodyLenCursor = row.id;
-    }
-
     this.db.exec(`
-      -- UNIQUE(room_id, seq) already provides an implicit (room_id, seq) index
-      -- (sqlite_autoindex, same query plans); an explicit duplicate only taxes
-      -- every insert. Drop it from database files created by older builds.
-      DROP INDEX IF EXISTS idx_messages_room_seq;
+      -- No explicit (room_id, seq) index: UNIQUE(room_id, seq) already provides
+      -- one (sqlite_autoindex, same query plans), and a duplicate only taxes
+      -- every insert.
       CREATE INDEX IF NOT EXISTS idx_messages_reply ON messages(room_id, reply_to_seq);
       CREATE INDEX IF NOT EXISTS idx_messages_supersedes ON messages(room_id, supersedes_seq);
       -- Routine posts store NULL and therefore occupy no entry in this sparse
@@ -817,51 +814,6 @@ export class ChatStore {
       CREATE INDEX IF NOT EXISTS idx_memberships_agent_present
         ON memberships(agent_id, left_at, room_id);
 
-      -- Per-session read CURSORS for identities running multiple concurrent
-      -- sessions (join_room cursor:'private'). The memberships marker stays the
-      -- identity-level read receipt (advanced to the MAX across sessions). The
-      -- left_at column here is VESTIGIAL and no longer read: presence moved to
-      -- the session_presence table below, which every session (shared too)
-      -- registers in, so a leave can no longer evict a live twin.
-      CREATE TABLE IF NOT EXISTS session_markers (
-        room_id       INTEGER NOT NULL REFERENCES rooms(id),
-        agent_id      TEXT NOT NULL REFERENCES agents(id),
-        session_id    TEXT NOT NULL,
-        last_read_seq INTEGER NOT NULL DEFAULT 0,
-        updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
-        left_at       TEXT,
-        PRIMARY KEY (room_id, agent_id, session_id)
-      );
-      -- touch()/touchSessionMarkers refresh a session's rows by session_id
-      -- ALONE (a process-unique nonce, keyed independently of room/agent). The
-      -- PK starts with room_id, so that predicate had no usable index and did a
-      -- full session_markers scan on every liveness touch; this covers it.
-      CREATE INDEX IF NOT EXISTS idx_session_markers_session
-        ON session_markers(session_id);
-      CREATE INDEX IF NOT EXISTS idx_session_markers_room_updated
-        ON session_markers(room_id, updated_at);
-
-      -- Per-session PRESENCE, decoupled from cursors: EVERY session (shared or
-      -- private) registers a row here on join, keyed by its process nonce, so a
-      -- leave can tell whether any OTHER session of the identity is still here.
-      -- memberships.left_at is recomputed from this table as "present iff any
-      -- row is live (left_at IS NULL and refreshed within the GC window)", which
-      -- keeps the cross-process poller (it reads memberships.left_at) working
-      -- unchanged. Separate from session_markers so it never perturbs cursor
-      -- semantics (a shared session has a presence row but no cursor row).
-      CREATE TABLE IF NOT EXISTS session_presence (
-        room_id    INTEGER NOT NULL REFERENCES rooms(id),
-        agent_id   TEXT NOT NULL REFERENCES agents(id),
-        session_id TEXT NOT NULL,
-        updated_at TEXT NOT NULL DEFAULT (datetime('now')),
-        left_at    TEXT,
-        PRIMARY KEY (room_id, agent_id, session_id)
-      );
-      CREATE INDEX IF NOT EXISTS idx_session_presence_session
-        ON session_presence(session_id);
-      CREATE INDEX IF NOT EXISTS idx_session_presence_room_updated
-        ON session_presence(room_id, updated_at);
-
       -- Advisory single-winner work claims with TTL. Purely advisory: nothing
       -- fences the claimed resource itself; expiry frees claims from crashed
       -- holders.
@@ -875,29 +827,35 @@ export class ChatStore {
         PRIMARY KEY (room_id, key)
       );
 
-      -- In-turn wait leases: a row exists ONLY while an agent's blocking
+      -- In-turn wait leases: a row exists ONLY while a persona's blocking
       -- catch_up wait is open in that room, making "actively watching" a
       -- verifiable server state (recipientStatus/list_agents expose it as
       -- "watching"). expires_at is the wait deadline plus a small grace, so a
       -- crashed waiter's row self-expires; the handler deletes it on every
-      -- normal or aborted exit. Detached pollers never write here (their
-      -- probe is query_only), which is deliberate: shell liveness must not
-      -- read as model availability.
+      -- normal or aborted exit. Detached pollers never write here, which is
+      -- deliberate: an armed watcher is a shell process, and "watching" claims
+      -- an OPEN BLOCKING CALL. A generated watcher does refresh last_seen (see
+      -- memberships), so last_seen is the weaker signal of the two: recent
+      -- runtime activity. "watching" stays the strong one.
+      --
+      -- Keyed (room_id, agent_id) with the OWNING epoch as data, not as part of
+      -- the key: one persona has one runtime, so it has at most one wait per
+      -- room, and a takeover must REPLACE the loser's row rather than sit
+      -- beside it (two rows would report two watchers for one persona). The
+      -- epoch column is what makes the loser's later cleanup safe: its DELETE
+      -- is guarded on the epoch it captured, so it cannot remove the winner's
+      -- row after an upsert has already overwritten it.
       CREATE TABLE IF NOT EXISTS wait_leases (
         room_id    INTEGER NOT NULL REFERENCES rooms(id),
         agent_id   TEXT NOT NULL REFERENCES agents(id),
-        session_id TEXT NOT NULL,
+        epoch      INTEGER NOT NULL,
         started_at TEXT NOT NULL DEFAULT (datetime('now')),
         expires_at TEXT NOT NULL,
-        PRIMARY KEY (room_id, agent_id, session_id)
+        PRIMARY KEY (room_id, agent_id)
       );
     `);
-    // Add session_markers.left_at to database files created before presence
-    // became session-aware (the CREATE TABLE above already has it for fresh
-    // files). Runs after the table exists, so ensureColumn's ALTER is valid.
-    this.ensureColumn("session_markers", "left_at", "TEXT");
-    // claims is created in the block above, later than rooms/agents, so install
-    // its old/direct-writer NUL guards here before the one-time v3 heal.
+    // claims is created in the block above, later than rooms/agents, so its
+    // NUL guards install here, after the table exists.
     this.db.exec(`
       CREATE TRIGGER IF NOT EXISTS claims_reject_nul_insert BEFORE INSERT ON claims
       WHEN instr(NEW.note, char(0)) > 0 BEGIN
@@ -909,19 +867,6 @@ export class ChatStore {
         SELECT RAISE(ABORT, 'claim note contains a NUL character (U+0000)');
       END;
     `);
-
-    // Heal legacy embedded NULs in metadata columns too (message bodies are
-    // healed above, with their body_len reset). Listing SQL uses substr(), which
-    // stops at the first NUL, so a legacy NUL silently truncated the shown
-    // value. Runs after every table exists; new writes are already rejected.
-    // Run once with the versioned maintenance pass. Even small full-table
-    // scans become expensive when multiplied across many MCP processes.
-    if (needsMetadataV3) {
-      this.healNulColumn("rooms", "description");
-      this.healNulColumn("rooms", "pinned");
-      this.healNulColumn("agents", "description");
-      this.healNulColumn("claims", "note");
-    }
 
     // Full-text search over message bodies. External-content FTS5 mirrors
     // messages.body keyed by messages.id; triggers keep it in sync.
@@ -937,103 +882,52 @@ export class ChatStore {
           VALUES ('delete', old.id, old.body);
       END;
     `);
-    // Backfill decision by INDEX CONSISTENCY, not table existence: a process
-    // dying between the CREATE above and the rebuild below used to leave a
-    // database where every later start saw the table and skipped the rebuild
-    // forever -- all pre-FTS messages permanently invisible to search. A row
-    // A steady-state empty/nonempty mismatch repairs the crash window without
-    // a corpus scan; the pre-v2 migration additionally performs exact counts.
-    // The index row count MUST come from the messages_fts_docsize shadow
-    // table: with external content, COUNT(*) on the virtual table itself
+    // Rebuild decision by INDEX CONSISTENCY, not table existence: a process
+    // dying between the CREATE above and the rebuild below leaves a database
+    // where every later start sees the table and skips the rebuild forever,
+    // making everything written before the crash permanently invisible to
+    // search. The empty/nonempty mismatch repairs that window in O(1), with no
+    // corpus scan. The index row count MUST come from the messages_fts_docsize
+    // shadow table: with external content, COUNT(*) on the virtual table itself
     // reads the content table and always matches. BOTH counts are read in ONE
     // statement (a single consistent snapshot): two separate SELECTs could
     // straddle a concurrent insert -- messages counted pre-insert, fts counted
     // post-trigger -- making an already-inconsistent {2,1} file read as {2,2}
-    // and skip the rebuild it actually needed. A legacy NUL repair changes a
-    // body before these triggers exist; row counts still match in that case,
-    // so the repair flag must force a rebuild to replace stale tokens.
+    // and skip the rebuild it actually needed.
     const { hasMessages, hasFtsRows } = this.db
       .prepare(
         `SELECT EXISTS(SELECT 1 FROM messages LIMIT 1) AS hasMessages,
                 EXISTS(SELECT 1 FROM messages_fts_docsize LIMIT 1) AS hasFtsRows`,
       )
       .get() as { hasMessages: number; hasFtsRows: number };
-    let rebuildFts = healedMessageBody || hasMessages !== hasFtsRows;
-    // The steady-state sentinel above catches the historical empty-index crash
-    // class in O(1). A full consistency count remains appropriate during the
-    // one-time pre-v2 migration, but not on every MCP process startup.
-    if (!rebuildFts && needsV2Maintenance) {
-      const { msgCount, ftsCount } = this.db
-        .prepare(
-          `SELECT (SELECT COUNT(*) FROM messages) AS msgCount,
-                  (SELECT COUNT(*) FROM messages_fts_docsize) AS ftsCount`,
-        )
-        .get() as { msgCount: number; ftsCount: number };
-      rebuildFts = ftsCount !== msgCount;
-    }
-    if (rebuildFts) {
+    if (hasMessages !== hasFtsRows) {
       this.db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
-    }
-
-    // Mark this file migrated so the message-body NUL scan above is skipped on
-    // future startups (one-time work; the reject trigger keeps new rows clean).
-    // Set LAST, only after the scan ran, so a crash mid-scan leaves user_version
-    // unchanged and it re-runs.
-    if (currentVersion < SCHEMA_VERSION) {
-      this.db.pragma(`user_version = ${SCHEMA_VERSION}`);
-    }
-  }
-
-  private ensureColumn(table: string, column: string, type: string): void {
-    const cols = this.db
-      .prepare(`PRAGMA table_info(${table})`)
-      .all() as { name: string }[];
-    if (!cols.some((c) => c.name === column)) {
-      try {
-        this.db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${type}`);
-      } catch (e) {
-        // Two fresh processes migrating the same legacy file can both pass
-        // the PRAGMA check; the loser's ALTER must be a no-op, not a startup
-        // crash.
-        const msg = e instanceof Error ? e.message : String(e);
-        if (!/duplicate column name/i.test(msg)) throw e;
-      }
-    }
-  }
-
-  /**
-   * Heal legacy embedded NULs in a bounded TEXT metadata column (room
-   * description/pinned, agent description, claim note): replace U+0000 with
-   * U+FFFD so a listing's substr()/length() reads the value whole instead of
-   * truncating at the NUL. Cursored by rowid one row at a time (these columns
-   * cap at <=10k and NUL rows are exotic); a plain SELECT is not NUL-terminated,
-   * so the value is recoverable. `table`/`col` are fixed internal identifiers,
-   * never caller input. Healing clears the NUL, so the predicate never revisits
-   * a row and the rowid cursor moves strictly forward.
-   */
-  private healNulColumn(table: string, col: string): void {
-    const next = this.db.prepare(
-      `SELECT rowid AS rid, ${col} AS v FROM ${table}
-       WHERE instr(${col}, char(0)) > 0 AND rowid > ? ORDER BY rowid LIMIT 1`,
-    );
-    const fix = this.db.prepare(
-      `UPDATE ${table} SET ${col} = ? WHERE rowid = ?`,
-    );
-    let cursor = 0;
-    for (;;) {
-      const row = next.get(cursor) as { rid: number; v: string } | undefined;
-      if (!row) break;
-      fix.run(row.v.replace(/\u0000/g, "\ufffd"), row.rid);
-      cursor = row.rid;
     }
   }
 
   // --- rooms -------------------------------------------------------------
 
+  /**
+   * Create a room, epoch-fenced to the calling persona.
+   *
+   * Room administration stays UNAUTHENTICATED and global: any current persona
+   * can create or delete any room, and nothing verifies who they are. What the
+   * fence removes is authority from a runtime the system positively knows is
+   * superseded. Leaving the highest-blast-radius operations as the only
+   * unfenced writes made the epoch model exempt exactly what it should protect
+   * most: a fenced-out runtime could not post a message but could delete the
+   * room the message was in.
+   *
+   * Rooms must precede JOINS, not bindings. create_persona/resume_persona is
+   * one call that every participating runtime makes anyway, and
+   * bind -> create_room -> join_room satisfies the bootstrap workflow.
+   */
   createRoom(
     name: string,
     description: string | null,
     pinned: string | null,
+    agentId: string,
+    epoch: number,
   ): RoomRow {
     assertStorable(name, "room name");
     assertMaxLen(name, "room name", 200);
@@ -1041,27 +935,40 @@ export class ChatStore {
     assertMaxLen(description, "room description", 2000);
     assertStorable(pinned, "room pinned intro");
     assertMaxLen(pinned, "room pinned intro", 10_000);
-    return this.db
-      .prepare(
-        `INSERT INTO rooms (name, description, pinned) VALUES (?, ?, ?)
-         RETURNING *`,
-      )
-      .get(name, description, pinned) as RoomRow;
+    const tx = this.db.transaction(() => {
+      this.requireEpoch(agentId, epoch);
+      return this.db
+        .prepare(
+          `INSERT INTO rooms (name, description, pinned) VALUES (?, ?, ?)
+           RETURNING *`,
+        )
+        .get(name, description, pinned) as RoomRow;
+    });
+    return tx.immediate();
   }
 
-  setPinned(roomId: number, pinned: string | null): void {
+  setPinned(
+    roomId: number,
+    agentId: string,
+    epoch: number,
+    pinned: string | null,
+  ): void {
     assertStorable(pinned, "room pinned intro");
     assertMaxLen(pinned, "room pinned intro", 10_000);
-    const info = this.db
-      .prepare("UPDATE rooms SET pinned = ? WHERE id = ?")
-      .run(pinned, roomId);
-    // 0 rows = the room vanished under us; report it instead of a false
-    // success the caller would trust.
-    if (info.changes === 0) {
-      throw new Error(
-        `room ${roomId} no longer exists (deleted); rejoin with join_room`,
-      );
-    }
+    const tx = this.db.transaction(() => {
+      this.requireEpoch(agentId, epoch);
+      const info = this.db
+        .prepare("UPDATE rooms SET pinned = ? WHERE id = ?")
+        .run(pinned, roomId);
+      // 0 rows = the room vanished under us; report it instead of a false
+      // success the caller would trust.
+      if (info.changes === 0) {
+        throw new Error(
+          `room ${roomId} no longer exists (deleted); rejoin with join_room`,
+        );
+      }
+    });
+    tx.immediate();
   }
 
   getRoom(roomId: number): RoomRow | undefined {
@@ -1215,6 +1122,22 @@ export class ChatStore {
     return c;
   }
 
+  /** Names of the rooms this persona is present in. Bounded: this feeds an
+   *  error message, and a persona in hundreds of rooms must not turn one
+   *  rejection into an unbounded response. */
+  presentRoomNames(agentId: string, limit = 50): string[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT r.name AS name FROM memberships m
+             JOIN rooms r ON r.id = m.room_id
+            WHERE m.agent_id = ? AND m.left_at IS NULL
+            ORDER BY r.id LIMIT ?`,
+        )
+        .all(agentId, limit) as { name: string }[]
+    ).map((r) => r.name);
+  }
+
   /** Resolve a room reference that may be a numeric id or a name. */
   resolveRoom(ref: string): RoomRow | undefined {
     // Number.isSafeInteger gate: a 16+ digit numeric ref past 2^53 rounds to a
@@ -1235,274 +1158,305 @@ export class ChatStore {
       | undefined;
   }
 
-  // --- agents / membership ----------------------------------------------
+  // --- personas -----------------------------------------------------------
 
-  upsertAgent(
-    id: string,
-    type: string | null,
-    role: string | null,
-    description: string | null,
-  ): void {
-    assertStorable(id, "agent id");
-    assertMaxLen(id, "agent id", 200);
-    assertStorable(type, "agent type");
-    assertMaxLen(type, "agent type", 100);
-    assertStorable(role, "agent role");
-    assertMaxLen(role, "agent role", 200);
-    assertStorable(description, "agent description");
-    assertMaxLen(description, "agent description", 2000);
-    this.db
-      .prepare(
-        `INSERT INTO agents (id, type, role, description)
-         VALUES (@id, @type, @role, @description)
-         ON CONFLICT(id) DO UPDATE SET
-           type        = COALESCE(excluded.type, agents.type),
-           role        = COALESCE(excluded.role, agents.role),
-           description = COALESCE(excluded.description, agents.description)`,
-      )
-      .run({ id, type, role, description });
+  /**
+   * Verify that `epoch` is still the persona's current runtime epoch, throwing
+   * PersonaLostError if not.
+   *
+   * MUST be called from INSIDE the transaction that performs the guarded write.
+   * Checking first and writing afterwards is not equivalent: a takeover
+   * committing in the gap leaves the check passing and the write landing under
+   * an authority the caller no longer holds, which is the entire failure this
+   * exists to prevent. Every caller below is inside a tx.immediate().
+   */
+  private requireEpoch(agentId: string, epoch: number): void {
+    const row = this.db
+      .prepare("SELECT runtime_epoch FROM agents WHERE id = ?")
+      .get(agentId) as { runtime_epoch: number } | undefined;
+    if (!row) throw new PersonaLostError(agentId, epoch, null);
+    if (row.runtime_epoch !== epoch) {
+      throw new PersonaLostError(agentId, epoch, row.runtime_epoch);
+    }
   }
 
   /**
-   * Insert a brand-new agent row, doing nothing if the id is already taken.
-   * Returns true only if THIS call created it, so a caller assigning a generated
-   * id can claim it atomically: two processes racing on the same candidate id
-   * cannot both "win" and collapse onto one shared identity/read-marker.
+   * Verify that this persona is PRESENT in the room, throwing if it has left.
+   *
+   * Like requireEpoch, this MUST run inside the transaction that performs the
+   * guarded write. Checking first and writing afterwards leaves a leave_room
+   * committing in the gap, and the write then lands from a persona every peer
+   * has already been told is absent.
+   *
+   * Participation is what this guards: authoring, advancing a read marker,
+   * changing a role, taking a new claim, and opening a wait. It deliberately
+   * does NOT guard non-advancing history reads or releasing a claim you already
+   * hold -- both are useful while absent and neither claims presence.
+   *
+   * The soft-left membership row survives, so the remedy is always the same and
+   * the error says it: rejoin. join_room keeps the read marker and the role, so
+   * recovery costs one call and loses nothing.
    */
-  tryCreateAgent(
-    id: string,
-    type: string | null,
-    role: string | null,
-    description: string | null,
-  ): boolean {
-    assertStorable(id, "agent id");
-    assertMaxLen(id, "agent id", 200);
-    assertStorable(type, "agent type");
-    assertMaxLen(type, "agent type", 100);
-    assertStorable(role, "agent role");
-    assertMaxLen(role, "agent role", 200);
-    assertStorable(description, "agent description");
-    assertMaxLen(description, "agent description", 2000);
+  private requirePresent(roomId: number, agentId: string): void {
+    const row = this.db
+      .prepare(
+        "SELECT left_at FROM memberships WHERE room_id = ? AND agent_id = ?",
+      )
+      .get(roomId, agentId) as { left_at: string | null } | undefined;
+    if (!row) {
+      throw new Error(
+        `you are not a member of room ${roomId}; join_room it first`,
+      );
+    }
+    if (row.left_at !== null) {
+      throw new Error(
+        `you have LEFT room ${roomId}, so you cannot participate in it: ` +
+          `peers see you as absent. Call join_room to rejoin -- your read ` +
+          `position and room-local role are preserved.`,
+      );
+    }
+  }
+
+  /** The persona's current epoch, or null if the row is gone. For
+   *  NON-advancing reads, which disclose loss without failing. */
+  currentEpoch(agentId: string): number | null {
+    const row = this.db
+      .prepare("SELECT runtime_epoch FROM agents WHERE id = ?")
+      .get(agentId) as { runtime_epoch: number } | undefined;
+    return row ? row.runtime_epoch : null;
+  }
+
+  getPersona(id: string): PersonaRow | undefined {
+    return this.db.prepare("SELECT * FROM agents WHERE id = ?").get(id) as
+      | PersonaRow
+      | undefined;
+  }
+
+  /**
+   * Claim a generated persona id atomically. Returns false if the id is taken,
+   * so a caller drawing candidate ids cannot collapse two personas onto one row
+   * (and with it one read marker, one membership set, and one claim owner).
+   */
+  tryCreatePersona(p: {
+    id: string;
+    brand: string;
+    model: string;
+    version: string;
+    resumeWord: string;
+    description: string | null;
+  }): boolean {
+    assertStorable(p.id, "persona id");
+    assertMaxLen(p.id, "persona id", MAX_AGENT_ID_CHARS);
+    assertStorable(p.brand, "brand");
+    assertMaxLen(p.brand, "brand", 100);
+    assertStorable(p.model, "model");
+    assertMaxLen(p.model, "model", 100);
+    assertStorable(p.version, "version");
+    assertMaxLen(p.version, "version", 100);
+    assertStorable(p.resumeWord, "resume word");
+    assertMaxLen(p.resumeWord, "resume word", 200);
+    assertStorable(p.description, "persona description");
+    assertMaxLen(p.description, "persona description", 2000);
     const info = this.db
       .prepare(
-        `INSERT INTO agents (id, type, role, description)
-         VALUES (@id, @type, @role, @description)
+        `INSERT INTO agents
+           (id, is_human, brand, model, version, resume_word, runtime_epoch, description)
+         VALUES (@id, 0, @brand, @model, @version, @resumeWord, 1, @description)
          ON CONFLICT(id) DO NOTHING`,
       )
-      .run({ id, type, role, description });
+      .run(p);
     return info.changes > 0;
   }
 
   /**
-   * Recompute memberships.left_at for ONE identity from its session_presence
-   * rows: present (left_at NULL) iff any row is LIVE (not left, and refreshed
-   * within the GC window); otherwise mark it left. A NO-OP when the identity has
-   * NO presence rows at all -- such an identity (a non-session caller: the web
-   * viewer, tests, or a pre-redesign build) manages memberships.left_at directly
-   * and must not be evicted by a presence recompute.
+   * Bindingless resume: take over a persona and return the NEW epoch.
+   *
+   * The increment is unconditional on success and happens in the same
+   * transaction as the credential check, so "latest valid resume wins" is
+   * decided by SQLite's write serialization rather than by call ordering in any
+   * one process. It runs on EVERY successful attach, not only on a contested
+   * one: a caller cannot tell whether the previous runtime is alive, and an
+   * attach that skipped the increment would leave that runtime's pollers and
+   * captured epochs valid alongside the new one's.
+   *
+   * The two failures are deliberately distinguished: an unknown id says so, and
+   * bad credentials on a known id say so. That is the right trade HERE because
+   * the threat model is an operator pasting the wrong id, not an attacker
+   * probing for valid ones -- an operator who mistyped an id needs to be told
+   * that, not handed a uniform "rejected" that sends them hunting for a lost
+   * word. This is collision prevention, not authentication.
    */
-  private recomputeMembershipPresence(roomId: number, agentId: string): void {
-    const any = this.db
-      .prepare(
-        "SELECT 1 FROM session_presence WHERE room_id = ? AND agent_id = ? LIMIT 1",
-      )
-      .get(roomId, agentId);
-    if (!any) return;
-    const live = this.db
-      .prepare(
-        `SELECT 1 FROM session_presence
-         WHERE room_id = ? AND agent_id = ? AND left_at IS NULL
-           AND updated_at >= datetime('now', ?) LIMIT 1`,
-      )
-      .get(roomId, agentId, SESSION_GC_AGE);
-    if (live) {
-      this.db
-        .prepare(
-          "UPDATE memberships SET left_at = NULL WHERE room_id = ? AND agent_id = ?",
-        )
-        .run(roomId, agentId);
-    } else {
-      this.db
-        .prepare(
-          `UPDATE memberships SET left_at = datetime('now')
-           WHERE room_id = ? AND agent_id = ? AND left_at IS NULL`,
-        )
-        .run(roomId, agentId);
-    }
+  attachPersona(a: {
+    id: string;
+    resumeWord: string;
+    brand: string;
+    model: string;
+    version: string;
+  }): { epoch: number; persona: PersonaRow } {
+    return this.db
+      .transaction(() => {
+        const row = this.getPersona(a.id);
+        if (!row || row.is_human === 1) {
+          throw new Error(
+            `no LLM persona "${a.id}"; check the id, or create_persona for a new one`,
+          );
+        }
+        // Word FIRST, then tuple. A caller who cannot present the word has no
+        // standing to be told anything about the persona, including which model
+        // it is; only after the word matches is a tuple mismatch meaningful --
+        // and then it is a model change, not a rejected credential.
+        if (row.resume_word !== a.resumeWord) {
+          throw new Error(
+            `resume rejected for persona "${a.id}": the resume word does not ` +
+              `match the one it was created with`,
+          );
+        }
+        if (
+          row.brand !== a.brand ||
+          row.model !== a.model ||
+          row.version !== a.version
+        ) {
+          throw new ModelTupleMismatchError(
+            a.id,
+            // Non-null by the is_human check above: the table CHECK keeps an
+            // LLM row's tuple whole.
+            { brand: row.brand!, model: row.model!, version: row.version! },
+            { brand: a.brand, model: a.model, version: a.version },
+            this.presentRoomNames(a.id),
+          );
+        }
+        const next = row.runtime_epoch + 1;
+        this.db
+          .prepare("UPDATE agents SET runtime_epoch = ? WHERE id = ?")
+          .run(next, a.id);
+        return { epoch: next, persona: { ...row, runtime_epoch: next } };
+      })
+      .immediate();
   }
 
-  /**
-   * Reap dead session_presence rows for a room and reconcile presence. Recompute
-   * each affected identity FIRST -- while its rows still exist, so an identity
-   * whose only rows are expired is marked left rather than mistaken for an
-   * unmanaged (no-rows) identity -- THEN delete the left/expired rows.
-   */
-  private gcSessionPresence(roomId: number): void {
-    // Reap ONLY expired rows (not left-but-fresh ones): a left row must survive
-    // its 7-day window because my_mentions reads it to keep muting the room for
-    // the session that left -- deleting it on the next unrelated join would
-    // silently un-mute. Recompute ignores left rows either way (they are not
-    // "live"), so keeping them does not affect identity presence.
-    const dead = `updated_at < datetime('now', ?)`;
-    const affected = this.db
-      .prepare(
-        `SELECT DISTINCT agent_id FROM session_presence WHERE room_id = ? AND (${dead})`,
-      )
-      .all(roomId, SESSION_GC_AGE) as { agent_id: string }[];
-    for (const { agent_id } of affected) {
-      this.recomputeMembershipPresence(roomId, agent_id);
-    }
-    this.db
-      .prepare(`DELETE FROM session_presence WHERE room_id = ? AND (${dead})`)
-      .run(roomId, SESSION_GC_AGE);
-  }
+  // --- membership ---------------------------------------------------------
 
   /**
-   * Join (or rejoin) a room: clears any prior leave, refreshes liveness, and
-   * registers this session's PRESENCE. presenceId (the process nonce) is set for
-   * every MCP session, shared OR private; sessionId (the cursor nonce) only for
-   * a private cursor. A null presenceId (non-session caller: web, tests) keeps
-   * the old identity-level presence, seeding no presence row.
+   * Join (or rejoin) a room: clears any prior leave and refreshes liveness.
+   *
+   * Presence is PER PERSONA. With one runtime per persona there is no second
+   * live seat to reconcile: a takeover fences the loser out instead.
+   *
+   * `cursorStart` applies ONLY when this call creates the membership. A rejoin
+   * must never move a cursor: the whole point of resuming a persona is that its
+   * read position survives, and a "start at latest" that also applied on rejoin
+   * would silently discard the backlog it was resumed to read.
    */
   joinRoom(
     roomId: number,
     agentId: string,
-    sessionId: string | null = null,
-    presenceId: string | null = null,
-  ): void {
-    // One IMMEDIATE transaction: this was the file's only multi-statement
-    // read-then-write path running autocommitted, where a cross-process
-    // deleteRoom interleaving between statements surfaced as an opaque
-    // NOT NULL/FK constraint error instead of a clean failure.
+    epoch: number,
+    opts: { cursorStart?: "beginning" | "latest"; role?: string } = {},
+  ): { created: boolean } {
+    if (opts.role !== undefined) {
+      assertStorable(opts.role, "role");
+      assertMaxLen(opts.role, "role", 200);
+      assertRole(opts.role);
+    }
+    // One IMMEDIATE transaction: this is a multi-statement read-then-write path,
+    // and a cross-process deleteRoom interleaving between statements otherwise
+    // surfaces as an opaque NOT NULL/FK constraint error instead of a clean
+    // failure. It also scopes the epoch guard to the same transaction as every
+    // write below it.
     const tx = this.db.transaction(() => {
+      this.requireEpoch(agentId, epoch);
       // Existence check INSIDE the write transaction: the caller resolved the
       // room earlier, and a cross-process delete_room in that window otherwise
       // surfaces as a raw "FOREIGN KEY constraint failed".
       this.requireRoom(roomId);
-      this.db
+      const info = this.db
         .prepare(
           "INSERT OR IGNORE INTO memberships (room_id, agent_id) VALUES (?, ?)",
         )
         .run(roomId, agentId);
+      const created = info.changes > 0;
+      if (created && opts.cursorStart === "latest") {
+        // Baseline a NEW membership at the room head so the joiner sees only
+        // what arrives from now on. Read inside this transaction, so a message
+        // committed concurrently is either below the baseline (skipped, as
+        // asked) or above it (delivered) -- never lost between the two.
+        this.db
+          .prepare(
+            `UPDATE memberships
+             SET last_read_seq = COALESCE(
+               (SELECT MAX(seq) FROM messages WHERE room_id = ?), 0)
+             WHERE room_id = ? AND agent_id = ?`,
+          )
+          .run(roomId, roomId, agentId);
+      }
       this.db
         .prepare(
           `UPDATE memberships SET left_at = NULL, last_seen = datetime('now')
            WHERE room_id = ? AND agent_id = ?`,
         )
         .run(roomId, agentId);
-      if (presenceId !== null) {
-        // Register/refresh this session's presence (present => left_at NULL).
+      if (opts.role !== undefined) {
         this.db
           .prepare(
-            `INSERT INTO session_presence (room_id, agent_id, session_id)
-             VALUES (?, ?, ?)
-             ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
-               updated_at = datetime('now'), left_at = NULL`,
+            "UPDATE memberships SET role = ? WHERE room_id = ? AND agent_id = ?",
           )
-          .run(roomId, agentId, presenceId);
-        // Reap dead presence rows and reconcile memberships.left_at.
-        this.gcSessionPresence(roomId);
+          .run(opts.role, roomId, agentId);
       }
-      if (sessionId !== null) {
-        // Private cursor: seed a new one from the identity marker; an existing
-        // one keeps its position (refresh only updated_at against the GC, which
-        // must never reap the very session this join resumes).
-        this.db
-          .prepare(
-            `INSERT INTO session_markers (room_id, agent_id, session_id, last_read_seq)
-             VALUES (?, ?, ?, (SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?))
-             ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
-               updated_at = datetime('now')`,
-          )
-          .run(roomId, agentId, sessionId, roomId, agentId);
-        this.db
-          .prepare(
-            "DELETE FROM session_markers WHERE room_id = ? AND updated_at < datetime('now', ?)",
-          )
-          .run(roomId, SESSION_GC_AGE);
+      return { created };
+    });
+    return tx.immediate();
+  }
+
+  /**
+   * Set or clear this persona's ROOM-LOCAL role. `role` is the new value and
+   * null clears it; there is no "omit to keep" path here, because omission is
+   * handled by not calling this at all. Room-local by construction: the same
+   * persona keeps a different role in every other room.
+   */
+  setRole(roomId: number, agentId: string, epoch: number, role: string | null): void {
+    assertStorable(role, "role");
+    assertMaxLen(role, "role", 200);
+    assertRole(role);
+    const tx = this.db.transaction(() => {
+      this.requireEpoch(agentId, epoch);
+      this.requireRoom(roomId);
+      // A role describes what you are IN THIS ROOM; you cannot hold one while
+      // absent.
+      this.requirePresent(roomId, agentId);
+      // Refresh last_seen in the SAME statement. A role change is a deliberate
+      // act in THIS room, so the seat is demonstrably attended here; leaving
+      // last_seen alone would let an explicit set_role in room B refresh only
+      // whatever room the runtime happens to have active.
+      const info = this.db
+        .prepare(
+          `UPDATE memberships SET role = ?, last_seen = datetime('now')
+           WHERE room_id = ? AND agent_id = ?`,
+        )
+        .run(role, roomId, agentId);
+      if (info.changes === 0) {
+        throw new Error(
+          `you are not a member of room ${roomId}; join_room it first`,
+        );
       }
     });
     tx.immediate();
   }
 
-  /**
-   * Drop THIS session's private cursor for a room: called when a session
-   * joins a room in SHARED mode, so a leftover private row from an earlier
-   * private join cannot keep feeding my_mentions a stale baseline that the
-   * session's own catch_up (now shared) no longer uses.
-   */
-  clearSessionCursor(roomId: number, agentId: string, sessionId: string): void {
-    this.db
-      .prepare(
-        "DELETE FROM session_markers WHERE room_id = ? AND agent_id = ? AND session_id = ?",
-      )
-      .run(roomId, agentId, sessionId);
+  /** This persona's room-local role, or null. */
+  getRole(roomId: number, agentId: string): string | null {
+    const row = this.db
+      .prepare("SELECT role FROM memberships WHERE room_id = ? AND agent_id = ?")
+      .get(roomId, agentId) as { role: string | null } | undefined;
+    return row ? row.role : null;
   }
 
   /**
-   * Soft leave: keep the membership row (and read positions) but mark THIS
-   * session not present. Private session cursors are deliberately KEPT: a
-   * lagging session's true read position lives only in its session_markers row,
-   * and dead ones are reaped by the 7-day GC.
-   *
-   * SESSION-aware via session_presence: mark this session's presence row left,
-   * then recompute the identity-level memberships.left_at from the surviving
-   * sessions -- present iff any twin (shared OR private) still has a live
-   * presence row. So one session leaving never evicts a live twin, for EVERY
-   * cursor mode (the earlier session_markers-only twin check saw private
-   * sessions only, so shared twins evicted each other and a private leave
-   * evicted a shared twin). A caller with no presence row (presenceId null, or
-   * a pre-redesign session) falls back to an identity-level leave.
+   * Soft leave: keep the membership row (and its read position and role) but
+   * mark the persona not present. Rejoining resumes exactly where it left off.
    */
-  leaveRoom(
-    roomId: number,
-    agentId: string,
-    presenceId: string | null = null,
-  ): boolean {
+  leaveRoom(roomId: number, agentId: string, epoch: number): boolean {
     const tx = this.db.transaction(() => {
-      // Reconcile stale presence in this room on the way out: broadens the GC
-      // beyond join, so a crashed twin's aged row is reaped (and its identity
-      // recomputed) whenever anyone leaves, not only on the next join. The
-      // active leaver's own row was refreshed on its last join/touch, so it is
-      // not expired and is not reaped here.
-      this.gcSessionPresence(roomId);
-      if (presenceId !== null) {
-        const row = this.db
-          .prepare(
-            "SELECT 1 FROM session_presence WHERE room_id = ? AND agent_id = ? AND session_id = ?",
-          )
-          .get(roomId, agentId, presenceId);
-        if (row) {
-          const s = this.db
-            .prepare(
-              `UPDATE session_presence SET left_at = datetime('now')
-               WHERE room_id = ? AND agent_id = ? AND session_id = ? AND left_at IS NULL`,
-            )
-            .run(roomId, agentId, presenceId);
-          // Reconcile the identity flag from the sessions that remain.
-          this.recomputeMembershipPresence(roomId, agentId);
-          return s.changes > 0; // true iff this session went present -> left
-        }
-        // No presence row for THIS session -- e.g. the 7-day GC reaped it while
-        // the process stayed alive (idle, no touch). If the identity still has
-        // OTHER presence rows (a live twin), reconcile from them rather than
-        // blindly evicting via the identity-level leave below (which would defeat
-        // the redesign's no-twin-eviction guarantee). Only an identity with NO
-        // presence rows at all (web viewer, tests, pre-redesign) takes that path.
-      }
-      // The same protection is required for a legacy/sessionless leave. During
-      // a rolling upgrade it may share an identity with current session-aware
-      // twins; an unconditional identity leave must not evict those live rows.
-      const anyLive = this.db
-        .prepare(
-          `SELECT 1 FROM session_presence
-           WHERE room_id = ? AND agent_id = ? AND left_at IS NULL LIMIT 1`,
-        )
-        .get(roomId, agentId);
-      if (anyLive) {
-        this.recomputeMembershipPresence(roomId, agentId);
-        return false;
-      }
+      this.requireEpoch(agentId, epoch);
       const info = this.db
         .prepare(
           `UPDATE memberships SET left_at = datetime('now'), last_seen = datetime('now')
@@ -1515,156 +1469,74 @@ export class ChatStore {
   }
 
   /**
-   * Refresh ALL of a session's cursor rows against the 7-day GC, without
-   * touching membership state: used when the session has an identity but no
-   * active room (post-leave my_mentions polling must still shield cursors).
-   */
-  touchSessionMarkers(_agentId: string, sessionId: string): void {
-    // Key on session_id ALONE, not (agent_id, session_id): the session_id is a
-    // process-unique nonce, and a single process can switch identity
-    // (join_room under a new agent_id). Its earlier identity's private cursor
-    // still belongs to THIS live session, so it must keep being refreshed;
-    // scoping the refresh to the current agent_id let that older cursor age
-    // out and get GC'd, and switching back recreated it at the identity
-    // marker, silently skipping everything the private cursor had not read.
-    this.db
-      .prepare(
-        "UPDATE session_markers SET updated_at = datetime('now') WHERE session_id = ?",
-      )
-      .run(sessionId);
-  }
-
-  /**
-   * Mark an active agent alive. Also clears the ACTIVE room's left_at (an
-   * actively-acting session re-asserts identity presence there). With
-   * presenceId, refresh this session's cursor rows (every identity) and the
-   * current identity's presence rows in EVERY room against the 7-day GC, and
-   * reconcile the active room's presence.
+   * Mark a persona alive in a room, clearing that room's left_at (an actively
+   * acting runtime re-asserts presence there).
    *
-   * One IMMEDIATE transaction: these statements ran as separate autocommits,
-   * and another process's GC interleaving between the membership update and
-   * the presence upsert could recompute from the half-applied state, leaving
-   * a live presence row beside a left membership (an active session hidden
-   * from inboxes and pollers) until the next touch.
-   *
-   * The GC runs here too: join/leave/prune alone never reconciled a crashed
-   * twin in a stable room, so it could read present:true indefinitely. touch
-   * covers exactly the rooms whose agents anyone can list (list_agents reads
-   * the caller's ACTIVE room). Reconciliation stays OPPORTUNISTIC overall: a
-   * room no live session joins/leaves/prunes/touches keeps stale presence
-   * until the next such operation inside it.
+   * EPOCH-FENCED like any other write. A liveness touch looks harmless, but it
+   * is what makes a persona read as present/active to every other agent and to
+   * recipient status; an unfenced touch would let a runtime that has already
+   * lost the persona keep publishing it as an available listener, which is the
+   * false-listener-truth failure the epoch exists to close. Throwing here is
+   * correct: the caller treats liveness as best-effort and the next real
+   * operation reports persona_lost.
    */
-  touch(roomId: number, agentId: string, presenceId: string | null = null): void {
+  touch(roomId: number, agentId: string, epoch: number): void {
     const tx = this.db.transaction(() => {
-      this.db
-        .prepare(
-          "UPDATE memberships SET last_seen = datetime('now'), left_at = NULL WHERE room_id = ? AND agent_id = ?",
-        )
-        .run(roomId, agentId);
-      if (presenceId !== null) {
-        // Re-assert this session's presence in the ACTIVE room (recreating a
-        // row the 7-day GC reaped while the process stayed alive but idle), so
-        // a NULL memberships.left_at is always backed by a live presence row
-        // and a later leave or crash reconciles correctly. The active room is
-        // never one the session soft-left (leave clears the session's active
-        // room), so this cannot resurrect a left room's presence. Upsert FIRST
-        // so the GC below never reaps the toucher itself.
-        this.db
-          .prepare(
-            `INSERT INTO session_presence (room_id, agent_id, session_id)
-             VALUES (?, ?, ?)
-             ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
-               updated_at = datetime('now'), left_at = NULL`,
-          )
-          .run(roomId, agentId, presenceId);
-        this.gcSessionPresence(roomId);
-        this.touchSessionAlive(presenceId, agentId);
-      }
-    });
-    tx.immediate();
-  }
-
-  /**
-   * Shield a live session's cursor AND presence rows from the 7-day GC in EVERY
-   * room (keyed by the process nonce, so it also covers rooms the session is not
-   * currently active in). CURSOR rows are refreshed nonce-wide, for every
-   * identity the session has ever held (see touchSessionMarkers for why).
-   * PRESENCE rows are refreshed only for the CURRENT identity: a session that
-   * switched identity no longer acts as the old one, so the old identity's
-   * presence must age out via the GC and read as left -- a nonce-wide refresh
-   * kept it `present` for the life of the process with no way to leave it. The
-   * old identity's preserved cursor row means a later rejoin under that id
-   * resumes its exact read position. LEFT rows (leave tombstones) are refreshed
-   * too -- the GC reaps by updated_at alone, so a live session's my_mentions
-   * muting otherwise silently expired at the GC age while the session kept
-   * polling; left_at itself is never cleared here, and a dead session's
-   * tombstones still age out. Used for the no-active-room case (post-leave
-   * my_mentions polling) and by touch().
-   */
-  touchSessionAlive(sessionId: string, agentId: string): void {
-    this.touchSessionMarkers("", sessionId);
-    this.db
-      .prepare(
-        "UPDATE session_presence SET updated_at = datetime('now') WHERE session_id = ? AND agent_id = ?",
-      )
-      .run(sessionId, agentId);
-  }
-
-  /**
-   * Refresh activity for one room captured by a cross-room operation without
-   * silently rejoining it. The exact session-presence row must still be live;
-   * a left/tombstoned or never-joined session is a no-op even when a twin keeps
-   * the identity-level membership present. IMMEDIATE makes the live-row check
-   * and refresh atomic with a concurrent leave.
-   */
-  touchSessionRoom(
-    roomId: number,
-    agentId: string,
-    sessionId: string,
-  ): boolean {
-    const tx = this.db.transaction(() => {
-      const live = this.db
-        .prepare(
-          `SELECT 1 FROM session_presence
-           WHERE room_id = ? AND agent_id = ? AND session_id = ?
-             AND left_at IS NULL`,
-        )
-        .get(roomId, agentId, sessionId);
-      if (!live) return false;
-      this.db
-        .prepare(
-          `UPDATE session_presence SET updated_at = datetime('now')
-           WHERE room_id = ? AND agent_id = ? AND session_id = ?
-             AND left_at IS NULL`,
-        )
-        .run(roomId, agentId, sessionId);
+      this.requireEpoch(agentId, epoch);
       this.db
         .prepare(
           `UPDATE memberships SET last_seen = datetime('now'), left_at = NULL
            WHERE room_id = ? AND agent_id = ?`,
         )
         .run(roomId, agentId);
-      return true;
+    });
+    tx.immediate();
+  }
+
+  /**
+   * Refresh activity for one room captured by a cross-room operation, WITHOUT
+   * rejoining it: a room this persona explicitly left stays left. Returns false
+   * when there was no present membership to refresh.
+   */
+  touchJoinedRoom(roomId: number, agentId: string, epoch: number): boolean {
+    const tx = this.db.transaction(() => {
+      this.requireEpoch(agentId, epoch);
+      const info = this.db
+        .prepare(
+          `UPDATE memberships SET last_seen = datetime('now')
+           WHERE room_id = ? AND agent_id = ? AND left_at IS NULL`,
+        )
+        .run(roomId, agentId);
+      return info.changes > 0;
     });
     return tx.immediate();
   }
 
   /**
-   * Open an in-turn wait lease: this (room, agent, session) has a blocking
-   * catch_up call pending. TTL covers the wait plus grace, so a hard-killed
-   * process cannot leave a permanent "watching" ghost. Expired rows for the
-   * room are reaped in passing. IMMEDIATE (read-then-write) and room-checked,
-   * so a concurrently deleted room fails with the clean rejoin message
-   * instead of a raw FK error.
+   * Open an in-turn wait lease: this persona has a blocking catch_up pending in
+   * this room. TTL covers the wait plus grace, so a hard-killed process cannot
+   * leave a permanent "watching" ghost. Expired rows for the room are reaped in
+   * passing.
+   *
+   * The upsert writes the CALLER'S epoch into the row (`epoch = excluded.epoch`
+   * on conflict). Leaving the old value in place would invert the guard in
+   * endWaitLease: the winner's row would carry the loser's epoch, so the
+   * loser's cleanup would match and delete it while the winner's own cleanup
+   * would not.
    */
   beginWaitLease(
     roomId: number,
     agentId: string,
-    sessionId: string,
+    epoch: number,
     ttlSeconds: number,
   ): void {
     const tx = this.db.transaction(() => {
+      this.requireEpoch(agentId, epoch);
       this.requireRoom(roomId);
+      // A lease ADVERTISES this persona as watching the room. An absent
+      // persona advertising a live watch is the exact contradiction the
+      // present-membership rule exists to remove.
+      this.requirePresent(roomId, agentId);
       this.db
         .prepare(
           "DELETE FROM wait_leases WHERE room_id = ? AND expires_at <= datetime('now')",
@@ -1672,23 +1544,35 @@ export class ChatStore {
         .run(roomId);
       this.db
         .prepare(
-          `INSERT INTO wait_leases (room_id, agent_id, session_id, expires_at)
+          `INSERT INTO wait_leases (room_id, agent_id, epoch, expires_at)
            VALUES (?, ?, ?, datetime('now', '+' || ? || ' seconds'))
-           ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
-             started_at = datetime('now'), expires_at = excluded.expires_at`,
+           ON CONFLICT(room_id, agent_id) DO UPDATE SET
+             epoch = excluded.epoch,
+             started_at = datetime('now'),
+             expires_at = excluded.expires_at`,
         )
-        .run(roomId, agentId, sessionId, Math.max(1, Math.floor(ttlSeconds)));
+        .run(roomId, agentId, epoch, Math.max(1, Math.floor(ttlSeconds)));
     });
     tx.immediate();
   }
 
-  /** Close an in-turn wait lease (normal return, timeout, or abort alike). */
-  endWaitLease(roomId: number, agentId: string, sessionId: string): void {
+  /**
+   * Close an in-turn wait lease (normal return, timeout, or abort alike).
+   *
+   * Guarded on the epoch the caller CAPTURED when it opened the lease, never on
+   * the persona's current epoch. A fenced-out runtime still runs its finally
+   * block, and that cleanup can land after the winner has already replaced the
+   * row; an unguarded DELETE would then remove the winner's live lease and
+   * report it as not watching. Deliberately NOT wrapped in requireEpoch: a lost
+   * runtime must still be able to clean up after itself, it just must not touch
+   * anything that is no longer its own.
+   */
+  endWaitLease(roomId: number, agentId: string, epoch: number): void {
     this.db
       .prepare(
-        "DELETE FROM wait_leases WHERE room_id = ? AND agent_id = ? AND session_id = ?",
+        "DELETE FROM wait_leases WHERE room_id = ? AND agent_id = ? AND epoch = ?",
       )
-      .run(roomId, agentId, sessionId);
+      .run(roomId, agentId, epoch);
   }
 
   getMembership(
@@ -1704,61 +1588,21 @@ export class ChatStore {
       | undefined;
   }
 
-  /**
-   * Read the effective cursor: the per-session position when sessionId is set
-   * (falling back to the identity marker if the session row does not exist
-   * yet), else the identity marker. Read-only, so it is safe inside a deferred
-   * (read) transaction.
-   */
+  /** Read position for (room, persona). Read-only, so it is safe inside a
+   *  deferred (read) transaction. */
   getCursor(
     roomId: number,
     agentId: string,
-    sessionId: string | null,
   ): { last_read_seq: number; left_at: string | null } | undefined {
-    const membership = this.getMembership(roomId, agentId);
-    if (!membership || sessionId === null) return membership;
-    const s = this.db
-      .prepare(
-        "SELECT last_read_seq FROM session_markers WHERE room_id = ? AND agent_id = ? AND session_id = ?",
-      )
-      .get(roomId, agentId, sessionId) as { last_read_seq: number } | undefined;
-    return s
-      ? { last_read_seq: s.last_read_seq, left_at: membership.left_at }
-      : membership;
+    return this.getMembership(roomId, agentId);
   }
 
-  /**
-   * Move the cursor to seq. Shared mode sets the identity marker exactly
-   * (rewind allowed, preserving mark_read semantics). Session mode upserts the
-   * session cursor exactly and raises the identity marker monotonically to the
-   * MAX across sessions, keeping it meaningful as "some session of this
-   * identity has read this far" for read receipts.
-   */
-  private setCursor(
-    roomId: number,
-    agentId: string,
-    sessionId: string | null,
-    seq: number,
-  ): void {
-    if (sessionId === null) {
-      this.db
-        .prepare(
-          "UPDATE memberships SET last_read_seq = ? WHERE room_id = ? AND agent_id = ?",
-        )
-        .run(seq, roomId, agentId);
-      return;
-    }
+  /** Move the read position to seq exactly. Rewind is allowed, which is what
+   *  mark_read's explicit-seq form relies on. */
+  private setCursor(roomId: number, agentId: string, seq: number): void {
     this.db
       .prepare(
-        `INSERT INTO session_markers (room_id, agent_id, session_id, last_read_seq)
-         VALUES (?, ?, ?, ?)
-         ON CONFLICT(room_id, agent_id, session_id) DO UPDATE SET
-           last_read_seq = excluded.last_read_seq, updated_at = datetime('now')`,
-      )
-      .run(roomId, agentId, sessionId, seq);
-    this.db
-      .prepare(
-        "UPDATE memberships SET last_read_seq = max(last_read_seq, ?) WHERE room_id = ? AND agent_id = ?",
+        "UPDATE memberships SET last_read_seq = ? WHERE room_id = ? AND agent_id = ?",
       )
       .run(seq, roomId, agentId);
   }
@@ -1789,13 +1633,12 @@ export class ChatStore {
   }
 
   /**
-   * Advance shared/private cursors at or beyond a proven safe floor through an
-   * accepted self-authored post. The caller derives that floor from the crossing
-   * aggregate: it is either the latest peer seq in the room or the posting
-   * cursor when no later peer exists. This is a plain indexed marker pass, not a
-   * correlated history scan per private session. Sibling marker timestamps are
-   * deliberately untouched: active sessions refresh their own liveness, while
-   * dead cursors must still GC.
+   * Advance the author's own cursor past a self-authored post, but only from at
+   * or beyond a proven safe floor. The caller derives that floor from the
+   * crossing aggregate: it is either the latest peer seq in the room or the
+   * posting cursor when no later peer exists. Guarding on the floor is what
+   * keeps this from stepping over an unread PEER message that happens to sit
+   * below the new post.
    */
   private advanceOwnOnlyCursors(
     roomId: number,
@@ -1806,13 +1649,6 @@ export class ChatStore {
     this.db
       .prepare(
         `UPDATE memberships
-         SET last_read_seq = max(last_read_seq, ?)
-         WHERE room_id = ? AND agent_id = ? AND last_read_seq >= ?`,
-      )
-      .run(throughSeq, roomId, agentId, safeFloor);
-    this.db
-      .prepare(
-        `UPDATE session_markers
          SET last_read_seq = max(last_read_seq, ?)
          WHERE room_id = ? AND agent_id = ? AND last_read_seq >= ?`,
       )
@@ -1836,7 +1672,10 @@ export class ChatStore {
     size_trimmed?: boolean;
   } {
     const PREVIEW = 300;
-    const cols = `SELECT a.id, a.type, a.role,
+    // role comes from the MEMBERSHIP, not the persona: it is what this persona
+    // is in THIS room.
+    const cols = `SELECT a.id, a.brand, a.model, a.version, a.is_human,
+                         m.role AS role,
                          substr(a.description, 1, ${PREVIEW}) AS description,
                          CASE WHEN length(a.description) > ${PREVIEW} THEN 1 ELSE 0 END AS description_cut,
                          m.joined_at, m.rowid AS _rid,
@@ -1851,11 +1690,12 @@ export class ChatStore {
                    FROM memberships m JOIN agents a ON a.id = m.agent_id
                    WHERE m.room_id = @room`;
     const lim = Math.max(1, Math.floor(limit));
-    type Row = Omit<AgentRow, "present" | "active" | "watching"> & {
+    type Row = Omit<AgentRow, "present" | "active" | "watching" | "is_human"> & {
       left_at: string | null;
       description_cut: number;
       _rid: number;
       watching: number;
+      is_human: number;
     };
     // Base params (room + optional filter) go to BOTH the row and count queries;
     // row-only params (keyset cursor, limit) are added separately so each
@@ -1866,7 +1706,13 @@ export class ChatStore {
       // Literal-substring semantics: escape LIKE wildcards so a filter of
       // "50%" matches those three characters, not everything.
       base.like = `%${filter.trim().replace(/[\\%_]/g, "\\$&")}%`;
-      cond = ` AND (IFNULL(a.role,'') LIKE @like ESCAPE '\\' OR IFNULL(a.type,'') LIKE @like ESCAPE '\\'
+      // Every field this listing SHOWS is searchable. version was missing, so
+      // "find the runtimes still on v2" returned nothing while the column sat
+      // in the response.
+      cond = ` AND (IFNULL(m.role,'') LIKE @like ESCAPE '\\'
+                  OR IFNULL(a.brand,'') LIKE @like ESCAPE '\\'
+                  OR IFNULL(a.model,'') LIKE @like ESCAPE '\\'
+                  OR IFNULL(a.version,'') LIKE @like ESCAPE '\\'
                   OR IFNULL(a.description,'') LIKE @like ESCAPE '\\' OR a.id LIKE @like ESCAPE '\\')`;
     }
     // KEYSET on the MONOTONIC membership rowid (NOT (joined_at, id)): rowid is
@@ -1902,6 +1748,7 @@ export class ChatStore {
       const isWatching = watching === 1;
       return {
         ...rest,
+        is_human: rest.is_human === 1,
         ...(description_cut ? { description_truncated: true } : {}),
         present: left_at === null,
         active:
@@ -1990,7 +1837,7 @@ export class ChatStore {
    * ANY message from others carries seq above the token, NOTHING is inserted
    * and the reject result carries the crossing messages (bounded previews,
    * per-row directed) so the caller can assess the delta and idempotently
-   * retry; a token ahead of this session's effective cursor is invalid (it
+   * retry; a token ahead of this persona's read cursor is invalid (it
    * cannot have come from that cursor's catch_up and would otherwise bypass
    * the guard). The reject baseline is the TOKEN, unlike the accept path's
    * cursor-relative crossed. opts.crossedPreviewChars additionally returns
@@ -2006,8 +1853,8 @@ export class ChatStore {
     format: "text" | "json",
     mentions: string[] | null,
     replyToSeq: number | null,
-    supersedesSeq: number | null = null,
-    sessionId: string | null = null,
+    supersedesSeq: number | null,
+    epoch: number,
     opts: {
       ifLastReadSeq?: number | null;
       crossedPreviewChars?: number;
@@ -2103,9 +1950,16 @@ export class ChatStore {
     }
     const ifToken = opts.ifLastReadSeq ?? null;
     const tx = this.db.transaction(() => {
+      // FIRST, before the dedup lookup: a fenced-out runtime must not even be
+      // told the seq of a message it posted in a previous tenure, and must
+      // certainly not insert a new one.
+      this.requireEpoch(agentId, epoch);
       // The caller's room reference predates this transaction; a concurrent
       // delete_room otherwise surfaces as a raw FK failure on the INSERT.
       this.requireRoom(roomId);
+      // Authoring is the loudest form of participation. A persona every peer
+      // has been told is absent must not appear in the transcript.
+      this.requirePresent(roomId, agentId);
       // Lost-response retry: one indexed lookup only when the caller opted in.
       // It precedes CAS/reference validation so a committed first attempt is
       // recoverable even if room state or a referenced parent later changed.
@@ -2169,14 +2023,14 @@ export class ChatStore {
       ) {
         throw new Error("if_last_read_seq must be a non-negative safe integer");
       }
-      const cursor = this.getCursor(roomId, agentId, sessionId);
+      const cursor = this.getCursor(roomId, agentId);
       const from = cursor?.last_read_seq ?? 0;
       if (ifToken !== null) {
         // A future/wrong-cursor token made the predicate `seq > token` empty
         // and silently disabled the CAS while unread messages still existed.
-        // Bind the token to the effective shared/private cursor that could
-        // actually have produced it. This is misuse detection, not auth: the
-        // optional guard remains a caller-chosen safety primitive.
+        // Bind the token to the read cursor that could actually have produced
+        // it. This is misuse detection, not auth: the optional guard remains a
+        // caller-chosen safety primitive.
         if (ifToken > from) {
           throw new Error(
             `if_last_read_seq ${ifToken} is ahead of the current read marker ${from}; ` +
@@ -2312,8 +2166,8 @@ export class ChatStore {
       // own-only suffix made every 5s poll (and every 500ms blocking probe) walk
       // that suffix forever. If crossing found peers after `from`, its MAX is
       // the room's latest peer row; otherwise `from` itself is known safe. Any
-      // cursor at/after that floor can move through this own post. This protects
-      // caught-up sibling sessions without scanning history once per sibling.
+      // cursor at/after that floor can move through this own post, without
+      // scanning history.
       const safeCursorFloor = crossing.c > 0 ? crossing.mx! : from;
       this.advanceOwnOnlyCursors(roomId, agentId, next, safeCursorFloor);
       // Opt-in crossed previews on an ACCEPTED post, in the same transaction
@@ -2394,8 +2248,6 @@ export class ChatStore {
     return {
       seq: r.seq,
       from: r.agent_id,
-      from_type: r.from_type,
-      from_role: r.from_role,
       format: r.format,
       ...(r.priority > 0 ? { priority: true as const } : {}),
       content,
@@ -2454,6 +2306,11 @@ export class ChatStore {
       sz = JSON.stringify(head).length;
     }
     const h = head as MessageRow;
+    // A body cut all the way to empty is an oversized row whatever stage got it
+    // there. Stage 4 sets this explicitly, but stage 2's escaping correction can
+    // reach keep=0 on its own for a control-heavy body, and a caller that reads
+    // `oversized` to decide "fetch this with get_message" must not miss those.
+    if (h.content === "" && codepointLen(r) > 0) h.oversized = true;
     // Stage 3: shed mentions (down to none if needed); size can live
     // entirely in a legal `to` list. Flags set before the deciding measure.
     if (sz > budget && Array.isArray(h.to) && h.to.length > 0) {
@@ -2476,15 +2333,8 @@ export class ChatStore {
       stub.oversized = true;
       sz = JSON.stringify(head).length;
       const half = (s: string) => safeCut(s, Math.floor(s.length / 2));
-      while (
-        sz > budget &&
-        ((stub.from_role?.length ?? 0) > 0 ||
-          (stub.from_type?.length ?? 0) > 0 ||
-          (stub.room_name?.length ?? 0) > 0)
-      ) {
-        if (stub.from_role) stub.from_role = half(stub.from_role);
-        if (stub.from_type) stub.from_type = half(stub.from_type);
-        if (stub.room_name) stub.room_name = half(stub.room_name);
+      while (sz > budget && (stub.room_name?.length ?? 0) > 0) {
+        stub.room_name = half(stub.room_name as string);
         sz = JSON.stringify(head).length;
       }
       // Sender identity shortens last (the seq still identifies the message).
@@ -2759,9 +2609,8 @@ export class ChatStore {
    * messages), one row per (agent, room), oldest pending first (the most
    * starved recipient leads). This is the read a supervisor polls to decide
    * whom to wake; my_mentions is self-scoped and cannot answer it. Markers
-   * are identity-level (a lagging private session's cursor is invisible
-   * cross-agent, so an agent can be further behind than reported), and
-   * idle_seconds is per room membership, matching list_agents. The directed
+   * are per (persona, room), and idle_seconds is per room membership, matching
+   * list_agents. The directed
    * predicate is inlined rather than directedAt(): that helper binds one
    * FIXED id, and here the id varies per membership row. Fetches limit+1 to
    * report truncation without a tail COUNT. Keyset paging makes a bounded
@@ -3010,20 +2859,43 @@ export class ChatStore {
   /**
    * Non-advancing unread probe for the blocking wait: EXACTLY catchUp's
    * predicate (seq > cursor AND agent_id != self, the cursor resolved through
-   * the same session selector), minus the fetch and the advance. Any drift
+   * the persona's one marker for the room), minus the fetch and the advance.
+   * Any drift
    * between this predicate and catchUp's makes the wait loop spin (a positive
    * probe whose advancing read returns nothing). Autocommit reads: under WAL
    * they take a shared lock, so a 500ms cadence never contends for the write
    * lock the way catchUp's IMMEDIATE transaction would. Throws when the
    * membership is gone (room deleted mid-wait), same as catchUp.
+   *
+   * EPOCH-FENCED, and this is what bounds how long a fenced-out wait keeps
+   * sitting there. The advancing read on a hit was always fenced, but a QUIET
+   * stale wait never reaches it: with no epoch here, a runtime taken over at
+   * second 3 of a 25-second wait went right on waiting, holding a lease that
+   * told peers it was watching, and learned nothing until traffic arrived or
+   * the deadline expired. Checking each probe caps that at one interval.
+   *
+   * The epoch rides as returned DATA anchored on the persona row, not as a
+   * WHERE predicate: as a predicate a fenced runtime would get "no row", which
+   * this method already means "the room or membership is gone" -- a wrong and
+   * actively misleading diagnosis. Anchoring on agents keeps the two apart.
    */
-  unreadProbe(
-    roomId: number,
-    agentId: string,
-    sessionId: string | null,
-  ): number {
-    const cursor = this.getCursor(roomId, agentId, sessionId);
-    if (!cursor) throw new Error("not a member of this room");
+  unreadProbe(roomId: number, agentId: string, epoch: number): number {
+    const row = this.db
+      .prepare(
+        `SELECT a.runtime_epoch AS current_epoch,
+                (SELECT mb.last_read_seq FROM memberships mb
+                  WHERE mb.room_id = @room AND mb.agent_id = @agent)
+                  AS last_read_seq
+         FROM agents a WHERE a.id = @agent`,
+      )
+      .get({ room: roomId, agent: agentId }) as
+      | { current_epoch: number; last_read_seq: number | null }
+      | undefined;
+    if (!row) throw new PersonaLostError(agentId, epoch, null);
+    if (row.current_epoch !== epoch) {
+      throw new PersonaLostError(agentId, epoch, row.current_epoch);
+    }
+    if (row.last_read_seq === null) throw new Error("not a member of this room");
     // A wait only needs a yes/no wake signal. COUNT(*) rescanned the complete
     // unread tail twice per second per wait (including a large self-authored
     // tail that never advances); the room/seq index lets this stop at one row.
@@ -3032,48 +2904,36 @@ export class ChatStore {
         `SELECT 1 FROM messages
          WHERE room_id = ? AND seq > ? AND agent_id != ? LIMIT 1`,
       )
-      .get(roomId, cursor.last_read_seq, agentId)
+      .get(roomId, row.last_read_seq, agentId)
       ? 1
       : 0;
   }
 
   /**
    * Bounded per-room unread summary for one agent: every room the agent is
-   * present in (rooms this session soft-left are muted) holding unread
+   * present in (rooms this persona soft-left are muted) holding unread
    * messages from others, with total `unread` and `directed` (aimed at the
    * agent) counts, most-directed first. Feeds both my_mentions' by_room arm
-   * and catch_up's rooms_with_unread disclosure on an empty read. Session
-   * awareness matches my_mentions: with a sessionId, each room baselines off
-   * that session's OWN private cursor where one exists (COALESCE to the
-   * identity marker). excludeRoomId drops the room just read (catch_up's
-   * summary lists OTHER rooms). Fetches limit+1 to report truncation without
-   * a tail COUNT. Read-only, so it is safe inside deferred and immediate
-   * transactions alike.
+   * and catch_up's rooms_with_unread disclosure on an empty read. Rooms this
+   * persona soft-left are muted by the membership join. excludeRoomId drops the
+   * room just read (catch_up's summary lists OTHER rooms). Fetches limit+1 to
+   * report truncation without a tail COUNT. Read-only, so it is safe inside
+   * deferred and immediate transactions alike.
    */
   unreadByRoom(
     agentId: string,
-    sessionId: string | null,
     limit: number,
     excludeRoomId?: number,
   ): {
     rooms: { room_id: number; name: string; unread: number; directed: number }[];
     truncated: boolean;
   } {
-    // '' never collides with a real session id (same convention as myMentions).
-    const sessionKey = sessionId ?? "";
     const lim = Math.max(1, Math.floor(limit));
     const excl = excludeRoomId !== undefined ? " AND g.room_id != ?" : "";
     // Placeholders in SQL text order: the directedAt pair (SELECT), the
-    // membership join, the session-marker key, the author exclusion, the
-    // presence key, the optional room exclusion, then the LIMIT.
-    const params: (string | number)[] = [
-      agentId,
-      agentId,
-      agentId,
-      sessionKey,
-      agentId,
-      sessionKey,
-    ];
+    // membership join, the author exclusion, the optional room exclusion, then
+    // the LIMIT.
+    const params: (string | number)[] = [agentId, agentId, agentId, agentId];
     if (excludeRoomId !== undefined) params.push(excludeRoomId);
     params.push(lim + 1);
     const rows = this.db
@@ -3083,14 +2943,9 @@ export class ChatStore {
          FROM messages g
          JOIN memberships mb ON mb.room_id = g.room_id
               AND mb.agent_id = ? AND mb.left_at IS NULL
-         LEFT JOIN session_markers sm ON sm.room_id = g.room_id
-              AND sm.agent_id = mb.agent_id AND sm.session_id = ?
          JOIN rooms r ON r.id = g.room_id
-         WHERE g.seq > COALESCE(sm.last_read_seq, mb.last_read_seq)
-           AND g.agent_id != ?
-           AND NOT EXISTS (SELECT 1 FROM session_presence sp
-                           WHERE sp.room_id = g.room_id AND sp.agent_id = mb.agent_id
-                             AND sp.session_id = ? AND sp.left_at IS NOT NULL)${excl}
+         WHERE g.seq > mb.last_read_seq
+           AND g.agent_id != ?${excl}
          GROUP BY g.room_id, r.name
          ORDER BY directed DESC, unread DESC, g.room_id ASC
          LIMIT ?`,
@@ -3113,8 +2968,7 @@ export class ChatStore {
    * and advances over lower-priority rows through a disclosed cutoff. Directed
    * rows always qualify so advancing cannot silently erase my_mentions items.
    *
-   * unreadSummary (its sessionId is the RAW process nonce, my_mentions-style,
-   * not this room's cursor selector): on an EMPTY read, include a bounded
+   * unreadSummary: on an EMPTY read, include a bounded
    * rooms_with_unread summary of every OTHER room holding unread, computed in
    * the SAME snapshot as the empty determination -- across two separate
    * queries a message arriving in this room could make the read report
@@ -3125,10 +2979,13 @@ export class ChatStore {
     agentId: string,
     limit: number,
     previewChars?: number,
+    // Defaulted only because it sits after an optional parameter. 0 is a
+    // FAIL-CLOSED sentinel, not "no fencing": personas start at epoch 1 and
+    // only ever increment, so an omitted epoch matches nothing and the read is
+    // rejected rather than silently running unfenced.
     maxBytes: number = DEFAULT_MAX_BYTES,
-    sessionId: string | null = null,
+    epoch: number = 0,
     unreadSummary: {
-      sessionId: string | null;
       priorityOnly?: boolean;
     } | null = null,
   ): {
@@ -3177,13 +3034,21 @@ export class ChatStore {
     // never returned): a response the client rejects as oversized can no
     // longer strand a peer message behind an advanced marker.
     const tx = this.db.transaction(() => {
-      const cursor = this.getCursor(roomId, agentId, sessionId);
+      // ADVANCING read: fenced like a mutation, because it moves the read
+      // marker. A stale runtime whose catch_up committed would consume messages
+      // the current runtime has not seen and can no longer reach.
+      this.requireEpoch(agentId, epoch);
+      const cursor = this.getCursor(roomId, agentId);
       if (!cursor) {
         // Distinguish a real non-member from a room deleted after the caller
         // resolved it. This extra PK lookup runs only on the error path.
         this.requireRoom(roomId);
         throw new Error("not a member of this room");
       }
+      // Consuming messages while absent is invisible consumption: peers see a
+      // left persona and cannot tell their traffic is being read. read_history
+      // stays open for exactly this reason -- it consumes nothing.
+      this.requirePresent(roomId, agentId);
       const from = cursor.last_read_seq;
       const priorityOnly = unreadSummary?.priorityOnly === true;
       // Captured under the same IMMEDIATE snapshot as the filtered scan. Own
@@ -3281,7 +3146,7 @@ export class ChatStore {
         ).c;
       }
       if (lastSeq > from) {
-        this.setCursor(roomId, agentId, sessionId, lastSeq);
+        this.setCursor(roomId, agentId, lastSeq);
       }
       // Empty read: same-snapshot disclosure of where the traffic actually
       // is. Emitted even when no other room has unread ([]): that positively
@@ -3299,12 +3164,7 @@ export class ChatStore {
           }
         | null = null;
       if (unreadSummary !== null && messages.length === 0) {
-        const fetched = this.unreadByRoom(
-          agentId,
-          unreadSummary.sessionId,
-          UNREAD_SUMMARY_MAX,
-          roomId,
-        );
+        const fetched = this.unreadByRoom(agentId, UNREAD_SUMMARY_MAX, roomId);
         // The v0.9 summary was appended after catch_up had already spent the
         // entire page budget. Twenty legal, control-heavy room names could
         // inflate a declared 1k response past 25k. Bound the summary within
@@ -3366,11 +3226,9 @@ export class ChatStore {
    * global total order across rooms), each row tagged room_id/room_name.
    *
    * Strictly a PEEK: no read marker moves. An entry clears when its room is
-   * actually read (catch_up / mark_read there). Baselines follow the CALLER's
-   * cursor: with a sessionId, each room's private session cursor when one
-   * exists (falling back to the identity marker), so the inbox never hides a
-   * message the same session's catch_up would still deliver; identity-level
-   * otherwise. The poller remains identity-level (it cannot know the nonce).
+   * actually read (catch_up / mark_read there). Baselines follow the persona's
+   * one read marker per room, which is the same marker catch_up and the poller
+   * use, so the inbox can never hide a message catch_up would still deliver.
    *
    * Paging: rows come back oldest-first by messages.id (a global total order
    * across rooms); pass next_after_id back as afterId to page past `limit` or
@@ -3390,7 +3248,6 @@ export class ChatStore {
     limit: number,
     previewChars?: number,
     maxBytes: number = DEFAULT_MAX_BYTES,
-    sessionId: string | null = null,
     afterId = 0,
   ): {
     messages: MentionRow[];
@@ -3400,9 +3257,6 @@ export class ChatStore {
     by_room_truncated?: boolean;
     byte_limited?: boolean;
   } {
-    // '' never collides with a real session id, so one query shape serves
-    // both shared and private cursors.
-    const sessionKey = sessionId ?? "";
     const tx = this.db.transaction(() => {
       // Fetch ONE more than `limit` so a page cut by the ROW limit (not the
       // byte budget) is detectable. Without the probe, my_mentions was the only
@@ -3417,54 +3271,41 @@ export class ChatStore {
            FROM ${MESSAGE_FROM}
            JOIN memberships mb ON mb.room_id = g.room_id
                 AND mb.agent_id = ? AND mb.left_at IS NULL
-           LEFT JOIN session_markers sm ON sm.room_id = g.room_id
-                AND sm.agent_id = mb.agent_id AND sm.session_id = ?
            JOIN rooms r ON r.id = g.room_id
-           WHERE g.seq > COALESCE(sm.last_read_seq, mb.last_read_seq)
+           WHERE g.seq > mb.last_read_seq
              AND g.id > ? AND g.agent_id != ?
              AND ${directedAt("g")}
-             AND NOT EXISTS (SELECT 1 FROM session_presence sp
-                             WHERE sp.room_id = g.room_id AND sp.agent_id = mb.agent_id
-                               AND sp.session_id = ? AND sp.left_at IS NOT NULL)
            ORDER BY g.id ASC LIMIT ?`,
         ),
-        [agentId, sessionKey, afterId, agentId, agentId, agentId, sessionKey, limit + 1],
+        [agentId, afterId, agentId, agentId, agentId, limit + 1],
         maxBytes,
       );
       const hasExtra = fetched.length > limit;
       const rows = hasExtra ? fetched.slice(0, limit) : fetched;
 
-      // total_directed: a SCALAR aggregate over all present, not-this-session-left
-      // rooms -- NOT a materialized per-room array reduced in JS (an agent in
-      // 100k unread rooms otherwise cloned and sorted the whole set). The
-      // NOT EXISTS mutes a room THIS session left even while a twin keeps the
-      // identity present. Placeholders: the membership join, the session-marker
-      // key, the author exclusion, the directedAt pair, then the presence key.
+      // total_directed: a SCALAR aggregate over every present room -- NOT a
+      // materialized per-room array reduced in JS (a persona in 100k unread
+      // rooms otherwise cloned and sorted the whole set). Placeholders: the
+      // membership join, the author exclusion, then the directedAt pair.
       const { td } = this.db
         .prepare(
           `SELECT COUNT(*) AS td FROM messages g
            JOIN memberships mb ON mb.room_id = g.room_id
                 AND mb.agent_id = ? AND mb.left_at IS NULL
-           LEFT JOIN session_markers sm ON sm.room_id = g.room_id
-                AND sm.agent_id = mb.agent_id AND sm.session_id = ?
-           WHERE g.seq > COALESCE(sm.last_read_seq, mb.last_read_seq)
+           WHERE g.seq > mb.last_read_seq
              AND g.agent_id != ?
-             AND ${directedAt("g")}
-             AND NOT EXISTS (SELECT 1 FROM session_presence sp
-                             WHERE sp.room_id = g.room_id AND sp.agent_id = mb.agent_id
-                               AND sp.session_id = ? AND sp.left_at IS NOT NULL)`,
+             AND ${directedAt("g")}`,
         )
-        .get(agentId, sessionKey, agentId, agentId, agentId, sessionKey) as {
+        .get(agentId, agentId, agentId, agentId) as {
         td: number;
       };
       const total_directed = td;
 
       // by_room: fetch only the TOP rooms by directed count in SQL (bounded
       // memory), most-directed first, then trim to the byte budget. The query
-      // lives in unreadByRoom (shared with catch_up's rooms_with_unread) and
-      // carries the same session-aware muting and cursor baselines.
+      // lives in unreadByRoom, shared with catch_up's rooms_with_unread.
       const BY_ROOM_MAX = 4000;
-      const byRoomFetch = this.unreadByRoom(agentId, sessionId, BY_ROOM_MAX);
+      const byRoomFetch = this.unreadByRoom(agentId, BY_ROOM_MAX);
       let byRoom = byRoomFetch.rooms;
       // Rooms past BY_ROOM_MAX (the least-directed) were dropped -- flag it.
       const roomLimitHit = byRoomFetch.truncated;
@@ -3609,12 +3450,21 @@ export class ChatStore {
   markRead(
     roomId: number,
     agentId: string,
+    epoch: number,
     seq?: number,
-    sessionId: string | null = null,
   ): { previous: number; new: number; latest: number } {
     const tx = this.db.transaction(() => {
-      const cursor = this.getCursor(roomId, agentId, sessionId);
-      if (!cursor) throw new Error("not a member of this room");
+      this.requireEpoch(agentId, epoch);
+      const cursor = this.getCursor(roomId, agentId);
+      if (!cursor) {
+        // Same ordering rule as claimResource: name a deleted room as deleted
+        // rather than reporting its vanished membership as a non-membership.
+        this.requireRoom(roomId);
+        throw new Error("not a member of this room");
+      }
+      // Advancing a marker is participation: it consumes messages peers can
+      // see you have not read.
+      this.requirePresent(roomId, agentId);
       const { latest } = this.db
         .prepare(
           "SELECT COALESCE(MAX(seq), 0) AS latest FROM messages WHERE room_id = ?",
@@ -3622,7 +3472,7 @@ export class ChatStore {
         .get(roomId) as { latest: number };
       const target =
         seq === undefined ? latest : Math.max(0, Math.min(seq, latest));
-      this.setCursor(roomId, agentId, sessionId, target);
+      this.setCursor(roomId, agentId, target);
       return { previous: cursor.last_read_seq, new: target, latest };
     });
     return tx.immediate();
@@ -3695,6 +3545,8 @@ export class ChatStore {
    */
   pruneMessages(
     roomId: number,
+    agentId: string,
+    epoch: number,
     keepLast: number,
     force: boolean,
   ): {
@@ -3709,20 +3561,9 @@ export class ChatStore {
     // ALL rows would reset MAX(seq), breaking the monotonic-seq invariant.
     keepLast = Math.max(1, Math.floor(keepLast));
     const tx = this.db.transaction(() => {
+      this.requireEpoch(agentId, epoch);
       // A deleted room must not report a successful no-op prune.
       this.requireRoom(roomId);
-      // Reap EXPIRED private session cursors first (same 7-day window as the
-      // GC in joinRoom): that GC only runs on private joins, so a room whose
-      // sessions all vanished otherwise kept a dead marker at some ancient
-      // seq blocking every future unforced prune.
-      this.db
-        .prepare(
-          "DELETE FROM session_markers WHERE room_id = ? AND updated_at < datetime('now', ?)",
-        )
-        .run(roomId, SESSION_GC_AGE);
-      // Reconcile presence too (reap crashed sessions' aged rows, recompute
-      // memberships.left_at) so a prune also refreshes who is present.
-      this.gcSessionPresence(roomId);
       const { c: total } = this.db
         .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = ?")
         .get(roomId) as { c: number };
@@ -3736,24 +3577,17 @@ export class ChatStore {
         // Refuse to delete a message that ANY member who did NOT author it has
         // not yet read. Members that left are included: soft leave preserves the
         // read position for resume, so their unread is real until they return.
-        // Private session cursors count too: the identity marker is the MAX
-        // across sessions, so a lagging twin's unread is invisible to it and
-        // only the session_markers row knows. (The author has implicitly
-        // "seen" its own message, matching catch_up's self-exclusion.) Pass
-        // force=true to prune past this.
+        // (The author has implicitly "seen" its own message, matching catch_up's
+        // self-exclusion.) Pass force=true to prune past this.
         const { u } = this.db
           .prepare(
             `SELECT COUNT(*) AS u FROM messages g
              WHERE g.room_id = ? AND g.seq < ?
-               AND (EXISTS (
+               AND EXISTS (
                  SELECT 1 FROM memberships mm
                  WHERE mm.room_id = g.room_id
                    AND mm.last_read_seq < g.seq AND mm.agent_id != g.agent_id
-               ) OR EXISTS (
-                 SELECT 1 FROM session_markers sm
-                 WHERE sm.room_id = g.room_id
-                   AND sm.last_read_seq < g.seq AND sm.agent_id != g.agent_id
-               ))`,
+               )`,
           )
           .get(roomId, cutoff.seq) as { u: number };
         if (u > 0) {
@@ -3763,21 +3597,13 @@ export class ChatStore {
           // whom the refusal itself exempts.
           const { m } = this.db
             .prepare(
-              `SELECT MIN(m) AS m FROM (
-                 SELECT mm.last_read_seq AS m FROM memberships mm
-                  WHERE mm.room_id = ? AND EXISTS (
-                    SELECT 1 FROM messages g WHERE g.room_id = mm.room_id
-                      AND g.seq < ? AND g.seq > mm.last_read_seq
-                      AND g.agent_id != mm.agent_id)
-                 UNION ALL
-                 SELECT sm.last_read_seq FROM session_markers sm
-                  WHERE sm.room_id = ? AND EXISTS (
-                    SELECT 1 FROM messages g WHERE g.room_id = sm.room_id
-                      AND g.seq < ? AND g.seq > sm.last_read_seq
-                      AND g.agent_id != sm.agent_id)
-               )`,
+              `SELECT MIN(mm.last_read_seq) AS m FROM memberships mm
+                WHERE mm.room_id = ? AND EXISTS (
+                  SELECT 1 FROM messages g WHERE g.room_id = mm.room_id
+                    AND g.seq < ? AND g.seq > mm.last_read_seq
+                    AND g.agent_id != mm.agent_id)`,
             )
-            .get(roomId, cutoff.seq, roomId, cutoff.seq) as {
+            .get(roomId, cutoff.seq) as {
             m: number | null;
           };
           return {
@@ -3803,8 +3629,16 @@ export class ChatStore {
   /** Hard-delete a room and all of its messages and memberships. Throws a
    *  clean "already deleted" error if another process removed it first,
    *  instead of reporting a false success with zero counts. */
-  deleteRoom(roomId: number): { messages: number; members: number } {
+  deleteRoom(
+    roomId: number,
+    agentId: string,
+    epoch: number,
+  ): { messages: number; members: number } {
     const tx = this.db.transaction(() => {
+      // Fenced for the same reason as createRoom, and more urgently: this is
+      // the one irreversible operation in the tool surface. No membership is
+      // required (deletion has always been global admin), only a live persona.
+      this.requireEpoch(agentId, epoch);
       this.requireRoom(roomId);
       const { c: messages } = this.db
         .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = ?")
@@ -3816,8 +3650,6 @@ export class ChatStore {
       // and so foreign keys to rooms(id) are satisfied.
       this.db.prepare("DELETE FROM messages WHERE room_id = ?").run(roomId);
       this.db.prepare("DELETE FROM memberships WHERE room_id = ?").run(roomId);
-      this.db.prepare("DELETE FROM session_markers WHERE room_id = ?").run(roomId);
-      this.db.prepare("DELETE FROM session_presence WHERE room_id = ?").run(roomId);
       this.db.prepare("DELETE FROM claims WHERE room_id = ?").run(roomId);
       this.db.prepare("DELETE FROM wait_leases WHERE room_id = ?").run(roomId);
       this.db.prepare("DELETE FROM rooms WHERE id = ?").run(roomId);
@@ -3834,13 +3666,14 @@ export class ChatStore {
    * winner: the read-check and upsert run in one IMMEDIATE transaction, so two
    * simultaneous claimants cannot both be granted (unlike two "I claim X" chat
    * posts, which can cross). Re-claiming your own key renews the TTL; an
-   * expired claim is grantable to anyone. Ownership is per agent_id: two
-   * sessions sharing an identity share its claims.
+   * expired claim is grantable to anyone. Ownership is per PERSONA, so a claim
+   * survives a resume: the runtime that takes the persona over inherits it.
    */
   claimResource(
     roomId: number,
     key: string,
     agentId: string,
+    epoch: number,
     ttlSeconds: number,
     note: string | null,
   ):
@@ -3858,9 +3691,16 @@ export class ChatStore {
     assertStorable(note, "claim note");
     assertMaxLen(note, "claim note", 2000);
     const tx = this.db.transaction(() => {
+      this.requireEpoch(agentId, epoch);
       // Same deleted-room window as postMessage: fail cleanly, not with a
-      // raw FK error from the claims INSERT.
+      // raw FK error from the claims INSERT. BEFORE the presence check, because
+      // a delete cascades the membership away and "you are not a member" is a
+      // false diagnosis of a room that no longer exists.
       this.requireRoom(roomId);
+      // Taking (or renewing) a claim asserts coordination inside a room this
+      // persona is not in. release_claim stays open: dropping a claim you
+      // already hold is cleanup, not participation.
+      this.requirePresent(roomId, agentId);
       const row = this.db
         .prepare(
           `SELECT agent_id, note,
@@ -3916,10 +3756,12 @@ export class ChatStore {
     roomId: number,
     key: string,
     agentId: string,
+    epoch: number,
   ):
     | { released: true; key: string }
     | { released: false; key: string; reason: string } {
     const tx = this.db.transaction(() => {
+      this.requireEpoch(agentId, epoch);
       this.requireRoom(roomId);
       const row = this.db
         .prepare(

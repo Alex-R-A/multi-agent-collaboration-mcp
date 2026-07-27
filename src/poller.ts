@@ -21,7 +21,7 @@ import { join, resolve } from "node:path";
 type Args = {
   agent: string;
   room?: string;
-  session?: string;
+  epoch?: number;
   ownerPid?: number;
   db?: string;
   mentionsOnly: boolean;
@@ -34,7 +34,7 @@ type Hit = { room_id: number; room_name: string };
 
 const USAGE = `agent-chat-poller: wait for unread work with one SQLite probe every five seconds.
 Usage:
-  poller.js --agent <id> [--room <id|name>] [--session <nonce>]
+  poller.js --agent <id> [--room <id|name>] [--epoch <n>]
             [--owner-pid <pid>]
             [--mentions-only] [--interval <seconds>] [--timeout <seconds>]
             [--ok-on-timeout]
@@ -42,7 +42,14 @@ Usage:
 The interval must be 5..3600 seconds (default 5). The timeout must be
 1..86400 seconds (default 1200). Exit 0 = work exists; with --ok-on-timeout,
 exit 0 also reports a quiet deadline as has_updates:false. Without it,
-timeout exits 124. Exit 2 = invalid arguments, duplicate watcher, or DB error.
+timeout exits 124. Exit 2 = invalid arguments, duplicate watcher, DB error, or
+a stale binding (the persona was resumed by a newer runtime).
+
+--epoch binds this watcher to one runtime tenure of the persona. Every probe
+reads the persona's current epoch; once it moves, this watcher is speaking for
+a runtime that no longer holds the persona, so it exits 2 rather than reporting
+traffic to a seat nobody is sitting in. Omit it only for a diagnostic watch
+that should survive a takeover.
 `;
 
 function argumentError(message: string): never {
@@ -61,7 +68,7 @@ function parseInteger(value: string, flag: string, min: number, max: number): nu
 function parseArgs(argv: string[]): Args {
   let agent: string | undefined;
   let room: string | undefined;
-  let session: string | undefined;
+  let epoch: number | undefined;
   let ownerPid: number | undefined;
   let db: string | undefined;
   let mentionsOnly = false;
@@ -87,7 +94,9 @@ function parseArgs(argv: string[]): Args {
 
     if (flag === "--agent") agent = take();
     else if (flag === "--room") room = take();
-    else if (flag === "--session") session = take();
+    else if (flag === "--epoch") {
+      epoch = parseInteger(take(), flag, 1, Number.MAX_SAFE_INTEGER);
+    }
     else if (flag === "--owner-pid") {
       ownerPid = parseInteger(take(), flag, 1, 2_147_483_647);
     }
@@ -104,7 +113,7 @@ function parseArgs(argv: string[]): Args {
       timeoutOk = true;
     } else if (flag === "--since") {
       argumentError(
-        "--since is intentionally unsupported: frozen baselines can re-fire forever; use --session",
+        "--since is intentionally unsupported: a frozen baseline re-fires forever once crossed; every probe reads the current read marker instead",
       );
     } else if (flag === "--help" || flag === "-h") {
       process.stdout.write(USAGE);
@@ -117,11 +126,10 @@ function parseArgs(argv: string[]): Args {
   if (!agent) argumentError("--agent is required");
   if (agent.length > 200) argumentError("--agent is too long");
   if (room && room.length > 500) argumentError("--room is too long");
-  if (session && session.length > 500) argumentError("--session is too long");
   return {
     agent,
     room,
-    session,
+    epoch,
     ownerPid,
     db,
     mentionsOnly,
@@ -187,18 +195,22 @@ async function sleepWhileOwnerAlive(
   milliseconds: number,
   ownerPid: number | undefined,
 ): Promise<boolean> {
-  // Independent/manual pollers need no five-second owner heartbeat; let their
-  // single timer sleep for the requested interval without needless wakeups.
+  // A watcher with no owner has nothing to check for; let its single timer
+  // sleep the whole interval instead of waking every five seconds to ask.
   if (ownerPid === undefined) {
     await sleep(milliseconds);
     return true;
   }
+  // An owned watcher subdivides the interval so it notices a dead owner within
+  // five seconds rather than at the next probe, which may be an hour away. This
+  // is a liveness CHECK of another process, unrelated to the last_seen
+  // heartbeat this watcher writes for its own persona.
   const deadline = Date.now() + milliseconds;
   for (;;) {
     const remaining = deadline - Date.now();
     if (remaining <= 0) return true;
     await sleep(Math.min(5_000, remaining));
-    if (ownerPid !== undefined && !processIsAlive(ownerPid)) return false;
+    if (!processIsAlive(ownerPid)) return false;
   }
 }
 
@@ -255,7 +267,14 @@ try {
 
   database = new Database(path);
   database.pragma("busy_timeout = 2000");
-  database.pragma("query_only = ON");
+  // A GENERATED runtime watcher -- one this server's wait_for_messages handed
+  // out, identified by carrying both --owner-pid and --epoch -- refreshes its
+  // persona's last_seen so an armed seat does not read as offline while the
+  // model is between turns. Nothing else the watcher does may write, and a
+  // watcher without that pair (a hand-run diagnostic watch) stays strictly
+  // read-only.
+  const heartbeatEnabled = args.ownerPid !== undefined && args.epoch !== undefined;
+  if (!heartbeatEnabled) database.pragma("query_only = ON");
 
   let resolvedRoom: { id: number; name: string } | undefined;
   if (args.room) {
@@ -271,58 +290,71 @@ try {
     if (!resolvedRoom) argumentError(`no room "${args.room}"`);
   }
 
-  // A global /tmp/agent-chat-pollers directory makes the first OS user its
-  // owner (0700) and prevents every other user from starting a watcher. Use a
-  // per-UID primary directory on POSIX. When this user owns the legacy
-  // directory, acquire the same scoped lock there first as a zero-runtime-cost
-  // rolling-upgrade guard: old and new pollers must not bypass each other's
-  // singleton merely because the lock directory changed.
+  // ONE lock directory, per OS user. A shared /tmp/agent-chat-pollers would make
+  // the first user to create it the 0700 owner and lock every other user out of
+  // running a watcher at all, so POSIX gets a uid suffix. Elsewhere tmpdir() is
+  // already per-user.
   const uid = typeof process.getuid === "function" ? process.getuid() : null;
-  const legacyLockDir = join(tmpdir(), "agent-chat-pollers");
-  try {
-    mkdirSync(legacyLockDir, { recursive: true, mode: 0o700 });
-  } catch (error) {
-    const code = (error as NodeJS.ErrnoException).code;
-    if (uid === null || !["EACCES", "EPERM", "EEXIST"].includes(code ?? "")) {
-      throw error;
-    }
+  const lockDir = join(
+    tmpdir(),
+    uid === null ? "agent-chat-pollers" : `agent-chat-pollers-${uid}`,
+  );
+  mkdirSync(lockDir, { recursive: true, mode: 0o700 });
+  const lockStat = lstatSync(lockDir);
+  if (!lockStat.isDirectory()) {
+    argumentError(`watcher lock path is not a directory: ${lockDir}`);
   }
-  const legacyStat = lstatSync(legacyLockDir);
-  const lockDirs: string[] = [];
-  if (legacyStat.isDirectory() && (uid === null || legacyStat.uid === uid)) {
-    lockDirs.push(legacyLockDir);
-  } else if (uid === null) {
-    argumentError(`watcher lock path is not a directory: ${legacyLockDir}`);
+  if (uid !== null && lockStat.uid !== uid) {
+    argumentError(`watcher lock directory is owned by another user: ${lockDir}`);
   }
-  if (uid !== null) {
-    const uidLockDir = join(tmpdir(), `agent-chat-pollers-${uid}`);
-    mkdirSync(uidLockDir, { recursive: true, mode: 0o700 });
-    const uidStat = lstatSync(uidLockDir);
-    if (!uidStat.isDirectory() || uidStat.uid !== uid) {
-      argumentError(`watcher lock directory is owned by another user: ${uidLockDir}`);
-    }
-    lockDirs.push(uidLockDir);
-  }
+  // The epoch is PART of the singleton key. Two watchers of the same persona
+  // and room at different epochs are not duplicates: the older one belongs to a
+  // runtime that has already been fenced out and will exit on its next probe.
+  // Keying without it made a freshly-resumed runtime unable to arm a watcher
+  // until the dying one noticed, leaving the new seat deaf for up to one
+  // interval at exactly the moment it most needed to hear.
   const scopeKey = JSON.stringify([
     path,
     args.agent,
     resolvedRoom?.id ?? null,
-    args.session ?? null,
+    args.epoch ?? null,
     args.mentionsOnly,
   ]);
   const lockName =
     createHash("sha256").update(scopeKey).digest("hex") + ".lock";
-  for (const lockDir of lockDirs) {
-    const lockPath = join(lockDir, lockName);
-    // Register before acquiring: a signal delivered immediately after the
-    // synchronous create still lets cleanup find the token-owned file.
-    lockPaths.push(lockPath);
-    acquireLock(lockPath, lockToken);
-  }
+  const lockPath = join(lockDir, lockName);
+  // Register before acquiring: a signal delivered immediately after the
+  // synchronous create still lets cleanup find the token-owned file.
+  lockPaths.push(lockPath);
+  acquireLock(lockPath, lockToken);
 
-  const params: Record<string, string | number> = {
-    agent: args.agent,
-    session: args.session ?? "",
+  const params: Record<string, string | number> = { agent: args.agent };
+
+  /**
+   * A watcher bound to an epoch stops the moment the persona moves on.
+   *
+   * The epoch is carried as returned DATA, never as a WHERE predicate. As a
+   * predicate it would simply remove the row, and the two probes read a missing
+   * row very differently: the scoped one reports "the room was deleted or the
+   * membership disappeared", which is a false and actively misleading
+   * diagnosis, while the all-rooms one reads it as an ordinary quiet interval
+   * and never exits at all. Comparing in JS keeps the true reason attached to
+   * the exit.
+   */
+  const checkEpoch = (current: number | null): void => {
+    if (args.epoch === undefined) return;
+    if (current === null) {
+      argumentError(
+        `persona "${args.agent}" no longer exists; this watcher's binding is dead`,
+      );
+    }
+    if (current !== args.epoch) {
+      argumentError(
+        `stale_binding: persona "${args.agent}" is now at runtime epoch ${current}, ` +
+          `this watcher was bound at ${args.epoch}. A newer runtime holds the ` +
+          `persona; regenerate the poller command from that runtime.`,
+      );
+    }
   };
   const directed = args.mentionsOnly
     ? ` AND (g.mentions IS NOT NULL OR g.reply_to_agent IS NOT NULL)
@@ -333,37 +365,75 @@ try {
 
   if (resolvedRoom) {
     const membership = database
-      .prepare("SELECT 1 FROM memberships WHERE room_id = ? AND agent_id = ?")
-      .get(resolvedRoom.id, args.agent);
+      .prepare(
+        "SELECT left_at FROM memberships WHERE room_id = ? AND agent_id = ?",
+      )
+      .get(resolvedRoom.id, args.agent) as { left_at: string | null } | undefined;
     if (!membership) {
       argumentError(
         `agent "${args.agent}" has not joined room ${resolvedRoom.id}`,
       );
     }
+    if (membership.left_at !== null) {
+      argumentError(
+        `left_room: agent "${args.agent}" has left room ${resolvedRoom.id}; ` +
+          `a watcher on a room you are absent from would deliver traffic peers ` +
+          `can see you are not receiving. Rejoin with join_room and use the ` +
+          `poller command it returns.`,
+      );
+    }
     params.room_id = resolvedRoom.id;
+    // has_updates, current_epoch and left_at are all COLUMNS of a row this
+    // query always returns while the room and membership exist, so "no row"
+    // keeps its single unambiguous meaning.
     const statement = database.prepare(
       `SELECT r.name AS room_name,
+              (SELECT a.runtime_epoch FROM agents a WHERE a.id = @agent)
+                AS current_epoch,
+              mb.left_at AS left_at,
               EXISTS (
                 SELECT 1 FROM messages g
                 WHERE g.room_id = r.id
-                  AND g.seq > CASE WHEN @session = '' THEN mb.last_read_seq
-                                   ELSE COALESCE(sm.last_read_seq, mb.last_read_seq) END
+                  AND g.seq > mb.last_read_seq
                   AND g.agent_id != @agent${directed}
                 LIMIT 1
               ) AS has_updates
        FROM rooms r
        JOIN memberships mb ON mb.room_id = r.id AND mb.agent_id = @agent
-       LEFT JOIN session_markers sm ON sm.room_id = r.id
-            AND sm.agent_id = mb.agent_id AND sm.session_id = @session
        WHERE r.id = @room_id`,
     );
     probe = () => {
       const row = statement.get(params) as
-        | { room_name: string; has_updates: number }
+        | {
+            room_name: string;
+            current_epoch: number | null;
+            left_at: string | null;
+            has_updates: number;
+          }
         | undefined;
       if (!row) {
         argumentError(
           `room ${resolvedRoom.id} was deleted or the membership disappeared while watching`,
+        );
+      }
+      checkEpoch(row.current_epoch);
+      // Checked on EVERY probe, not just at arm time. A watcher armed while
+      // present and left afterwards kept firing invisibly: peers correctly saw
+      // the persona absent while its watcher still delivered. left_at rides as
+      // returned DATA for the same reason the epoch does -- as a WHERE
+      // predicate it would produce "no row", which already means the room or
+      // membership is gone, and the two need different diagnostics.
+      //
+      // This is a DIFFERENT exit from stale_binding. Both say do not re-arm
+      // this command, but one means another runtime holds the persona and the
+      // other means this persona is not in the room; the next agent should not
+      // have to guess which.
+      if (row.left_at !== null) {
+        argumentError(
+          `left_room: agent "${args.agent}" left room ${resolvedRoom.id} while ` +
+            `this watcher was armed; it stops rather than deliver traffic to a ` +
+            `room peers can see you are absent from. Rejoin with join_room and ` +
+            `use the poller command it returns.`,
         );
       }
       return row.has_updates
@@ -377,30 +447,88 @@ try {
       )
       .get(args.agent);
     if (!present) argumentError(`agent "${args.agent}" is not present in any room`);
+    // ANCHORED on the persona row, not on memberships. The unread test alone
+    // returns ZERO rows on a quiet interval -- the normal case -- so there is no
+    // row to hang an epoch column on. Selecting FROM agents makes the result
+    // exactly one row whenever the persona exists, carrying the epoch every
+    // time and the hit only when there is one. A vanished persona yields no row,
+    // which checkEpoch reads as a dead binding rather than as silence.
     const statement = database.prepare(
-      `SELECT mb.room_id AS room_id, r.name AS room_name
-       FROM memberships mb
-       JOIN rooms r ON r.id = mb.room_id
-       LEFT JOIN session_markers sm ON sm.room_id = mb.room_id
-            AND sm.agent_id = mb.agent_id AND sm.session_id = @session
-       WHERE mb.agent_id = @agent AND mb.left_at IS NULL
-         AND (@session = '' OR NOT EXISTS (
-           SELECT 1 FROM session_presence sp
-           WHERE sp.room_id = mb.room_id AND sp.agent_id = mb.agent_id
-             AND sp.session_id = @session AND sp.left_at IS NOT NULL
-         ))
-         AND EXISTS (
-           SELECT 1 FROM messages g
-           WHERE g.room_id = mb.room_id
-             AND g.seq > CASE WHEN @session = '' THEN mb.last_read_seq
-                              ELSE COALESCE(sm.last_read_seq, mb.last_read_seq) END
-             AND g.agent_id != @agent${directed}
-           LIMIT 1
-         )
-       LIMIT 1`,
+      `SELECT a.runtime_epoch AS current_epoch,
+              (SELECT mb.room_id FROM memberships mb
+                WHERE mb.agent_id = @agent AND mb.left_at IS NULL
+                  AND EXISTS (
+                    SELECT 1 FROM messages g
+                    WHERE g.room_id = mb.room_id
+                      AND g.seq > mb.last_read_seq
+                      AND g.agent_id != @agent${directed}
+                    LIMIT 1
+                  )
+                LIMIT 1) AS room_id
+       FROM agents a WHERE a.id = @agent`,
     );
-    probe = () => statement.get(params) as Hit | undefined;
+    const roomName = database.prepare("SELECT name FROM rooms WHERE id = ?");
+    probe = () => {
+      const row = statement.get(params) as
+        | { current_epoch: number; room_id: number | null }
+        | undefined;
+      checkEpoch(row ? row.current_epoch : null);
+      if (!row || row.room_id === null) return undefined;
+      // Name lookup only on a HIT, so the quiet path stays one statement.
+      const named = roomName.get(row.room_id) as { name: string } | undefined;
+      if (!named) return undefined; // deleted between the two reads
+      return { room_id: row.room_id, room_name: named.name };
+    };
   }
+
+  /**
+   * Liveness heartbeat for a generated runtime watcher.
+   *
+   * ONE prepared, epoch-fenced UPDATE. The EXISTS clause is the fence: a watcher
+   * whose persona has since been resumed elsewhere matches no row, so a stale
+   * runtime cannot refresh liveness even in the interval before its next probe
+   * notices and exits. It sets last_seen and nothing else -- left_at is never
+   * cleared, so this cannot resurrect a seat that left the room. Failure is
+   * swallowed: a watcher that cannot write must still report traffic.
+   *
+   * Cost is one write per two minutes per armed watcher against five-second
+   * reads. Its contention impact is UNMEASURED.
+   */
+  const HEARTBEAT_INTERVAL_MS = 120_000;
+  // SCOPE MATTERS. A watcher with --room listens to exactly ONE room, so it may
+  // only refresh THAT room. Refreshing every present membership from a scoped
+  // watcher tells peers in rooms nobody is watching that this persona is
+  // listening there, which is the same false availability the rest of this
+  // work exists to remove. An unscoped watcher does watch every present room,
+  // so it refreshes them all.
+  const heartbeatScope = resolvedRoom ? " AND room_id = @room_id" : "";
+  const heartbeatStatement = heartbeatEnabled
+    ? database.prepare(
+        `UPDATE memberships SET last_seen = datetime('now')
+          WHERE agent_id = @agent AND left_at IS NULL${heartbeatScope}
+            AND EXISTS (SELECT 1 FROM agents a
+                         WHERE a.id = @agent AND a.runtime_epoch = @epoch)`,
+      )
+    : null;
+  let lastHeartbeatMs = 0;
+  const heartbeat = (): void => {
+    if (!heartbeatStatement) return;
+    const now = Date.now();
+    if (lastHeartbeatMs !== 0 && now - lastHeartbeatMs < HEARTBEAT_INTERVAL_MS) {
+      return;
+    }
+    // Stamp before running, so a failing write throttles like a succeeding one
+    // instead of retrying every probe.
+    lastHeartbeatMs = now;
+    try {
+      heartbeatStatement.run({
+        agent: args.agent,
+        epoch: args.epoch,
+        ...(resolvedRoom ? { room_id: resolvedRoom.id } : {}),
+      });
+    } catch {}
+  };
+  heartbeat();
 
   const deadline = Date.now() + args.timeoutSeconds * 1000;
   for (;;) {
@@ -409,6 +537,7 @@ try {
         `owner MCP process ${args.ownerPid} has ended; regenerate the poller command`,
       );
     }
+    heartbeat();
     // Probe before deciding that the deadline is quiet. The final sleep lands
     // on the deadline; checking time first discarded messages that arrived
     // during that last interval and reported a false timeout.

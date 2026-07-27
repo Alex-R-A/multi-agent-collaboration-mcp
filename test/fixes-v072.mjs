@@ -1,7 +1,7 @@
 // Regression tests for the EIGHTH-round fixes (v0.7.2), each reproducing an
 // issue a reviewer confirmed against v0.7.1:
-//  1  existing/old-writer NUL rows: migration heals them (NUL -> U+FFFD, read
-//     whole) and a BEFORE INSERT trigger rejects an old build's NUL insert
+//  1  a BEFORE INSERT trigger rejects a NUL body from ANY writer, including
+//     one going around the store with raw SQL
 //  2  `length` is CODEPOINTS everywhere (get_message and the bulk reads agreed
 //     to disagree by the astral factor)
 //  5  fetchBounded charges mentions too (empty-body/huge-mention rows no longer
@@ -15,6 +15,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { EPOCH1, mkAgent, bindArgs, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
@@ -33,55 +34,60 @@ const throws = (fn, re) => {
   }
 };
 
-// --- 1: existing/old-writer NUL rows healed + rejected ------------------------
+// --- 1: NUL is rejected at every writer, JS and DB alike ----------------------
+// What keeps the file clean is that no writer can introduce one: the store
+// rejects in JS, and the trigger rejects a writer that never passes through the
+// store (the web server holds its own handle).
 {
   const dir = mkdtempSync(join(tmpdir(), "v072-nul-"));
   const DB = join(dir, "t.db");
-  { const s = new ChatStore(DB); const r = s.createRoom("r", null, null).id; s.upsertAgent("a", null, null, null); s.upsertAgent("b", null, null, null); s.joinRoom(r, "a"); s.joinRoom(r, "b"); s.close(); }
-  // An OLD build (no reject trigger) inserts a NUL body directly.
-  {
-    const raw = new Database(DB);
-    raw.exec("DROP TRIGGER IF EXISTS messages_reject_nul");
-    raw.prepare("INSERT INTO messages (room_id,seq,agent_id,format,body) VALUES (1,1,'b','text',?)").run("abc" + NUL + "def");
-    // A build old enough to write a NUL predates the migration marker too, so
-    // clear user_version: the current build must then re-run the one-time heal
-    // (the scan is now gated on user_version to avoid re-reading every body).
-    raw.pragma("user_version = 0");
-    raw.close();
+  const s = new ChatStore(DB);
+  const r = mkRoom(s, "r", null, null).id;
+  mkAgent(s, "a");
+  mkAgent(s, "b");
+  s.joinRoom(r, "a", EPOCH1, {});
+  s.joinRoom(r, "b", EPOCH1, {});
+  check(
+    "store write with a NUL body is rejected in JS",
+    throws(
+      () => s.postMessage(r, "b", "p" + NUL + "q", "text", null, null, null, EPOCH1),
+      /NUL/,
+    ),
+    null,
+  );
+  // A DIRECT writer, bypassing the store entirely.
+  const raw = new Database(DB);
+  let rejected = false;
+  try {
+    raw
+      .prepare(
+        "INSERT INTO messages (room_id,seq,agent_id,format,body,body_len) VALUES (?,1,'b','text',?,?)",
+      )
+      .run(r, "x" + NUL + "y", 3);
+  } catch (e) {
+    rejected = /NUL/.test(e.message);
   }
-  // Reopen with the current build: the migration heals the existing NUL row.
-  {
-    const s = new ChatStore(DB);
-    const gm = s.getMessage(1, 1, 0, 1000);
-    check(
-      "existing NUL row is healed (full text readable, NUL shown as U+FFFD)",
-      gm.content === "abc�def",
-      gm.content,
-    );
-    check(
-      "healing also rebuilds FTS so post-NUL tokens are searchable",
-      s.searchMessages(1, "def", 10).matches.length === 1,
-      s.searchMessages(1, "def", 10),
-    );
-    // An old build trying to insert ANOTHER NUL row is now rejected by the trigger.
-    const raw = new Database(DB);
-    let rejected = false;
-    try { raw.prepare("INSERT INTO messages (room_id,seq,agent_id,format,body) VALUES (1,2,'b','text',?)").run("x" + NUL + "y"); }
-    catch (e) { rejected = /NUL/.test(e.message); }
-    raw.close();
-    check("old-build NUL insert is rejected by the DB trigger", rejected, null);
-    check("new-build NUL write is rejected in JS", throws(() => s.postMessage(1, "b", "p" + NUL + "q", "text", null, null), /NUL/), null);
-    s.close();
-  }
+  check("direct NUL insert is rejected by the DB trigger", rejected, null);
+  // The trigger must not be over-broad: a legal body still lands, and stays
+  // searchable, so the guard is not passing by rejecting everything.
+  s.postMessage(r, "b", "abc def", "text", null, null, null, EPOCH1);
+  check(
+    "a legal body still writes and is searchable",
+    s.searchMessages(r, "def", 10).matches.length === 1,
+    s.searchMessages(r, "def", 10),
+  );
+  raw.close();
+  s.close();
   rmSync(dir, { recursive: true, force: true });
 }
 
 // --- 2: `length` is codepoints everywhere -------------------------------------
 {
   const s = new ChatStore(":memory:");
-  const r = s.createRoom("r", null, null).id;
-  s.upsertAgent("a", null, null, null); s.upsertAgent("b", null, null, null); s.joinRoom(r, "a"); s.joinRoom(r, "b");
-  s.postMessage(r, "b", "\u{1F600}".repeat(200), "text", null, null); // 200 emoji = 200 codepoints, 400 UTF-16
+  const r = mkRoom(s, "r", null, null).id;
+  mkAgent(s, "u");
+  mkAgent(s, "a"); mkAgent(s, "b"); s.joinRoom(r, "a", EPOCH1, {}); s.joinRoom(r, "b", EPOCH1, {});
+  s.postMessage(r, "b", "\u{1F600}".repeat(200), "text", null, null, null, EPOCH1); // 200 emoji = 200 codepoints, 400 UTF-16
   const hist = s.readHistory(r, 1, undefined, 100).messages[0]; // preview cut
   const gm = s.getMessage(r, 1, 0, 100);
   check(
@@ -95,13 +101,13 @@ const throws = (fn, re) => {
 // --- 5: fetchBounded charges mentions; empty-body/huge-mention rows bounded ----
 {
   const s = new ChatStore(":memory:");
-  const r = s.createRoom("r", null, null).id;
-  s.upsertAgent("a", null, null, null); s.upsertAgent("b", null, null, null); s.joinRoom(r, "a"); s.joinRoom(r, "b");
+  const r = mkRoom(s, "r", null, null).id;
+  mkAgent(s, "a"); mkAgent(s, "b"); s.joinRoom(r, "a", EPOCH1, {}); s.joinRoom(r, "b", EPOCH1, {});
   // 300 rows: empty body, but a big mentions list each (~2000 chars serialized).
   const bigMentions = Array.from({ length: 100 }, (_, i) => "agent-" + String(i).padStart(4, "0"));
-  for (let i = 0; i < 300; i++) s.postMessage(r, "b", "", "text", bigMentions, null);
+  for (let i = 0; i < 300; i++) s.postMessage(r, "b", "", "text", bigMentions, null, null, EPOCH1);
   const heapBefore = process.memoryUsage().heapUsed;
-  const page = s.catchUp(r, "a", 500, undefined, 100_000);
+  const page = s.catchUp(r, "a", 500, undefined, 100_000, EPOCH1);
   const heapGrowth = process.memoryUsage().heapUsed - heapBefore;
   check("catch_up over huge-mention rows fits max_bytes", size(page) <= 100_000, size(page));
   check("catch_up delivers at least one and flags more remain", page.messages.length >= 1 && page.byte_limited === true, page.messages.length);
@@ -119,7 +125,7 @@ const throws = (fn, re) => {
   // 2000 = the store's description cap (v0.8.4); still far past the 300-char
   // listing preview, so the budget math is exercised identically.
   const heavy = "d".repeat(2000);
-  for (let i = 0; i < 80; i++) s.createRoom("room-" + i, heavy, null);
+  for (let i = 0; i < 80; i++) mkRoom(s, "room-" + i, heavy, null);
   const { rooms } = s.listRooms(200, 0);
   // The store returns just the array; the whole MCP result adds total/flags.
   const wholeResponse = { rooms, total: 80, truncated: true };
@@ -133,8 +139,9 @@ const throws = (fn, re) => {
   const DB = join(dir, "t.db");
   {
     const s = new ChatStore(DB);
-    s.createRoom("joined-room", null, null);
-    s.createRoom("other-room", null, null);
+    mkRoom(s, "joined-room", null, null);
+    mkRoom(s, "other-room", null, null);
+    mkAgent(s, "u");
     s.close();
   }
   // MCP client.
@@ -168,7 +175,9 @@ const throws = (fn, re) => {
   await w(1);
   s({ jsonrpc: "2.0", method: "notifications/initialized" });
 
-  await call("join_room", { room: "joined-room", agent_id: "u" });
+  await call("resume_persona", bindArgs("u"));
+
+  await call("join_room", { room: "joined-room" });
   // Scoping to a room the identity never joined -> refuse.
   const notJoined = await call("wait_for_messages", { room: "other-room" });
   check("wait_for_messages refuses a room you never joined", notJoined.isErr && /never joined/.test(notJoined.data.error), notJoined);
@@ -184,14 +193,14 @@ const throws = (fn, re) => {
   // Poller: zero-padded value accepted, huge value rejected.
   {
     const setup = new ChatStore(DB);
-    setup.upsertAgent("w", null, null, null);
-    setup.joinRoom(1, "w");
+    mkAgent(setup, "w");
+    setup.joinRoom(1, "w", EPOCH1, {});
     setup.close();
   }
-  const POLLER = join(ROOT, "scripts", "wait-for-updates.sh");
-  const padded = spawnSync("bash", [POLLER, "--agent", "w", "--interval", "0000000005", "--timeout", "1"], { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20_000 });
+  const POLLER = join(ROOT, "dist", "poller.js");
+  const padded = spawnSync("node", [POLLER, "--agent", "w", "--interval", "0000000005", "--timeout", "1"], { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20_000 });
   check("poller accepts a zero-padded --interval (times out cleanly)", padded.status === 124, { status: padded.status, stderr: padded.stderr });
-  const huge = spawnSync("bash", [POLLER, "--agent", "w", "--interval", "99999999999", "--timeout", "1"], { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20_000 });
+  const huge = spawnSync("node", [POLLER, "--agent", "w", "--interval", "99999999999", "--timeout", "1"], { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20_000 });
   check("poller rejects a genuinely huge --interval", huge.status === 2 && /between 5 and 3600/.test(huge.stderr), { status: huge.status, stderr: huge.stderr });
 
   rmSync(dir, { recursive: true, force: true });

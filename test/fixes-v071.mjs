@@ -7,8 +7,10 @@
 //  3  get_message pages a huge body with BOUNDED memory (window, not prefix)
 //  4  bulk reads bound memory by iterating and stopping at the budget
 //  5  list tools bound the SERIALIZED response and page with offset
-//  6  a session that switches identity keeps its old identity's private cursor
-//     alive (touch by session nonce), so switching back loses no messages
+//  (6 covered a session that switched IDENTITY keeping its old identity's
+//   private cursor alive. Private session cursors are gone -- one runtime holds
+//   one persona -- so the case cannot arise and its test was deleted. The
+//   surviving half, per-room read markers, is covered by fixes-v064.)
 //  7  search: g.id tie-break + limit+1 probe (no false next_offset)
 //  8  chmod tightens only directories WE create, never a pre-existing parent
 //  12 delete_room on an already-deleted room fails cleanly
@@ -18,6 +20,7 @@ import Database from "better-sqlite3";
 import { mkdtempSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { EPOCH1, mkAgent, mkRoom, rmRoom } from "./persona-helpers.mjs";
 
 let failures = 0;
 const check = (n, c, x) => {
@@ -38,59 +41,93 @@ const throws = (fn, re) => {
 // --- 1 + 13: NUL and lone surrogates rejected at every write path -------------
 {
   const s = new ChatStore(":memory:");
-  const r = s.createRoom("n", null, null).id;
-  s.upsertAgent("a", null, null, null);
-  s.upsertAgent("b", null, null, null);
-  s.joinRoom(r, "a");
-  s.joinRoom(r, "b");
+  const r = mkRoom(s, "n", null, null).id;
+  mkAgent(s, "a");
+  mkAgent(s, "b");
+  s.joinRoom(r, "a", EPOCH1, {});
+  s.joinRoom(r, "b", EPOCH1, {});
   check(
     "post_message with an embedded NUL is rejected (was silent truncation)",
-    throws(() => s.postMessage(r, "b", "abc" + NUL + "def", "text", null, null), /NUL/),
+    throws(() => s.postMessage(r, "b", "abc" + NUL + "def", "text", null, null, null, EPOCH1), /NUL/),
     null,
   );
   check(
     "post_message with a lone high surrogate is rejected",
-    throws(() => s.postMessage(r, "b", "x\ud800y", "text", null, null), /surrogate/),
+    throws(() => s.postMessage(r, "b", "x\ud800y", "text", null, null, null, EPOCH1), /surrogate/),
     null,
   );
   check(
     "create_room with a NUL pinned is rejected",
-    throws(() => s.createRoom("bad", null, "pin" + NUL + "ned"), /NUL/),
+    throws(() => mkRoom(s, "bad", null, "pin" + NUL + "ned"), /NUL/),
     null,
   );
   check(
-    "upsertAgent with a NUL role is rejected",
-    throws(() => s.upsertAgent("c", null, "ro" + NUL + "le", null), /NUL/),
+    "set_role with a NUL role is rejected",
+    throws(() => s.setRole(r, "a", EPOCH1, "re" + NUL + "viewer"), /NUL/),
+    null,
+  );
+  check(
+    "join_room with a NUL role is rejected",
+    throws(() => s.joinRoom(r, "a", EPOCH1, { role: "re" + NUL + "viewer" }), /NUL/),
     null,
   );
   check(
     "claim with a NUL note is rejected",
-    throws(() => s.claimResource(r, "k", "a", 900, "no" + NUL + "te"), /NUL/),
+    throws(() => s.claimResource(r, "k", "a", EPOCH1, 900, "no" + NUL + "te"), /NUL/),
     null,
   );
   // A legitimate control char that is NOT NUL still stores and round-trips.
-  s.postMessage(r, "b", "ctl\u0001ok", "text", null, null);
+  s.postMessage(r, "b", "ctl\u0001ok", "text", null, null, null, EPOCH1);
   const back = s.getMessage(r, 1, 0, 1000);
   check("a non-NUL control char round-trips intact", back.content === "ctl\u0001ok", back.content);
   s.close();
 }
 
-// --- 2: body_len never wrong; fullLen()=max() never under-reports -------------
+// --- 2: body_len is exact for astral text, and NOT NULL ----------------------
+//
+// SQLite's length() counts codepoints, so a body of 200 emoji measures 200
+// there and 400 in the UTF-16 unit the viewer reports. That is why the exact
+// length is STAMPED at insert instead of computed at read time. The column is
+// NOT NULL, so there is no fallback path and no reader has to guess which unit
+// it is holding: a writer that omits it is rejected outright.
 {
   const dir = mkdtempSync(join(tmpdir(), "v071-blen-"));
   const DB = join(dir, "t.db");
-  { const s = new ChatStore(DB); s.createRoom("r", null, null); s.upsertAgent("a", null, null, null); s.joinRoom(1, "a"); s.close(); }
-  // Old build inserts a 200-emoji (400 UTF-16) reply with no body_len.
-  const raw = new Database(DB);
-  raw.prepare("INSERT INTO messages (room_id,seq,agent_id,format,body) VALUES (1,1,'a','text',?)").run("\u{1F600}".repeat(200));
-  raw.close();
-  const s = new ChatStore(DB); // migrate + backfill
+  const s = new ChatStore(DB);
+  mkRoom(s, "r", null, null);
+  mkAgent(s, "a");
+  s.joinRoom(1, "a", EPOCH1, {});
+  const astral = "\u{1F600}".repeat(200);
+  s.postMessage(1, "a", astral, "text", null, null, null, EPOCH1);
   const gm = s.getMessage(1, 1, 0, 100_000); // whole body fits
   check(
-    "astral old-build row reports the exact length and pages fully (no truncation)",
-    gm.truncated !== true && gm.content === "\u{1F600}".repeat(200),
+    "an astral body pages fully and reports its exact length",
+    gm.truncated !== true && gm.content === astral,
     { truncated: gm.truncated, len: gm.content.length },
   );
+  const raw = new Database(DB);
+  const stamped = raw.prepare("SELECT body_len FROM messages WHERE seq = 1").get();
+  check(
+    "body_len is the UTF-16 length (400), not SQLite's codepoint count (200)",
+    stamped.body_len === 400,
+    stamped,
+  );
+  // The negative half. Without it the NOT NULL is unproven: every row this
+  // suite writes goes through a store that stamps the column anyway.
+  let omitted = "";
+  try {
+    raw
+      .prepare("INSERT INTO messages (room_id,seq,agent_id,format,body) VALUES (1,2,'a','text',?)")
+      .run("no length stamped");
+  } catch (e) {
+    omitted = String(e?.message ?? e);
+  }
+  check(
+    "a direct writer that omits body_len is REJECTED, not stored with NULL",
+    /NOT NULL constraint failed: messages\.body_len/.test(omitted),
+    omitted || "NO ERROR RAISED",
+  );
+  raw.close();
   s.close();
   rmSync(dir, { recursive: true, force: true });
 }
@@ -98,14 +135,14 @@ const throws = (fn, re) => {
 // --- 3: get_message deep page is memory-bounded (window, not prefix) ----------
 {
   const s = new ChatStore(":memory:");
-  const r = s.createRoom("big", null, null).id;
-  s.upsertAgent("b", null, null, null);
-  s.joinRoom(r, "b");
+  const r = mkRoom(s, "big", null, null).id;
+  mkAgent(s, "b");
+  s.joinRoom(r, "b", EPOCH1, {});
   // 5 MB body: a prefix fetch of a deep page would materialize megabytes; a
   // window fetch holds only ~maxChars. Assert the deep page returns the right
   // window and heap stays bounded.
   const body = "abcdefghij".repeat(500_000); // 5,000,000 chars
-  s.postMessage(r, "b", body, "text", null, null);
+  s.postMessage(r, "b", body, "text", null, null, null, EPOCH1);
   const deep = s.getMessage(r, 1, 4_000_000, 1000);
   check(
     "deep get_message page returns exactly its window",
@@ -127,17 +164,17 @@ const throws = (fn, re) => {
 // --- 4: bulk read bounds memory by iterating and stopping ---------------------
 {
   const s = new ChatStore(":memory:");
-  const r = s.createRoom("bulk", null, null).id;
-  s.upsertAgent("a", null, null, null);
-  s.upsertAgent("b", null, null, null);
-  s.joinRoom(r, "a");
-  s.joinRoom(r, "b");
+  const r = mkRoom(s, "bulk", null, null).id;
+  mkAgent(s, "a");
+  mkAgent(s, "b");
+  s.joinRoom(r, "a", EPOCH1, {});
+  s.joinRoom(r, "b", EPOCH1, {});
   // 20 legal 400k bodies. A fetch-all would still materialize ~8 MB to return
   // one, enough to violate the 5 MB assertion without making routine tests a
   // host stress workload.
-  for (let i = 0; i < 20; i++) s.postMessage(r, "b", "z".repeat(400_000), "text", null, null);
+  for (let i = 0; i < 20; i++) s.postMessage(r, "b", "z".repeat(400_000), "text", null, null, null, EPOCH1);
   const heapBefore = process.memoryUsage().heapUsed;
-  const page = s.catchUp(r, "a", 500, undefined, 100_000);
+  const page = s.catchUp(r, "a", 500, undefined, 100_000, EPOCH1);
   const heapGrowth = process.memoryUsage().heapUsed - heapBefore;
   check("catch_up over huge bodies still fits max_bytes", size(page) <= 100_000, size(page));
   check("catch_up delivers the head and flags byte_limited", page.messages.length >= 1 && page.byte_limited === true, page.messages.length);
@@ -154,7 +191,7 @@ const throws = (fn, re) => {
   const s = new ChatStore(":memory:");
   // 60 rooms, each with a control-heavy 300-char pinned that serializes ~6x.
   const heavy = "\u0001".repeat(300);
-  for (let i = 0; i < 60; i++) s.createRoom("room-" + i, null, heavy);
+  for (let i = 0; i < 60; i++) mkRoom(s, "room-" + i, null, heavy);
   const first = s.listRooms(200, 0);
   check("list_rooms response is serialized-bounded", size(first.rooms) <= 100_000, size(first.rooms));
   check("list_rooms reports the true total", first.total === 60, first.total);
@@ -172,52 +209,14 @@ const throws = (fn, re) => {
   s.close();
 }
 
-// --- 6: identity switch keeps the old identity's private cursor alive ---------
-// touchSessionMarkers keys on the session nonce, not (agent, nonce), so a
-// session that renames still refreshes its earlier identity's cursor.
-{
-  const dir = mkdtempSync(join(tmpdir(), "v071-switch-"));
-  const DB = join(dir, "t.db");
-  const s = new ChatStore(DB);
-  const r = s.createRoom("sw", null, null).id;
-  s.upsertAgent("A", null, null, null);
-  s.upsertAgent("poster", null, null, null);
-  s.joinRoom(r, "poster");
-  for (let i = 1; i <= 10; i++) s.postMessage(r, "poster", "m" + i, "text", null, null);
-  const NONCE = "sess-nonce-1";
-  s.joinRoom(r, "A", NONCE); // A's private cursor at 0
-  s.markRead(r, "A", 3, NONCE); // A read to 3 privately
-  s.markRead(r, "A", 10); // identity marker (shared twin) to 10
-  // Age A's cursor to 8 days old (as if the process was busy under identity B).
-  {
-    const raw = new Database(DB);
-    raw.prepare("UPDATE session_markers SET updated_at = datetime('now','-8 days') WHERE session_id = ?").run(NONCE);
-    raw.close();
-  }
-  // The process is now acting as identity B but SAME session nonce; a touch
-  // must refresh A's cursor too (keyed by nonce), sparing it the GC.
-  s.upsertAgent("B", null, null, null);
-  s.touchSessionMarkers("B", NONCE);
-  // A prune (which reaps expired cursors) must NOT drop A's now-fresh cursor.
-  s.pruneMessages(r, 1, true);
-  const cur = s.getCursor(r, "A", NONCE);
-  check(
-    "the renamed session's old-identity private cursor survived the GC",
-    cur && cur.last_read_seq === 3,
-    cur,
-  );
-  s.close();
-  rmSync(dir, { recursive: true, force: true });
-}
-
 // --- 7: search tie-break + no false next_offset -------------------------------
 {
   const s = new ChatStore(":memory:");
-  const r = s.createRoom("s", null, null).id;
-  s.upsertAgent("b", null, null, null);
-  s.joinRoom(r, "b");
+  const r = mkRoom(s, "s", null, null).id;
+  mkAgent(s, "b");
+  s.joinRoom(r, "b", EPOCH1, {});
   // Identical bodies -> identical rank; the g.id tie-break makes paging total.
-  for (let i = 0; i < 4; i++) s.postMessage(r, "b", "needle same", "text", null, null);
+  for (let i = 0; i < 4; i++) s.postMessage(r, "b", "needle same", "text", null, null, null, EPOCH1);
   const seen = new Set();
   let offset = 0;
   for (let i = 0; i < 6; i++) {
@@ -261,11 +260,11 @@ if (process.platform !== "win32") {
 // --- 12: delete_room on an already-deleted room fails cleanly -----------------
 {
   const s = new ChatStore(":memory:");
-  const r = s.createRoom("d", null, null).id;
-  s.deleteRoom(r);
+  const r = mkRoom(s, "d", null, null).id;
+  rmRoom(s, r);
   check(
     "second delete_room reports 'already deleted', not a false zero-count success",
-    throws(() => s.deleteRoom(r), /no longer exists/),
+    throws(() => rmRoom(s, r), /no longer exists/),
     null,
   );
   s.close();
@@ -277,11 +276,11 @@ if (process.platform !== "win32") {
 // with a concurrent join between pages.
 {
   const s = new ChatStore(":memory:");
-  const r = s.createRoom("many", null, null).id;
+  const r = mkRoom(s, "many", null, null).id;
   const ids = Array.from({ length: 12 }, (_, i) => "agent-" + String(i).padStart(2, "0"));
   for (const id of ids) {
-    s.upsertAgent(id, null, null, null);
-    s.joinRoom(r, id); // all within the same wall-clock second
+    mkAgent(s, id);
+    s.joinRoom(r, id, EPOCH1, {}); // all within the same wall-clock second
   }
   const seen = [];
   let after;
@@ -290,7 +289,7 @@ if (process.platform !== "win32") {
     for (const a of agents) seen.push(a.id);
     // A concurrent same-second join on page 2 would shift an OFFSET; keyset is
     // immune. Insert one mid-traversal to prove it.
-    if (p === 1) { s.upsertAgent("agent-zz", null, null, null); s.joinRoom(r, "agent-zz"); }
+    if (p === 1) { mkAgent(s, "agent-zz"); s.joinRoom(r, "agent-zz", EPOCH1, {}); }
     if (next_after === undefined || agents.length === 0) break;
     after = next_after;
   }

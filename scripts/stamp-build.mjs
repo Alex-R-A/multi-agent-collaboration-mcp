@@ -33,8 +33,10 @@ try {
 
 // A timestamp alone makes every no-change rebuild tell already-running MCP
 // processes they are stale. Hash the executable JS instead: reconnect only
-// when the deployed behavior actually differs. Keep the timestamp for human
-// diagnostics and as a compatibility fallback for stamps made by old builds.
+// when the deployed behavior actually differs. built_at is kept for human
+// diagnostics and ordering ONLY -- it is never compared to decide staleness,
+// and there is no fallback for a stamp without a hash: every stamp this script
+// writes carries one.
 const dist = join(root, "dist");
 const files = [];
 const walk = (dir) => {

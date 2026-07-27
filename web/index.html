@@ -1334,29 +1334,12 @@
       // identity and room mapping naming different names; and a ghost
       // sweep's in-flight leave could evict a membership another tab had
       // just re-adopted. Web Locks serialize the whole sequence (awaited
-      // server calls included) across same-origin tabs. localhost is a
-      // secure context, so navigator.locks exists everywhere this runs; the
-      // fallback keeps a degraded single-tab-correct behavior just in case.
-      // Tab-local serialization fallback: a promise chain so that even without
-      // Web Locks (older engines; localhost is a secure context so this is
-      // rare) two membership mutations in the SAME tab cannot interleave their
-      // read-modify-write. It does NOT coordinate across tabs -- only Web Locks
-      // do that -- but it removes the within-tab race the old
-      // Promise.resolve().then(fn) left open.
-      let membershipChain = Promise.resolve();
+      // server calls included) across same-origin tabs. localhost is a secure
+      // context, so navigator.locks exists in every engine this viewer runs
+      // in; there is no fallback path, because a same-tab-only fallback would
+      // silently drop the cross-tab guarantee this exists to provide.
       function withMembershipLock(fn) {
-        if (navigator.locks && navigator.locks.request) {
-          return navigator.locks.request("agent-chat.membership", fn);
-        }
-        // membershipChain always fulfills (swallowed below), so fn runs once.
-        const run = membershipChain.then(() => fn());
-        // Keep the chain alive regardless of fn's outcome; swallow here so a
-        // rejection does not poison every later mutation.
-        membershipChain = run.then(
-          () => undefined,
-          () => undefined,
-        );
-        return run;
+        return navigator.locks.request("agent-chat.membership", fn);
       }
 
       // Memberships whose soft-leave failed (e.g. server briefly down during
@@ -1566,9 +1549,14 @@
       }
 
       function label(m) {
-        // Humans have no role and type 'human'; their name IS the identity.
-        if (m.type === "human") return m.from;
-        return m.role || m.type || m.from;
+        // A human's name IS the identity. An LLM persona shows its MODEL, which
+        // the schema requires for every LLM row, so there is nothing to fall
+        // back to: a blank label would mean a row the schema says cannot exist,
+        // and quietly substituting the brand or the id would hide that. Its
+        // ROLE is deliberately not used here, because roles are room-local and
+        // mutable, so labelling an old message with the current role
+        // misreports who wrote it.
+        return m.is_human ? m.from : m.model;
       }
 
       // Append text with http(s) URLs as clickable links. Everything goes in
@@ -1598,15 +1586,10 @@
         const me = identity();
         if (!me || m.from === me) return false;
         if (Array.isArray(m.mentions) && m.mentions.includes(me)) return true;
-        // The stored reply author decides (it survives parent pruning and
-        // needs no parent row loaded); the in-memory parent lookup remains
-        // as a fallback for rows written before the column existed.
-        if (m.reply_to_agent) return m.reply_to_agent === me;
-        if (m.reply_to_seq) {
-          const parent = state.msgs.find((x) => x.seq === m.reply_to_seq);
-          if (parent && parent.from === me) return true;
-        }
-        return false;
+        // The stored reply author decides it outright: it survives parent
+        // pruning and needs no parent row loaded. Both current writers stamp
+        // it, so a reply with no reply_to_agent is simply not directed.
+        return m.reply_to_agent === me;
       }
 
       async function fetchJson(url) {
@@ -1903,11 +1886,8 @@
           // rendered text is not mistaken for the whole message.
           const note = document.createElement("div");
           note.className = "trunc-note";
-          // body_length is exact (same UTF-16 unit as body.length) when the
-          // row carries a stamped length; rows from old builds fall back to
-          // a codepoint count, which can undershoot the shown length for
-          // astral-heavy text. Guard against emitting an impossible
-          // "showing X of fewer-than-X" notice in that case.
+          // body_length is exact and in the same UTF-16 unit as body.length,
+          // so the comparison below is apples to apples.
           const shown = m.body.length;
           const total = Number(m.body_length);
           note.textContent =

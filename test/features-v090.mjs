@@ -1,7 +1,7 @@
 // Phase 1 receive-path tests (v0.9.0):
 //  A1 catch_up({room}) reads a named joined room WITHOUT switching the active
-//     room, honoring that room's own private session cursor
-//  A2 rooms_with_unread on an empty catch_up: session-aware, own-posts
+//     room, honoring that room's own read marker
+//  A2 rooms_with_unread on an empty catch_up: own-posts
 //     excluded, excludes the room just read, directed-first ordering,
 //     truncation flag, [] when nowhere has traffic
 //  A3 recipientStatus marker_behind (0 when caught up, null for unknown)
@@ -21,15 +21,13 @@ import { ChatStore } from "../dist/db.js";
 import Database from "better-sqlite3";
 import { spawnSync, spawn } from "node:child_process";
 import {
-  chmodSync,
   mkdtempSync,
-  readFileSync,
   rmSync,
-  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { EPOCH1, mkAgent, bindArgs, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
@@ -38,28 +36,26 @@ const check = (n, c, x) => {
   if (!c) failures++;
 };
 
-// --- A1/A2: store-level cross-room summary and private-cursor awareness ------
+// --- A1/A2: store-level cross-room summary and read-marker awareness --------
 {
   const s = new ChatStore(":memory:");
-  const r1 = s.createRoom("alpha", null, null).id;
-  const r2 = s.createRoom("beta", null, null).id;
-  const r3 = s.createRoom("gamma", null, null).id;
-  s.upsertAgent("a", null, null, null);
-  s.upsertAgent("b", null, null, null);
-  s.joinRoom(r1, "a");
-  s.joinRoom(r2, "a", "S", "S"); // private session S in beta
-  s.joinRoom(r3, "a");
-  s.joinRoom(r1, "b");
-  s.joinRoom(r2, "b");
-  s.joinRoom(r3, "b");
-  s.postMessage(r2, "b", "beta broadcast", "text", null, null);
-  s.postMessage(r2, "b", "beta directed", "text", ["a"], null);
-  s.postMessage(r3, "b", "gamma broadcast", "text", null, null);
+  const r1 = mkRoom(s, "alpha", null, null).id;
+  const r2 = mkRoom(s, "beta", null, null).id;
+  const r3 = mkRoom(s, "gamma", null, null).id;
+  mkAgent(s, "a");
+  mkAgent(s, "b");
+  s.joinRoom(r1, "a", EPOCH1, {});
+  s.joinRoom(r2, "a", EPOCH1, {});
+  s.joinRoom(r3, "a", EPOCH1, {});
+  s.joinRoom(r1, "b", EPOCH1, {});
+  s.joinRoom(r2, "b", EPOCH1, {});
+  s.joinRoom(r3, "b", EPOCH1, {});
+  s.postMessage(r2, "b", "beta broadcast", "text", null, null, null, EPOCH1);
+  s.postMessage(r2, "b", "beta directed", "text", ["a"], null, null, EPOCH1);
+  s.postMessage(r3, "b", "gamma broadcast", "text", null, null, null, EPOCH1);
 
   // Empty read of alpha with a summary: beta (1 directed) sorts before gamma.
-  const empty = s.catchUp(r1, "a", 50, undefined, undefined, null, {
-    sessionId: "S",
-  });
+  const empty = s.catchUp(r1, "a", 50, undefined, undefined, EPOCH1, {});
   check("A2 empty read carries rooms_with_unread", Array.isArray(empty.rooms_with_unread), empty);
   check(
     "A2 summary lists beta first (directed DESC), then gamma",
@@ -77,39 +73,25 @@ const check = (n, c, x) => {
     empty.rooms_with_unread,
   );
 
-  // A twin (shared cursor) drains beta at the identity level; session S's
-  // private cursor is still behind, so a session-aware summary keeps beta.
-  s.catchUp(r2, "a", 50);
-  const twinView = s.catchUp(r1, "a", 50, undefined, undefined, null, {
-    sessionId: "S",
-  });
+  // A1: the named-room read consumes beta without switching the active room.
+  const named = s.catchUp(r2, "a", 50, undefined, undefined, EPOCH1);
   check(
-    "A2 session-aware summary still shows beta for the lagging private session",
-    twinView.rooms_with_unread.some((r) => r.room_id === r2 && r.unread === 2),
-    twinView.rooms_with_unread,
+    "A1 named-room read returns both of beta's messages",
+    named.messages.length === 2 && named.advanced === true,
+    named,
   );
-  const idView = s.catchUp(r1, "a", 50, undefined, undefined, null, {
-    sessionId: null,
-  });
+  // One cursor per persona: once beta is drained it leaves the summary and
+  // stays gone.
+  const idView = s.catchUp(r1, "a", 50, undefined, undefined, EPOCH1, {});
   check(
-    "A2 identity-level summary shows beta drained (only gamma left)",
+    "A2 summary shows beta drained (only gamma left)",
     idView.rooms_with_unread.length === 1 && idView.rooms_with_unread[0].room_id === r3,
     idView.rooms_with_unread,
   );
 
-  // A1: the named-room read honors the private selector.
-  const priv = s.catchUp(r2, "a", 50, undefined, undefined, "S");
-  check(
-    "A1 private-cursor read of beta still returns both messages",
-    priv.messages.length === 2 && priv.advanced === true,
-    priv,
-  );
-
   // Non-empty read: no summary field at all.
-  s.postMessage(r1, "b", "alpha msg", "text", null, null);
-  const nonEmpty = s.catchUp(r1, "a", 50, undefined, undefined, null, {
-    sessionId: null,
-  });
+  s.postMessage(r1, "b", "alpha msg", "text", null, null, null, EPOCH1);
+  const nonEmpty = s.catchUp(r1, "a", 50, undefined, undefined, EPOCH1, {});
   check(
     "A2 non-empty read omits rooms_with_unread",
     nonEmpty.messages.length === 1 && nonEmpty.rooms_with_unread === undefined,
@@ -117,22 +99,20 @@ const check = (n, c, x) => {
   );
 
   // Nowhere has traffic: an explicit empty array, not an omission.
-  s.catchUp(r3, "a", 50);
-  const quiet = s.catchUp(r1, "a", 50, undefined, undefined, null, {
-    sessionId: null,
-  });
+  s.catchUp(r3, "a", 50, undefined, 100000, EPOCH1);
+  const quiet = s.catchUp(r1, "a", 50, undefined, undefined, EPOCH1, {});
   check(
     "A2 quiet-everywhere empty read reports rooms_with_unread: []",
     Array.isArray(quiet.rooms_with_unread) && quiet.rooms_with_unread.length === 0,
     quiet,
   );
 
-  // No summary requested (legacy shape): field absent even on an empty read.
-  const legacy = s.catchUp(r1, "a", 50);
+  // No summary requested: the field is absent even on an empty read.
+  const noSummary = s.catchUp(r1, "a", 50, undefined, 100000, EPOCH1);
   check(
     "A2 summary is opt-in (absent without unreadSummary)",
-    legacy.rooms_with_unread === undefined,
-    legacy,
+    noSummary.rooms_with_unread === undefined,
+    noSummary,
   );
   s.close();
 }
@@ -140,20 +120,18 @@ const check = (n, c, x) => {
 // --- A2b: truncation flag on the summary --------------------------------------
 {
   const s = new ChatStore(":memory:");
-  s.upsertAgent("a", null, null, null);
-  s.upsertAgent("b", null, null, null);
-  const home = s.createRoom("home", null, null).id;
-  s.joinRoom(home, "a");
+  mkAgent(s, "a");
+  mkAgent(s, "b");
+  const home = mkRoom(s, "home", null, null).id;
+  s.joinRoom(home, "a", EPOCH1, {});
   // 21 other rooms with unread; the summary caps at 20.
   for (let i = 0; i < 21; i++) {
-    const r = s.createRoom(`spill-${i}`, null, null).id;
-    s.joinRoom(r, "a");
-    s.joinRoom(r, "b");
-    s.postMessage(r, "b", "x", "text", null, null);
+    const r = mkRoom(s, `spill-${i}`, null, null).id;
+    s.joinRoom(r, "a", EPOCH1, {});
+    s.joinRoom(r, "b", EPOCH1, {});
+    s.postMessage(r, "b", "x", "text", null, null, null, EPOCH1);
   }
-  const res = s.catchUp(home, "a", 50, undefined, undefined, null, {
-    sessionId: null,
-  });
+  const res = s.catchUp(home, "a", 50, undefined, undefined, EPOCH1, {});
   check(
     "A2b summary truncates at 20 rooms with the flag set",
     res.rooms_with_unread.length === 20 && res.rooms_with_unread_truncated === true,
@@ -165,19 +143,19 @@ const check = (n, c, x) => {
 // --- A3: marker_behind ---------------------------------------------------------
 {
   const s = new ChatStore(":memory:");
-  const r = s.createRoom("room", null, null).id;
-  s.upsertAgent("a", null, null, null);
-  s.upsertAgent("b", null, null, null);
-  s.joinRoom(r, "a");
-  s.joinRoom(r, "b");
-  for (let i = 0; i < 3; i++) s.postMessage(r, "a", "m" + i, "text", null, null);
+  const r = mkRoom(s, "room", null, null).id;
+  mkAgent(s, "a");
+  mkAgent(s, "b");
+  s.joinRoom(r, "a", EPOCH1, {});
+  s.joinRoom(r, "b", EPOCH1, {});
+  for (let i = 0; i < 3; i++) s.postMessage(r, "a", "m" + i, "text", null, null, null, EPOCH1);
   let st = s.recipientStatus(r, ["b", "ghost"], 5);
   check(
     "A3 marker_behind counts unswept messages; null for unknown",
     st[0].marker_behind === 3 && st[1].marker_behind === null,
     st,
   );
-  s.catchUp(r, "b", 50);
+  s.catchUp(r, "b", 50, undefined, 100000, EPOCH1);
   st = s.recipientStatus(r, ["b"], 5);
   check("A3 marker_behind is 0 once caught up", st[0].marker_behind === 0, st);
   s.close();
@@ -186,22 +164,22 @@ const check = (n, c, x) => {
 // --- A4: pendingDirected --------------------------------------------------------
 {
   const s = new ChatStore(":memory:");
-  const r1 = s.createRoom("lane-one", null, null).id;
-  const r2 = s.createRoom("lane-two", null, null).id;
-  s.upsertAgent("boss", null, null, null);
-  s.upsertAgent("w1", null, null, null);
-  s.upsertAgent("w2", null, null, null);
-  s.joinRoom(r1, "boss");
-  s.joinRoom(r1, "w1");
-  s.joinRoom(r2, "boss");
-  s.joinRoom(r2, "w2");
-  const first = s.postMessage(r1, "boss", "task for w1", "text", ["w1"], null);
-  s.postMessage(r2, "boss", "task for w2", "text", ["w2"], null);
+  const r1 = mkRoom(s, "lane-one", null, null).id;
+  const r2 = mkRoom(s, "lane-two", null, null).id;
+  mkAgent(s, "boss");
+  mkAgent(s, "w1");
+  mkAgent(s, "w2");
+  s.joinRoom(r1, "boss", EPOCH1, {});
+  s.joinRoom(r1, "w1", EPOCH1, {});
+  s.joinRoom(r2, "boss", EPOCH1, {});
+  s.joinRoom(r2, "w2", EPOCH1, {});
+  const first = s.postMessage(r1, "boss", "task for w1", "text", ["w1"], null, null, EPOCH1);
+  s.postMessage(r2, "boss", "task for w2", "text", ["w2"], null, null, EPOCH1);
   // A reply to w1's message is directed at w1 without a mention.
-  s.postMessage(r1, "w1", "w1 speaks", "text", null, null);
-  const w1msg = s.catchUp(r1, "boss", 50); // boss reads so boss has no pending
+  s.postMessage(r1, "w1", "w1 speaks", "text", null, null, null, EPOCH1);
+  const w1msg = s.catchUp(r1, "boss", 50, undefined, 100000, EPOCH1); // boss reads so boss has no pending
   // catch_up excludes boss's own post, so w1's message is the only row.
-  s.postMessage(r1, "boss", "re: w1", "text", null, w1msg.messages[0].seq);
+  s.postMessage(r1, "boss", "re: w1", "text", null, w1msg.messages[0].seq, null, EPOCH1);
 
   let view = s.pendingDirected(50);
   check(
@@ -223,14 +201,14 @@ const check = (n, c, x) => {
   );
   check("A4 truncation flag with limit 1", s.pendingDirected(1).truncated === true, null);
 
-  s.catchUp(r1, "w1", 50);
+  s.catchUp(r1, "w1", 50, undefined, 100000, EPOCH1);
   view = s.pendingDirected(50);
   check(
     "A4 reading clears the row",
     view.pending.length === 1 && view.pending[0].agent_id === "w2",
     view.pending,
   );
-  s.leaveRoom(r2, "w2");
+  s.leaveRoom(r2, "w2", EPOCH1);
   view = s.pendingDirected(50);
   check("A4 left members are excluded", view.pending.length === 0, view.pending);
   s.close();
@@ -280,15 +258,18 @@ await (async () => {
   // Rooms and a second agent driven through a DIRECT store handle on the
   // same file (cross-process WAL is the deployment reality).
   const s = new ChatStore(DB);
-  const rA = s.createRoom("active-room", null, null).id;
-  const rB = s.createRoom("other-room", null, null).id;
-  s.upsertAgent("peer", null, null, null);
-  s.joinRoom(rA, "peer");
-  s.joinRoom(rB, "peer");
+  const rA = mkRoom(s, "active-room", null, null).id;
+  const rB = mkRoom(s, "other-room", null, null).id;
+  mkAgent(s, "peer");
+  s.joinRoom(rA, "peer", EPOCH1, {});
+  s.joinRoom(rB, "peer", EPOCH1, {});
 
-  await call("join_room", { room: "other-room", agent_id: "u" });
-  await call("join_room", { room: "active-room", agent_id: "u" }); // active = A
-  s.postMessage(rB, "peer", "hello in B", "text", ["u"], null);
+  mkAgent(s, "u");
+  await call("resume_persona", bindArgs("u"));
+
+  await call("join_room", { room: "other-room" });
+  await call("join_room", { room: "active-room" }); // active = A
+  s.postMessage(rB, "peer", "hello in B", "text", ["u"], null, null, EPOCH1);
 
   // B1: empty active-room read names itself and discloses room B.
   const empty = await call("catch_up", {});
@@ -321,8 +302,8 @@ await (async () => {
   );
   const never = await call("catch_up", { room: "does-not-exist" });
   check("B1 unknown room fails cleanly", never.isError === true, never.data);
-  s.upsertAgent("u", null, null, null); // ensure exists for the next check
-  const unjoined = s.createRoom("unjoined-room", null, null).id;
+  mkAgent(s, "u"); // ensure exists for the next check
+  const unjoined = mkRoom(s, "unjoined-room", null, null).id;
   const nomember = await call("catch_up", { room: "unjoined-room" });
   check(
     "B1 never-joined room fails with the join remedy",
@@ -334,14 +315,14 @@ await (async () => {
   // Cross-room rows must remain expandable in their SOURCE room. Sequences
   // are per-room, so silently falling back to the active room can return a
   // real but unrelated message with the same seq.
-  const pageA = s.createRoom("page-active", null, null).id;
-  const pageB = s.createRoom("page-source", null, null).id;
-  s.joinRoom(pageA, "peer");
-  s.joinRoom(pageB, "peer");
+  const pageA = mkRoom(s, "page-active", null, null).id;
+  const pageB = mkRoom(s, "page-source", null, null).id;
+  s.joinRoom(pageA, "peer", EPOCH1, {});
+  s.joinRoom(pageB, "peer", EPOCH1, {});
   await call("join_room", { room: "page-source" });
   await call("join_room", { room: "page-active" });
-  s.postMessage(pageA, "peer", "WRONG active-room body", "text", null, null);
-  s.postMessage(pageB, "peer", "B".repeat(500), "text", null, null);
+  s.postMessage(pageA, "peer", "WRONG active-room body", "text", null, null, null, EPOCH1);
+  s.postMessage(pageB, "peer", "B".repeat(500), "text", null, null, null, EPOCH1);
   const cut = await call("catch_up", { room: "page-source", preview_chars: 10 });
   check(
     "B1 cross-room catch_up returns a truncated source-room row",
@@ -368,11 +349,11 @@ await (async () => {
   // The MCP handler's routing fields are part of max_bytes too. A dense row
   // that makes the store spend almost the full budget must be shrunk enough
   // that adding agent_id/room_id/room_name cannot push the wire result over.
-  const budgetRoom = s.createRoom("budget-room", null, null).id;
-  s.upsertAgent("noisy", "\u0001".repeat(100), "\u0002".repeat(200), null);
-  s.joinRoom(budgetRoom, "noisy");
+  const budgetRoom = mkRoom(s, "budget-room", null, null).id;
+  mkAgent(s, "noisy");
+  s.joinRoom(budgetRoom, "noisy", EPOCH1, {});
   await call("join_room", { room: "budget-room" });
-  s.postMessage(budgetRoom, "noisy", "\u0003".repeat(5000), "text", null, null);
+  s.postMessage(budgetRoom, "noisy", "\u0003".repeat(5000), "text", null, null, null, EPOCH1);
   const bounded = await call("catch_up", { max_bytes: 1000 });
   check(
     "B1 complete advancing catch_up response honors max_bytes",
@@ -384,10 +365,10 @@ await (async () => {
   // If the fixed routing metadata itself leaves less than one safe stub, the
   // handler must reject BEFORE entering the advancing store transaction.
   const denseRoomName = "meta-" + "\u0001".repeat(190);
-  const denseRoom = s.createRoom(denseRoomName, null, null).id;
-  s.joinRoom(denseRoom, "peer");
+  const denseRoom = mkRoom(s, denseRoomName, null, null).id;
+  s.joinRoom(denseRoom, "peer", EPOCH1, {});
   await call("join_room", { room: denseRoomName });
-  s.postMessage(denseRoom, "peer", "recoverable", "text", null, null);
+  s.postMessage(denseRoom, "peer", "recoverable", "text", null, null, null, EPOCH1);
   const tooSmall = await call("catch_up", { max_bytes: 1000 });
   check(
     "B1 an impossible metadata budget fails before marker advance",
@@ -409,22 +390,22 @@ await (async () => {
   // B2: delivery warnings. ghost = never joined; leaver = joined then left;
   // stale = idle with older backlog; idle-caught-up = idle but current before
   // this send; peer = active. Only factual pre-existing lag warrants idle text.
-  s.upsertAgent("leaver", null, null, null);
-  s.joinRoom(rA, "leaver");
+  mkAgent(s, "leaver");
+  s.joinRoom(rA, "leaver", EPOCH1, {});
   // Model the leave/wait race: a lease may outlive membership presence. A
   // definitive left warning must win over stale watching:true state.
-  s.beginWaitLease(rA, "leaver", "STALE-LEAVER-WAIT", 30);
-  s.leaveRoom(rA, "leaver");
-  s.upsertAgent("stale", null, null, null);
-  s.joinRoom(rA, "stale");
-  s.markRead(rA, "stale");
-  s.upsertAgent("watcher", null, null, null);
-  s.joinRoom(rA, "watcher");
-  s.markRead(rA, "watcher");
-  s.postMessage(rA, "peer", "older backlog", "text", null, null);
-  s.upsertAgent("idle-caught-up", null, null, null);
-  s.joinRoom(rA, "idle-caught-up");
-  s.markRead(rA, "idle-caught-up");
+  s.beginWaitLease(rA, "leaver", EPOCH1, 30);
+  s.leaveRoom(rA, "leaver", EPOCH1);
+  mkAgent(s, "stale");
+  s.joinRoom(rA, "stale", EPOCH1, {});
+  s.markRead(rA, "stale", EPOCH1);
+  mkAgent(s, "watcher");
+  s.joinRoom(rA, "watcher", EPOCH1, {});
+  s.markRead(rA, "watcher", EPOCH1);
+  s.postMessage(rA, "peer", "older backlog", "text", null, null, null, EPOCH1);
+  mkAgent(s, "idle-caught-up");
+  s.joinRoom(rA, "idle-caught-up", EPOCH1, {});
+  s.markRead(rA, "idle-caught-up", EPOCH1);
   {
     const raw = new Database(DB);
     raw.prepare(
@@ -432,8 +413,8 @@ await (async () => {
     ).run();
     raw.close();
   }
-  s.beginWaitLease(rA, "watcher", "OPEN-WAIT", 30);
-  s.touch(rA, "peer");
+  s.beginWaitLease(rA, "watcher", EPOCH1, 30);
+  s.touch(rA, "peer", EPOCH1);
   const post = await call("post_message", {
     content: "fanout",
     to: ["ghost", "leaver", "stale", "idle-caught-up", "watcher", "peer"],
@@ -444,9 +425,12 @@ await (async () => {
     w.length === 3 &&
       w.some((x) => x.startsWith("ghost:") && /never joined/.test(x)) &&
       w.some((x) => x.startsWith("leaver:") && /left/.test(x)) &&
+      // The wording names WHAT was measured. "no observed activity" read as a
+      // claim about the model; the signal is only that nothing -- neither an
+      // MCP call nor an armed watcher's heartbeat -- touched this seat.
       w.some((x) =>
         x.startsWith("stale:") &&
-        /no observed activity in this room for 2h/.test(x) &&
+        /no MCP call or watcher heartbeat in this room for 2h/.test(x) &&
         /marker was 1 seq behind before this post/.test(x),
       ) &&
       !w.some((x) => /likely unreachable/.test(x)),
@@ -472,8 +456,8 @@ await (async () => {
       post.data.recipients.find((r) => r.id === "watcher").status === "active",
     post.data.recipients,
   );
-  s.endWaitLease(rA, "leaver", "STALE-LEAVER-WAIT");
-  s.endWaitLease(rA, "watcher", "OPEN-WAIT");
+  s.endWaitLease(rA, "leaver", EPOCH1);
+  s.endWaitLease(rA, "watcher", EPOCH1);
   const clean = await call("post_message", { content: "to peer", to: ["peer"] });
   check(
     "B2 all-active post omits delivery_warnings",
@@ -503,7 +487,7 @@ await (async () => {
       info.data.limits?.metadata_caps_chars?.claim_key === 500 &&
       typeof info.data.manual === "string" &&
       info.data.manual.includes("OPERATING MANUAL") &&
-      info.data.manual.includes("--session"),
+      info.data.manual.includes("--epoch"),
     info.data.limits,
   );
   const wfm = await call("wait_for_messages", { timeout: 90, interval: 5 });
@@ -535,14 +519,14 @@ await (async () => {
   const dir = mkdtempSync(join(tmpdir(), "v090-check-"));
   const DB = join(dir, "t.db");
   const s = new ChatStore(DB);
-  const r1 = s.createRoom("noisy", null, null).id;
-  const r2 = s.createRoom("quiet", null, null).id;
-  s.upsertAgent("a", null, null, null);
-  s.upsertAgent("b", null, null, null);
-  s.joinRoom(r1, "a");
-  s.joinRoom(r2, "a");
-  s.joinRoom(r1, "b");
-  s.postMessage(r1, "b", "wake up", "text", ["a"], null);
+  const r1 = mkRoom(s, "noisy", null, null).id;
+  const r2 = mkRoom(s, "quiet", null, null).id;
+  mkAgent(s, "a");
+  mkAgent(s, "b");
+  s.joinRoom(r1, "a", EPOCH1, {});
+  s.joinRoom(r2, "a", EPOCH1, {});
+  s.joinRoom(r1, "b", EPOCH1, {});
+  s.postMessage(r1, "b", "wake up", "text", ["a"], null, null, EPOCH1);
   s.close();
   const CHECK = join(ROOT, "dist", "check.js");
   const env = { ...process.env, AGENT_CHAT_DB: DB };
@@ -563,12 +547,12 @@ await (async () => {
   // directed wake, not every room with unrelated broadcast traffic.
   {
     const extra = new ChatStore(DB);
-    const broadcast = extra.createRoom("broadcast-only", null, null).id;
-    extra.upsertAgent("c", null, null, null);
-    extra.joinRoom(broadcast, "a");
-    extra.joinRoom(broadcast, "b");
-    extra.joinRoom(broadcast, "c");
-    extra.postMessage(broadcast, "b", "not directed", "text", null, null);
+    const broadcast = mkRoom(extra, "broadcast-only", null, null).id;
+    mkAgent(extra, "c");
+    extra.joinRoom(broadcast, "a", EPOCH1, {});
+    extra.joinRoom(broadcast, "b", EPOCH1, {});
+    extra.joinRoom(broadcast, "c", EPOCH1, {});
+    extra.postMessage(broadcast, "b", "not directed", "text", null, null, null, EPOCH1);
     extra.close();
   }
   const mentionHit = spawnSync(
@@ -585,58 +569,13 @@ await (async () => {
     { status: mentionHit.status, out: mentionHit.stdout, err: mentionHit.stderr },
   );
 
-  const leanQuiet = spawnSync(
-    "node",
-    [CHECK, "--wake-only", "--agent", "c", "--mentions-only"],
-    { env, encoding: "utf8" },
-  );
-  const leanJson = leanQuiet.status === 1 ? JSON.parse(leanQuiet.stdout) : null;
-  check(
-    "C1 poller quiet path skips repeated exact broadcast-backlog counts",
-    leanQuiet.status === 1 && leanJson?.has_updates === false &&
-      leanJson?.unread_count_skipped === true &&
-      !("unread" in leanJson),
-    { status: leanQuiet.status, out: leanQuiet.stdout, err: leanQuiet.stderr },
-  );
-  const scopedLean = spawnSync(
-    "node",
-    [
-      CHECK,
-      "--wake-only",
-      "--room",
-      "broadcast-only",
-      "--agent",
-      "c",
-      "--mentions-only",
-    ],
-    { env, encoding: "utf8" },
-  );
-  const scopedLeanJson =
-    scopedLean.status === 1 ? JSON.parse(scopedLean.stdout) : null;
-  check(
-    "C1 scoped mentions-only quiet path skips the broadcast count too",
-    scopedLean.status === 1 && scopedLeanJson?.has_updates === false &&
-      scopedLeanJson?.unread_count_skipped === true,
-    { status: scopedLean.status, out: scopedLean.stdout, err: scopedLean.stderr },
-  );
-
-  // Count Node launches during a bounded quiet watch. The compatibility shell
-  // must exec exactly one persistent watcher, not spawn one probe per tick.
-  const countFile = join(dir, "probe-count");
-  const nodeWrapper = join(dir, "counting-node.sh");
-  writeFileSync(countFile, "");
-  writeFileSync(
-    nodeWrapper,
-    '#!/bin/sh\nprintf "x\\n" >> "$COUNT_FILE"\nexec "$REAL_NODE" "$@"\n',
-  );
-  chmodSync(nodeWrapper, 0o700);
+  // A bounded quiet watch is ONE persistent Node process, not one probe per
+  // tick. dist/poller.js is invoked directly; there is no shell wrapper.
   const pollStarted = Date.now();
   const boundedPoll = spawnSync(
-    "bash",
+    "node",
     [
-      join(ROOT, "scripts", "wait-for-updates.sh"),
-      "--node",
-      nodeWrapper,
+      join(ROOT, "dist", "poller.js"),
       "--agent",
       "c",
       "--mentions-only",
@@ -646,28 +585,21 @@ await (async () => {
       "1",
       "--ok-on-timeout",
     ],
-    {
-      env: { ...env, COUNT_FILE: countFile, REAL_NODE: process.execPath },
-      encoding: "utf8",
-      timeout: 10_000,
-    },
+    { env, encoding: "utf8", timeout: 10_000 },
   );
   const pollElapsed = Date.now() - pollStarted;
-  const probeLog = readFileSync(countFile, "utf8").trim();
-  const probeCount = probeLog === "" ? 0 : probeLog.split("\n").length;
   let boundedJson = null;
   try {
     boundedJson = JSON.parse(boundedPoll.stdout.trim());
   } catch {}
   check(
-    "C1 benign quiet timeout uses one Node process and exits 0 with typed stdout",
-    boundedPoll.status === 0 && probeCount === 1 &&
+    "C1 benign quiet timeout exits 0 with typed stdout after one bounded watch",
+    boundedPoll.status === 0 &&
       boundedJson?.has_updates === false && boundedJson?.timed_out === true &&
       boundedPoll.stderr === "" &&
       pollElapsed >= 1000 && pollElapsed < 6000,
     {
       status: boundedPoll.status,
-      probes: probeCount,
       elapsed: pollElapsed,
       out: boundedPoll.stdout,
       err: boundedPoll.stderr,
@@ -680,10 +612,10 @@ await (async () => {
   {
     const extra = new ChatStore(DB);
     for (let i = 0; i < 21; i++) {
-      const room = extra.createRoom(`wake-${i}`, null, null).id;
-      extra.joinRoom(room, "a");
-      extra.joinRoom(room, "b");
-      extra.postMessage(room, "b", "directed", "text", ["a"], null);
+      const room = mkRoom(extra, `wake-${i}`, null, null).id;
+      extra.joinRoom(room, "a", EPOCH1, {});
+      extra.joinRoom(room, "b", EPOCH1, {});
+      extra.postMessage(room, "b", "directed", "text", ["a"], null, null, EPOCH1);
     }
     extra.close();
   }
@@ -711,15 +643,6 @@ await (async () => {
     help.status === 0 && /Usage:/.test(help.stdout),
     { status: help.status, out: help.stdout.slice(0, 120) },
   );
-  const shHelp = spawnSync("bash", [join(ROOT, "scripts", "wait-for-updates.sh"), "--help"], {
-    env,
-    encoding: "utf8",
-  });
-  check(
-    "C1 wait-for-updates.sh --help exits 0 with usage",
-    shHelp.status === 0 && /Usage:/.test(shHelp.stdout),
-    { status: shHelp.status, out: shHelp.stdout.slice(0, 120), err: shHelp.stderr },
-  );
   rmSync(dir, { recursive: true, force: true });
 }
 
@@ -727,19 +650,17 @@ await (async () => {
 {
   const s = new ChatStore(":memory:");
   const weird = "r\u{1F989}oom-'quote\"-é"; // astral + quotes + accent
-  const home = s.createRoom("plain-home", null, null).id;
-  const w = s.createRoom(weird, null, null).id;
-  s.upsertAgent("a", null, null, null);
-  s.upsertAgent("b", null, null, null);
-  s.joinRoom(home, "a");
-  s.joinRoom(w, "a");
-  s.joinRoom(w, "b");
+  const home = mkRoom(s, "plain-home", null, null).id;
+  const w = mkRoom(s, weird, null, null).id;
+  mkAgent(s, "a");
+  mkAgent(s, "b");
+  s.joinRoom(home, "a", EPOCH1, {});
+  s.joinRoom(w, "a", EPOCH1, {});
+  s.joinRoom(w, "b", EPOCH1, {});
   // Directed via a reply chain, no mention: a posts, b replies to it.
-  const mine = s.postMessage(w, "a", "root", "text", null, null);
-  s.postMessage(w, "b", "reply", "text", null, mine.seq);
-  const res = s.catchUp(home, "a", 50, undefined, undefined, null, {
-    sessionId: null,
-  });
+  const mine = s.postMessage(w, "a", "root", "text", null, null, null, EPOCH1);
+  s.postMessage(w, "b", "reply", "text", null, mine.seq, null, EPOCH1);
+  const res = s.catchUp(home, "a", 50, undefined, undefined, EPOCH1, {});
   const entry = res.rooms_with_unread.find((r) => r.room_id === w);
   check(
     "D1 adversarial room name round-trips exactly; reply counts as directed",
@@ -754,14 +675,12 @@ await (async () => {
   // appended up to twenty of them after spending the entire message budget.
   for (let i = 0; i < 20; i++) {
     const name = `dense-${String(i).padStart(2, "0")}-` + "\u0001".repeat(190);
-    const room = s.createRoom(name, null, null).id;
-    s.joinRoom(room, "a");
-    s.joinRoom(room, "b");
-    s.postMessage(room, "b", "unread", "text", null, null);
+    const room = mkRoom(s, name, null, null).id;
+    s.joinRoom(room, "a", EPOCH1, {});
+    s.joinRoom(room, "b", EPOCH1, {});
+    s.postMessage(room, "b", "unread", "text", null, null, null, EPOCH1);
   }
-  const boundedSummary = s.catchUp(home, "a", 50, undefined, 1000, null, {
-    sessionId: null,
-  });
+  const boundedSummary = s.catchUp(home, "a", 50, undefined, 1000, EPOCH1, {});
   check(
     "D1 rooms_with_unread shares the complete catch_up byte budget",
     JSON.stringify(boundedSummary).length <= 1000 &&

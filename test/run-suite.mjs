@@ -4,6 +4,14 @@ import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
 const TEST_TIMEOUT_MS = 30_000;
+// Per-file overrides. The bound exists to stop a HUNG file from stalling the
+// suite, not to cap legitimate work: features-persona spawns a dozen watcher
+// children whose reactions are gated by the poller's five-second MINIMUM probe
+// interval, so its floor is set by the product, not by the test. Shortening it
+// to fit 30s would mean deleting watcher-lifecycle coverage.
+const TIMEOUT_OVERRIDES_MS = {
+  "features-persona.mjs": 90_000,
+};
 const files = [
   "bounded-lines.mjs",
   "my-mentions.mjs",
@@ -18,9 +26,7 @@ const files = [
   "fixes-v09.mjs",
   "fixes-v078.mjs",
   "fixes-v0710.mjs",
-  "fixes-v08.mjs",
   "fixes-v082.mjs",
-  "fixes-v083.mjs",
   "fixes-v084.mjs",
   "features-v090.mjs",
   "features-v0100.mjs",
@@ -29,6 +35,7 @@ const files = [
   "mcp-lifecycle-v0121.mjs",
   "poller-lifecycle-v0121.mjs",
   "web-participate.mjs",
+  "features-persona.mjs",
 ];
 
 let active = null;
@@ -43,6 +50,7 @@ function killActive(signal = "SIGKILL") {
 }
 
 function run(file) {
+  const timeoutMs = TIMEOUT_OVERRIDES_MS[file] ?? TEST_TIMEOUT_MS;
   return new Promise((resolve) => {
     const path = fileURLToPath(new URL(`./${file}`, import.meta.url));
     const child = spawn(process.execPath, [path], {
@@ -59,7 +67,7 @@ function run(file) {
     const timer = setTimeout(() => {
       timedOut = true;
       killActive();
-    }, TEST_TIMEOUT_MS);
+    }, timeoutMs);
     child.on("error", (error) => {
       spawnError = error;
       killActive();
@@ -90,7 +98,7 @@ for (const file of files) {
   const result = await run(file);
   if (result.code !== 0 || result.timedOut || result.spawnError) {
     const reason = result.timedOut
-      ? `timed out after ${TEST_TIMEOUT_MS}ms`
+      ? `timed out after ${TIMEOUT_OVERRIDES_MS[file] ?? TEST_TIMEOUT_MS}ms`
       : result.spawnError
         ? `spawn failed: ${result.spawnError.message}`
         : `exited ${result.code ?? result.signal}`;

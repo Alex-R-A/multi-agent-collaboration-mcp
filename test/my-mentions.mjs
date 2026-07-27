@@ -9,6 +9,7 @@ import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ChatStore } from "../dist/db.js";
+import { EPOCH1, mkAgent, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CHECK = join(ROOT, "dist", "check.js");
@@ -23,25 +24,25 @@ const DB = join(dir, "inbox.db");
 const s = new ChatStore(DB);
 
 // Three rooms; hero is in all three, then leaves gamma.
-const r1 = s.createRoom("alpha", null, null).id;
-const r2 = s.createRoom("beta", null, null).id;
-const r3 = s.createRoom("gamma", null, null).id;
-s.upsertAgent("hero", "human", null, null);
-s.upsertAgent("ann", "claude", null, null);
-s.upsertAgent("ben", "codex", null, null);
-for (const r of [r1, r2, r3]) s.joinRoom(r, "hero");
-s.joinRoom(r1, "ann");
-s.joinRoom(r2, "ann");
-s.joinRoom(r3, "ben");
+const r1 = mkRoom(s, "alpha", null, null).id;
+const r2 = mkRoom(s, "beta", null, null).id;
+const r3 = mkRoom(s, "gamma", null, null).id;
+mkAgent(s, "hero");
+mkAgent(s, "ann");
+mkAgent(s, "ben");
+for (const r of [r1, r2, r3]) s.joinRoom(r, "hero", EPOCH1, {});
+s.joinRoom(r1, "ann", EPOCH1, {});
+s.joinRoom(r2, "ann", EPOCH1, {});
+s.joinRoom(r3, "ben", EPOCH1, {});
 
-s.postMessage(r1, "ann", "alpha broadcast", "text", null, null); // a1
-s.postMessage(r1, "ann", "alpha ping", "text", ["hero"], null); // a2 directed
-s.postMessage(r1, "hero", "hero speaks", "text", null, null); // a3 (own)
-s.postMessage(r1, "ann", "reply to hero", "text", null, 3); // a4 directed (reply)
-s.postMessage(r2, "ann", "beta broadcast one", "text", null, null); // b1
-s.postMessage(r2, "ann", "beta broadcast two", "text", null, null); // b2
-s.postMessage(r3, "ben", "gamma ping", "text", ["hero"], null); // g1 directed
-s.leaveRoom(r3, "hero"); // mutes gamma
+s.postMessage(r1, "ann", "alpha broadcast", "text", null, null, null, EPOCH1); // a1
+s.postMessage(r1, "ann", "alpha ping", "text", ["hero"], null, null, EPOCH1); // a2 directed
+s.postMessage(r1, "hero", "hero speaks", "text", null, null, null, EPOCH1); // a3 (own)
+s.postMessage(r1, "ann", "reply to hero", "text", null, 3, null, EPOCH1); // a4 directed (reply)
+s.postMessage(r2, "ann", "beta broadcast one", "text", null, null, null, EPOCH1); // b1
+s.postMessage(r2, "ann", "beta broadcast two", "text", null, null, null, EPOCH1); // b2
+s.postMessage(r3, "ben", "gamma ping", "text", ["hero"], null, null, EPOCH1); // g1 directed
+s.leaveRoom(r3, "hero", EPOCH1); // mutes gamma
 
 // --- inbox contents, ordering, room tags -----------------------------------
 {
@@ -85,7 +86,7 @@ s.leaveRoom(r3, "hero"); // mutes gamma
 
 // --- entries clear by actually reading the room -----------------------------
 {
-  s.catchUp(r1, "hero", 50); // read alpha
+  s.catchUp(r1, "hero", 50, undefined, 100000, EPOCH1); // read alpha
   const inbox = s.myMentions("hero", 50);
   check("reading a room clears its inbox entries", inbox.messages.length === 0, inbox.messages);
   check("total_directed drops to 0", inbox.total_directed === 0, inbox.total_directed);
@@ -95,7 +96,7 @@ s.leaveRoom(r3, "hero"); // mutes gamma
 
 // --- rejoin unmutes ----------------------------------------------------------
 {
-  s.joinRoom(r3, "hero");
+  s.joinRoom(r3, "hero", EPOCH1, {});
   const inbox = s.myMentions("hero", 50);
   check(
     "rejoining gamma surfaces its pending mention",
@@ -106,7 +107,7 @@ s.leaveRoom(r3, "hero"); // mutes gamma
 
 // --- byte bound ---------------------------------------------------------------
 {
-  s.postMessage(r2, "ann", "z".repeat(30_000), "text", ["hero"], null);
+  s.postMessage(r2, "ann", "z".repeat(30_000), "text", ["hero"], null, null, EPOCH1);
   const inbox = s.myMentions("hero", 50, undefined, 5000);
   check(
     "byte budget trims the inbox and flags it",
@@ -152,7 +153,7 @@ function probe(args) {
 
   // Drain everything; the all-rooms probe must then report quiet (exit 1).
   const s2 = new ChatStore(DB);
-  for (const r of [1, 2, 3]) s2.catchUp(r, "hero", 500);
+  for (const r of [1, 2, 3]) s2.catchUp(r, "hero", 500, undefined, 100000, EPOCH1);
   s2.close();
   const quiet = probe(["--agent", "hero"]);
   check(

@@ -1,7 +1,7 @@
 // Phase 2 blocking-wait tests (v0.10.0): catch_up({wait_seconds}) with the
 // capture/probe/abort core plus the in_turn_wait presence lease.
 //  S1 unreadProbe uses catchUp's exact predicate (own posts excluded,
-//     session cursor honored, non-member throws)
+//     epoch fenced, non-member throws)
 //  S2 wait leases: watching in recipientStatus/list_agents, expiry, reaping
 //  S3 deleteRoom clears leases
 //  M1 immediate backlog return (no sleep when messages already wait)
@@ -12,20 +12,21 @@
 //  M4b concurrent waits in one process keep independent leases
 //  M4c named-room waits heartbeat the captured room, not the active room
 //  M5 active-room change mid-wait: captured room governs
-//  M6 cursor-mode flip mid-wait: session_changed, nothing advanced
-//  M7 shared twin consumes mid-wait: no stale refire, later message delivered
+//  M6 takeover mid-wait: the wait does not advance under a lost authority
+//  M7 a concurrent read consumes mid-wait: no stale refire, later message delivered
 //  M8 client cancellation: response suppressed, marker NOT advanced, lease
 //     dropped, backlog recoverable
 //  M9 room deleted mid-wait: clean error, not a raw constraint failure
 //  M10 120s server cap returns immediate backlog; 121 is rejected
 //  M11 two waiters (separate server processes) both receive one post
-import { ChatStore } from "../dist/db.js";
+import { ChatStore, PersonaLostError } from "../dist/db.js";
 import Database from "better-sqlite3";
 import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { EPOCH1, mkAgent, bindArgs, mkRoom, rmRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
@@ -38,27 +39,63 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // --- S1: probe predicate parity -------------------------------------------------
 {
   const s = new ChatStore(":memory:");
-  const r = s.createRoom("probe-room", null, null).id;
-  s.upsertAgent("a", null, null, null);
-  s.upsertAgent("b", null, null, null);
-  s.joinRoom(r, "a", "S", "S"); // private session S
-  s.joinRoom(r, "b");
-  s.postMessage(r, "a", "own post", "text", null, null);
-  check("S1 own post does not count as unread", s.unreadProbe(r, "a", null) === 0, null);
-  s.postMessage(r, "b", "peer post", "text", null, null);
-  check("S1 peer post counts", s.unreadProbe(r, "a", null) === 1, null);
-  // Twin advances the identity marker; session S's private cursor still sees it.
-  s.catchUp(r, "a", 50);
-  check("S1 identity probe drained", s.unreadProbe(r, "a", null) === 0, null);
-  // Session S's cursor is still 0: one unread (the peer post; own posts never count).
-  check("S1 private-session probe still sees it", s.unreadProbe(r, "a", "S") === 1, null);
+  const r = mkRoom(s, "probe-room", null, null).id;
+  mkAgent(s, "u");
+  mkAgent(s, "a");
+  mkAgent(s, "b");
+  s.joinRoom(r, "a", EPOCH1, {});
+  s.joinRoom(r, "b", EPOCH1, {});
+  s.postMessage(r, "a", "own post", "text", null, null, null, EPOCH1);
+  check("S1 own post does not count as unread", s.unreadProbe(r, "a", EPOCH1) === 0, null);
+  s.postMessage(r, "b", "peer post", "text", null, null, null, EPOCH1);
+  check("S1 peer post counts", s.unreadProbe(r, "a", EPOCH1) === 1, null);
+  // The advancing read drains the ONE cursor this persona has.
+  s.catchUp(r, "a", 50, undefined, 100000, EPOCH1);
+  check("S1 probe drained after the advancing read", s.unreadProbe(r, "a", EPOCH1) === 0, null);
+  // Parity is the point of this section: the probe and catch_up must agree, so
+  // a probe that fires must be followed by a read that returns something.
+  s.postMessage(r, "b", "another peer post", "text", null, null, null, EPOCH1);
+  check("S1 probe fires again on new peer traffic", s.unreadProbe(r, "a", EPOCH1) === 1, null);
+  check(
+    "S1 the advancing read agrees with the probe (no spin)",
+    s.catchUp(r, "a", 50, undefined, 100000, EPOCH1).messages.length === 1,
+    null,
+  );
+  // The probe reports THREE distinct conditions and must not confuse them. A
+  // live persona that never joined is a non-membership; a persona at a stale
+  // epoch, or one whose row is gone, is a lost persona. Collapsing the second
+  // pair into "not a member" would tell a taken-over runtime to rejoin a room
+  // it is already in.
+  mkAgent(s, "never-joined");
   let threw = "";
   try {
-    s.unreadProbe(r, "never-joined", null);
+    s.unreadProbe(r, "never-joined", EPOCH1);
   } catch (e) {
     threw = e.message;
   }
   check("S1 non-member probe throws", /not a member/.test(threw), threw);
+  let stale = null;
+  try {
+    s.unreadProbe(r, "a", EPOCH1 + 1);
+  } catch (e) {
+    stale = e;
+  }
+  check(
+    "S1 a stale epoch probe throws persona_lost, NOT a membership error",
+    stale instanceof PersonaLostError && !/not a member/.test(stale.message),
+    stale && stale.message,
+  );
+  let vanished = null;
+  try {
+    s.unreadProbe(r, "no-such-persona", EPOCH1);
+  } catch (e) {
+    vanished = e;
+  }
+  check(
+    "S1 a probe for a persona that does not exist reports loss, not non-membership",
+    vanished instanceof PersonaLostError && vanished.currentEpoch === null,
+    vanished && vanished.message,
+  );
   s.close();
 }
 
@@ -67,9 +104,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const dir = mkdtempSync(join(tmpdir(), "v0100-lease-"));
   const DB = join(dir, "t.db");
   const s = new ChatStore(DB);
-  const r = s.createRoom("lease-room", null, null).id;
-  s.upsertAgent("w", null, null, null);
-  s.joinRoom(r, "w", null, "P");
+  const r = mkRoom(s, "lease-room", null, null).id;
+  mkAgent(s, "w");
+  s.joinRoom(r, "w", EPOCH1, {});
   {
     const raw = new Database(DB);
     raw.prepare(
@@ -78,19 +115,19 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     raw.close();
   }
   check(
-    "S2 captured-room touch refreshes an exact live session",
-    s.touchSessionRoom(r, "w", "P") === true &&
+    "S2 captured-room touch refreshes a live membership",
+    s.touchJoinedRoom(r, "w", EPOCH1) === true &&
       s.recipientStatus(r, ["w"], 5)[0].status === "active",
     s.recipientStatus(r, ["w"], 5)[0],
   );
-  s.leaveRoom(r, "w", "P");
+  s.leaveRoom(r, "w", EPOCH1);
   check(
-    "S2 captured-room touch cannot resurrect a left session",
-    s.touchSessionRoom(r, "w", "P") === false &&
+    "S2 captured-room touch cannot resurrect a LEFT room",
+    s.touchJoinedRoom(r, "w", EPOCH1) === false &&
       s.getMembership(r, "w").left_at !== null,
     s.getMembership(r, "w"),
   );
-  s.joinRoom(r, "w", null, "P");
+  s.joinRoom(r, "w", EPOCH1, {});
   {
     const raw = new Database(DB);
     raw.prepare(
@@ -98,7 +135,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     ).run(r);
     raw.close();
   }
-  s.beginWaitLease(r, "w", "NONCE", 30);
+  s.beginWaitLease(r, "w", EPOCH1, 30);
   let st = s.recipientStatus(r, ["w"], 5);
   check(
     "S2 open lease is watching+active despite an old heartbeat",
@@ -111,30 +148,32 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     la.watching === true && la.active === true,
     la,
   );
-  s.endWaitLease(r, "w", "NONCE");
+  s.endWaitLease(r, "w", EPOCH1);
   st = s.recipientStatus(r, ["w"], 5);
   check("S2 closed lease reads as not watching", st[0].watching === false, st);
-  // An expired lease (crashed waiter) must read false and get reaped.
+  // An expired lease (crashed waiter) must read false and get reaped. The row is
+  // written under a DEAD epoch, which is what a hard-killed earlier tenure
+  // leaves behind.
   {
     const raw = new Database(DB);
     raw.prepare(
-      `INSERT INTO wait_leases (room_id, agent_id, session_id, expires_at)
-       VALUES (?, 'w', 'DEAD', datetime('now', '-1 seconds'))`,
+      `INSERT INTO wait_leases (room_id, agent_id, epoch, expires_at)
+       VALUES (?, 'w', 99, datetime('now', '-1 seconds'))`,
     ).run(r);
     raw.close();
   }
   st = s.recipientStatus(r, ["w"], 5);
   check("S2 expired lease reads as not watching", st[0].watching === false, st);
-  s.beginWaitLease(r, "w", "NONCE2", 30);
+  s.beginWaitLease(r, "w", EPOCH1, 30);
   {
     const raw = new Database(DB);
     const dead = raw
-      .prepare("SELECT COUNT(*) AS c FROM wait_leases WHERE session_id = 'DEAD'")
+      .prepare("SELECT COUNT(*) AS c FROM wait_leases WHERE epoch = 99")
       .get();
     raw.close();
     check("S2 beginWaitLease reaps expired rows", dead.c === 0, dead);
   }
-  s.deleteRoom(r);
+  rmRoom(s, r);
   {
     const raw = new Database(DB);
     const left = raw.prepare("SELECT COUNT(*) AS c FROM wait_leases").get();
@@ -211,16 +250,18 @@ await (async () => {
   const srv = startServer(DB);
   await srv.init();
   const s = new ChatStore(DB);
-  const rA = s.createRoom("wait-a", null, null).id;
-  const rB = s.createRoom("wait-b", null, null).id;
-  s.upsertAgent("peer", null, null, null);
-  s.joinRoom(rA, "peer");
-  s.joinRoom(rB, "peer");
-  await srv.call("join_room", { room: "wait-b", agent_id: "u" });
-  await srv.call("join_room", { room: "wait-a", agent_id: "u" }); // active = A
+  const rA = mkRoom(s, "wait-a", null, null).id;
+  const rB = mkRoom(s, "wait-b", null, null).id;
+  mkAgent(s, "peer");
+  s.joinRoom(rA, "peer", EPOCH1, {});
+  s.joinRoom(rB, "peer", EPOCH1, {});
+  mkAgent(s, "u");
+  await srv.call("resume_persona", bindArgs("u"));
+  await srv.call("join_room", { room: "wait-b" });
+  await srv.call("join_room", { room: "wait-a" }); // active = A
 
   // M1: backlog present -> no sleep.
-  s.postMessage(rA, "peer", "already here", "text", null, null);
+  s.postMessage(rA, "peer", "already here", "text", null, null, null, EPOCH1);
   const t1 = Date.now();
   const m1 = await srv.call("catch_up", { wait_seconds: 10 });
   check(
@@ -233,7 +274,7 @@ await (async () => {
   const id2 = srv.sendCall("catch_up", { wait_seconds: 10 });
   await sleep(700);
   const during = s.recipientStatus(rA, ["u"], 5)[0];
-  s.postMessage(rA, "peer", "handoff", "text", ["u"], null);
+  s.postMessage(rA, "peer", "handoff", "text", ["u"], null, null, EPOCH1);
   const m2 = srv.parse(await srv.waitFor(id2));
   check(
     "M2 pending call returns the posted message and advances",
@@ -264,8 +305,11 @@ await (async () => {
     m4.data,
   );
 
-  // M4b: two calls from ONE MCP process used to share one lease row. The
-  // short timeout then deleted it while the longer call was still live.
+  // M4b: two concurrent calls from ONE runtime. The lease row is per (room,
+  // persona) so a takeover replaces it rather than sitting beside it, which
+  // means both waits share ONE row -- and the short one finishing must NOT
+  // delete it while the long one is still live. The runtime refcounts its own
+  // open waits and only the last one out closes the lease.
   const short4b = srv.sendCall("catch_up", { wait_seconds: 1 });
   const long4b = srv.sendCall("catch_up", { wait_seconds: 10 });
   await sleep(700);
@@ -277,7 +321,7 @@ await (async () => {
       )
       .get(rA);
     raw.close();
-    check("M4b same-process waits create two lease rows", leases.c === 2, leases);
+    check("M4b one persona holds exactly one lease row per room", leases.c === 1, leases);
   }
   const shortResult4b = srv.parse(await srv.waitFor(short4b));
   const between4b = s.recipientStatus(rA, ["u"], 5)[0];
@@ -286,7 +330,7 @@ await (async () => {
     shortResult4b.data.timed_out === true && between4b.watching === true,
     { short: shortResult4b.data, between: between4b },
   );
-  s.postMessage(rA, "peer", "for the surviving wait", "text", null, null);
+  s.postMessage(rA, "peer", "for the surviving wait", "text", null, null, null, EPOCH1);
   const longResult4b = srv.parse(await srv.waitFor(long4b));
   check(
     "M4b surviving wait receives the later post",
@@ -316,7 +360,7 @@ await (async () => {
       (during4c.idle_seconds ?? Infinity) < 60,
     during4c,
   );
-  s.postMessage(rB, "peer", "cross-room handoff", "text", null, null);
+  s.postMessage(rB, "peer", "cross-room handoff", "text", null, null, null, EPOCH1);
   const result4c = srv.parse(await srv.waitFor(cross4c));
   const who4c = await srv.call("whoami", {});
   check(
@@ -331,7 +375,7 @@ await (async () => {
   const id5 = srv.sendCall("catch_up", { wait_seconds: 10 });
   await sleep(600);
   await srv.call("join_room", { room: "wait-b" }); // active moves to B mid-wait
-  s.postMessage(rA, "peer", "for the captured room", "text", null, null);
+  s.postMessage(rA, "peer", "for the captured room", "text", null, null, null, EPOCH1);
   const m5 = srv.parse(await srv.waitFor(id5));
   const who5 = await srv.call("whoami", {});
   check(
@@ -342,33 +386,49 @@ await (async () => {
     m5.data,
   );
   check("M5 the concurrent join still moved the active room", who5.data.room_id === rB, who5.data);
-  await srv.call("join_room", { room: "wait-a" }); // back to A, shared
+  await srv.call("join_room", { room: "wait-a" }); // back to A
 
-  // M6: cursor-mode flip mid-wait -> session_changed, nothing advanced.
+  // M6: a TAKEOVER mid-wait. The authority under an open wait can change, and
+  // the wait must not consume the message under an authority it no longer
+  // holds.
   const before6 = s.getMembership(rA, "u").last_read_seq;
   const id6 = srv.sendCall("catch_up", { wait_seconds: 10 });
   await sleep(600);
-  await srv.call("join_room", { room: "wait-a", cursor: "private" }); // flip shared->private
-  s.postMessage(rA, "peer", "post-flip message", "text", null, null);
+  s.attachPersona({
+    id: "u",
+    resumeWord: "test-resume-word",
+    brand: "testbrand",
+    model: "testmodel",
+    version: "1",
+  });
+  s.postMessage(rA, "peer", "post-takeover message", "text", null, null, null, EPOCH1);
   const m6 = srv.parse(await srv.waitFor(id6));
   check(
-    "M6 flip mid-wait returns session_changed without reading",
-    m6.data.session_changed === true && m6.data.call_again === true &&
-      m6.data.messages.length === 0,
-    m6.data,
+    // isError, not just the payload. A fenced wait that returned this body in a
+    // SUCCESS envelope would read as an ordinary result to any client that
+    // checks the protocol flag before the body, which is the normal order.
+    "M6 takeover mid-wait fails the wait with terminal persona_lost",
+    m6.isError === true &&
+      m6.data.code === "persona_lost" &&
+      m6.data.terminal === true,
+    { isError: m6.isError, data: m6.data },
   );
   check(
-    "M6 no marker advanced past the pre-flip position",
+    "M6 the fenced wait advanced no marker",
     s.getMembership(rA, "u").last_read_seq === before6,
     { before: before6, now: s.getMembership(rA, "u").last_read_seq },
   );
-  const recover6 = await srv.call("catch_up", {});
+  // The message is not lost: it is still unread for whoever holds the persona.
   check(
-    "M6 the message is recoverable by the next call",
-    recover6.data.messages.some((m) => m.content === "post-flip message"),
-    recover6.data.messages,
+    "M6 the message survives for the current holder",
+    s.catchUp(rA, "u", 50, undefined, 100000, s.currentEpoch("u")).messages.some(
+      (m) => m.content === "post-takeover message",
+    ),
+    null,
   );
-  await srv.call("join_room", { room: "wait-a", cursor: "shared" }); // back to shared
+  // Re-bind this runtime so the remaining M7+ cases run under a live persona.
+  await srv.call("resume_persona", bindArgs("u"));
+  await srv.call("join_room", { room: "wait-a" });
 
   // M7: shared twin consumes mid-wait (atomically, so the outcome is
   // deterministic): the waiter must NOT refire on the consumed message and
@@ -397,7 +457,7 @@ await (async () => {
     raw.close();
   }
   await sleep(1200); // several probe ticks over the already-consumed message
-  s.postMessage(rA, "peer", "the real one", "text", null, null);
+  s.postMessage(rA, "peer", "the real one", "text", null, null, null, EPOCH1);
   const m7 = srv.parse(await srv.waitFor(id7));
   check(
     "M7 twin-consumed message never refires; the later message is delivered",
@@ -413,7 +473,7 @@ await (async () => {
   srv.cancel(id8);
   await sleep(200);
   const before8 = s.getMembership(rA, "u").last_read_seq;
-  const seq8 = s.postMessage(rA, "peer", "posted after cancel", "text", null, null).seq;
+  const seq8 = s.postMessage(rA, "peer", "posted after cancel", "text", null, null, null, EPOCH1).seq;
   const m8 = await srv.waitFor(id8, 2500, true);
   check("M8 cancelled call's response is suppressed", m8 === null, m8);
   check(
@@ -431,12 +491,12 @@ await (async () => {
   );
 
   // M9: room deleted mid-wait -> clean error naming the deletion.
-  const rD = s.createRoom("doomed", null, null).id;
-  s.joinRoom(rD, "peer");
+  const rD = mkRoom(s, "doomed", null, null).id;
+  s.joinRoom(rD, "peer", EPOCH1, {});
   await srv.call("join_room", { room: "doomed" });
   const id9 = srv.sendCall("catch_up", { wait_seconds: 8 });
   await sleep(700);
-  s.deleteRoom(rD);
+  rmRoom(s, rD);
   const m9 = srv.parse(await srv.waitFor(id9));
   check(
     "M9 deletion mid-wait yields a clean error",
@@ -447,7 +507,7 @@ await (async () => {
 
   // M10: opt into the deployment ceiling and prove it without sleeping for it:
   // existing backlog returns immediately; one second above rejects in schema.
-  s.postMessage(rA, "peer", "upper-cap immediate backlog", "text", null, null);
+  s.postMessage(rA, "peer", "upper-cap immediate backlog", "text", null, null, null, EPOCH1);
   const m10edge = await srv.call("catch_up", { wait_seconds: 120 });
   check(
     "M10 configured wait_seconds=120 returns existing backlog immediately",
@@ -463,46 +523,58 @@ await (async () => {
     m10,
   );
 
-  // M12: identity mutation mid-wait -- a concurrent join under a NEW
-  // agent_id switches the session identity, but the captured identity
-  // governs: the wait returns and advances for the ORIGINAL agent.
+  // M12: a concurrent ROOM change mid-wait. The identity cannot change any more
+  // (one runtime holds one persona for its whole life, and a join takes no
+  // agent_id), but the active ROOM still can, and the captured room must still
+  // govern the wait: it returns and advances for the room it started on.
   const before12 = s.getMembership(rA, "u").last_read_seq;
   const id12 = srv.sendCall("catch_up", { wait_seconds: 10 });
   await sleep(600);
-  await srv.call("join_room", { room: "wait-b", agent_id: "v" }); // identity -> v
-  const seq12 = s.postMessage(rA, "peer", "for the old identity", "text", null, null).seq;
+  await srv.call("join_room", { room: "wait-b" }); // active room moves mid-wait
+  const seq12 = s.postMessage(rA, "peer", "for the captured room", "text", null, null, null, EPOCH1).seq;
   const m12 = srv.parse(await srv.waitFor(id12));
   const who12 = await srv.call("whoami", {});
   check(
-    "M12 identity change mid-wait: captured identity still receives and advances",
-    m12.data.agent_id === "u" && m12.data.messages.length === 1 &&
-      m12.data.messages[0].content === "for the old identity" &&
+    "M12 room change mid-wait: the captured room still receives and advances",
+    m12.data.agent_id === "u" && m12.data.room_id === rA &&
+      m12.data.messages.length === 1 &&
+      m12.data.messages[0].content === "for the captured room" &&
       s.getMembership(rA, "u").last_read_seq === seq12 && before12 < seq12,
     { data: m12.data, marker: s.getMembership(rA, "u").last_read_seq },
   );
   check(
-    "M12 the session itself now runs as the new identity",
-    who12.data.agent_id === "v",
+    "M12 the runtime keeps its persona and moved only the active room",
+    who12.data.agent_id === "u" && who12.data.room_id === rB,
     who12.data,
   );
 
   s.close();
   srv.child.kill();
 
-  // M11: two waiters in separate server processes, one post wakes both.
+  // M11: two waiters in separate server processes, one post wakes both. They
+  // are two DISTINCT personas: two runtimes can no longer share one, and each
+  // has its own read position, so the single post is unread for both.
+  {
+    const seed = new ChatStore(DB);
+    mkAgent(seed, "waiter-1");
+    mkAgent(seed, "waiter-2");
+    seed.close();
+  }
   const srv1 = startServer(DB);
   const srv2 = startServer(DB);
   await srv1.init();
   await srv2.init();
-  await srv1.call("join_room", { room: "wait-a", agent_id: "w1" });
-  await srv2.call("join_room", { room: "wait-a", agent_id: "w2" });
+  await srv1.call("resume_persona", bindArgs("waiter-1"));
+  await srv2.call("resume_persona", bindArgs("waiter-2"));
+  await srv1.call("join_room", { room: "wait-a" });
+  await srv2.call("join_room", { room: "wait-a" });
   await srv1.call("catch_up", {}); // drain backlogs so both waits block
   await srv2.call("catch_up", {});
   const w1 = srv1.sendCall("catch_up", { wait_seconds: 10 });
   const w2 = srv2.sendCall("catch_up", { wait_seconds: 10 });
   await sleep(700);
   const s2 = new ChatStore(DB);
-  s2.postMessage(rA, "peer", "broadcast to waiters", "text", null, null);
+  s2.postMessage(rA, "peer", "broadcast to waiters", "text", null, null, null, EPOCH1);
   const r1 = srv1.parse(await srv1.waitFor(w1));
   const r2 = srv2.parse(await srv2.waitFor(w2));
   check(

@@ -1,26 +1,23 @@
 // Regression tests for the v0.8.4 review fixes:
-//  #1 the all-rooms poller probe with --session baselines off the session's
-//     OWN private cursor, so a private session lagging its twin is woken
-//     (the identity marker is the MAX across sessions and hid its unread)
 //  #2 tools/list advertises post_message `content` WITHOUT excluding objects
 //     (the z.custom union arm was dropped from the generated JSON Schema, so
 //     schema-validating clients rejected every object body client-side)
 //  #3 store-level metadata length caps: a direct caller cannot create a claim
 //     key (etc.) that busts the listing byte budgets, which assume the MCP
 //     schema caps
-//  #4 a live session's leave tombstone is refreshed by its touches, so
-//     my_mentions muting no longer silently expires at the 7-day GC age
-//     while the session is still polling
-//  #5 touch() runs the presence GC, so a crashed twin in a stable-but-active
-//     room is reconciled without waiting for a join/leave/prune
+//  (#1, #4, and #5 all rested on SESSIONS: a private session cursor lagging
+//   its twin, a live session's leave tombstone, and reconciling a crashed twin.
+//   A persona has exactly one runtime, so there is no twin to lag, no second
+//   cursor to baseline against, and nothing to reconcile; those tests were
+//   deleted with the model they tested.)
 //  (web gating and the web search probe are covered in web-participate.mjs.)
 import { ChatStore } from "../dist/db.js";
-import Database from "better-sqlite3";
-import { spawnSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
+import { EPOCH1, mkAgent, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
@@ -28,47 +25,6 @@ const check = (n, c, x) => {
   console.log(`${c ? "PASS" : "FAIL"}  ${n}${c ? "" : "  >> " + JSON.stringify(x)}`);
   if (!c) failures++;
 };
-
-// --- #1: --session baselines the all-rooms probe off the session cursor ------
-{
-  const dir = mkdtempSync(join(tmpdir(), "v084-poll-"));
-  const DB = join(dir, "t.db");
-  const s = new ChatStore(DB);
-  const r = s.createRoom("room", null, null).id;
-  s.upsertAgent("a", null, null, null);
-  s.upsertAgent("b", null, null, null);
-  s.joinRoom(r, "a", "A", "A"); // private session A
-  s.joinRoom(r, "a", "B", "B"); // private twin B
-  s.joinRoom(r, "b", null, "BOB");
-  for (let i = 0; i < 3; i++) s.postMessage(r, "b", "m" + i, "text", null, null);
-  // Twin B reads everything, advancing the identity marker past A's cursor.
-  s.catchUp(r, "a", 50, undefined, undefined, "B");
-  s.close();
-  const CHECK = join(ROOT, "dist", "check.js");
-  const env = { ...process.env, AGENT_CHAT_DB: DB };
-  const idp = spawnSync("node", [CHECK, "--agent", "a"], { env, encoding: "utf8" });
-  const sess = spawnSync("node", [CHECK, "--agent", "a", "--session", "A"], {
-    env,
-    encoding: "utf8",
-  });
-  check(
-    "#1 identity-level probe sees nothing (twin advanced the marker)",
-    idp.status === 1,
-    { status: idp.status, err: idp.stderr },
-  );
-  check(
-    "#1 --session probe wakes the lagging private session (exit 0)",
-    sess.status === 0,
-    { status: sess.status, out: sess.stdout, err: sess.stderr },
-  );
-  const parsed = sess.status === 0 ? JSON.parse(sess.stdout) : null;
-  check(
-    "#1 --session probe reports the session's own unread count",
-    !!parsed && parsed.unread === 3,
-    parsed,
-  );
-  rmSync(dir, { recursive: true, force: true });
-}
 
 // --- #2: advertised content schema admits objects; runtime still validates ---
 await (async () => {
@@ -116,8 +72,14 @@ await (async () => {
     send({ jsonrpc: "2.0", id: i, method: "tools/call", params: { name, arguments: args } });
     return wait(i);
   };
+  // Bind first: room administration is epoch-fenced.
+  await call("create_persona", {
+    brand: "testbrand",
+    model: "testmodel",
+    version: "1",
+  });
   await call("create_room", { name: "schema-room" });
-  await call("join_room", { room: "schema-room", agent_id: "u" });
+  await call("join_room", { room: "schema-room" });
   const obj = await call("post_message", { content: { plan: "x", steps: [1, 2] } });
   const str = await call("post_message", { content: "plain" });
   const num = await call("post_message", { content: 42 });
@@ -135,9 +97,9 @@ await (async () => {
 // --- #3: store-level metadata caps match the MCP schema caps ------------------
 {
   const s = new ChatStore(":memory:");
-  const r = s.createRoom("room", null, null).id;
-  s.upsertAgent("a", null, null, null);
-  s.joinRoom(r, "a");
+  const r = mkRoom(s, "room", null, null).id;
+  mkAgent(s, "a");
+  s.joinRoom(r, "a", EPOCH1, {});
   const threw = (fn) => {
     try {
       fn();
@@ -148,96 +110,32 @@ await (async () => {
   };
   check(
     "#3 store rejects a 120k-char claim key",
-    /exceeds 500/.test(threw(() => s.claimResource(r, "k".repeat(120_000), "a", 900, null))),
+    /exceeds 500/.test(threw(() => s.claimResource(r, "k".repeat(120_000), "a", EPOCH1, 900, null))),
     null,
   );
   check(
     "#3 store rejects a 201-char room name",
-    /exceeds 200/.test(threw(() => s.createRoom("n".repeat(201), null, null))),
+    /exceeds 200/.test(threw(() => mkRoom(s, "n".repeat(201), null, null))),
     null,
   );
   check(
     "#3 store rejects a 201-char agent id",
-    /exceeds 200/.test(threw(() => s.upsertAgent("i".repeat(201), null, null, null))),
+    /exceeds 200/.test(threw(() => mkAgent(s, "i".repeat(201)))),
     null,
   );
   check(
     "#3 store rejects a 201-char mention id",
     /exceeds 200/.test(
-      threw(() => s.postMessage(r, "a", "x", "text", ["m".repeat(201)], null)),
+      threw(() => s.postMessage(r, "a", "x", "text", ["m".repeat(201)], null, null, EPOCH1)),
     ),
     null,
   );
   // At-cap values still pass (the MCP schema allows exactly these lengths).
-  const ok = s.claimResource(r, "k".repeat(500), "a", 900, null);
+  const ok = s.claimResource(r, "k".repeat(500), "a", EPOCH1, 900, null);
   check("#3 at-cap 500-char key is still granted", ok.granted === true, ok);
   s.close();
 }
 
-// --- #4: a live session's mute survives past the GC age -----------------------
-{
-  const dir = mkdtempSync(join(tmpdir(), "v084-tomb-"));
-  const DB = join(dir, "t.db");
-  const s = new ChatStore(DB);
-  const r = s.createRoom("room", null, null).id;
-  for (const id of ["a", "b", "c"]) s.upsertAgent(id, null, null, null);
-  s.joinRoom(r, "a", "A", "A");
-  s.joinRoom(r, "a", "B", "B"); // twin keeps the identity present
-  s.joinRoom(r, "b", null, "BOB");
-  s.postMessage(r, "b", "hi @a", "text", ["a"], null);
-  s.leaveRoom(r, "a", "A"); // session A mutes the room
-  // Simulate the tombstone approaching the GC age while session A stays
-  // alive and polling: its next touch must refresh the LEFT row too.
-  const raw = new Database(DB);
-  raw
-    .prepare(
-      "UPDATE session_presence SET updated_at = datetime('now','-8 days') WHERE session_id = 'A'",
-    )
-    .run();
-  raw.close();
-  s.touchSessionAlive("A", "a"); // as session A's next tool call would
-  s.joinRoom(r, "c", null, "C"); // runs the GC
-  const inbox = s.myMentions("a", 50, undefined, 100000, "A", 0);
-  check(
-    "#4 live session's mute survives past the GC age",
-    inbox.messages.length === 0,
-    inbox.messages.length,
-  );
-  s.close();
-  rmSync(dir, { recursive: true, force: true });
-}
-
-// --- #5: an ordinary touch reconciles a crashed twin in the active room -------
-{
-  const dir = mkdtempSync(join(tmpdir(), "v084-gc-"));
-  const DB = join(dir, "t.db");
-  const s = new ChatStore(DB);
-  const r = s.createRoom("room", null, null).id;
-  s.upsertAgent("live", null, null, null);
-  s.upsertAgent("dead", null, null, null);
-  s.joinRoom(r, "live", null, "L");
-  s.joinRoom(r, "dead", null, "D"); // this session then crashes
-  const raw = new Database(DB);
-  raw
-    .prepare(
-      "UPDATE session_presence SET updated_at = datetime('now','-8 days') WHERE session_id = 'D'",
-    )
-    .run();
-  raw.close();
-  s.touch(r, "live", "L"); // an ordinary tool-call touch
-  check(
-    "#5 touch reaps a crashed twin's stale presence",
-    s.getMembership(r, "dead").left_at !== null,
-    s.getMembership(r, "dead"),
-  );
-  check(
-    "#5 the live toucher stays present",
-    s.getMembership(r, "live").left_at === null,
-    s.getMembership(r, "live"),
-  );
-  s.close();
-  rmSync(dir, { recursive: true, force: true });
-}
 
 console.log(`\n${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"}`);
 process.exit(failures === 0 ? 0 : 1);

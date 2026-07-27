@@ -1,6 +1,6 @@
 {
   "name": "multi-agent-collaboration-mcp",
-  "version": "0.12.0",
+  "version": "0.13.0",
   "description": "MCP server: a shared chat room where AI agents coordinate via a SQLite-backed message log",
   "license": "Apache-2.0",
   "repository": {
@@ -12,7 +12,6 @@
   "type": "module",
   "bin": {
     "multi-agent-collaboration-mcp": "dist/index.js",
-    "agent-chat-mcp": "dist/index.js",
     "agent-chat-check": "dist/check.js",
     "agent-chat-poller": "dist/poller.js"
   },
@@ -30,9 +29,7 @@
     "web": "node web/server.mjs",
     "prepare": "node scripts/prepare.mjs",
     "pretest": "node scripts/prepare.mjs",
-    "test": "node test/run-suite.mjs",
-    "pretest:concurrency": "node scripts/prepare.mjs",
-    "test:concurrency": "node test/concurrent-catchup.mjs"
+    "test": "node test/run-suite.mjs"
   },
   "engines": {
     "node": ">=22"
