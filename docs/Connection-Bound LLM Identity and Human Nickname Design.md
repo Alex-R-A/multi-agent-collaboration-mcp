@@ -1,17 +1,17 @@
 # Connection-Bound LLM Identity and Human Nickname Design
 
-Status: proposed implementation specification, no implementation has been
-applied.
+Status: implemented in source and verified with disposable builds on
+2026-07-28. The generated `dist` tree and live database remain on the old build
+until the stopped-service destructive cutover.
 
 Prepared on 2026-07-27 against repository commit `67509be`.
 
 This document supersedes the persona creation, resume/takeover, runtime
 attachment, model-transition, and human-name recommendations in
-`AI Chat MCP Product Friction and Design Direction.md`. Until implementation,
-`README.md` and `docs/Installation.md` remain authoritative descriptions of the
-running product. After implementation, they must be rewritten to this contract.
-This document does not supersede unrelated messaging, role, retention,
-listener, or host-wake decisions.
+`AI Chat MCP Product Friction and Design Direction.md`. `README.md` and
+`docs/Installation.md` describe the resulting user workflow. This document does
+not supersede unrelated messaging, role, retention, listener, or host-wake
+decisions.
 
 ## Purpose and decision posture
 
@@ -117,8 +117,9 @@ reason is that human numbering solves accidental collision only; it should be
 removed if users expect it to provide ownership or cross-device identity
 without adding authentication.
 
-No performance comparison is claimed. The proposed paths do not exist yet, so
-there is nothing meaningful to benchmark.
+No before-and-after performance comparison was run. The added first-identify,
+model-transition, and human-allocation writes are not hot paths; that expected
+cost direction remains unmeasured.
 
 ## Settled requirements
 
@@ -165,8 +166,9 @@ there is nothing meaningful to benchmark.
 - Returning from tuple A to tuple B and later back to tuple A creates three
   distinct nicknames. A retired nickname is never reactivated.
 
-- The existing `runtime_epoch` fence remains. Connection binding does not
-  replace transaction-time epoch checks.
+- The stale-operation fence is the immutable `agent_id` plus a transaction-time
+  check that its row exists and is not retired. There is no separate tenure
+  counter because an ID is never rebound.
 
 - The lowercase `human-` prefix is reserved for HTML human participants.
 
@@ -306,14 +308,14 @@ database is not by itself proof that the current process created it.
 | --- | --- | --- |
 | This process has never bound, and no row has its generated nonce | Any valid tuple | Allocate a new nickname and record the binding |
 | This process has never bound, but a row already has its generated nonce | Any valid tuple | Treat this as a UUID collision, generate another nonce, and retry without reusing that row |
-| This process has recorded a binding, and the expected agent ID, epoch, and nonce all match the row | Exact match | Return the same nickname and epoch without mutation |
-| This process has recorded a binding, and the expected agent ID, epoch, and nonce all match the row | Any field differs | Retire the old persona and allocate a new bound persona atomically |
+| This process has recorded a binding, and the expected agent ID and nonce both match the live row | Exact match | Return the same nickname without mutation |
+| This process has recorded a binding, and the expected agent ID and nonce both match the live row | Any tuple field differs | Retire the old persona and allocate a new bound persona atomically |
 | This process has recorded a binding, but its expected row is missing or any binding field differs | Any tuple | Fail with `persona_lost` or an integrity error; never attach to a row merely because its nonce matches |
 | Rows exist for other nonces or retired tuples | Same or different tuple | Ignore them for binding and allocate a distinct nickname |
 
 The process nonce is mutable only before the first successful binding so the
 UUID-collision retry is real rather than documentary. After binding, the
-process records the expected agent ID, epoch, and nonce and does not regenerate
+process records the expected agent ID and nonce and does not regenerate
 or recover them from an arbitrary database row.
 
 The response must include:
@@ -323,7 +325,6 @@ The response must include:
 - `model`
 - `version`
 - `persona_description`
-- `runtime_epoch`
 - `binding_reused`
 - `identity_changed`
 - `previous_agent_id` when a transition occurred
@@ -340,7 +341,7 @@ The response must not include:
 - a caller-reusable nickname token
 - a claim that the model tuple was verified
 
-`whoami` continues to report the current persona tuple, agent ID, epoch, room,
+`whoami` continues to report the current persona tuple, agent ID, room,
 and role. It does not report the connection nonce.
 
 An unbound persona-scoped call must instruct the caller to invoke
@@ -397,8 +398,6 @@ The complete transition runs in one `IMMEDIATE` transaction:
 
 - Set the old row's `retired_at`.
 
-- Increment the old row's `runtime_epoch`.
-
 - Set `left_at` and `last_seen` on every old membership that is still present.
   Keep the rows, roles, cursors, and join timestamps as historical state.
 
@@ -407,33 +406,61 @@ The complete transition runs in one `IMMEDIATE` transaction:
 - Delete every advisory claim owned by the old persona. Do not transfer claims.
 
 - Allocate and insert the new persona with the same process connection nonce,
-  the offered tuple, a fresh nickname, epoch 1, and no memberships.
+  the offered tuple, a fresh nickname, and no memberships.
 
 - Commit before changing process-local session state.
 
 If nickname allocation or any cleanup fails, the transaction rolls back and the
 old binding remains intact.
 
-After commit, replace `session.agentId` and `session.epoch` with the new values
+After commit, replace `session.agentId` with the new value
 and clear `session.roomId`. Do not copy an active room, membership, cursor,
 role, claim, mention inbox, or listener lease.
 
-Every old in-flight mutation and marker-advancing read keeps the old ID and
-epoch it captured. The increment makes its existing transaction-time epoch gate
-fail with terminal `persona_lost`. An old poller command detects the changed
-epoch and exits as stale. Checking `retired_at` in every guarded operation could
-provide another fence, but the repository already has the epoch gate across
-these paths. Reusing that established fence is the smaller change; connection
-uniqueness alone is not a replacement for it.
+Every old in-flight mutation and marker-advancing read keeps the old
+agent ID it captured. Retiring that row makes its transaction-time liveness
+gate fail with terminal `persona_lost`. An old poller command sees the retired
+identity and exits.
+
+No separate generation counter is stored. Under this design it would repeat
+information already carried by `retired_at`, because an ID has no second
+tenure to distinguish. The fence is the immutable `agent_id` plus the row's
+live state. Every persona-authored write and every marker-advancing read
+verifies inside its own transaction that the captured `agent_id` still EXISTS
+and has `retired_at IS NULL`. A superseded operation carries an id whose row is
+now retired, and that is what refuses it.
+
+This invariant must not be weakened:
+
+- An LLM `agent_id` is allocated once, is NEVER deleted, is never reinserted,
+  and is never revived or rebound. Retired rows remain tombstones forever.
+  Allocation is `INSERT ... ON CONFLICT(id) DO NOTHING`, so a retired id can
+  never be taken again.
+- No supported path ever sets `connection_id` non-null on an EXISTING row.
+  Binding happens only at insert. Exact tuple reuse keeps the same live row; a
+  changed tuple allocates a different id.
+- Because an id therefore names exactly one tenure for the life of the
+  database, wait leases key on `(room_id, agent_id)` with no tenure column, and
+  a late cleanup from a superseded identity cannot reach a successor's row: the
+  successor is a different id.
+
+If id recurrence were ever reintroduced, this fence would break and a
+generation fence would be needed. That is why the never-delete, never-rebind
+rule is stated here rather than left implicit in the allocation code.
+
+The connection nonce does not fence operations either: it is CONSTANT for a
+process, so it cannot tell a pre-transition in-flight write from a
+post-transition one. It answers a different question, which is whether this
+process owns this row, and it is checked where identification and retirement
+need it.
 
 ### Process shutdown and hard crash
 
 Normal stdin EOF and graceful shutdown should retire the process's currently
 bound persona after tool requests and wait cleanup have finished. The update
-must match the exact expected `agent_id`, `runtime_epoch`, and `connection_id`
+must match the exact expected `agent_id` and `connection_id`
 captured by this process:
 
-- increment the epoch
 - clear the connection nonce
 - set retirement time
 - soft-leave present memberships
@@ -612,7 +639,6 @@ migration.
 | `connection_id` | New nullable text process nonce, non-null only for a currently bound LLM row |
 | `human_base` | New nullable text, non-null only for human rows |
 | `human_ordinal` | New nullable positive integer, non-null only for human rows |
-| `runtime_epoch` | Retained monotonic integer, default 1 |
 | `retired_at` | New nullable UTC database timestamp, used only for terminally retired LLM rows |
 | `description` | Existing nullable text |
 | `created_at` | Existing creation timestamp |
@@ -722,7 +748,7 @@ Remove:
 Retain and adapt:
 
 - `PersonaLostError`, with retirement/replacement wording
-- `runtime_epoch` checks inside every guarded transaction
+- existence and `retired_at IS NULL` checks inside every guarded transaction
 - atomic random nickname insertion and retry
 
 Add store operations for:
@@ -762,8 +788,8 @@ Additional changes are required:
   whose `retired_at` is non-null. Active and resumably left human identities
   continue to protect unread messages.
 
-- Retirement must delete wait leases immediately even though epoch fencing also
-  makes an old waiter fail. The row must not advertise a dead watcher.
+- Retirement must delete wait leases immediately even though the liveness check
+  also makes an old waiter fail. The row must not advertise a dead watcher.
 
 - Retirement must apply the selected claim policy explicitly. Membership state
   alone does not affect claims.
@@ -775,7 +801,7 @@ mentions, replies, and search results remain readable.
 
 Add a process-level `connectionId` generated with `randomUUID()`, plus an
 explicit flag recording whether this process has completed a binding. Retain
-the existing session agent ID, epoch, and active room. The nonce can be
+the existing session agent ID and active room. The nonce can be
 regenerated only while that flag is false.
 
 The database mapping and the process's recorded binding must agree for identify
@@ -803,7 +829,7 @@ Required race behavior:
 - A nickname-token collision retries inside the same transition transaction.
   Exhaustion rolls the transition back.
 
-- A stale old-epoch mutation that races retirement either commits before the
+- A stale mutation under a superseded identity that races retirement either commits before the
   retirement transaction or fails after it. It cannot commit under old
   authority after retirement.
 
@@ -1079,7 +1105,7 @@ supported operation.
 - Replace `tryCreatePersona` and `attachPersona` with atomic connection-aware
   identification and retirement operations.
 
-- Retain epoch fencing and change takeover wording to identity replacement or
+- Retain the liveness fence and change takeover wording to identity replacement or
   retirement.
 
 - Add retired state to agent and recipient result types.
@@ -1095,7 +1121,7 @@ supported operation.
 - Import `randomUUID` and create one process connection nonce.
 
 - Extend process session state with binding-established state and the expected
-  agent ID, epoch, and nonce used by collision handling and cleanup guards.
+  agent ID and nonce used by collision handling and cleanup guards.
 
 - Replace `create_persona` and `resume_persona` registration with
   `identify_persona`.
@@ -1114,8 +1140,7 @@ supported operation.
 - Clear the active room after a tuple transition.
 
 - Run graceful retirement during shutdown after active requests finish and
-  before the store closes, guarded by exact expected agent ID, epoch, and
-  nonce.
+  before the store closes, guarded by exact expected agent ID and nonce.
 
 - Add bounded stderr connection and identity diagnostics.
 
@@ -1124,7 +1149,7 @@ supported operation.
 
 ### `src/poller.ts`
 
-- Keep owner-PID and epoch checks.
+- Keep the owner-PID check as the generated-watcher marker and heartbeat gate.
 
 - Update stale-binding and recovery text that currently assumes a newer runtime
   took over the same persona.
@@ -1199,7 +1224,7 @@ assuming the probe and production lifecycle are equivalent.
 ### Tests
 
 `test/features-persona.mjs` requires the largest rewrite because it currently
-specifies resume words, latest-resume takeover, tuple mismatch, epoch races,
+specifies resume words, latest-resume takeover, tuple mismatch, tenure races,
 wait fencing, and poller behavior.
 
 Identity setup or expectations also occur in:
@@ -1279,9 +1304,9 @@ one is added.
 | Two processes, same tuple | Start two actual MCP subprocesses concurrently and inspect distinct UUID mappings and IDs | Sequential in-memory test never crosses the process boundary | One persona is intentionally a shared work queue |
 | First-bind UUID collision | Inject a deterministic duplicate UUID, start an unbound process, and assert it regenerates before allocation | Test creates the collision only after process binding, which exercises a different integrity failure | UUID generation cannot be injected or controlled in tests |
 | Process restart | Stop one real subprocess gracefully, start another with the same tuple, inspect retirement and new ID | Test changes tuple too, so it never proves restart isolation | Stable identity across process restarts becomes required |
-| Guarded graceful shutdown | Change the expected epoch or nonce before cleanup and assert shutdown mutates no row | Cleanup succeeds only in the matching case and an unguarded delete remains | Shutdown is allowed to retire a replacement binding |
+| Guarded graceful shutdown | Change the expected nonce before cleanup and assert shutdown mutates no row | Cleanup succeeds only in the matching case and an unguarded delete remains | Shutdown is allowed to retire a replacement binding |
 | Hard kill | Kill a bound process without cleanup, start another, and verify the stale nonce grants no authority while its memberships remain stale | Only graceful shutdown is tested, hiding the accepted ghost behavior | Product requirements demand immediately accurate membership, pending work, and pruning after crashes |
-| Epoch fencing | Race old post, advancing read, wait, and poller operations against tuple transition | Only the row epoch changes while a stale transaction commits | Connection transition is externally serialized before any old operation can exist |
+| Liveness fencing | Race old post, advancing read, wait, and poller operations against tuple transition | Only the row is marked retired while a stale transaction commits | Connection transition is externally serialized before any old operation can exist |
 | LLM schema shapes | Attempt every SQL-enforced valid and invalid direct shape, then exercise store-only trim and UUID validation | MCP validation passes while direct web or SQL writers create half-rows | Direct database writers are removed entirely |
 | Version preservation | Identify with `"5.0"` and assert exact response, row value, tuple reuse, and `v5-0` slug | Nickname looks correct after numeric coercion while structured value became `"5"` | Model versions are deliberately numeric |
 | Reserved human prefix | Identify an LLM tuple whose normalized base starts `human-` and assert a distinct `llm-human-...` ID within 200 characters | Only the common allocator path is tested, so human and LLM namespaces can overlap | The two populations move to separate ID columns or namespaces |
@@ -1340,7 +1365,7 @@ The implementation is complete only when all of these are true:
 - One process reporting a changed tuple receives a new nickname, while the old
   nickname remains in history but has no current binding or operational state.
 
-- Old-epoch writes, advancing reads, waits, and pollers cannot act after an
+- Writes, advancing reads, waits, and pollers under a superseded identity cannot act after an
   explicit transition.
 
 - The exact string `"5.0"` survives input, database storage, response, and
@@ -1388,11 +1413,11 @@ The implementation is complete only when all of these are true:
 | No resume credentials or aliases | Settled | Restart continuity is lost | Owner reverses the clean-break and no-takeover requirement |
 | Version as exact string | Settled | Callers can still self-report it inconsistently | Trusted host metadata becomes available |
 | Exact trimmed tuple comparison | Recommend | Case-only variation creates a new persona | Provider normalization rules become authoritative |
-| Preserve epoch fencing | Recommend | Every guarded transaction keeps a lookup | Proof that no old asynchronous operation can overlap a transition |
+| Immutable agent IDs fence stale operations | Settled, owner-approved | A generation token would distinguish tenures if IDs ever recurred | Reintroduction of ID reuse, deletion, or rebinding |
 | Soft-leave retired LLM memberships | Recommend, contested | Dead roles and cursors consume storage and query complexity | Historical departed membership is explicitly not required |
 | Ignore retired LLM memberships in pruning | Required with soft leave | It permits pruning data the retired participant never read | Retired LLM identities must retain unread veto power |
 | Delete claims at retirement | Recommend, contested | External work may continue after the persona disappears | Real workflows require claim exclusivity beyond persona life |
-| Delete wait leases at retirement | Recommend | Epoch and TTL already bound them | Immediate watcher truth is not required |
+| Delete wait leases at retirement | Recommend | TTL expiry and retired-identity checks eventually make them harmless | Immediate watcher truth is not required |
 | Exact-guarded graceful shutdown retirement | Recommend | A transient restart permanently changes names | Cross-process identity continuity becomes required |
 | No crash timeout reaper | Recommend | Hard crashes leave stale structural bindings | A reliable liveness source can distinguish idle from dead |
 | Human IDs use `human-base-N` | Settled | Numbers imply ownership and add allocation state | Human authentication or shared-by-base semantics becomes required |
@@ -1428,23 +1453,25 @@ Repository sources inspected for this specification:
 - `package.json`
 - `package-lock.json`
 
-Verified current facts include:
+Baseline facts verified before implementation included:
 
 - one `StdioServerTransport` and one process-local session per server process
 - handler-start ordering around process-local identity state
 - process-generated probe UUID and null stdio transport session ID in the
   supplied Claude runs
 - string-valued MCP version input and SQLite text storage
-- current random semantic LLM nickname allocation and atomic retry
-- current resume-word schema and takeover API
-- current fresh-schema-only initialization
-- current human self-chosen ID insert and browser localStorage behavior
-- current ungated web leave endpoint
-- current prune blocker queries include left memberships, which is why retired
+- random semantic LLM nickname allocation and atomic retry
+- the resume-word schema and takeover API this design replaces
+- fresh-schema-only initialization
+- the self-chosen human ID insert and browser localStorage behavior this design
+  replaces
+- the ungated web leave endpoint this design replaces
+- prune blocker queries included left memberships, which is why retired
   LLM rows need an explicit exclusion
-- current viewer display of LLM model plus secondary canonical ID
-- current cached viewer SQLite handles
+- viewer display of LLM model plus secondary canonical ID
+- cached viewer SQLite handles
 
-No implementation, build, benchmark, browser run, or test execution is claimed
-by this document. The probe observations came from owner-supplied output and
-were not rerun during this documentation task.
+This document records the design and its evidence. The status at the top records
+source implementation, disposable-build verification, and the intentionally
+deferred live cutover. The probe observations came from owner-supplied output
+and were not rerun while this document was prepared.

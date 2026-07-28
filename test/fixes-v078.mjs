@@ -6,7 +6,7 @@
 //  #4  list_rooms is KEYSET-paged (after_id/next_id), so a room deleted between
 //      pages can no longer shift OFFSET and skip a still-live room.
 import { ChatStore } from "../dist/db.js";
-import { EPOCH1, mkAgent, mkRoom, rmRoom } from "./persona-helpers.mjs";
+import { mkAgent, mkRoom, rmRoom } from "./persona-helpers.mjs";
 
 let failures = 0;
 const check = (n, c, x) => {
@@ -20,10 +20,10 @@ const check = (n, c, x) => {
   const r = mkRoom(s, "room", null, null).id;
   mkAgent(s, "w");
   mkAgent(s, "p");
-  s.joinRoom(r, "w", EPOCH1, {});
-  s.joinRoom(r, "p", EPOCH1, {});
+  s.joinRoom(r, "w", {});
+  s.joinRoom(r, "p", {});
   const N = 60; // > default limit 50, but all fit well inside 100k bytes
-  for (let i = 0; i < N; i++) s.postMessage(r, "p", "hi " + i, "text", ["w"], null, null, EPOCH1);
+  for (let i = 0; i < N; i++) s.postMessage(r, "p", "hi " + i, "text", ["w"], null, null);
 
   const page = s.myMentions("w", 50, undefined, 100000, 0);
   check(
@@ -62,9 +62,9 @@ const check = (n, c, x) => {
   const r2 = mkRoom(s2, "room", null, null).id;
   mkAgent(s2, "w");
   mkAgent(s2, "p");
-  s2.joinRoom(r2, "w", EPOCH1, {});
-  s2.joinRoom(r2, "p", EPOCH1, {});
-  for (let i = 0; i < 50; i++) s2.postMessage(r2, "p", "hi " + i, "text", ["w"], null, null, EPOCH1);
+  s2.joinRoom(r2, "w", {});
+  s2.joinRoom(r2, "p", {});
+  for (let i = 0; i < 50; i++) s2.postMessage(r2, "p", "hi " + i, "text", ["w"], null, null);
   const exact = s2.myMentions("w", 50, undefined, 100000, 0);
   check(
     "exactly `limit` directed messages emits NO false byte_limited",

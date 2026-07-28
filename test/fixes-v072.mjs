@@ -15,7 +15,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { EPOCH1, mkAgent, bindArgs, mkRoom } from "./persona-helpers.mjs";
+import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
@@ -45,12 +45,12 @@ const throws = (fn, re) => {
   const r = mkRoom(s, "r", null, null).id;
   mkAgent(s, "a");
   mkAgent(s, "b");
-  s.joinRoom(r, "a", EPOCH1, {});
-  s.joinRoom(r, "b", EPOCH1, {});
+  s.joinRoom(r, "a", {});
+  s.joinRoom(r, "b", {});
   check(
     "store write with a NUL body is rejected in JS",
     throws(
-      () => s.postMessage(r, "b", "p" + NUL + "q", "text", null, null, null, EPOCH1),
+      () => s.postMessage(r, "b", "p" + NUL + "q", "text", null, null, null),
       /NUL/,
     ),
     null,
@@ -70,7 +70,7 @@ const throws = (fn, re) => {
   check("direct NUL insert is rejected by the DB trigger", rejected, null);
   // The trigger must not be over-broad: a legal body still lands, and stays
   // searchable, so the guard is not passing by rejecting everything.
-  s.postMessage(r, "b", "abc def", "text", null, null, null, EPOCH1);
+  s.postMessage(r, "b", "abc def", "text", null, null, null);
   check(
     "a legal body still writes and is searchable",
     s.searchMessages(r, "def", 10).matches.length === 1,
@@ -86,8 +86,8 @@ const throws = (fn, re) => {
   const s = new ChatStore(":memory:");
   const r = mkRoom(s, "r", null, null).id;
   mkAgent(s, "u");
-  mkAgent(s, "a"); mkAgent(s, "b"); s.joinRoom(r, "a", EPOCH1, {}); s.joinRoom(r, "b", EPOCH1, {});
-  s.postMessage(r, "b", "\u{1F600}".repeat(200), "text", null, null, null, EPOCH1); // 200 emoji = 200 codepoints, 400 UTF-16
+  mkAgent(s, "a"); mkAgent(s, "b"); s.joinRoom(r, "a", {}); s.joinRoom(r, "b", {});
+  s.postMessage(r, "b", "\u{1F600}".repeat(200), "text", null, null, null); // 200 emoji = 200 codepoints, 400 UTF-16
   const hist = s.readHistory(r, 1, undefined, 100).messages[0]; // preview cut
   const gm = s.getMessage(r, 1, 0, 100);
   check(
@@ -102,12 +102,14 @@ const throws = (fn, re) => {
 {
   const s = new ChatStore(":memory:");
   const r = mkRoom(s, "r", null, null).id;
-  mkAgent(s, "a"); mkAgent(s, "b"); s.joinRoom(r, "a", EPOCH1, {}); s.joinRoom(r, "b", EPOCH1, {});
+  mkAgent(s, "a"); mkAgent(s, "b"); s.joinRoom(r, "a", {}); s.joinRoom(r, "b", {});
   // 300 rows: empty body, but a big mentions list each (~2000 chars serialized).
   const bigMentions = Array.from({ length: 100 }, (_, i) => "agent-" + String(i).padStart(4, "0"));
-  for (let i = 0; i < 300; i++) s.postMessage(r, "b", "", "text", bigMentions, null, null, EPOCH1);
+  for (let i = 0; i < 300; i++) {
+    s.postMessage(r, "b", "", "text", bigMentions, null, null);
+  }
   const heapBefore = process.memoryUsage().heapUsed;
-  const page = s.catchUp(r, "a", 500, undefined, 100_000, EPOCH1);
+  const page = s.catchUp(r, "a", 500, undefined, 100_000);
   const heapGrowth = process.memoryUsage().heapUsed - heapBefore;
   check("catch_up over huge-mention rows fits max_bytes", size(page) <= 100_000, size(page));
   check("catch_up delivers at least one and flags more remain", page.messages.length >= 1 && page.byte_limited === true, page.messages.length);
@@ -141,7 +143,6 @@ const throws = (fn, re) => {
     const s = new ChatStore(DB);
     mkRoom(s, "joined-room", null, null);
     mkRoom(s, "other-room", null, null);
-    mkAgent(s, "u");
     mkAgent(s, "never-joined");
     s.close();
   }
@@ -176,7 +177,12 @@ const throws = (fn, re) => {
   await w(1);
   s({ jsonrpc: "2.0", method: "notifications/initialized" });
 
-  await call("resume_persona", bindArgs("u"));
+  const identified = await call("identify_persona", {
+    brand: "wait",
+    model: "membership-client",
+    version: "1.0",
+  });
+  const mcpAgentId = identified.data.agent_id;
 
   const noMemberships = await call("wait_for_messages", {});
   check(
@@ -192,7 +198,13 @@ const throws = (fn, re) => {
   check("wait_for_messages refuses a room you never joined", notJoined.isErr && /never joined/.test(notJoined.data.error), notJoined);
   // The joined room works.
   const ok = await call("wait_for_messages", {});
-  check("wait_for_messages returns a command for a joined identity", typeof ok.data.command === "string" && ok.data.command.includes("--agent 'u'"), ok.data);
+  check(
+    "wait_for_messages returns a command for a joined identity",
+    typeof ok.data.command === "string" &&
+      ok.data.command.includes(`--agent '${mcpAgentId}'`) &&
+      ok.data.command.includes("--owner-pid"),
+    ok.data,
+  );
   // Leave the only room, then unscoped watch -> refuse (would exit 2).
   await call("leave_room", {});
   const noRooms = await call("wait_for_messages", {});
@@ -203,13 +215,12 @@ const throws = (fn, re) => {
       /join_room/.test(noRooms.data.error),
     noRooms,
   );
-  child.kill();
 
   // Poller: zero-padded value accepted, huge value rejected.
   {
     const setup = new ChatStore(DB);
     mkAgent(setup, "w");
-    setup.joinRoom(1, "w", EPOCH1, {});
+    setup.joinRoom(1, "w", {});
     setup.close();
   }
   const POLLER = join(ROOT, "dist", "poller.js");
@@ -227,7 +238,7 @@ const throws = (fn, re) => {
   );
   const leftAllPoller = spawnSync(
     "node",
-    [POLLER, "--agent", "u", "--timeout", "1"],
+    [POLLER, "--agent", mcpAgentId, "--timeout", "1"],
     { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20_000 },
   );
   check(
@@ -249,7 +260,7 @@ const throws = (fn, re) => {
   );
   const leftAllCheck = spawnSync(
     "node",
-    [CHECK, "--agent", "u", "--db", DB],
+    [CHECK, "--agent", mcpAgentId, "--db", DB],
     { encoding: "utf8", timeout: 20_000 },
   );
   check(
@@ -263,6 +274,14 @@ const throws = (fn, re) => {
   const huge = spawnSync("node", [POLLER, "--agent", "w", "--interval", "99999999999", "--timeout", "1"], { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20_000 });
   check("poller rejects a genuinely huge --interval", huge.status === 2 && /between 5 and 3600/.test(huge.stderr), { status: huge.status, stderr: huge.stderr });
 
+  if (child.exitCode === null && child.signalCode === null) {
+    const closed = new Promise((resolve) => child.once("close", resolve));
+    // Keep the left-all-rooms fixture live through both CLI checks. A graceful
+    // shutdown retires the identity, and retirement correctly outranks
+    // membership state.
+    child.kill("SIGKILL");
+    await closed;
+  }
   rmSync(dir, { recursive: true, force: true });
 }
 

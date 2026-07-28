@@ -14,13 +14,14 @@
 // - poller: base-10 --interval, sleep child dies with the script
 // - check: unsafe-integer --since rejected
 import { spawn, spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdtempSync, rmSync, statSync, existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 import { ChatStore } from "../dist/db.js";
-import { EPOCH1, mkAgent, bindArgs, mkRoom, rmRoom } from "./persona-helpers.mjs";
+import { mkAgent, mkRoom, rmRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
@@ -116,15 +117,20 @@ function mcpClient(env) {
   {
     const s = new ChatStore(DB);
     const r = mkRoom(s, "strict", null, null).id;
-    mkAgent(s, "me");
     mkAgent(s, "other");
-    s.joinRoom(r, "other", EPOCH1, {});
-    for (let i = 1; i <= 3; i++) s.postMessage(r, "other", "m" + i, "text", null, null, null, EPOCH1);
+    s.joinRoom(r, "other", {});
+    for (let i = 1; i <= 3; i++) {
+      s.postMessage(r, "other", "m" + i, "text", null, null, null);
+    }
     s.close();
   }
   const c = mcpClient({ AGENT_CHAT_DB: DB });
   await c.init();
-  await c.call("resume_persona", bindArgs("me"));
+  await c.call("identify_persona", {
+    brand: "strict",
+    model: "schema-client",
+    version: "1.0",
+  });
   await c.call("join_room", { room: "strict" });
 
   const typo = await c.raw("mark_read", { sequence: 0 });
@@ -166,7 +172,7 @@ function mcpClient(env) {
   // be reachable without rebinding.
   const c2 = mcpClient({ AGENT_CHAT_DB: DB });
   await c2.init();
-  const created = await c2.call("create_persona", {
+  const created = await c2.call("identify_persona", {
     brand: "testbrand",
     model: "testmodel",
     version: "1",
@@ -214,26 +220,26 @@ function mcpClient(env) {
   // Before binding a persona: no identity to watch for.
   const preJoin = await cp.raw("wait_for_messages", {});
   check(
-    "wait_for_messages before binding asks you to create or resume a persona",
+    "wait_for_messages before binding asks you to identify a persona",
     !!(preJoin.result && preJoin.result.isError) &&
-      /create_persona|resume_persona/.test(preJoin.result.content[0].text),
+      /identify_persona/.test(preJoin.result.content[0].text),
     preJoin,
   );
-  {
-    const seed = new ChatStore(DB);
-    mkAgent(seed, "poller-user");
-    seed.close();
-  }
-  await cp.call("resume_persona", bindArgs("poller-user"));
+  const pollerPersona = await cp.call("identify_persona", {
+    brand: "poller",
+    model: "runtime",
+    version: "1.0",
+  });
   await cp.call("join_room", { room: "strict" });
   const w = await cp.call("wait_for_messages", {});
   check(
     "wait_for_messages returns a runnable command for THIS identity",
     typeof w.command === "string" &&
       w.command.includes("poller.js") &&
-      w.command.includes("--agent 'poller-user'") &&
-      w.command.includes("--epoch '2'") &&
+      w.command.includes(`--agent '${pollerPersona.agent_id}'`) &&
+      w.command.includes("--owner-pid") &&
       w.command.includes("--ok-on-timeout") &&
+      !w.command.includes("--since") &&
       !w.command.includes("--room") &&
       !w.command.includes("--mentions-only"),
     w.command,
@@ -260,8 +266,8 @@ function mcpClient(env) {
   // The returned command must actually RUN and produce a valid poller verdict,
   // not crash. poller-user joined a room with an unread backlog (seqs 1-3 from
   // "other"), so the deterministic result is exit 0 = "new messages".
-  // Run the WHOLE returned command through `bash -c` (robust to whatever flags
-  // it carries -- e.g. --epoch), appending a short timeout/interval.
+  // Run the WHOLE returned command through `bash -c`, appending a short
+  // timeout/interval.
   const runnable = spawnSync(
     "bash",
     ["-c", `${w.command} --timeout 3 --interval 5`],
@@ -283,11 +289,11 @@ function mcpClient(env) {
   const r = mkRoom(s, "big", null, null).id;
   mkAgent(s, "a");
   mkAgent(s, "b");
-  s.joinRoom(r, "a", EPOCH1, {});
-  s.joinRoom(r, "b", EPOCH1, {});
+  s.joinRoom(r, "a", {});
+  s.joinRoom(r, "b", {});
   const body = "x".repeat(300_000);
-  s.postMessage(r, "b", body, "text", null, null, null, EPOCH1);
-  const page = s.catchUp(r, "a", 50, undefined, 1000, EPOCH1);
+  s.postMessage(r, "b", body, "text", null, null, null);
+  const page = s.catchUp(r, "a", 50, undefined, 1000);
   check("giant body arrives as a stub within max_bytes", JSON.stringify(page).length <= 1000, JSON.stringify(page).length);
   check(
     "stub length is the EXACT full length despite the capped fetch",
@@ -312,9 +318,9 @@ function mcpClient(env) {
   const s = new ChatStore(":memory:");
   const r = mkRoom(s, "esc", null, null).id;
   mkAgent(s, "b");
-  s.joinRoom(r, "b", EPOCH1, {});
+  s.joinRoom(r, "b", {});
   const nuls = "\u0001".repeat(5000);
-  s.postMessage(r, "b", nuls, "text", null, null, null, EPOCH1); // seq 1
+  s.postMessage(r, "b", nuls, "text", null, null, null); // seq 1
   const first = s.getMessage(r, 1, 0, 1000);
   check(
     "escape-heavy slice honors max_chars SERIALIZED (was 6x over)",
@@ -335,7 +341,7 @@ function mcpClient(env) {
   // between a surrogate pair: "ab<emoji>cd" is codepoints a,b,emoji,c,d.
   // Fetching from codepoint 2 returns the WHOLE emoji first (its high
   // surrogate), never a lone low surrogate.
-  s.postMessage(r, "b", "ab\u{1F600}cd", "text", null, null, null, EPOCH1); // seq 2
+  s.postMessage(r, "b", "ab\u{1F600}cd", "text", null, null, null); // seq 2
   const mid = s.getMessage(r, 2, 2, 10);
   check(
     "codepoint offset never splits a surrogate pair",
@@ -354,7 +360,7 @@ function mcpClient(env) {
   const s = new ChatStore(":memory:");
   const r = mkRoom(s, "doomed", null, null).id;
   mkAgent(s, "a");
-  s.joinRoom(r, "a", EPOCH1, {});
+  s.joinRoom(r, "a", {});
   rmRoom(s, r);
   const expectClean = (name, fn) => {
     try {
@@ -374,17 +380,17 @@ function mcpClient(env) {
       );
     }
   };
-  expectClean("postMessage", () => s.postMessage(r, "a", "x", "text", null, null, null, EPOCH1));
-  expectClean("catchUp", () => s.catchUp(r, "a", 50, undefined, 100000, EPOCH1));
-  expectClean("joinRoom", () => s.joinRoom(r, "a", EPOCH1, {}));
-  expectClean("claimResource", () => s.claimResource(r, "k", "a", EPOCH1, 900, null));
-  expectClean("releaseClaim", () => s.releaseClaim(r, "k", "a", EPOCH1));
+  expectClean("postMessage", () => s.postMessage(r, "a", "x", "text", null, null, null));
+  expectClean("catchUp", () => s.catchUp(r, "a", 50, undefined, 100000));
+  expectClean("joinRoom", () => s.joinRoom(r, "a", {}));
+  expectClean("claimResource", () => s.claimResource(r, "k", "a", 900, null));
+  expectClean("releaseClaim", () => s.releaseClaim(r, "k", "a"));
   expectClean("listClaims", () => s.listClaims(r));
-  expectClean("setPinned", () => s.setPinned(r, "a", EPOCH1, "pin"));
-  expectClean("pruneMessages", () => s.pruneMessages(r, "a", EPOCH1, 1, true));
-  expectClean("setRole", () => s.setRole(r, "a", EPOCH1, "x"));
-  expectClean("markRead", () => s.markRead(r, "a", EPOCH1));
-  expectClean("beginWaitLease", () => s.beginWaitLease(r, "a", EPOCH1, 30));
+  expectClean("setPinned", () => s.setPinned(r, "a", "pin"));
+  expectClean("pruneMessages", () => s.pruneMessages(r, "a", 1, true));
+  expectClean("setRole", () => s.setRole(r, "a", "x"));
+  expectClean("markRead", () => s.markRead(r, "a"));
+  expectClean("beginWaitLease", () => s.beginWaitLease(r, "a", 30));
   s.close();
 }
 
@@ -409,8 +415,8 @@ function mcpClient(env) {
   const r1 = s.getRoomByName("one").id;
   mkAgent(s, "longdesc", { description: "D".repeat(2000) });
   mkAgent(s, "plain");
-  s.joinRoom(r1, "longdesc", EPOCH1, {});
-  s.joinRoom(r1, "plain", EPOCH1, {});
+  s.joinRoom(r1, "longdesc", {});
+  s.joinRoom(r1, "plain", {});
   const ag = s.listAgents(r1, 5);
   const ld = ag.agents.find((a) => a.id === "longdesc");
   check(
@@ -421,7 +427,7 @@ function mcpClient(env) {
   const agCut = s.listAgents(r1, 5, undefined, 1);
   check("list_agents honors limit with total", agCut.agents.length === 1 && agCut.total === 2, agCut);
 
-  s.claimResource(r1, "k1", "plain", EPOCH1, 900, "N".repeat(2000));
+  s.claimResource(r1, "k1", "plain", 900, "N".repeat(2000));
   const cl = s.listClaims(r1);
   check(
     "list_claims previews long notes with a flag and total",
@@ -430,8 +436,8 @@ function mcpClient(env) {
   );
 
   mkAgent(s, "gone");
-  s.joinRoom(r1, "gone", EPOCH1, {});
-  s.leaveRoom(r1, "gone", EPOCH1);
+  s.joinRoom(r1, "gone", {});
+  s.leaveRoom(r1, "gone");
   check("presentCount counts only present members", s.presentCount(r1) === 2, s.presentCount(r1));
   s.close();
 }
@@ -441,8 +447,10 @@ function mcpClient(env) {
   const s = new ChatStore(":memory:");
   const r = mkRoom(s, "s", null, null).id;
   mkAgent(s, "b");
-  s.joinRoom(r, "b", EPOCH1, {});
-  for (let i = 1; i <= 5; i++) s.postMessage(r, "b", "needle " + i, "text", null, null, null, EPOCH1);
+  s.joinRoom(r, "b", {});
+  for (let i = 1; i <= 5; i++) {
+    s.postMessage(r, "b", "needle " + i, "text", null, null, null);
+  }
   const seen = new Set();
   let offset = 0;
   let pages = 0;
@@ -470,8 +478,8 @@ if (process.platform !== "win32") {
   const s = new ChatStore(DB);
   const r = mkRoom(s, "p", null, null).id;
   mkAgent(s, "a");
-  s.joinRoom(r, "a", EPOCH1, {});
-  s.postMessage(r, "a", "x", "text", null, null, null, EPOCH1); // force WAL sidecars into being
+  s.joinRoom(r, "a", {});
+  s.postMessage(r, "a", "x", "text", null, null, null); // force WAL sidecars into being
   const mode = (p) => statSync(p).mode & 0o777;
   check("database file is owner-only (0600)", mode(DB) === 0o600, mode(DB).toString(8));
   check("database directory is owner-only (0700)", mode(join(dir, "sub")) === 0o700, mode(join(dir, "sub")).toString(8));
@@ -492,13 +500,13 @@ if (process.platform !== "win32") {
     roomId = mkRoom(s, "w", null, null).id;
     mkAgent(s, "author");
     mkAgent(s, "replier");
-    s.joinRoom(roomId, "author", EPOCH1, {});
-    s.joinRoom(roomId, "replier", EPOCH1, {});
-    s.postMessage(roomId, "author", "the parent", "text", null, null, null, EPOCH1); // seq 1
-    s.postMessage(roomId, "replier", "the reply", "text", null, 1, null, EPOCH1); // seq 2
+    s.joinRoom(roomId, "author", {});
+    s.joinRoom(roomId, "replier", {});
+    s.postMessage(roomId, "author", "the parent", "text", null, null, null); // seq 1
+    s.postMessage(roomId, "replier", "the reply", "text", null, 1, null); // seq 2
     // 30 legal 99k bodies: a 400-row page used to serialize all of them.
     for (let i = 0; i < 30; i++) {
-      s.postMessage(roomId, "author", "B".repeat(99_000), "text", null, null, null, EPOCH1);
+      s.postMessage(roomId, "author", "B".repeat(99_000), "text", null, null, null);
     }
     s.close();
   }
@@ -547,13 +555,12 @@ if (process.platform !== "win32") {
     );
 
     // The same-origin probe below must reach the marker write to get a 200, so a
-    // participant has to be joined through the web API first. It uses a HUMAN
-    // name: "author" is an LLM persona, and a human join naming it is rejected
-    // (that rejection is covered in features-persona.mjs).
+    // participant has to be allocated through the web API first. Canonical
+    // rejoin rejects the LLM author because only human identities may use it.
     const llmCollision = await fetch(`${base}/api/join`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ room: roomId, name: "author" }),
+      body: JSON.stringify({ room: roomId, agent_id: "author" }),
     });
     check(
       "a human web join cannot take an LLM persona's id",
@@ -563,19 +570,36 @@ if (process.platform !== "win32") {
     const wjoin = await fetch(`${base}/api/join`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ room: roomId, name: "human-reader" }),
+      body: JSON.stringify({
+        room: roomId,
+        base_name: "reader",
+        operation_id: randomUUID(),
+      }),
     });
-    check("web join for the origin probes succeeds", wjoin.status === 200, wjoin.status);
+    const webIdentity = await wjoin.json();
+    check(
+      "web join for the origin probes succeeds",
+      wjoin.status === 200 && webIdentity.agent_id === "human-reader-1",
+      { status: wjoin.status, body: webIdentity },
+    );
     const foreign = await fetch(`${base}/api/read`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Origin: "http://localhost:9999" },
-      body: JSON.stringify({ room: roomId, name: "human-reader", seq: 1 }),
+      body: JSON.stringify({
+        room: roomId,
+        agent_id: webIdentity.agent_id,
+        seq: 1,
+      }),
     });
     check("a DIFFERENT localhost port's Origin is rejected", foreign.status === 403, foreign.status);
     const same = await fetch(`${base}/api/read`, {
       method: "POST",
       headers: { "Content-Type": "application/json", Origin: base },
-      body: JSON.stringify({ room: roomId, name: "human-reader", seq: 1 }),
+      body: JSON.stringify({
+        room: roomId,
+        agent_id: webIdentity.agent_id,
+        seq: 1,
+      }),
     });
     check("the viewer's own exact origin is accepted", same.status === 200, same.status);
   } finally {
@@ -615,7 +639,7 @@ if (process.platform !== "win32") {
     const s = new ChatStore(DB);
     const r = mkRoom(s, "q", null, null).id;
     mkAgent(s, "watcher");
-    s.joinRoom(r, "watcher", EPOCH1, {});
+    s.joinRoom(r, "watcher", {});
     s.close();
   }
   const POLLER = join(ROOT, "dist", "poller.js");

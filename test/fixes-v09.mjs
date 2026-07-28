@@ -23,7 +23,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { EPOCH1, mkAgent, mkRoom } from "./persona-helpers.mjs";
+import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
@@ -37,11 +37,13 @@ const check = (n, c, x) => {
   const dir = mkdtempSync(join(tmpdir(), "v09-omit-"));
   const s = new ChatStore(join(dir, "t.db"));
   const r = mkRoom(s, "r", null, null).id;
-  mkAgent(s, "a"); s.joinRoom(r, "a", EPOCH1, {});
+  mkAgent(s, "a"); s.joinRoom(r, "a", {});
   // 10 large replies; preview_chars shrinks them so boundByBytes would fit all
   // it fetched -- but fetchBounded stopped on the raw budget with rows behind.
-  const root = s.postMessage(r, "a", "root", "text", null, null, null, EPOCH1).seq;
-  for (let i = 0; i < 10; i++) s.postMessage(r, "a", "R" + i + ".".repeat(50000), "text", null, root, null, EPOCH1);
+  const root = s.postMessage(r, "a", "root", "text", null, null, null).seq;
+  for (let i = 0; i < 10; i++) {
+    s.postMessage(r, "a", "R" + i + ".".repeat(50000), "text", null, root, null);
+  }
   const th = s.getThread(r, root, 3, 10);
   check(
     "get_thread flags byte_limited when a preview cut hides replies",
@@ -51,7 +53,7 @@ const check = (n, c, x) => {
   // 10 whitespace-heavy JSON matches: reparse compacts them below raw size.
   const gap = " ".repeat(60000);
   for (let i = 0; i < 10; i++) {
-    s.postMessage(r, "a", '["needle",' + gap + '"v' + i + '"]', "json", null, null, null, EPOCH1);
+    s.postMessage(r, "a", '["needle",' + gap + '"v' + i + '"]', "json", null, null, null);
   }
   const sr = s.searchMessages(r, "needle", 20, 0);
   check(
@@ -130,10 +132,14 @@ const check = (n, c, x) => {
   const unbound = await call("join_room", { room: "watch-me" });
   check(
     "join_room before binding a persona is refused, not auto-assigned",
-    unbound.isErr && /create_persona|resume_persona/.test(JSON.stringify(unbound.data)),
+    unbound.isErr && /identify_persona/.test(JSON.stringify(unbound.data)),
     unbound,
   );
-  await call("create_persona", { brand: "testbrand", model: "testmodel", version: "1" });
+  const identified = await call("identify_persona", {
+    brand: "testbrand",
+    model: "testmodel",
+    version: "1.0",
+  });
 
   // A scoped watch requires PRESENT membership. Delivery and visibility have to
   // read the same membership state: a watcher on a room this persona has left
@@ -143,7 +149,9 @@ const check = (n, c, x) => {
   const present = await call("wait_for_messages", { room: "watch-me" });
   check(
     "wait_for_messages arms a scoped watch while present",
-    !present.isErr && typeof present.data.command === "string",
+    !present.isErr &&
+      typeof present.data.command === "string" &&
+      present.data.command.includes(`--agent '${identified.data.agent_id}'`),
     present,
   );
   await call("leave_room", {});
@@ -170,23 +178,22 @@ const check = (n, c, x) => {
   const never = await call("wait_for_messages", { room: "nope-never" });
   check("wait_for_messages still refuses a never-existent room", never.isErr, never);
 
-  // #5: scoped watches carry the live binding, never a frozen --since value. A
-  // baked-in --since re-fires forever once crossed; --epoch instead ties the
-  // watcher to a runtime tenure while every probe reads the CURRENT cursor.
+  // #5: generated watches carry their owner process and never a frozen
+  // --since value. Every probe reads the current cursor.
   await call("join_room", { room: "watch-me" });
   const scoped = await call("wait_for_messages", { room: "watch-me" });
   check(
-    "scoped watch emits --epoch, never --since",
+    "scoped watch carries --owner-pid, never --since",
     !scoped.isErr &&
-      /--epoch /.test(scoped.data.command || "") &&
+      /--owner-pid /.test(scoped.data.command || "") &&
       !/--since /.test(scoped.data.command || ""),
     scoped.data.command,
   );
   const allRooms = await call("wait_for_messages", {});
   check(
-    "all-rooms watch also carries --epoch and omits --since",
+    "all-rooms watch also carries --owner-pid and omits --since",
     !allRooms.isErr &&
-      /--epoch /.test(allRooms.data.command || "") &&
+      /--owner-pid /.test(allRooms.data.command || "") &&
       !/--since /.test(allRooms.data.command || ""),
     allRooms.data.command,
   );
@@ -262,7 +269,7 @@ const check = (n, c, x) => {
 {
   const dir = mkdtempSync(join(tmpdir(), "v09-poll-"));
   const DB = join(dir, "t.db");
-  { const s = new ChatStore(DB); mkRoom(s, "r", null, null); mkAgent(s, "w"); s.joinRoom(1, "w", EPOCH1, {}); s.close(); }
+  { const s = new ChatStore(DB); mkRoom(s, "r", null, null); mkAgent(s, "w"); s.joinRoom(1, "w", {}); s.close(); }
   const POLLER = join(ROOT, "dist", "poller.js");
   const run = (a) => spawnSync("node", [POLLER, ...a], { env: { ...process.env, AGENT_CHAT_DB: DB }, encoding: "utf8", timeout: 20000 });
   const padded = run(["--agent", "w", "--interval", "00000000005", "--timeout", "1"]);
@@ -278,8 +285,10 @@ const check = (n, c, x) => {
   const DB = join(dir, "t.db");
   const s = new ChatStore(DB);
   const r = mkRoom(s, "claims", null, null).id;
-  mkAgent(s, "a"); s.joinRoom(r, "a", EPOCH1, {});
-  for (const k of ["k-a", "k-b", "k-c", "k-d"]) s.claimResource(r, k, "a", EPOCH1, 900, null);
+  mkAgent(s, "a"); s.joinRoom(r, "a", {});
+  for (const k of ["k-a", "k-b", "k-c", "k-d"]) {
+    s.claimResource(r, k, "a", 900, null);
+  }
   const p1 = s.listClaims(r, 2, "");
   check(
     "claims page 1: first two by key, next_key set",
@@ -307,8 +316,8 @@ const check = (n, c, x) => {
 {
   const s = new ChatStore(":memory:");
   const r = mkRoom(s, "r", null, null).id;
-  mkAgent(s, "a"); s.joinRoom(r, "a", EPOCH1, {});
-  s.postMessage(r, "a", "\u{1F600}".repeat(75), "text", null, null, null, EPOCH1); // 75 emoji = 75 cp, 150 UTF-16
+  mkAgent(s, "a"); s.joinRoom(r, "a", {});
+  s.postMessage(r, "a", "\u{1F600}".repeat(75), "text", null, null, null); // 75 emoji = 75 cp, 150 UTF-16
   const p50 = s.readHistory(r, 10, undefined, 50).messages[0];
   check(
     "preview_chars:50 keeps 50 codepoints (emoji), not 25 UTF-16 halves",
@@ -329,8 +338,8 @@ const check = (n, c, x) => {
   const s = new ChatStore(":memory:");
   const r = mkRoom(s, "r", null, null).id;
   mkAgent(s, "y");
-  s.joinRoom(r, "y", EPOCH1, {});
-  const left = s.leaveRoom(r, "y", EPOCH1);
+  s.joinRoom(r, "y", {});
+  const left = s.leaveRoom(r, "y");
   check(
     "leave marks the persona's membership left",
     left === true && s.getMembership(r, "y").left_at !== null,

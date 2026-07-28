@@ -17,7 +17,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { EPOCH1, mkAgent, mkRoom } from "./persona-helpers.mjs";
+import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
@@ -72,11 +72,11 @@ await (async () => {
     send({ jsonrpc: "2.0", id: i, method: "tools/call", params: { name, arguments: args } });
     return wait(i);
   };
-  // Bind first: room administration is epoch-fenced.
-  await call("create_persona", {
+  // Identify first because room administration requires a live persona.
+  await call("identify_persona", {
     brand: "testbrand",
     model: "testmodel",
-    version: "1",
+    version: "1.0",
   });
   await call("create_room", { name: "schema-room" });
   await call("join_room", { room: "schema-room" });
@@ -99,7 +99,7 @@ await (async () => {
   const s = new ChatStore(":memory:");
   const r = mkRoom(s, "room", null, null).id;
   mkAgent(s, "a");
-  s.joinRoom(r, "a", EPOCH1, {});
+  s.joinRoom(r, "a", {});
   const threw = (fn) => {
     try {
       fn();
@@ -110,7 +110,7 @@ await (async () => {
   };
   check(
     "#3 store rejects a 120k-char claim key",
-    /exceeds 500/.test(threw(() => s.claimResource(r, "k".repeat(120_000), "a", EPOCH1, 900, null))),
+    /exceeds 500/.test(threw(() => s.claimResource(r, "k".repeat(120_000), "a", 900, null))),
     null,
   );
   check(
@@ -126,12 +126,12 @@ await (async () => {
   check(
     "#3 store rejects a 201-char mention id",
     /exceeds 200/.test(
-      threw(() => s.postMessage(r, "a", "x", "text", ["m".repeat(201)], null, null, EPOCH1)),
+      threw(() => s.postMessage(r, "a", "x", "text", ["m".repeat(201)], null, null)),
     ),
     null,
   );
   // At-cap values still pass (the MCP schema allows exactly these lengths).
-  const ok = s.claimResource(r, "k".repeat(500), "a", EPOCH1, 900, null);
+  const ok = s.claimResource(r, "k".repeat(500), "a", 900, null);
   check("#3 at-cap 500-char key is still granted", ok.granted === true, ok);
   s.close();
 }

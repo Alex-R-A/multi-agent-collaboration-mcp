@@ -9,10 +9,11 @@
 // connection instead of launching this process on every interval.
 //
 // Baselines are the persona's read markers (memberships.last_read_seq). This
-// probe is deliberately NOT epoch-bound: it is a one-shot diagnostic answering
-// "does this persona have unread work", a question that stays meaningful
-// regardless of which runtime currently holds the persona. The watcher that
-// speaks FOR a runtime is poller.ts, and that one is bound.
+// probe carries no binding of its own: it is a one-shot diagnostic answering
+// "does this persona have unread work", which stays meaningful no matter which
+// process asks. It still refuses an explicitly named identity that is unknown
+// or terminally retired, because there is no meaningful answer for those. The
+// watcher that speaks FOR a process is poller.ts.
 import Database from "better-sqlite3";
 import { existsSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -47,6 +48,9 @@ Flags:
 Exit codes: 0 = updates exist (JSON status on stdout; rooms_with_updates names
 up to 20 firing rooms on the all-rooms path and
 rooms_with_updates_truncated:true means more fired), 1 = nothing new, 2 = error.
+An explicit --agent is validated: an unknown id is an error, and a terminally
+retired one exits 2 with retired_identity rather than being reported as left or
+quiet. --since without --agent asks about room traffic and needs no identity.
 `;
 
 function parseArgs(argv: string[]): Args {
@@ -152,6 +156,16 @@ try {
     if (!agent) fail("--agent is required when watching all rooms");
     const counts = db
       .transaction(() => {
+        // Identity BEFORE membership, in the same snapshot. A retired persona
+        // has soft-left everything, so without this it reports left_all_rooms
+        // and tells the caller to rejoin -- advice a terminal identity cannot
+        // act on. This diagnostic holds no binding, but retirement is a
+        // property of the IDENTITY, so it can and must see it.
+        const persona = db
+          .prepare("SELECT retired_at FROM agents WHERE id = ?")
+          .get(agent) as { retired_at: string | null } | undefined;
+        if (!persona) return "unknown_agent" as const;
+        if (persona.retired_at !== null) return "retired" as const;
         const memberships = db
           .prepare(
             `SELECT COUNT(*) AS total,
@@ -235,6 +249,16 @@ try {
         };
       })
       .deferred();
+    if (counts === "unknown_agent") {
+      fail(`no persona "${agent}"; check the id`);
+    }
+    if (counts === "retired") {
+      fail(
+        `retired_identity: agent "${agent}" was terminally retired; its ` +
+          "history stands, but it has no actionable unread and can never " +
+          "rejoin. Check a live persona instead.",
+      );
+    }
     if (counts === "no_memberships") {
       fail(
         `no_room_memberships: agent "${agent}" has no room memberships; ` +
@@ -308,6 +332,20 @@ try {
       if (!room) return { state: "missing" as const };
       const roomId = room.id;
 
+      // Same-snapshot identity validation whenever an explicit --agent is
+      // given, which covers BOTH the marker path and --since --agent. A
+      // --since probe with no agent is a room-traffic question that needs no
+      // identity, so it stays untouched.
+      if (args.agent !== undefined) {
+        const persona = db
+          .prepare("SELECT retired_at FROM agents WHERE id = ?")
+          .get(args.agent) as { retired_at: string | null } | undefined;
+        if (!persona) return { state: "unknown_agent" as const, roomId };
+        if (persona.retired_at !== null) {
+          return { state: "retired" as const, roomId };
+        }
+      }
+
       let baseline: number;
       if (args.since !== undefined) {
         baseline = args.since;
@@ -380,6 +418,16 @@ try {
     .deferred();
   if (snap.state === "missing") {
     fail(`no room "${roomRef}"`);
+  }
+  if (snap.state === "unknown_agent") {
+    fail(`no persona "${args.agent}"; check the id`);
+  }
+  if (snap.state === "retired") {
+    fail(
+      `retired_identity: agent "${args.agent}" was terminally retired; its ` +
+        "history stands, but it has no actionable unread in this room and can " +
+        "never rejoin. Check a live persona instead.",
+    );
   }
   if (snap.state === "not_joined") {
     fail(

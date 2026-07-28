@@ -46,6 +46,18 @@ export const MAX_CLIENT_MESSAGE_ID_CHARS = 200;
  * as a store assertion after the fact. */
 export const MAX_AGENT_ID_CHARS = 200;
 
+/**
+ * Longest human BASE name, derived from MAX_AGENT_ID_CHARS rather than chosen:
+ * the canonical id is `human-` + base + `-` + ordinal, and the widest ordinal
+ * is Number.MAX_SAFE_INTEGER at 16 digits.
+ *
+ *   6 ("human-") + 177 (base) + 1 ("-") + 16 (ordinal) = 200
+ *
+ * The complete candidate is still validated before insertion; this bound only
+ * guarantees no VALID base can be rejected later by the id cap.
+ */
+export const MAX_HUMAN_BASE_CHARS = 177;
+
 /** Above this body length the store's json well-formedness re-validation is
  *  skipped: parsing a ~GB body into memory to walk it would defeat the
  *  memory-bounded read design, and such a caller owns validation (the MCP
@@ -165,71 +177,101 @@ export const MIN_CATCH_UP_RESULT_BUDGET =
   Math.max(CATCH_UP_ENVELOPE, PRIORITY_CATCH_UP_ENVELOPE) + STUB_ALLOWANCE;
 
 /**
- * A persona-authored operation was fenced out: the runtime that issued it no
- * longer holds the persona, because a later valid resume took it over. Terminal
- * by contract -- retrying cannot succeed, and the caller must create or resume a
- * persona before acting again. A distinct class (not a bare Error) so the MCP
- * layer can render it as `persona_lost` without string-matching a message.
+ * A persona-authored operation was refused because the authority it captured is
+ * no longer valid. Terminal by contract for THAT operation: retrying it cannot
+ * succeed. A distinct class (not a bare Error) so the MCP layer can render it
+ * as `persona_lost` without string-matching a message.
+ *
+ * Three distinguishable states reach this, and they are not the same thing:
+ *
+ *  - the agents row is GONE (`missing` true). Nothing to act as.
+ *  - the row is TERMINALLY RETIRED (`retired` true). It keeps its history and
+ *    its non-advancing reads, but it can never act again.
+ *  - the row is live but the caller's recorded BINDING does not describe it
+ *    (both booleans false). The identity exists and is not retired; this
+ *    particular captured binding is simply not the one that owns it.
+ *
+ * This class deliberately carries NO process-recovery advice. Whether a caller
+ * should restart depends on session state only the MCP layer can see -- a late
+ * request from a superseded identity can arrive at a process that is perfectly
+ * healthy under a newer one.
  */
+export type PersonaLossReason = "missing" | "retired" | "binding_mismatch";
+
 export class PersonaLostError extends Error {
   readonly agentId: string;
-  readonly expectedEpoch: number;
-  readonly currentEpoch: number | null;
-  constructor(agentId: string, expectedEpoch: number, currentEpoch: number | null) {
+  readonly reason: PersonaLossReason;
+  /** The agents row is gone entirely. */
+  readonly missing: boolean;
+  /** The row exists and is terminally retired. */
+  readonly retired: boolean;
+  constructor(agentId: string, reason: PersonaLossReason) {
     super(
-      currentEpoch === null
-        ? `persona "${agentId}" no longer exists; create or resume a persona before acting`
-        : `persona "${agentId}" was taken over by a later runtime ` +
-          `(your epoch ${expectedEpoch}, current ${currentEpoch}); ` +
-          `this runtime's authority is gone and retrying cannot restore it`,
+      // Describes ONLY the lost identity and the operation that failed. It
+      // deliberately gives no process-recovery advice: whether the caller
+      // should restart depends on session state this layer cannot see, and an
+      // unconditional "call identify_persona" would contradict the fact that a
+      // process still holding this dead binding is exactly the case where
+      // identify_persona must fail.
+      reason === "missing"
+        ? `persona "${agentId}" no longer exists, so this operation cannot proceed`
+        : reason === "retired"
+          ? `persona "${agentId}" was terminally retired and can never act ` +
+            `again; its history stands, but it cannot post, advance a read ` +
+            `marker, claim, or join`
+          : `persona "${agentId}" exists and is live, but it is not the ` +
+            `identity this operation was issued under; that authority is gone ` +
+            `and retrying this operation cannot restore it`,
     );
     this.name = "PersonaLostError";
     this.agentId = agentId;
-    this.expectedEpoch = expectedEpoch;
-    this.currentEpoch = currentEpoch;
+    this.reason = reason;
+    // Derived here rather than passed, so the two can never both be true: a
+    // row cannot be simultaneously absent and retired, and a live-row binding
+    // mismatch is neither.
+    this.missing = reason === "missing";
+    this.retired = reason === "retired";
   }
 }
 
 /**
- * A CORRECT resume word presented with a different brand/model/version.
+ * This process generated a connection nonce that some row already carries,
+ * BEFORE it had bound anything.
  *
- * This is not a rejected credential. The word proves the caller is the
- * persona's legitimate owner; what it reports is that the thing sitting behind
- * the seat CHANGED. brand/model/version are immutable by construction, so a
- * runtime whose actual model no longer matches them is a different participant
- * asking to wear an old name, and letting it through would keep posting under a
- * model identifier that is false to every peer reading the room -- the one
- * thing the tuple exists to prevent.
- *
- * Distinct from a wrong word (a rejected credential, whose remedy is to find
- * the right word) and from PersonaLostError (a takeover, whose remedy is to
- * resume again). The remedy here is a NEW persona.
+ * Thrown, not silently resolved, because the only correct response lives in the
+ * process that owns the nonce: generate another one and identify again. The
+ * store must never attach to a row merely because its nonce matches, which is
+ * exactly what a "reuse the matching row" fallback would do -- and that row
+ * belongs to a different process incarnation. Reachable only while unbound; a
+ * bound process compares against the binding it recorded.
  */
-export class ModelTupleMismatchError extends Error {
-  readonly agentId: string;
-  readonly stored: { brand: string; model: string; version: string };
-  readonly offered: { brand: string; model: string; version: string };
-  /** Rooms the persona is currently present in, so the caller can be told which
-   *  conversations to notify. It has no binding to look them up with itself. */
-  readonly rooms: string[];
-  constructor(
-    agentId: string,
-    stored: { brand: string; model: string; version: string },
-    offered: { brand: string; model: string; version: string },
-    rooms: string[],
-  ) {
+export class ConnectionNonceCollisionError extends Error {
+  readonly connectionId: string;
+  constructor(connectionId: string) {
     super(
-      `persona "${agentId}" is ${stored.brand}/${stored.model}/${stored.version}, ` +
-        `but this runtime is ${offered.brand}/${offered.model}/${offered.version}. ` +
-        `The resume word is correct, so this is a MODEL CHANGE, not a bad ` +
-        `credential: brand/model/version are immutable and a persona cannot be ` +
-        `carried across them. Create a new persona instead.`,
+      `connection nonce ${connectionId} is already recorded against another ` +
+        `persona row; regenerate it and identify again`,
     );
-    this.name = "ModelTupleMismatchError";
-    this.agentId = agentId;
-    this.stored = stored;
-    this.offered = offered;
-    this.rooms = rooms;
+    this.name = "ConnectionNonceCollisionError";
+    this.connectionId = connectionId;
+  }
+}
+
+/**
+ * Nickname allocation exhausted its candidates inside the identify transaction.
+ *
+ * The six-hex token is only 24 bits, so a collision is a normal event and the
+ * caller retries with a fresh candidate. Running out means the id space for
+ * this tuple is genuinely saturated (or the candidate supplier is broken), and
+ * the transaction rolls back rather than committing a half-transition.
+ */
+export class NicknameExhaustedError extends Error {
+  constructor(attempts: number) {
+    super(
+      `could not allocate a free persona nickname after ${attempts} attempts; ` +
+        `no identity was created and any prior binding is unchanged`,
+    );
+    this.name = "NicknameExhaustedError";
   }
 }
 
@@ -374,17 +416,59 @@ export type RoomSummary = RoomRow & {
 /** A row of the agents table: one PERSONA, LLM or human. */
 export type PersonaRow = {
   id: string;
-  /** 1 for a web participant. Humans carry no LLM tuple and no resume word,
-   *  and the table CHECK enforces that both shapes stay whole. */
+  /** 1 for a web participant. Humans carry the base/ordinal pair and no LLM
+   *  tuple, connection, or retirement; the table CHECK enforces that all three
+   *  legal shapes stay whole. */
   is_human: number;
   brand: string | null;
   model: string | null;
   version: string | null;
-  resume_word: string | null;
-  runtime_epoch: number;
+  /** The MCP stdio server PROCESS INCARNATION that currently holds this LLM
+   *  identity. Internal: never rendered into a tool response, viewer payload,
+   *  message column, or listing. Non-null does NOT mean the process is alive --
+   *  a hard kill leaves the value behind, and nothing may read it as liveness
+   *  or as authority (no caller can submit one). */
+  connection_id: string | null;
+  /** Human rows only: the base name the viewer submitted, case preserved. */
+  human_base: string | null;
+  /** Human rows only: the allocated ordinal. `id` is base + ordinal. */
+  human_ordinal: number | null;
+  /** LLM rows only: set once, terminally. A retired identity can never post,
+   *  advance a read marker, claim, join, or bind again, and is never revived. */
+  retired_at: string | null;
   description: string | null;
   created_at: string;
 };
+
+/** The process-recorded binding an identify call is asserting. Null before this
+ *  process has ever bound. BOTH fields must match the stored row: a nonce match
+ *  alone is not proof this process owns the row, and neither is an id match.
+ *
+ *  An agent_id is allocated once, never deleted, never reinserted, and never
+ *  rebound, so it has exactly one tenure for the life of the database. The
+ *  stale-operation fence is therefore the id itself plus the row's live state:
+ *  a superseded operation carries an id that is now retired. */
+export type ExpectedBinding = {
+  agentId: string;
+  connectionId: string;
+};
+
+/** What `identifyPersona` did. `identityChanged` distinguishes a transition
+ *  (old nickname retired, new one allocated) from plain idempotent reuse. */
+export type IdentifyResult = {
+  persona: PersonaRow;
+  bindingReused: boolean;
+  identityChanged: boolean;
+  previousAgentId?: string;
+  previousRoomCount?: number;
+  previousRoomNames?: string[];
+  previousRoomNamesTruncated?: boolean;
+};
+
+/** Bounded list of a retired identity's former rooms carried in the transition
+ *  response. The cap exists because a persona can be present in an unbounded
+ *  number of rooms and the response must stay inside the client output cap. */
+export const MAX_PREVIOUS_ROOM_NAMES = 200;
 
 export type AgentRow = {
   id: string;
@@ -406,6 +490,10 @@ export type AgentRow = {
   /** True while an unexpired best-effort blocking catch_up wait lease exists
    *  in this room (see RecipientStatus.watching). */
   watching: boolean;
+  /** This LLM identity was terminally retired. Its membership row is retained
+   *  as history (joined_at, role, final cursor), so it still appears here, but
+   *  a retired row is always present:false, active:false, watching:false. */
+  retired: boolean;
 };
 
 export type RecipientStatus = {
@@ -419,8 +507,14 @@ export type RecipientStatus = {
    *  armed watcher. So `active` means a runtime exists and is reachable. It is
    *  not evidence that the model is reasoning, reading, or able to wake, and a
    *  seat with a live watcher reads `active` no matter how long the model
-   *  behind it has been silent. `watching` is the stronger claim. */
-  status: "active" | "idle" | "left" | "unknown";
+   *  behind it has been silent. `watching` is the stronger claim.
+   *
+   *  retired is TERMINAL and distinct from both: `unknown` means no such
+   *  identity or no participation here, `left` means it can come back, and
+   *  `retired` means the nickname is real, its history stands, and it can
+   *  never receive work again. Collapsing retired into left would tell a
+   *  poster to wait for a reader that cannot return. */
+  status: "active" | "idle" | "left" | "retired" | "unknown";
   present: boolean;
   idle_seconds: number | null;
   last_read_seq: number | null;
@@ -672,38 +766,131 @@ export class ChatStore {
         created_at  TEXT NOT NULL DEFAULT (datetime('now'))
       );
 
-      -- One row per PERSONA. An LLM persona carries an immutable
-      -- brand/model/version tuple and a server-generated resume word; a human
-      -- web participant carries neither. The CHECK makes those the ONLY two
-      -- shapes any writer can create -- including direct ones (the web server,
-      -- sqlite3, a test) that never pass through this file's JS guards -- so a
-      -- half-persona (resumable without metadata, or metadata with no resume
-      -- path) cannot exist in the database.
+      -- One row per PERSONA, in exactly three legal shapes:
+      --
+      --   human            human_base/human_ordinal set, no tuple, no
+      --                    connection, never retired
+      --   bound LLM        complete tuple, a connection nonce, not retired
+      --   retired LLM      complete tuple, no connection, retired_at set
+      --
+      -- The CHECK is what makes those the ONLY shapes ANY writer can create,
+      -- including the direct ones (web/server.mjs holds its own handle, tests
+      -- open the file, sqlite3 exists) that never pass through this file's JS
+      -- guards. JS still owns trim() semantics, UUID format, and readable
+      -- messages; SQL owns the shape, because JS cannot reach the other
+      -- writers.
+      --
+      -- "Bound" deliberately does not say LIVE. A hard-killed process leaves a
+      -- non-null connection_id behind and nothing may read that as liveness or
+      -- as possession: no caller can submit a connection value, and a first
+      -- bind that collides regenerates instead of adopting the row.
       CREATE TABLE IF NOT EXISTS agents (
-        id            TEXT PRIMARY KEY,
+        -- NOT NULL is NOT redundant here. In an ordinary rowid table SQLite
+        -- deliberately departs from the standard: a PRIMARY KEY on a non-
+        -- INTEGER column does not imply NOT NULL, so 'id TEXT PRIMARY KEY'
+        -- alone accepts NULL, and repeatedly, because NULLs compare distinct in
+        -- the implicit unique index. Two nameless participants is the result.
+        id            TEXT PRIMARY KEY NOT NULL,
         is_human      INTEGER NOT NULL DEFAULT 0,
         brand         TEXT,
         model         TEXT,
         version       TEXT,
-        resume_word   TEXT,
-        -- Monotonic, never reused. Creation binds runtime 1; every bindingless
-        -- attach increments. A runtime captures this value when it binds, and
-        -- an operation carrying a captured value below the current one is from
-        -- a superseded tenure. Monotonicity is what a reusable process nonce
-        -- lacked: a nonce can be handed back to the same runtime after it lost
-        -- and regained the persona, making a stale in-flight write look current.
-        runtime_epoch INTEGER NOT NULL DEFAULT 1,
+        -- The MCP stdio server PROCESS INCARNATION holding this identity.
+        -- Internal association only: it is never returned by a tool, never
+        -- accepted as input, and never joined into a message or listing.
+        connection_id TEXT,
+        human_base    TEXT,
+        human_ordinal INTEGER,
+        -- Terminal for LLM rows. Never cleared, so a nickname is never
+        -- reactivated: A -> B -> A is three distinct identities.
+        retired_at    TEXT,
         description   TEXT,
         created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+        CHECK (is_human IN (0, 1)),
+        -- NUL FIRST, because it is what makes every other text check honest.
+        -- SQLite's length(), substr(), and GLOB all stop at the first NUL, so
+        -- without this an id of 'ab<NUL>cd' measures 2, passes the bounds, and
+        -- passes the character grammar -- while every listing that reads it
+        -- back silently loses the tail. Measured, not assumed: length() of a
+        -- NUL-bearing string returns the prefix count, and the || operator
+        -- PRESERVES the NUL, which is why this one check also covers
+        -- human_base through the id-equality rule below.
+        CHECK (instr(id, char(0)) = 0),
+        -- Lower bound as well as upper: '' is a legal TEXT primary key in
+        -- SQLite, and an empty nickname would be an addressable participant
+        -- nobody can mention, reply to, or tell apart from a missing value.
+        CHECK (length(id) BETWEEN 1 AND ${MAX_AGENT_ID_CHARS}),
         CHECK (
           (is_human = 1
-             AND brand IS NULL AND model IS NULL
-             AND version IS NULL AND resume_word IS NULL)
+             AND brand IS NULL AND model IS NULL AND version IS NULL
+             AND connection_id IS NULL AND retired_at IS NULL
+             AND human_base IS NOT NULL AND human_ordinal IS NOT NULL
+             AND length(human_base) BETWEEN 1 AND ${MAX_HUMAN_BASE_CHARS}
+             -- ASCII letters, digits, underscore, dot, dash only. GLOB is
+             -- case-sensitive, so this rejects whitespace, ordinary control
+             -- characters, and anything non-ASCII. It does NOT reject an
+             -- embedded NUL: GLOB stops scanning there, so a NUL-bearing base
+             -- passes this test. The global instr(id, ...) check above is what
+             -- covers that case, via the id-equality rule below.
+             AND human_base NOT GLOB '*[^A-Za-z0-9_.-]*'
+             AND substr(human_base, 1, 1) GLOB '[A-Za-z0-9_]'
+             AND lower(substr(human_base, 1, 6)) <> 'human-'
+             -- typeof, not just bounds: 1.5 satisfies both bounds, and
+             -- CAST(1.5 AS TEXT) is '1.5', so the id-equality rule would
+             -- happily accept 'human-alex-1.5' as a canonical identity.
+             AND typeof(human_ordinal) = 'integer'
+             AND human_ordinal > 0
+             AND human_ordinal <= ${Number.MAX_SAFE_INTEGER}
+             -- Implies the reserved lowercase prefix: id is BUILT from it.
+             AND id = 'human-' || human_base || '-' || CAST(human_ordinal AS TEXT))
           OR
           (is_human = 0
-             AND brand IS NOT NULL AND model IS NOT NULL
-             AND version IS NOT NULL AND resume_word IS NOT NULL)
+             AND human_base IS NULL AND human_ordinal IS NULL
+             AND brand IS NOT NULL AND model IS NOT NULL AND version IS NOT NULL
+             -- length() is NUL-terminated in SQLite, so the instr() guards do
+             -- the real work: a lone NUL measures 0 and fails the lower bound,
+             -- but a NUL in the MIDDLE measures only the prefix before it and
+             -- would otherwise pass.
+             AND length(brand) BETWEEN 1 AND 100
+             AND length(model) BETWEEN 1 AND 100
+             AND length(version) BETWEEN 1 AND 100
+             AND instr(brand, char(0)) = 0
+             AND instr(model, char(0)) = 0
+             AND instr(version, char(0)) = 0
+             -- Case-insensitive, so 'Human-' cannot squat the namespace.
+             AND lower(substr(id, 1, 6)) <> 'human-'
+             AND ((retired_at IS NULL AND connection_id IS NOT NULL)
+                  OR (retired_at IS NOT NULL AND connection_id IS NULL)))
         )
+      );
+
+      -- Durable idempotency for human nickname allocation, keyed by an
+      -- operation UUID the BROWSER generates before its first request. It
+      -- turns "the response was lost" and "localStorage.setItem threw" from
+      -- duplicate-identity events into replays.
+      --
+      -- Deliberately NO foreign key on room_id: deleting a room must not erase
+      -- the record needed to answer a replay. A replay for a deleted room
+      -- returns the identity that was committed and reports the room gone,
+      -- which is recoverable; losing the row would allocate a second ordinal
+      -- for one user action, which is not.
+      --
+      -- This is idempotency, not ownership. It authenticates nothing.
+      CREATE TABLE IF NOT EXISTS human_allocations (
+        -- NOT NULL for the same SQLite reason as agents.id, and here it is the
+        -- whole point of the table: NULL keys compare distinct, so without it
+        -- one browser could insert unlimited NULL-keyed rows and the
+        -- idempotency this table exists to provide would silently not exist.
+        operation_id    TEXT PRIMARY KEY NOT NULL,
+        room_id         INTEGER NOT NULL,
+        human_base      TEXT NOT NULL,
+        result_agent_id TEXT NOT NULL REFERENCES agents(id),
+        created_at      TEXT NOT NULL DEFAULT (datetime('now')),
+        -- typeof for the same reason as human_ordinal: affinity would let 1.5
+        -- through, and this value is compared against a rooms.id integer when
+        -- a replay decides whether the requested room still exists.
+        CHECK (typeof(room_id) = 'integer'
+               AND room_id > 0 AND room_id <= ${Number.MAX_SAFE_INTEGER})
       );
 
       -- role is ROOM-LOCAL and nullable: one persona can be reviewer in one
@@ -797,6 +984,31 @@ export class ChatStore {
       WHEN instr(NEW.description, char(0)) > 0 BEGIN
         SELECT RAISE(ABORT, 'agent description contains a NUL character (U+0000)');
       END;
+
+      -- An allocation record must AGREE with the identity it records. The
+      -- foreign key only proves result_agent_id names some agent, so without
+      -- this a row could record base 'sam' against human-alex-1, or point at an
+      -- LLM row outright -- and a replay would then hand the browser back an
+      -- identity that is not the one the base asked for. A CHECK cannot express
+      -- this because it cannot read another table, hence a trigger.
+      CREATE TRIGGER IF NOT EXISTS human_allocations_require_matching_human
+      BEFORE INSERT ON human_allocations
+      WHEN NOT EXISTS (
+        SELECT 1 FROM agents a
+         WHERE a.id = NEW.result_agent_id
+           AND a.is_human = 1
+           AND a.human_base = NEW.human_base
+      ) BEGIN
+        SELECT RAISE(ABORT, 'human_allocations.result_agent_id must name a human agent whose human_base equals the recorded base');
+      END;
+
+      -- Append-only. Denying UPDATE outright is smaller than re-validating it,
+      -- and there is no legitimate reason to rewrite a committed allocation:
+      -- its whole purpose is to be the durable answer a replay returns.
+      CREATE TRIGGER IF NOT EXISTS human_allocations_append_only
+      BEFORE UPDATE ON human_allocations BEGIN
+        SELECT RAISE(ABORT, 'human_allocations is append-only: a committed allocation record cannot be modified');
+      END;
     `);
     this.db.exec(`
       -- No explicit (room_id, seq) index: UNIQUE(room_id, seq) already provides
@@ -822,6 +1034,19 @@ export class ChatStore {
       CREATE INDEX IF NOT EXISTS idx_memberships_agent_present
         ON memberships(agent_id, left_at, room_id);
 
+      -- One process incarnation holds at most one current LLM nickname. This
+      -- is the DATABASE's statement of that rule, so a direct writer cannot
+      -- point two live identities at one connection. Partial: retired and
+      -- human rows carry NULL and cost no index entry.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_connection
+        ON agents(connection_id) WHERE connection_id IS NOT NULL;
+
+      -- What actually prevents two concurrent viewers from allocating the same
+      -- human-alex-1: SQLite serializes the writes, and this index rejects the
+      -- loser's duplicate ordinal instead of letting both commit.
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_human_identity
+        ON agents(human_base, human_ordinal) WHERE is_human = 1;
+
       -- Advisory single-winner work claims with TTL. Purely advisory: nothing
       -- fences the claimed resource itself; expiry frees claims from crashed
       -- holders.
@@ -846,17 +1071,16 @@ export class ChatStore {
       -- memberships), so last_seen is the weaker signal of the two: recent
       -- runtime activity. "watching" stays the strong one.
       --
-      -- Keyed (room_id, agent_id) with the OWNING epoch as data, not as part of
-      -- the key: one persona has one runtime, so it has at most one wait per
-      -- room, and a takeover must REPLACE the loser's row rather than sit
-      -- beside it (two rows would report two watchers for one persona). The
-      -- epoch column is what makes the loser's later cleanup safe: its DELETE
-      -- is guarded on the epoch it captured, so it cannot remove the winner's
-      -- row after an upsert has already overwritten it.
+      -- Keyed (room_id, agent_id) and nothing else. One persona belongs to one
+      -- connection and an agent_id names one tenure for the life of the
+      -- database, so a persona has at most one wait row per room and two rows
+      -- would report two watchers for one persona. A late cleanup from a
+      -- superseded identity cannot reach a successor's row because the
+      -- successor is a DIFFERENT agent_id, and retirement deletes the retired
+      -- persona's leases outright in the same transaction.
       CREATE TABLE IF NOT EXISTS wait_leases (
         room_id    INTEGER NOT NULL REFERENCES rooms(id),
         agent_id   TEXT NOT NULL REFERENCES agents(id),
-        epoch      INTEGER NOT NULL,
         started_at TEXT NOT NULL DEFAULT (datetime('now')),
         expires_at TEXT NOT NULL,
         PRIMARY KEY (room_id, agent_id)
@@ -916,26 +1140,26 @@ export class ChatStore {
   // --- rooms -------------------------------------------------------------
 
   /**
-   * Create a room, epoch-fenced to the calling persona.
+   * Create a room, fenced to a live calling persona.
    *
    * Room administration stays UNAUTHENTICATED and global: any current persona
    * can create or delete any room, and nothing verifies who they are. What the
    * fence removes is authority from a runtime the system positively knows is
    * superseded. Leaving the highest-blast-radius operations as the only
-   * unfenced writes made the epoch model exempt exactly what it should protect
+   * unfenced writes made the fence exempt exactly what it should protect
    * most: a fenced-out runtime could not post a message but could delete the
    * room the message was in.
    *
-   * Rooms must precede JOINS, not bindings. create_persona/resume_persona is
-   * one call that every participating runtime makes anyway, and
-   * bind -> create_room -> join_room satisfies the bootstrap workflow.
+   * Rooms must precede JOINS, not identification. identify_persona is one call
+   * that every participating runtime makes anyway, and
+   * identify_persona -> create_room -> join_room satisfies the bootstrap
+   * workflow.
    */
   createRoom(
     name: string,
     description: string | null,
     pinned: string | null,
     agentId: string,
-    epoch: number,
   ): RoomRow {
     assertStorable(name, "room name");
     assertMaxLen(name, "room name", 200);
@@ -944,7 +1168,7 @@ export class ChatStore {
     assertStorable(pinned, "room pinned intro");
     assertMaxLen(pinned, "room pinned intro", 10_000);
     const tx = this.db.transaction(() => {
-      this.requireEpoch(agentId, epoch);
+      this.requireLive(agentId);
       return this.db
         .prepare(
           `INSERT INTO rooms (name, description, pinned) VALUES (?, ?, ?)
@@ -958,13 +1182,12 @@ export class ChatStore {
   setPinned(
     roomId: number,
     agentId: string,
-    epoch: number,
     pinned: string | null,
   ): void {
     assertStorable(pinned, "room pinned intro");
     assertMaxLen(pinned, "room pinned intro", 10_000);
     const tx = this.db.transaction(() => {
-      this.requireEpoch(agentId, epoch);
+      this.requireLive(agentId);
       // Writing the pinned intro is room participation.
       this.requirePresent(roomId, agentId);
       const info = this.db
@@ -1167,23 +1390,27 @@ export class ChatStore {
   // --- personas -----------------------------------------------------------
 
   /**
-   * Verify that `epoch` is still the persona's current runtime epoch, throwing
-   * PersonaLostError if not.
+   * Verify that this identity still EXISTS and is not retired, throwing
+   * PersonaLostError if either fails.
+   *
+   * This is the complete stale-operation fence. An agent_id is allocated once
+   * and never deleted, reinserted, revived, or rebound, so it names exactly one
+   * tenure forever; an operation captured under a superseded identity therefore
+   * carries an id whose row is now retired, and that is what this catches. No
+   * ordinal is needed to tell tenures apart because an id never has two.
    *
    * MUST be called from INSIDE the transaction that performs the guarded write.
-   * Checking first and writing afterwards is not equivalent: a takeover
+   * Checking first and writing afterwards is not equivalent: a retirement
    * committing in the gap leaves the check passing and the write landing under
    * an authority the caller no longer holds, which is the entire failure this
    * exists to prevent. Every caller below is inside a tx.immediate().
    */
-  private requireEpoch(agentId: string, epoch: number): void {
+  private requireLive(agentId: string): void {
     const row = this.db
-      .prepare("SELECT runtime_epoch FROM agents WHERE id = ?")
-      .get(agentId) as { runtime_epoch: number } | undefined;
-    if (!row) throw new PersonaLostError(agentId, epoch, null);
-    if (row.runtime_epoch !== epoch) {
-      throw new PersonaLostError(agentId, epoch, row.runtime_epoch);
-    }
+      .prepare("SELECT retired_at FROM agents WHERE id = ?")
+      .get(agentId) as { retired_at: string | null } | undefined;
+    if (!row) throw new PersonaLostError(agentId, "missing");
+    if (row.retired_at !== null) throw new PersonaLostError(agentId, "retired");
   }
 
   /**
@@ -1223,13 +1450,27 @@ export class ChatStore {
     );
   }
 
-  /** The persona's current epoch, or null if the row is gone. For
-   *  NON-advancing reads, which disclose loss without failing. */
-  currentEpoch(agentId: string): number | null {
+  /** Why this binding is unusable, or null when it is live. For NON-advancing
+   *  reads, which DISCLOSE loss instead of failing, and for arm-time checks
+   *  that need the reason rather than an exception. */
+  personaLoss(expected: ExpectedBinding): PersonaLossReason | null {
+    this.assertConnectionId(expected.connectionId);
     const row = this.db
-      .prepare("SELECT runtime_epoch FROM agents WHERE id = ?")
-      .get(agentId) as { runtime_epoch: number } | undefined;
-    return row ? row.runtime_epoch : null;
+      .prepare(
+        "SELECT is_human, connection_id, retired_at FROM agents WHERE id = ?",
+      )
+      .get(expected.agentId) as
+      | {
+          is_human: number;
+          connection_id: string | null;
+          retired_at: string | null;
+        }
+      | undefined;
+    if (!row) return "missing";
+    if (row.retired_at !== null) return "retired";
+    return row.is_human !== 0 || row.connection_id !== expected.connectionId
+      ? "binding_mismatch"
+      : null;
   }
 
   getPersona(id: string): PersonaRow | undefined {
@@ -1239,105 +1480,300 @@ export class ChatStore {
   }
 
   /**
-   * Claim a generated persona id atomically. Returns false if the id is taken,
-   * so a caller drawing candidate ids cannot collapse two personas onto one row
-   * (and with it one read marker, one membership set, and one claim owner).
+   * A connection nonce must be a UUID.
+   *
+   * The database only knows connection_id as opaque text, and the specification
+   * assigns UUID format checking to this layer. Without it "" or "conn-A" bind
+   * happily, and the column stops meaning "a value this server generated with
+   * randomUUID()" -- which is the only claim it makes. Lowercase hex only,
+   * because the sole legitimate producer is randomUUID().
    */
-  tryCreatePersona(p: {
+  private assertConnectionId(value: string): void {
+    if (
+      !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(value)
+    ) {
+      throw new Error(
+        "connection id must be a lowercase UUID generated by this server",
+      );
+    }
+  }
+
+  /** Validate the parts of an LLM identity this file is responsible for. The
+   *  table CHECK covers the same ground for writers that never come through
+   *  here; this exists to fail with a message a caller can act on. */
+  private assertLlmIdentity(p: {
     id: string;
     brand: string;
     model: string;
     version: string;
-    resumeWord: string;
     description: string | null;
-  }): boolean {
+  }): void {
     assertStorable(p.id, "persona id");
     assertMaxLen(p.id, "persona id", MAX_AGENT_ID_CHARS);
-    assertStorable(p.brand, "brand");
-    assertMaxLen(p.brand, "brand", 100);
-    assertStorable(p.model, "model");
-    assertMaxLen(p.model, "model", 100);
-    assertStorable(p.version, "version");
-    assertMaxLen(p.version, "version", 100);
-    assertStorable(p.resumeWord, "resume word");
-    assertMaxLen(p.resumeWord, "resume word", 200);
+    // A candidate supplier that returns "" is a broken allocator, not a
+    // collision, so say so here rather than letting the CHECK reject it as an
+    // opaque constraint failure after the retry loop has burned its attempts.
+    if (p.id.length === 0) {
+      throw new Error(
+        "persona id candidate is empty; the nickname allocator produced no id",
+      );
+    }
+    for (const [field, value] of [
+      ["brand", p.brand],
+      ["model", p.model],
+      ["version", p.version],
+    ] as const) {
+      assertStorable(value, field);
+      assertMaxLen(value, field, 100);
+      // EXACT trim normalization, checked rather than applied: silently
+      // trimming would make " gpt" and "gpt" the same persona on one call and
+      // different ones on the next, depending on which path normalized. The
+      // tuple is compared byte for byte, so it must arrive already exact.
+      if (value !== value.trim() || value.length === 0) {
+        throw new Error(
+          `${field} must be a trimmed, non-empty string (got ${JSON.stringify(value)})`,
+        );
+      }
+    }
     assertStorable(p.description, "persona description");
     assertMaxLen(p.description, "persona description", 2000);
+  }
+
+  /**
+   * Insert one candidate nickname. False means the id was taken, so a caller
+   * drawing candidates cannot collapse two personas onto one row (and with it
+   * one read marker, one membership set, and one claim owner).
+   */
+  private tryInsertPersona(p: {
+    id: string;
+    brand: string;
+    model: string;
+    version: string;
+    connectionId: string;
+    description: string | null;
+  }): boolean {
+    this.assertLlmIdentity(p);
     const info = this.db
       .prepare(
         `INSERT INTO agents
-           (id, is_human, brand, model, version, resume_word, runtime_epoch, description)
-         VALUES (@id, 0, @brand, @model, @version, @resumeWord, 1, @description)
+           (id, is_human, brand, model, version, connection_id, description)
+         VALUES (@id, 0, @brand, @model, @version, @connectionId, @description)
          ON CONFLICT(id) DO NOTHING`,
       )
       .run(p);
     return info.changes > 0;
   }
 
-  /**
-   * Bindingless resume: take over a persona and return the NEW epoch.
-   *
-   * The increment is unconditional on success and happens in the same
-   * transaction as the credential check, so "latest valid resume wins" is
-   * decided by SQLite's write serialization rather than by call ordering in any
-   * one process. It runs on EVERY successful attach, not only on a contested
-   * one: a caller cannot tell whether the previous runtime is alive, and an
-   * attach that skipped the increment would leave that runtime's pollers and
-   * captured epochs valid alongside the new one's.
-   *
-   * The two failures are deliberately distinguished: an unknown id says so, and
-   * bad credentials on a known id say so. That is the right trade HERE because
-   * the threat model is an operator pasting the wrong id, not an attacker
-   * probing for valid ones -- an operator who mistyped an id needs to be told
-   * that, not handed a uniform "rejected" that sends them hunting for a lost
-   * word. This is collision prevention, not authentication.
-   */
-  attachPersona(a: {
-    id: string;
-    resumeWord: string;
+  /** Draw candidates until one inserts. The six-hex token is 24 bits, so a
+   *  collision is ordinary and correctness comes from the atomic insert, not
+   *  from the token's width. Exhaustion throws so the enclosing transaction
+   *  rolls back rather than committing half a transition. */
+  private allocatePersona(a: {
     brand: string;
     model: string;
     version: string;
-  }): { epoch: number; persona: PersonaRow } {
+    connectionId: string;
+    description: string | null;
+    nextCandidateId: () => string;
+    maxAttempts: number;
+  }): PersonaRow {
+    for (let attempt = 0; attempt < a.maxAttempts; attempt++) {
+      const id = a.nextCandidateId();
+      if (
+        this.tryInsertPersona({
+          id,
+          brand: a.brand,
+          model: a.model,
+          version: a.version,
+          connectionId: a.connectionId,
+          description: a.description,
+        })
+      ) {
+        // Read back rather than synthesize: created_at is a database default.
+        return this.getPersona(id)!;
+      }
+    }
+    throw new NicknameExhaustedError(a.maxAttempts);
+  }
+
+  /**
+   * The one identity operation: create, reuse, or replace, decided by this
+   * process's connection nonce and the exact tuple.
+   *
+   * `expected` is what the PROCESS recorded when it last bound, and it is not a
+   * cache. A row whose connection_id equals our nonce is NOT proof we own it --
+   * a UUID collision produces exactly that -- so an unbound process treats any
+   * such row as a collision to regenerate around, and a bound process requires
+   * agent id AND nonce to match before it will touch anything.
+   *
+   * A changed tuple is a REPLACEMENT, not a rename: the old nickname is retired
+   * terminally, keeps its authored history and membership rows, and is never
+   * revived. Marking it retired in the same transaction is what fences the old
+   * identity's in-flight writes, open waits, and detached pollers: they carry
+   * the old agent_id, and that row is now terminal.
+   *
+   * IMMEDIATE: it reads the binding, then writes under it.
+   */
+  identifyPersona(a: {
+    connectionId: string;
+    brand: string;
+    model: string;
+    version: string;
+    description: string | null;
+    expected: ExpectedBinding | null;
+    nextCandidateId: () => string;
+    maxAttempts?: number;
+  }): IdentifyResult {
+    const maxAttempts = a.maxAttempts ?? 12;
+    this.assertConnectionId(a.connectionId);
+    if (a.expected !== null) this.assertConnectionId(a.expected.connectionId);
     return this.db
       .transaction(() => {
-        const row = this.getPersona(a.id);
-        if (!row || row.is_human === 1) {
-          throw new Error(
-            `no LLM persona "${a.id}"; check the id, or create_persona for a new one`,
-          );
+        // --- never bound: allocate, refusing to adopt a colliding row -------
+        if (a.expected === null) {
+          const clash = this.db
+            .prepare("SELECT id FROM agents WHERE connection_id = ?")
+            .get(a.connectionId) as { id: string } | undefined;
+          if (clash) throw new ConnectionNonceCollisionError(a.connectionId);
+          const persona = this.allocatePersona({ ...a, maxAttempts });
+          return { persona, bindingReused: false, identityChanged: false };
         }
-        // Word FIRST, then tuple. A caller who cannot present the word has no
-        // standing to be told anything about the persona, including which model
-        // it is; only after the word matches is a tuple mismatch meaningful --
-        // and then it is a model change, not a rejected credential.
-        if (row.resume_word !== a.resumeWord) {
-          throw new Error(
-            `resume rejected for persona "${a.id}": the resume word does not ` +
-              `match the one it was created with`,
-          );
+
+        // --- bound: every recorded field must still match -------------------
+        const { agentId, connectionId } = a.expected;
+        const row = this.getPersona(agentId);
+        if (!row) throw new PersonaLostError(agentId, "missing");
+        // Report retirement as retirement: a caller told only "your binding
+        // does not match" would reasonably re-read and retry, and the terminal
+        // wording says that cannot work.
+        if (row.retired_at !== null) {
+          throw new PersonaLostError(agentId, "retired");
         }
         if (
-          row.brand !== a.brand ||
-          row.model !== a.model ||
-          row.version !== a.version
+          row.is_human === 1 ||
+          row.connection_id !== connectionId ||
+          connectionId !== a.connectionId
         ) {
-          throw new ModelTupleMismatchError(
-            a.id,
-            // Non-null by the is_human check above: the table CHECK keeps an
-            // LLM row's tuple whole.
-            { brand: row.brand!, model: row.model!, version: row.version! },
-            { brand: a.brand, model: a.model, version: a.version },
-            this.presentRoomNames(a.id),
-          );
+          throw new PersonaLostError(agentId, "binding_mismatch");
         }
-        const next = row.runtime_epoch + 1;
+
+        // Exact string comparison: no case folding, alias table, or version
+        // parsing. "5.0" and "5" are different models to this system because
+        // nothing here is entitled to decide they are the same.
+        if (
+          row.brand === a.brand &&
+          row.model === a.model &&
+          row.version === a.version
+        ) {
+          return { persona: row, bindingReused: true, identityChanged: false };
+        }
+
+        // --- tuple transition ------------------------------------------------
+        const { present } = this.roomMembershipCounts(agentId);
+        const names = this.presentRoomNames(agentId, MAX_PREVIOUS_ROOM_NAMES);
+        // Clear the nonce BEFORE inserting the replacement: both rows would
+        // otherwise hold it at once and the partial unique index would reject
+        // the insert, rolling back a transition that should have succeeded.
         this.db
-          .prepare("UPDATE agents SET runtime_epoch = ? WHERE id = ?")
-          .run(next, a.id);
-        return { epoch: next, persona: { ...row, runtime_epoch: next } };
+          .prepare(
+            `UPDATE agents
+                SET connection_id = NULL, retired_at = datetime('now')
+              WHERE id = ? AND connection_id = ? AND retired_at IS NULL`,
+          )
+          .run(agentId, connectionId);
+        // Soft leave: the rows, roles, join times, and final cursors stay as
+        // the only durable record that this participant was ever in the room.
+        this.db
+          .prepare(
+            `UPDATE memberships
+                SET left_at = datetime('now'), last_seen = datetime('now')
+              WHERE agent_id = ? AND left_at IS NULL`,
+          )
+          .run(agentId);
+        // Leases first: the retirement already dooms the old waiter, but a row
+        // left behind advertises a watcher that cannot wake.
+        this.db.prepare("DELETE FROM wait_leases WHERE agent_id = ?").run(agentId);
+        // Claims are deleted, not transferred. A terminal identity cannot
+        // release its own claim and the TTL ceiling is 86,400s, so keeping it
+        // would block a live participant for a day on behalf of a persona that
+        // can never come back. This is the contested call in the design: it
+        // does trade away exclusivity for work that outlived its holder.
+        this.db.prepare("DELETE FROM claims WHERE agent_id = ?").run(agentId);
+
+        const persona = this.allocatePersona({ ...a, maxAttempts });
+        return {
+          persona,
+          bindingReused: false,
+          identityChanged: true,
+          previousAgentId: agentId,
+          previousRoomCount: present,
+          previousRoomNames: names,
+          previousRoomNamesTruncated: present > names.length,
+        };
       })
       .immediate();
+  }
+
+  /**
+   * Graceful shutdown retirement, guarded on the EXACT binding this process
+   * recorded.
+   *
+   * Returns false and mutates nothing when any guard differs. Nickname ids are
+   * never reused, so the danger is not that some other process holds this id;
+   * it is that a mismatch means THIS process's recorded state is stale -- the
+   * row was already retired, or transitioned to a new identity, or altered by a
+   * writer outside this file. Acting on a row we no longer describe is exactly
+   * the mutation to refuse, so "a row with this id exists" is never enough.
+   *
+   * A hard kill cannot run this at all. The row then keeps its connection
+   * nonce and its present memberships until the database is replaced. That
+   * stale row confers no authority -- no caller can submit a nonce, and a
+   * first-bind collision regenerates -- but it does inflate member counts,
+   * collect directed work, and block non-forced pruning. There is deliberately
+   * no timeout reaper: an idle live CLI and a dead one are indistinguishable
+   * from here, and a reaper would retire the live one.
+   */
+  retireConnection(a: ExpectedBinding): boolean {
+    this.assertConnectionId(a.connectionId);
+    return this.db
+      .transaction(() => {
+        const info = this.db
+          .prepare(
+            `UPDATE agents
+                SET connection_id = NULL, retired_at = datetime('now')
+              WHERE id = ? AND connection_id = ?
+                AND is_human = 0 AND retired_at IS NULL`,
+          )
+          .run(a.agentId, a.connectionId);
+        if (info.changes === 0) return false;
+        this.db
+          .prepare(
+            `UPDATE memberships
+                SET left_at = datetime('now'), last_seen = datetime('now')
+              WHERE agent_id = ? AND left_at IS NULL`,
+          )
+          .run(a.agentId);
+        this.db.prepare("DELETE FROM wait_leases WHERE agent_id = ?").run(a.agentId);
+        this.db.prepare("DELETE FROM claims WHERE agent_id = ?").run(a.agentId);
+        return true;
+      })
+      .immediate();
+  }
+
+  /** Which of `ids` name terminally retired LLM identities. Recipient status
+   *  needs this for ids with NO membership row in the room: without it a
+   *  retired nickname reads as `unknown`, which tells a poster the name was
+   *  wrong when it was real and is simply finished. */
+  retiredIds(ids: string[]): Set<string> {
+    if (ids.length === 0) return new Set();
+    const placeholders = ids.map(() => "?").join(",");
+    const rows = this.db
+      .prepare(
+        `SELECT id FROM agents
+          WHERE retired_at IS NOT NULL AND id IN (${placeholders})`,
+      )
+      .all(...ids) as { id: string }[];
+    return new Set(rows.map((r) => r.id));
   }
 
   // --- membership ---------------------------------------------------------
@@ -1345,18 +1781,17 @@ export class ChatStore {
   /**
    * Join (or rejoin) a room: clears any prior leave and refreshes liveness.
    *
-   * Presence is PER PERSONA. With one runtime per persona there is no second
-   * live seat to reconcile: a takeover fences the loser out instead.
+   * Presence is PER PERSONA. A persona belongs to one connection for its whole
+   * life, so there is never a second live seat to reconcile.
    *
    * `cursorStart` applies ONLY when this call creates the membership. A rejoin
-   * must never move a cursor: the whole point of resuming a persona is that its
-   * read position survives, and a "start at latest" that also applied on rejoin
-   * would silently discard the backlog it was resumed to read.
+   * must never move a cursor: a persona that steps out of a room and back keeps
+   * its read position, and a "start at latest" that also applied on rejoin
+   * would silently discard the backlog it returned to read.
    */
   joinRoom(
     roomId: number,
     agentId: string,
-    epoch: number,
     opts: { cursorStart?: "beginning" | "latest"; role?: string } = {},
   ): { created: boolean } {
     if (opts.role !== undefined) {
@@ -1367,10 +1802,10 @@ export class ChatStore {
     // One IMMEDIATE transaction: this is a multi-statement read-then-write path,
     // and a cross-process deleteRoom interleaving between statements otherwise
     // surfaces as an opaque NOT NULL/FK constraint error instead of a clean
-    // failure. It also scopes the epoch guard to the same transaction as every
-    // write below it.
+    // failure. It also scopes the liveness guard to the same transaction as
+    // every write below it.
     const tx = this.db.transaction(() => {
-      this.requireEpoch(agentId, epoch);
+      this.requireLive(agentId);
       // Existence check INSIDE the write transaction: the caller resolved the
       // room earlier, and a cross-process delete_room in that window otherwise
       // surfaces as a raw "FOREIGN KEY constraint failed".
@@ -1419,12 +1854,12 @@ export class ChatStore {
    * handled by not calling this at all. Room-local by construction: the same
    * persona keeps a different role in every other room.
    */
-  setRole(roomId: number, agentId: string, epoch: number, role: string | null): void {
+  setRole(roomId: number, agentId: string, role: string | null): void {
     assertStorable(role, "role");
     assertMaxLen(role, "role", 200);
     assertRole(role);
     const tx = this.db.transaction(() => {
-      this.requireEpoch(agentId, epoch);
+      this.requireLive(agentId);
       // A role describes participation in this room.
       this.requirePresent(roomId, agentId);
       // Refresh last_seen in the SAME statement. A role change is a deliberate
@@ -1460,9 +1895,9 @@ export class ChatStore {
    * Soft leave: keep the membership row (and its read position and role) but
    * mark the persona not present. Rejoining resumes exactly where it left off.
    */
-  leaveRoom(roomId: number, agentId: string, epoch: number): boolean {
+  leaveRoom(roomId: number, agentId: string): boolean {
     const tx = this.db.transaction(() => {
-      this.requireEpoch(agentId, epoch);
+      this.requireLive(agentId);
       const info = this.db
         .prepare(
           `UPDATE memberships SET left_at = datetime('now'), last_seen = datetime('now')
@@ -1481,17 +1916,17 @@ export class ChatStore {
    * A room with no present membership is simply not refreshed. The method is
    * void because heartbeat callers do not act on whether an update matched.
    *
-   * EPOCH-FENCED like any other write. A liveness touch looks harmless, but it
+   * LIVE-IDENTITY-FENCED like any other write. A liveness touch looks harmless, but it
    * is what makes a persona read as present/active to every other agent and to
    * recipient status; an unfenced touch would let a runtime that has already
    * lost the persona keep publishing it as an available listener, which is the
-   * false-listener-truth failure the epoch exists to close. Throwing here is
+   * false-listener-truth failure this guard exists to close. Throwing here is
    * correct: the caller treats liveness as best-effort and the next real
    * operation reports persona_lost.
    */
-  touch(roomId: number, agentId: string, epoch: number): void {
+  touch(roomId: number, agentId: string): void {
     const tx = this.db.transaction(() => {
-      this.requireEpoch(agentId, epoch);
+      this.requireLive(agentId);
       this.db
         .prepare(
           `UPDATE memberships SET last_seen = datetime('now')
@@ -1508,20 +1943,18 @@ export class ChatStore {
    * leave a permanent "watching" ghost. Expired rows for the room are reaped in
    * passing.
    *
-   * The upsert writes the CALLER'S epoch into the row (`epoch = excluded.epoch`
-   * on conflict). Leaving the old value in place would invert the guard in
-   * endWaitLease: the winner's row would carry the loser's epoch, so the
-   * loser's cleanup would match and delete it while the winner's own cleanup
-   * would not.
+   * One row per (room, agent) and no tenure column: an agent_id has exactly one
+   * tenure, so there is no second tenure of the same id whose lease this could
+   * be confused with. Concurrent waits from the SAME identity share the row and
+   * are counted process-side; the last waiter out closes it.
    */
   beginWaitLease(
     roomId: number,
     agentId: string,
-    epoch: number,
     ttlSeconds: number,
   ): void {
     const tx = this.db.transaction(() => {
-      this.requireEpoch(agentId, epoch);
+      this.requireLive(agentId);
       // A lease must not advertise an absent persona as watching.
       this.requirePresent(roomId, agentId);
       this.db
@@ -1531,14 +1964,13 @@ export class ChatStore {
         .run(roomId);
       this.db
         .prepare(
-          `INSERT INTO wait_leases (room_id, agent_id, epoch, expires_at)
-           VALUES (?, ?, ?, datetime('now', '+' || ? || ' seconds'))
+          `INSERT INTO wait_leases (room_id, agent_id, expires_at)
+           VALUES (?, ?, datetime('now', '+' || ? || ' seconds'))
            ON CONFLICT(room_id, agent_id) DO UPDATE SET
-             epoch = excluded.epoch,
              started_at = datetime('now'),
              expires_at = excluded.expires_at`,
         )
-        .run(roomId, agentId, epoch, Math.max(1, Math.floor(ttlSeconds)));
+        .run(roomId, agentId, Math.max(1, Math.floor(ttlSeconds)));
     });
     tx.immediate();
   }
@@ -1546,20 +1978,18 @@ export class ChatStore {
   /**
    * Close an in-turn wait lease (normal return, timeout, or abort alike).
    *
-   * Guarded on the epoch the caller CAPTURED when it opened the lease, never on
-   * the persona's current epoch. A fenced-out runtime still runs its finally
-   * block, and that cleanup can land after the winner has already replaced the
-   * row; an unguarded DELETE would then remove the winner's live lease and
-   * report it as not watching. Deliberately NOT wrapped in requireEpoch: a lost
-   * runtime must still be able to clean up after itself, it just must not touch
-   * anything that is no longer its own.
+   * Deliberately NOT wrapped in requireLive: a retired identity must still be
+   * able to clean up after itself. It cannot reach anything that is not its
+   * own, because the row is keyed by agent_id and a successor identity is a
+   * DIFFERENT agent_id -- so a late cleanup from a superseded persona can only
+   * ever delete that persona's own row.
    */
-  endWaitLease(roomId: number, agentId: string, epoch: number): void {
+  endWaitLease(roomId: number, agentId: string): void {
     this.db
       .prepare(
-        "DELETE FROM wait_leases WHERE room_id = ? AND agent_id = ? AND epoch = ?",
+        "DELETE FROM wait_leases WHERE room_id = ? AND agent_id = ?",
       )
-      .run(roomId, agentId, epoch);
+      .run(roomId, agentId);
   }
 
   getMembership(
@@ -1662,6 +2092,7 @@ export class ChatStore {
     // role comes from the MEMBERSHIP, not the persona: it is what this persona
     // is in THIS room.
     const cols = `SELECT a.id, a.brand, a.model, a.version, a.is_human,
+                         a.retired_at,
                          m.role AS role,
                          substr(a.description, 1, ${PREVIEW}) AS description,
                          CASE WHEN length(a.description) > ${PREVIEW} THEN 1 ELSE 0 END AS description_cut,
@@ -1677,8 +2108,12 @@ export class ChatStore {
                    FROM memberships m JOIN agents a ON a.id = m.agent_id
                    WHERE m.room_id = @room`;
     const lim = Math.max(1, Math.floor(limit));
-    type Row = Omit<AgentRow, "present" | "active" | "watching" | "is_human"> & {
+    type Row = Omit<
+      AgentRow,
+      "present" | "active" | "watching" | "is_human" | "retired"
+    > & {
       left_at: string | null;
+      retired_at: string | null;
       description_cut: number;
       _rid: number;
       watching: number;
@@ -1730,19 +2165,27 @@ export class ChatStore {
     const page = hasMore ? rows.slice(0, lim) : rows;
     const threshold = activeWithinMinutes * 60;
     const mapped = page.map((r) => {
-      const { left_at, description_cut, _rid, watching, ...rest } = r;
+      const { left_at, retired_at, description_cut, _rid, watching, ...rest } = r;
       void _rid;
-      const isWatching = watching === 1;
+      const retired = retired_at !== null;
+      // Retirement soft-leaves memberships and deletes leases in its own
+      // transaction, so these are already false by the data. Forcing them is
+      // for the writers this file cannot reach: a direct SQL writer can leave
+      // a retired row present, and a listing that showed it as a live member
+      // would send peers work it can never read.
+      const isWatching = !retired && watching === 1;
       return {
         ...rest,
         is_human: rest.is_human === 1,
         ...(description_cut ? { description_truncated: true } : {}),
-        present: left_at === null,
+        present: !retired && left_at === null,
         active:
+          !retired &&
           left_at === null &&
           (isWatching ||
             (r.idle_seconds !== null && r.idle_seconds <= threshold)),
         watching: isWatching,
+        retired,
       };
     });
     const { rows: agents, sizeTrimmed } = fitRows(mapped, LIST_ROW_BUDGET);
@@ -1840,7 +2283,6 @@ export class ChatStore {
     mentions: string[] | null,
     replyToSeq: number | null,
     supersedesSeq: number | null,
-    epoch: number,
     opts: {
       ifLastReadSeq?: number | null;
       crossedPreviewChars?: number;
@@ -1936,10 +2378,10 @@ export class ChatStore {
     }
     const ifToken = opts.ifLastReadSeq ?? null;
     const tx = this.db.transaction(() => {
-      // FIRST, before the dedup lookup: a fenced-out runtime must not even be
-      // told the seq of a message it posted in a previous tenure, and must
+      // FIRST, before the dedup lookup: a retired identity must not even be
+      // told the seq of a message it posted before retirement, and must
       // certainly not insert a new one.
-      this.requireEpoch(agentId, epoch);
+      this.requireLive(agentId);
       // Presence, room existence, and the cursor share one membership read.
       const membership = this.requirePresent(roomId, agentId);
       // Lost-response retry: one indexed lookup only when the caller opted in.
@@ -2552,9 +2994,28 @@ export class ChatStore {
       watching: number;
     }[];
     const byId = new Map(rows.map((r) => [r.agent_id, r]));
+    // Retirement is a property of the IDENTITY, not of a membership, so it is
+    // resolved for every requested id -- including ids with no membership row
+    // here, which would otherwise report `unknown` and tell a poster its
+    // recipient never existed when in fact it existed and is finished.
+    const retired = this.retiredIds(ids);
     const threshold = activeWithinMinutes * 60;
     return ids.map((id) => {
       const r = byId.get(id);
+      if (retired.has(id)) {
+        return {
+          id,
+          status: "retired",
+          present: false,
+          idle_seconds: null,
+          // Its final cursor is retained history and is still the truthful
+          // answer to "how far did it get", so report it when a membership
+          // exists. marker_behind stays meaningful for the same reason.
+          last_read_seq: r ? r.last_read_seq : null,
+          marker_behind: r ? Math.max(0, latest - r.last_read_seq) : null,
+          watching: false,
+        };
+      }
       if (!r) {
         return {
           id,
@@ -2847,34 +3308,35 @@ export class ChatStore {
    * lock the way catchUp's IMMEDIATE transaction would. Throws when the
    * membership is gone (room deleted mid-wait), same as catchUp.
    *
-   * EPOCH-FENCED, and this is what bounds how long a fenced-out wait keeps
+   * FENCED ON LIVENESS, and this is what bounds how long a dead wait keeps
    * sitting there. The advancing read on a hit was always fenced, but a QUIET
-   * stale wait never reaches it: with no epoch here, a runtime taken over at
+   * stale wait never reaches it: with no check here, an identity retired at
    * second 3 of a 25-second wait went right on waiting, holding a lease that
    * told peers it was watching, and learned nothing until traffic arrived or
    * the deadline expired. Checking each probe caps that at one interval.
    *
-   * The epoch rides as returned DATA anchored on the persona row, not as a
-   * WHERE predicate: as a predicate a fenced runtime would get "no row", which
+   * retired_at rides as returned DATA anchored on the persona row, not as a
+   * WHERE predicate: as a predicate a dead identity would get "no row", which
    * this method already means "the room or membership is gone" -- a wrong and
    * actively misleading diagnosis. Anchoring on agents keeps the two apart.
    */
-  unreadProbe(roomId: number, agentId: string, epoch: number): number {
+  unreadProbe(roomId: number, agentId: string): number {
     const row = this.db
       .prepare(
-        `SELECT a.runtime_epoch AS current_epoch,
+        `SELECT a.retired_at,
                 (SELECT mb.last_read_seq FROM memberships mb
                   WHERE mb.room_id = @room AND mb.agent_id = @agent)
                   AS last_read_seq
          FROM agents a WHERE a.id = @agent`,
       )
       .get({ room: roomId, agent: agentId }) as
-      | { current_epoch: number; last_read_seq: number | null }
+      | { retired_at: string | null; last_read_seq: number | null }
       | undefined;
-    if (!row) throw new PersonaLostError(agentId, epoch, null);
-    if (row.current_epoch !== epoch) {
-      throw new PersonaLostError(agentId, epoch, row.current_epoch);
-    }
+    // Same fence as requireLive, and this is the path a detached poller runs:
+    // a retired identity's watcher must EXIT rather than keep reporting
+    // traffic to a seat that can never act on it.
+    if (!row) throw new PersonaLostError(agentId, "missing");
+    if (row.retired_at !== null) throw new PersonaLostError(agentId, "retired");
     if (row.last_read_seq === null) throw new Error("not a member of this room");
     // A wait only needs a yes/no wake signal. COUNT(*) rescanned the complete
     // unread tail twice per second per wait (including a large self-authored
@@ -2959,12 +3421,7 @@ export class ChatStore {
     agentId: string,
     limit: number,
     previewChars?: number,
-    // Defaulted only because it sits after an optional parameter. 0 is a
-    // FAIL-CLOSED sentinel, not "no fencing": personas start at epoch 1 and
-    // only ever increment, so an omitted epoch matches nothing and the read is
-    // rejected rather than silently running unfenced.
     maxBytes: number = DEFAULT_MAX_BYTES,
-    epoch: number = 0,
     unreadSummary: {
       priorityOnly?: boolean;
     } | null = null,
@@ -3017,7 +3474,7 @@ export class ChatStore {
       // ADVANCING read: fenced like a mutation, because it moves the read
       // marker. A stale runtime whose catch_up committed would consume messages
       // the current runtime has not seen and can no longer reach.
-      this.requireEpoch(agentId, epoch);
+      this.requireLive(agentId);
       // Advancing reads require presence; read_history remains non-advancing.
       const from = this.requirePresent(roomId, agentId).last_read_seq;
       const priorityOnly = unreadSummary?.priorityOnly === true;
@@ -3420,11 +3877,10 @@ export class ChatStore {
   markRead(
     roomId: number,
     agentId: string,
-    epoch: number,
     seq?: number,
   ): { previous: number; new: number; latest: number } {
     const tx = this.db.transaction(() => {
-      this.requireEpoch(agentId, epoch);
+      this.requireLive(agentId);
       // Advancing a marker requires presence and reports the prior cursor.
       const previous = this.requirePresent(roomId, agentId).last_read_seq;
       const { latest } = this.db
@@ -3507,7 +3963,6 @@ export class ChatStore {
   pruneMessages(
     roomId: number,
     agentId: string,
-    epoch: number,
     keepLast: number,
     force: boolean,
   ): {
@@ -3522,7 +3977,7 @@ export class ChatStore {
     // ALL rows would reset MAX(seq), breaking the monotonic-seq invariant.
     keepLast = Math.max(1, Math.floor(keepLast));
     const tx = this.db.transaction(() => {
-      this.requireEpoch(agentId, epoch);
+      this.requireLive(agentId);
       // Pruning requires presence, including when force skips unread checks.
       this.requirePresent(roomId, agentId);
       const { c: total } = this.db
@@ -3540,13 +3995,23 @@ export class ChatStore {
         // read position for resume, so their unread is real until they return.
         // (The author has implicitly "seen" its own message, matching catch_up's
         // self-exclusion.) Pass force=true to prune past this.
+        //
+        // RETIRED LLM identities are the one exclusion, and it is required
+        // rather than optional: retirement soft-leaves their memberships, and
+        // a left membership blocks by design because it can come back. A
+        // retired one cannot, so without this join a single model transition
+        // would freeze the room's history permanently behind a cursor no
+        // reader will ever advance. Humans that left stay blockers -- they are
+        // resumable, which is exactly the difference.
         const { u } = this.db
           .prepare(
             `SELECT COUNT(*) AS u FROM messages g
              WHERE g.room_id = ? AND g.seq < ?
                AND EXISTS (
                  SELECT 1 FROM memberships mm
+                 JOIN agents aa ON aa.id = mm.agent_id
                  WHERE mm.room_id = g.room_id
+                   AND aa.retired_at IS NULL
                    AND mm.last_read_seq < g.seq AND mm.agent_id != g.agent_id
                )`,
           )
@@ -3559,7 +4024,8 @@ export class ChatStore {
           const { m } = this.db
             .prepare(
               `SELECT MIN(mm.last_read_seq) AS m FROM memberships mm
-                WHERE mm.room_id = ? AND EXISTS (
+                 JOIN agents aa ON aa.id = mm.agent_id
+                WHERE mm.room_id = ? AND aa.retired_at IS NULL AND EXISTS (
                   SELECT 1 FROM messages g WHERE g.room_id = mm.room_id
                     AND g.seq < ? AND g.seq > mm.last_read_seq
                     AND g.agent_id != mm.agent_id)`,
@@ -3593,13 +4059,12 @@ export class ChatStore {
   deleteRoom(
     roomId: number,
     agentId: string,
-    epoch: number,
   ): { messages: number; members: number } {
     const tx = this.db.transaction(() => {
       // Fenced for the same reason as createRoom, and more urgently: this is
       // the one irreversible operation in the tool surface. No membership is
       // required (deletion has always been global admin), only a live persona.
-      this.requireEpoch(agentId, epoch);
+      this.requireLive(agentId);
       this.requireRoom(roomId);
       const { c: messages } = this.db
         .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = ?")
@@ -3627,14 +4092,15 @@ export class ChatStore {
    * winner: the read-check and upsert run in one IMMEDIATE transaction, so two
    * simultaneous claimants cannot both be granted (unlike two "I claim X" chat
    * posts, which can cross). Re-claiming your own key renews the TTL; an
-   * expired claim is grantable to anyone. Ownership is per PERSONA, so a claim
-   * survives a resume: the runtime that takes the persona over inherits it.
+   * expired claim is grantable to anyone. Ownership is per PERSONA, and a
+   * persona belongs to one connection for life, so a claim has exactly one
+   * holder until it expires, is released, or its holder is retired (retirement
+   * DELETES it rather than transferring it).
    */
   claimResource(
     roomId: number,
     key: string,
     agentId: string,
-    epoch: number,
     ttlSeconds: number,
     note: string | null,
   ):
@@ -3652,7 +4118,7 @@ export class ChatStore {
     assertStorable(note, "claim note");
     assertMaxLen(note, "claim note", 2000);
     const tx = this.db.transaction(() => {
-      this.requireEpoch(agentId, epoch);
+      this.requireLive(agentId);
       // Taking a claim requires presence; releasing one remains cleanup.
       this.requirePresent(roomId, agentId);
       const row = this.db
@@ -3710,12 +4176,11 @@ export class ChatStore {
     roomId: number,
     key: string,
     agentId: string,
-    epoch: number,
   ):
     | { released: true; key: string }
     | { released: false; key: string; reason: string } {
     const tx = this.db.transaction(() => {
-      this.requireEpoch(agentId, epoch);
+      this.requireLive(agentId);
       this.requireRoom(roomId);
       const row = this.db
         .prepare(

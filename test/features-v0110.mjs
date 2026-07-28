@@ -12,7 +12,7 @@
 //  P1 MCP: room targets a joined room without switching active
 //  P2 MCP: expected_room asserts the active room; mutual exclusion with room
 //  P3 MCP: CAS reject shape + idempotent retry succeeds
-//  P4 MCP: back-compat accept shape (posted:true rides along)
+//  P4 MCP: ordinary accept shape (posted:true rides along)
 //  P5 MCP: client_message_id returns original seq on exact retry
 import { ChatStore } from "../dist/db.js";
 import { spawn } from "node:child_process";
@@ -20,7 +20,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { EPOCH1, mkAgent, bindArgs, mkRoom } from "./persona-helpers.mjs";
+import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
@@ -36,15 +36,15 @@ const check = (n, c, x) => {
   mkAgent(s, "u");
   mkAgent(s, "me");
   mkAgent(s, "peer");
-  s.joinRoom(r, "me", EPOCH1, {});
-  s.joinRoom(r, "peer", EPOCH1, {});
-  const mine = s.postMessage(r, "me", "root", "text", null, null, null, EPOCH1);
+  s.joinRoom(r, "me", {});
+  s.joinRoom(r, "peer", {});
+  const mine = s.postMessage(r, "me", "root", "text", null, null, null);
   check("S1 clean post: crossed 0, crossed_directed 0",
     mine.posted === true && mine.crossed === 0 && mine.crossed_directed === 0, mine);
-  s.postMessage(r, "peer", "broadcast", "text", null, null, null, EPOCH1);
-  s.postMessage(r, "peer", "mention", "text", ["me"], null, null, EPOCH1);
-  s.postMessage(r, "peer", "reply", "text", null, mine.seq, null, EPOCH1);
-  const next = s.postMessage(r, "me", "over the top", "text", null, null, null, EPOCH1);
+  s.postMessage(r, "peer", "broadcast", "text", null, null, null);
+  s.postMessage(r, "peer", "mention", "text", ["me"], null, null);
+  s.postMessage(r, "peer", "reply", "text", null, mine.seq, null);
+  const next = s.postMessage(r, "me", "over the top", "text", null, null, null);
   check(
     "S1 crossed 3 with 2 directed (mention + reply)",
     next.crossed === 3 && next.crossed_directed === 2 &&
@@ -60,12 +60,12 @@ const check = (n, c, x) => {
   const r = mkRoom(s, "cas-future-token", null, null).id;
   mkAgent(s, "me");
   mkAgent(s, "peer");
-  s.joinRoom(r, "me", EPOCH1, {});
-  s.joinRoom(r, "peer", EPOCH1, {});
-  s.postMessage(r, "peer", "unread context", "text", null, null, null, EPOCH1); // cursor=0, seq=1
+  s.joinRoom(r, "me", {});
+  s.joinRoom(r, "peer", {});
+  s.postMessage(r, "peer", "unread context", "text", null, null, null); // cursor=0, seq=1
   let aheadError = "";
   try {
-    s.postMessage(r, "me", "must not post", "text", null, null, null, EPOCH1, {
+    s.postMessage(r, "me", "must not post", "text", null, null, null, {
       ifLastReadSeq: 1,
     });
   } catch (e) {
@@ -85,20 +85,20 @@ const check = (n, c, x) => {
   const r = mkRoom(s, "cas-room", null, null).id;
   mkAgent(s, "me");
   mkAgent(s, "peer");
-  s.joinRoom(r, "me", EPOCH1, {});
-  s.joinRoom(r, "peer", EPOCH1, {});
-  s.postMessage(r, "peer", "first", "text", ["me"], null, null, EPOCH1);
-  const read = s.catchUp(r, "me", 50, undefined, 100000, EPOCH1);
+  s.joinRoom(r, "me", {});
+  s.joinRoom(r, "peer", {});
+  s.postMessage(r, "peer", "first", "text", ["me"], null, null);
+  const read = s.catchUp(r, "me", 50, undefined, 100000);
   const token = read.new_last_read_seq;
   // Current token: accepted.
-  const okPost = s.postMessage(r, "me", "verdict v1", "text", null, null, null, EPOCH1, {
+  const okPost = s.postMessage(r, "me", "verdict v1", "text", null, null, null, {
     ifLastReadSeq: token,
   });
   check("S2 CAS accepts on a current token", okPost.posted === true, okPost);
   // Peer lands one; the same token now rejects.
-  const sneak = s.postMessage(r, "peer", "changes everything", "text", ["me"], null, null, EPOCH1);
+  const sneak = s.postMessage(r, "peer", "changes everything", "text", ["me"], null, null);
   const before = s.unreadCount(r, 0, "peer");
-  const rej = s.postMessage(r, "me", "verdict v2", "text", null, null, null, EPOCH1, {
+  const rej = s.postMessage(r, "me", "verdict v2", "text", null, null, null, {
     ifLastReadSeq: token,
   });
   check(
@@ -116,24 +116,26 @@ const check = (n, c, x) => {
     { before, after: s.unreadCount(r, 0, "peer") },
   );
   // S6: the reject consumed nothing; catch_up still delivers the crossing row.
-  const after = s.catchUp(r, "me", 50, undefined, 100000, EPOCH1);
+  const after = s.catchUp(r, "me", 50, undefined, 100000);
   check(
     "S6 reject consumes nothing; catch_up still delivers the crossed message",
     after.messages.some((m) => m.content === "changes everything"),
     after.messages,
   );
   // Retry with the fresh token succeeds.
-  const retry = s.postMessage(r, "me", "verdict v2", "text", null, null, null, EPOCH1, {
+  const retry = s.postMessage(r, "me", "verdict v2", "text", null, null, null, {
     ifLastReadSeq: after.new_last_read_seq,
   });
   check("S2 idempotent retry with the fresh token is accepted", retry.posted === true, retry);
 
   // S3: 25 crossings, row cap 20 -> crossed_remaining 5.
   const r2 = mkRoom(s, "cas-flood", null, null).id;
-  s.joinRoom(r2, "me", EPOCH1, {});
-  s.joinRoom(r2, "peer", EPOCH1, {});
-  for (let i = 0; i < 25; i++) s.postMessage(r2, "peer", "n" + i, "text", null, null, null, EPOCH1);
-  const flood = s.postMessage(r2, "me", "verdict", "text", null, null, null, EPOCH1, {
+  s.joinRoom(r2, "me", {});
+  s.joinRoom(r2, "peer", {});
+  for (let i = 0; i < 25; i++) {
+    s.postMessage(r2, "peer", "n" + i, "text", null, null, null);
+  }
+  const flood = s.postMessage(r2, "me", "verdict", "text", null, null, null, {
     ifLastReadSeq: 0,
   });
   check(
@@ -151,17 +153,17 @@ const check = (n, c, x) => {
   const r = mkRoom(s, "prev-room", null, null).id;
   mkAgent(s, "me");
   mkAgent(s, "peer");
-  s.joinRoom(r, "me", EPOCH1, {});
-  s.joinRoom(r, "peer", EPOCH1, {});
-  s.postMessage(r, "peer", "context that crossed", "text", ["me"], null, null, EPOCH1);
-  s.postMessage(r, "peer", "broadcast context", "text", null, null, null, EPOCH1);
-  const plain = s.postMessage(r, "me", "no opt-in", "text", null, null, null, EPOCH1);
+  s.joinRoom(r, "me", {});
+  s.joinRoom(r, "peer", {});
+  s.postMessage(r, "peer", "context that crossed", "text", ["me"], null, null);
+  s.postMessage(r, "peer", "broadcast context", "text", null, null, null);
+  const plain = s.postMessage(r, "me", "no opt-in", "text", null, null, null);
   check(
     "S4 without the opt-in: counts only, no crossed_messages",
     plain.crossed === 2 && plain.crossed_messages === undefined,
     plain,
   );
-  const withPrev = s.postMessage(r, "me", "with opt-in", "text", null, null, null, EPOCH1, {
+  const withPrev = s.postMessage(r, "me", "with opt-in", "text", null, null, null, {
     crossedPreviewChars: 7,
   });
   check(
@@ -182,13 +184,13 @@ const check = (n, c, x) => {
   const r = mkRoom(s, "adv-room", null, null).id;
   mkAgent(s, "me");
   mkAgent(s, "peer");
-  s.joinRoom(r, "me", EPOCH1, {});
-  s.joinRoom(r, "peer", EPOCH1, {});
-  s.postMessage(r, "peer", "\u{1F989}".repeat(400), "text", null, null, null, EPOCH1); // astral, 400 cp
-  s.postMessage(r, "peer", "x".repeat(100_000), "text", null, null, null, EPOCH1); // huge
-  s.postMessage(r, "peer", "".repeat(2000), "text", null, null, null, EPOCH1); // control-heavy
-  s.postMessage(r, "peer", JSON.stringify({ deep: { nested: "value" } }), "json", null, null, null, EPOCH1);
-  const res = s.postMessage(r, "me", "over it", "text", null, null, null, EPOCH1, {
+  s.joinRoom(r, "me", {});
+  s.joinRoom(r, "peer", {});
+  s.postMessage(r, "peer", "\u{1F989}".repeat(400), "text", null, null, null); // astral, 400 cp
+  s.postMessage(r, "peer", "x".repeat(100_000), "text", null, null, null); // huge
+  s.postMessage(r, "peer", "".repeat(2000), "text", null, null, null); // control-heavy
+  s.postMessage(r, "peer", JSON.stringify({ deep: { nested: "value" } }), "json", null, null, null);
+  const res = s.postMessage(r, "me", "over it", "text", null, null, null, {
     ifLastReadSeq: 0,
   });
   check("S5 adversarial reject returns all four rows",
@@ -227,12 +229,12 @@ const check = (n, c, x) => {
   const r = mkRoom(s, "idempotent-post", null, null).id;
   mkAgent(s, "me");
   mkAgent(s, "peer");
-  s.joinRoom(r, "me", EPOCH1, {});
-  s.joinRoom(r, "peer", EPOCH1, {});
+  s.joinRoom(r, "me", {});
+  s.joinRoom(r, "peer", {});
   const opts = { clientMessageId: "verdict-req-1", ifLastReadSeq: 0 };
-  const first = s.postMessage(r, "me", "verdict", "text", ["peer"], null, null, EPOCH1, opts);
-  s.postMessage(r, "peer", "later context", "text", null, null, null, EPOCH1);
-  const retry = s.postMessage(r, "me", "verdict", "text", ["peer"], null, null, EPOCH1, opts);
+  const first = s.postMessage(r, "me", "verdict", "text", ["peer"], null, null, opts);
+  s.postMessage(r, "peer", "later context", "text", null, null, null);
+  const retry = s.postMessage(r, "me", "verdict", "text", ["peer"], null, null, opts);
   check(
     "S7 exact retry returns the original seq despite later CAS-stale traffic",
     first.posted === true && first.deduplicated === false &&
@@ -243,7 +245,9 @@ const check = (n, c, x) => {
   );
   let collision = "";
   try {
-    s.postMessage(r, "me", "different verdict", "text", ["peer"], null, null, EPOCH1, { clientMessageId: "verdict-req-1" });
+    s.postMessage(r, "me", "different verdict", "text", ["peer"], null, null, {
+      clientMessageId: "verdict-req-1",
+    });
   } catch (e) {
     collision = String(e?.message ?? e);
   }
@@ -300,10 +304,14 @@ await (async () => {
   const rA = mkRoom(s, "post-a", null, null).id;
   const rB = mkRoom(s, "post-b", null, null).id;
   mkAgent(s, "peer");
-  s.joinRoom(rA, "peer", EPOCH1, {});
-  s.joinRoom(rB, "peer", EPOCH1, {});
-  mkAgent(s, "u");
-  await call("resume_persona", bindArgs("u"));
+  s.joinRoom(rA, "peer", {});
+  s.joinRoom(rB, "peer", {});
+  const identified = await call("identify_persona", {
+    brand: "post",
+    model: "cas-client",
+    version: "1.0",
+  });
+  const mcpAgentId = identified.data.agent_id;
   await call("join_room", { room: "post-b" });
   await call("join_room", { room: "post-a" }); // active = A
 
@@ -340,7 +348,15 @@ await (async () => {
   // P3: CAS over MCP.
   const drain = await call("catch_up", {});
   const token = drain.data.new_last_read_seq;
-  s.postMessage(rA, "peer", "landed during composition", "text", ["u"], null, null, EPOCH1);
+  s.postMessage(
+    rA,
+    "peer",
+    "landed during composition",
+    "text",
+    [mcpAgentId],
+    null,
+    null,
+  );
   const p3rej = await call("post_message", {
     content: "verdict",
     if_last_read_seq: token,
@@ -374,7 +390,7 @@ await (async () => {
     { result: p3ahead.data, beforeAhead, after: s.readHistory(rA, 100).messages.length },
   );
 
-  // P4: back-compat accept shape.
+  // P4: ordinary accept shape.
   const p4 = await call("post_message", { content: "plain", to: ["peer"] });
   check(
     "P4 accept shape keeps seq/crossed/recipients and adds posted/crossed_directed",
@@ -389,7 +405,7 @@ await (async () => {
     content: "large dispositive result",
     client_message_id: "mcp-request-1",
   });
-  s.postMessage(rA, "peer", "later traffic", "text", null, null, null, EPOCH1);
+  s.postMessage(rA, "peer", "later traffic", "text", null, null, null);
   const p5retry = await call("post_message", {
     content: "large dispositive result",
     client_message_id: "mcp-request-1",
@@ -414,14 +430,14 @@ await (async () => {
 
   // P6: pruning must not erase the evidence behind a dispositive CAS token.
   const pruneRoom = mkRoom(s, "cas-prune", null, null).id;
-  s.joinRoom(pruneRoom, "peer", EPOCH1, {});
+  s.joinRoom(pruneRoom, "peer", {});
   await call("join_room", { room: "cas-prune" });
   const oldToken = (await call("catch_up", {})).data.new_last_read_seq;
-  s.postMessage(pruneRoom, "peer", "contradiction", "text", null, null, null, EPOCH1); // seq 1
+  s.postMessage(pruneRoom, "peer", "contradiction", "text", null, null, null); // seq 1
   await call("catch_up", {}); // user has read it, but oldToken remains 0
   await call("post_message", { content: "own suffix" }); // seq 2
-  s.markRead(pruneRoom, "peer", EPOCH1);
-  const pruned = s.pruneMessages(pruneRoom, "peer", EPOCH1, 1, false);
+  s.markRead(pruneRoom, "peer");
+  const pruned = s.pruneMessages(pruneRoom, "peer", 1, false);
   const evidenceGone = await call("post_message", {
     content: "must not land",
     if_last_read_seq: oldToken,

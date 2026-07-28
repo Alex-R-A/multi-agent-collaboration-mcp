@@ -20,7 +20,7 @@ import Database from "better-sqlite3";
 import { mkdtempSync, mkdirSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { EPOCH1, mkAgent, mkRoom, rmRoom } from "./persona-helpers.mjs";
+import { mkAgent, mkRoom, rmRoom } from "./persona-helpers.mjs";
 
 let failures = 0;
 const check = (n, c, x) => {
@@ -44,16 +44,16 @@ const throws = (fn, re) => {
   const r = mkRoom(s, "n", null, null).id;
   mkAgent(s, "a");
   mkAgent(s, "b");
-  s.joinRoom(r, "a", EPOCH1, {});
-  s.joinRoom(r, "b", EPOCH1, {});
+  s.joinRoom(r, "a", {});
+  s.joinRoom(r, "b", {});
   check(
     "post_message with an embedded NUL is rejected (was silent truncation)",
-    throws(() => s.postMessage(r, "b", "abc" + NUL + "def", "text", null, null, null, EPOCH1), /NUL/),
+    throws(() => s.postMessage(r, "b", "abc" + NUL + "def", "text", null, null, null), /NUL/),
     null,
   );
   check(
     "post_message with a lone high surrogate is rejected",
-    throws(() => s.postMessage(r, "b", "x\ud800y", "text", null, null, null, EPOCH1), /surrogate/),
+    throws(() => s.postMessage(r, "b", "x\ud800y", "text", null, null, null), /surrogate/),
     null,
   );
   check(
@@ -63,21 +63,21 @@ const throws = (fn, re) => {
   );
   check(
     "set_role with a NUL role is rejected",
-    throws(() => s.setRole(r, "a", EPOCH1, "re" + NUL + "viewer"), /NUL/),
+    throws(() => s.setRole(r, "a", "re" + NUL + "viewer"), /NUL/),
     null,
   );
   check(
     "join_room with a NUL role is rejected",
-    throws(() => s.joinRoom(r, "a", EPOCH1, { role: "re" + NUL + "viewer" }), /NUL/),
+    throws(() => s.joinRoom(r, "a", { role: "re" + NUL + "viewer" }), /NUL/),
     null,
   );
   check(
     "claim with a NUL note is rejected",
-    throws(() => s.claimResource(r, "k", "a", EPOCH1, 900, "no" + NUL + "te"), /NUL/),
+    throws(() => s.claimResource(r, "k", "a", 900, "no" + NUL + "te"), /NUL/),
     null,
   );
   // A legitimate control char that is NOT NUL still stores and round-trips.
-  s.postMessage(r, "b", "ctl\u0001ok", "text", null, null, null, EPOCH1);
+  s.postMessage(r, "b", "ctl\u0001ok", "text", null, null, null);
   const back = s.getMessage(r, 1, 0, 1000);
   check("a non-NUL control char round-trips intact", back.content === "ctl\u0001ok", back.content);
   s.close();
@@ -96,9 +96,9 @@ const throws = (fn, re) => {
   const s = new ChatStore(DB);
   mkRoom(s, "r", null, null);
   mkAgent(s, "a");
-  s.joinRoom(1, "a", EPOCH1, {});
+  s.joinRoom(1, "a", {});
   const astral = "\u{1F600}".repeat(200);
-  s.postMessage(1, "a", astral, "text", null, null, null, EPOCH1);
+  s.postMessage(1, "a", astral, "text", null, null, null);
   const gm = s.getMessage(1, 1, 0, 100_000); // whole body fits
   check(
     "an astral body pages fully and reports its exact length",
@@ -137,12 +137,12 @@ const throws = (fn, re) => {
   const s = new ChatStore(":memory:");
   const r = mkRoom(s, "big", null, null).id;
   mkAgent(s, "b");
-  s.joinRoom(r, "b", EPOCH1, {});
+  s.joinRoom(r, "b", {});
   // 5 MB body: a prefix fetch of a deep page would materialize megabytes; a
   // window fetch holds only ~maxChars. Assert the deep page returns the right
   // window and heap stays bounded.
   const body = "abcdefghij".repeat(500_000); // 5,000,000 chars
-  s.postMessage(r, "b", body, "text", null, null, null, EPOCH1);
+  s.postMessage(r, "b", body, "text", null, null, null);
   const deep = s.getMessage(r, 1, 4_000_000, 1000);
   check(
     "deep get_message page returns exactly its window",
@@ -167,14 +167,16 @@ const throws = (fn, re) => {
   const r = mkRoom(s, "bulk", null, null).id;
   mkAgent(s, "a");
   mkAgent(s, "b");
-  s.joinRoom(r, "a", EPOCH1, {});
-  s.joinRoom(r, "b", EPOCH1, {});
+  s.joinRoom(r, "a", {});
+  s.joinRoom(r, "b", {});
   // 20 legal 400k bodies. A fetch-all would still materialize ~8 MB to return
   // one, enough to violate the 5 MB assertion without making routine tests a
   // host stress workload.
-  for (let i = 0; i < 20; i++) s.postMessage(r, "b", "z".repeat(400_000), "text", null, null, null, EPOCH1);
+  for (let i = 0; i < 20; i++) {
+    s.postMessage(r, "b", "z".repeat(400_000), "text", null, null, null);
+  }
   const heapBefore = process.memoryUsage().heapUsed;
-  const page = s.catchUp(r, "a", 500, undefined, 100_000, EPOCH1);
+  const page = s.catchUp(r, "a", 500, undefined, 100_000);
   const heapGrowth = process.memoryUsage().heapUsed - heapBefore;
   check("catch_up over huge bodies still fits max_bytes", size(page) <= 100_000, size(page));
   check("catch_up delivers the head and flags byte_limited", page.messages.length >= 1 && page.byte_limited === true, page.messages.length);
@@ -214,9 +216,11 @@ const throws = (fn, re) => {
   const s = new ChatStore(":memory:");
   const r = mkRoom(s, "s", null, null).id;
   mkAgent(s, "b");
-  s.joinRoom(r, "b", EPOCH1, {});
+  s.joinRoom(r, "b", {});
   // Identical bodies -> identical rank; the g.id tie-break makes paging total.
-  for (let i = 0; i < 4; i++) s.postMessage(r, "b", "needle same", "text", null, null, null, EPOCH1);
+  for (let i = 0; i < 4; i++) {
+    s.postMessage(r, "b", "needle same", "text", null, null, null);
+  }
   const seen = new Set();
   let offset = 0;
   for (let i = 0; i < 6; i++) {
@@ -280,7 +284,7 @@ if (process.platform !== "win32") {
   const ids = Array.from({ length: 12 }, (_, i) => "agent-" + String(i).padStart(2, "0"));
   for (const id of ids) {
     mkAgent(s, id);
-    s.joinRoom(r, id, EPOCH1, {}); // all within the same wall-clock second
+    s.joinRoom(r, id, {}); // all within the same wall-clock second
   }
   const seen = [];
   let after;
@@ -289,7 +293,10 @@ if (process.platform !== "win32") {
     for (const a of agents) seen.push(a.id);
     // A concurrent same-second join on page 2 would shift an OFFSET; keyset is
     // immune. Insert one mid-traversal to prove it.
-    if (p === 1) { mkAgent(s, "agent-zz"); s.joinRoom(r, "agent-zz", EPOCH1, {}); }
+    if (p === 1) {
+      mkAgent(s, "agent-zz");
+      s.joinRoom(r, "agent-zz", {});
+    }
     if (next_after === undefined || agents.length === 0) break;
     after = next_after;
   }

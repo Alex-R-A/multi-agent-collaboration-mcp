@@ -4,7 +4,7 @@
 // - my_mentions pages with after_id (no repeating first page)
 // - my_mentions bounds by_room within max_bytes
 import { ChatStore } from "../dist/db.js";
-import { EPOCH1, mkAgent, mkRoom } from "./persona-helpers.mjs";
+import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
 let failures = 0;
 const check = (n, c, x) => {
@@ -18,12 +18,12 @@ const check = (n, c, x) => {
   const r = mkRoom(s, "r", null, null).id;
   mkAgent(s, "alice");
   mkAgent(s, "bob");
-  s.joinRoom(r, "alice", EPOCH1, {});
-  s.joinRoom(r, "bob", EPOCH1, {});
-  s.postMessage(r, "alice", "parent that will be pruned", "text", null, null, null, EPOCH1); // seq 1
-  for (let i = 0; i < 7; i++) s.postMessage(r, "bob", "filler " + i, "text", null, null, null, EPOCH1); // 2..8
-  s.postMessage(r, "bob", "late reply to alice", "text", null, 1, null, EPOCH1); // seq 9, directed at alice
-  const pruned = s.pruneMessages(r, "alice", EPOCH1, 5, true); // deletes seq < 5, incl. the parent
+  s.joinRoom(r, "alice", {});
+  s.joinRoom(r, "bob", {});
+  s.postMessage(r, "alice", "parent that will be pruned", "text", null, null, null); // seq 1
+  for (let i = 0; i < 7; i++) s.postMessage(r, "bob", "filler " + i, "text", null, null, null); // 2..8
+  s.postMessage(r, "bob", "late reply to alice", "text", null, 1, null); // seq 9, directed at alice
+  const pruned = s.pruneMessages(r, "alice", 5, true); // deletes seq < 5, incl. the parent
   check("prune removed the parent", pruned.deleted === 4, pruned);
   const inbox = s.myMentions("alice", 50);
   check(
@@ -42,9 +42,9 @@ const check = (n, c, x) => {
   const r = mkRoom(s, "r", null, null).id;
   mkAgent(s, "hero");
   mkAgent(s, "spammer");
-  s.joinRoom(r, "hero", EPOCH1, {});
-  s.joinRoom(r, "spammer", EPOCH1, {});
-  for (let i = 1; i <= 8; i++) s.postMessage(r, "spammer", "m" + i, "text", ["hero"], null, null, EPOCH1);
+  s.joinRoom(r, "hero", {});
+  s.joinRoom(r, "spammer", {});
+  for (let i = 1; i <= 8; i++) s.postMessage(r, "spammer", "m" + i, "text", ["hero"], null, null);
   const seen = [];
   let afterId = 0;
   for (let guard = 0; guard < 10; guard++) {
@@ -68,12 +68,12 @@ const check = (n, c, x) => {
   mkAgent(s, "noise");
   for (let i = 1; i <= 30; i++) {
     const id = mkRoom(s, "room-" + String(i).padStart(2, "0") + "-" + "x".repeat(80), null, null).id;
-    s.joinRoom(id, "hero", EPOCH1, {});
-    s.joinRoom(id, "noise", EPOCH1, {});
+    s.joinRoom(id, "hero", {});
+    s.joinRoom(id, "noise", {});
     // DIRECTED, one per room: an earlier version posted only broadcasts, so
     // the "pre-truncation" assertion below was === 0 and could not tell a
     // pre-truncation count from a post-truncation one (mutation-proven).
-    s.postMessage(id, "noise", "ping @hero", "text", ["hero"], null, null, EPOCH1);
+    s.postMessage(id, "noise", "ping @hero", "text", ["hero"], null, null);
   }
   const inbox = s.myMentions("hero", 50, undefined, 2000);
   const size = JSON.stringify(inbox).length;
@@ -98,10 +98,10 @@ const check = (n, c, x) => {
   const r = mkRoom(s, "busy", null, null).id;
   mkAgent(s, "hero");
   mkAgent(s, "n");
-  s.joinRoom(r, "hero", EPOCH1, {});
-  s.joinRoom(r, "n", EPOCH1, {});
+  s.joinRoom(r, "hero", {});
+  s.joinRoom(r, "n", {});
   for (let i = 0; i < 10; i++)
-    s.postMessage(r, "n", "hello @hero " + "x".repeat(300), "text", ["hero"], null, null, EPOCH1);
+    s.postMessage(r, "n", "hello @hero " + "x".repeat(300), "text", ["hero"], null, null);
   const inbox = s.myMentions("hero", 50, undefined, 1000);
   const size = JSON.stringify(inbox).length;
   check(`max_bytes=1000 is a hard bound (${size} <= 1000)`, size <= 1000, size);
@@ -115,14 +115,14 @@ const check = (n, c, x) => {
   const r = mkRoom(s, "r", null, null).id;
   mkAgent(s, "a");
   mkAgent(s, "b");
-  s.joinRoom(r, "a", EPOCH1, {});
-  s.joinRoom(r, "b", EPOCH1, {});
+  s.joinRoom(r, "a", {});
+  s.joinRoom(r, "b", {});
   // 100 valid mention ids INCLUDING the reader (an earlier version of this
   // test generated ids that never mentioned the reader, making the inbox
   // half vacuous).
   const ids = ["a", ...Array.from({ length: 99 }, (_, i) => "m" + i + "x".repeat(190))];
-  s.postMessage(r, "b", "short body", "text", ids, null, null, EPOCH1);
-  const page = s.catchUp(r, "a", 50, undefined, 1000, EPOCH1);
+  s.postMessage(r, "b", "short body", "text", ids, null, null);
+  const page = s.catchUp(r, "a", 50, undefined, 1000);
   const size = JSON.stringify(page).length;
   check(`catch_up WHOLE response hard-bounded (${size} <= 1000)`, size <= 1000, size);
   check(
@@ -130,7 +130,7 @@ const check = (n, c, x) => {
     page.messages[0].to_truncated === true && page.messages[0].to_total === 100,
     page.messages[0].to_total,
   );
-  s.markRead(r, "a", EPOCH1, 0); // rewind to test the inbox path on the same message
+  s.markRead(r, "a", 0); // rewind to test the inbox path on the same message
   const inbox = s.myMentions("a", 50, undefined, 1000);
   const isize = JSON.stringify(inbox).length;
   check(`my_mentions WHOLE response hard-bounded (${isize} <= 1000)`, isize <= 1000, isize);
@@ -145,16 +145,16 @@ const check = (n, c, x) => {
   const bigSender = "sender-" + "s".repeat(170); // legal long id
   mkAgent(s, "a");
   mkAgent(s, bigSender); // long metadata
-  s.joinRoom(r, "a", EPOCH1, {});
-  s.joinRoom(r, bigSender, EPOCH1, {});
-  s.postMessage(r, bigSender, "nine printable ids", "text", ["a", ...Array.from({ length: 8 }, (_, i) => "n" + i + "y".repeat(190))], null, null, EPOCH1);
-  s.postMessage(r, bigSender, String.fromCharCode(1).repeat(400), "text", ["a"], null, null, EPOCH1);
-  s.postMessage(r, bigSender, "plain body from a long-metadata sender", "text", null, null, null, EPOCH1);
+  s.joinRoom(r, "a", {});
+  s.joinRoom(r, bigSender, {});
+  s.postMessage(r, bigSender, "nine printable ids", "text", ["a", ...Array.from({ length: 8 }, (_, i) => "n" + i + "y".repeat(190))], null, null);
+  s.postMessage(r, bigSender, String.fromCharCode(1).repeat(400), "text", ["a"], null, null);
+  s.postMessage(r, bigSender, "plain body from a long-metadata sender", "text", null, null, null);
 
   let pages = 0;
   const delivered = [];
   for (;;) {
-    const p = s.catchUp(r, "a", 50, undefined, 1000, EPOCH1);
+    const p = s.catchUp(r, "a", 50, undefined, 1000);
     const sz = JSON.stringify(p).length;
     check(`repro catch_up page ${++pages} hard-bounded (${sz} <= 1000)`, sz <= 1000, sz);
     for (const m of p.messages) delivered.push(m.seq);
@@ -175,7 +175,7 @@ const check = (n, c, x) => {
     delivered.join(",") === "1,2,3",
     delivered,
   );
-  s.markRead(r, "a", EPOCH1, 0);
+  s.markRead(r, "a", 0);
   let afterId = 0;
   let ipages = 0;
   const inboxSeqs = [];

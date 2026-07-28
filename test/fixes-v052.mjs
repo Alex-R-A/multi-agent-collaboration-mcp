@@ -3,7 +3,7 @@
 // - reply_to_seq validated inside the insert transaction
 // - get_thread charges SERIALIZED size (escaping/envelope), not raw chars
 import { ChatStore, DEFAULT_MAX_BYTES } from "../dist/db.js";
-import { EPOCH1, mkAgent, mkRoom } from "./persona-helpers.mjs";
+import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
 let failures = 0;
 const check = (n, c, x) => {
@@ -16,16 +16,16 @@ const check = (n, c, x) => {
   const s = new ChatStore(":memory:");
   const r = mkRoom(s, "r", null, null).id;
   mkAgent(s, "a");
-  s.joinRoom(r, "a", EPOCH1, {});
+  s.joinRoom(r, "a", {});
   let rejected = false;
   try {
-    s.postMessage(r, "a", "dangling", "text", null, 999, null, EPOCH1);
+    s.postMessage(r, "a", "dangling", "text", null, 999, null);
   } catch (e) {
     rejected = /reply_to_seq 999 does not exist/.test(e.message);
   }
   check("reply to a nonexistent seq is rejected by postMessage itself", rejected);
-  s.postMessage(r, "a", "root", "text", null, null, null, EPOCH1); // seq 1
-  const ok = s.postMessage(r, "a", "reply", "text", null, 1, null, EPOCH1); // seq 2
+  s.postMessage(r, "a", "root", "text", null, null, null); // seq 1
+  const ok = s.postMessage(r, "a", "reply", "text", null, 1, null); // seq 2
   check("valid reply still accepted", ok.seq === 2, ok);
   s.close();
 }
@@ -35,10 +35,10 @@ const check = (n, c, x) => {
   const s = new ChatStore(":memory:");
   const r = mkRoom(s, "r", null, null).id;
   mkAgent(s, "a");
-  s.joinRoom(r, "a", EPOCH1, {});
+  s.joinRoom(r, "a", {});
   // \u0001 serializes 6x ("\u0001" per char): 60k raw chars ~= 360k serialized.
-  s.postMessage(r, "a", "\u0001".repeat(60_000), "text", null, null, null, EPOCH1); // seq 1
-  s.postMessage(r, "a", "focal reply", "text", null, 1, null, EPOCH1); // seq 2
+  s.postMessage(r, "a", "\u0001".repeat(60_000), "text", null, null, null); // seq 1
+  s.postMessage(r, "a", "focal reply", "text", null, 1, null); // seq 2
   const CAP = DEFAULT_MAX_BYTES + 10_000; // budget plus corrective-pass slack
   const viaParent = s.getThread(r, 2, 3);
   const parentTotal = JSON.stringify(viaParent).length;

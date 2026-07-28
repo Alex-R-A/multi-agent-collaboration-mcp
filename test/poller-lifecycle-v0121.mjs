@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ChatStore } from "../dist/db.js";
-import { EPOCH1, mkAgent, mkRoom } from "./persona-helpers.mjs";
+import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const POLLER = join(ROOT, "dist", "poller.js");
@@ -78,6 +78,7 @@ mkdirSync(pollerTmp, { mode: 0o700 });
 const DB = join(dir, "chat.db");
 let store;
 let lockPath = null;
+let ownedLockPath = null;
 let expectedLockPaths = [];
 const active = new Set();
 const remainingLocks = () => expectedLockPaths.filter((path) => existsSync(path));
@@ -86,22 +87,26 @@ try {
   const room = mkRoom(store, "poller-life", null, null).id;
   for (const id of ["me", "peer"]) {
     mkAgent(store, id);
-    store.joinRoom(room, id, EPOCH1, {});
+    store.joinRoom(room, id, {});
   }
   const canonical = realpathSync(DB);
-  const lockName =
+  const diagnosticLockName =
     createHash("sha256")
-      .update(JSON.stringify([canonical, "me", room, null, false]))
+      .update(JSON.stringify([canonical, "me", room, "diagnostic", false]))
       .digest("hex") + ".lock";
-  lockPath = join(
+  const ownedLockName =
+    createHash("sha256")
+      .update(JSON.stringify([canonical, "me", room, "owned", false]))
+      .digest("hex") + ".lock";
+  const lockDir = join(
     pollerTmp,
     typeof process.getuid === "function"
       ? `agent-chat-pollers-${process.getuid()}`
       : "agent-chat-pollers",
-    lockName,
   );
-  // ONE lock path. The watcher no longer double-locks a legacy directory.
-  expectedLockPaths = [lockPath];
+  lockPath = join(lockDir, diagnosticLockName);
+  ownedLockPath = join(lockDir, ownedLockName);
+  expectedLockPaths = [lockPath, ownedLockPath];
   const base = [
     "--agent",
     "me",
@@ -120,7 +125,15 @@ try {
   const finalLock = await waitForLock(lockPath, finalProbe.child);
   await sleep(150);
   const postedAt = Date.now();
-  store.postMessage(room, "peer", "during-final-sleep", "text", null, null, null, EPOCH1);
+  store.postMessage(
+    room,
+    "peer",
+    "during-final-sleep",
+    "text",
+    null,
+    null,
+    null,
+  );
   const finalResult = await finalProbe.wait(3_500);
   const finalDelay = Date.now() - postedAt;
   active.delete(finalProbe.child);
@@ -134,7 +147,7 @@ try {
     finalResult.code === 0 && finalJson?.has_updates === true && finalDelay >= 1_000,
     { finalResult, finalJson, finalDelay },
   );
-  store.markRead(room, "me", EPOCH1);
+  store.markRead(room, "me");
 
   // A genuine duplicate remains fail-closed, but reports the exact lock so a
   // PID-reuse false positive is diagnosable. Both children are bounded and
@@ -221,19 +234,35 @@ try {
     "10",
   ]);
   active.add(ownerBound.child);
-  const ownerLock = await waitForLock(lockPath, ownerBound.child);
+  const ownerLock = await waitForLock(ownedLockPath, ownerBound.child);
+  const diagnosticBesideOwner = startPoller([...base, "--timeout", "10"]);
+  active.add(diagnosticBesideOwner.child);
+  const diagnosticLock = await waitForLock(
+    lockPath,
+    diagnosticBesideOwner.child,
+  );
   owner.kill("SIGTERM");
   const ownerDeadline = Date.now() + 2_000;
   while (owner.exitCode === null && Date.now() < ownerDeadline) await sleep(20);
   if (owner.exitCode !== null) active.delete(owner);
   const ownerResult = await ownerBound.wait(6_500);
   active.delete(ownerBound.child);
+  diagnosticBesideOwner.child.kill("SIGTERM");
+  const diagnosticResult = await diagnosticBesideOwner.wait(2_000);
+  active.delete(diagnosticBesideOwner.child);
   check(
-    "generated watcher retires after its MCP owner ends",
-    ownerLock && ownerResult.code === 2 &&
+    "owned and diagnostic watchers coexist; owned watcher retires with its MCP owner",
+    ownerLock && diagnosticLock && ownerResult.code === 2 &&
       /owner MCP process.*ended/.test(ownerResult.stderr) &&
+      diagnosticResult.code === 143 &&
       remainingLocks().length === 0,
-    { ownerLock, ownerResult, remainingLocks: remainingLocks() },
+    {
+      ownerLock,
+      diagnosticLock,
+      ownerResult,
+      diagnosticResult,
+      remainingLocks: remainingLocks(),
+    },
   );
 } catch (error) {
   check("poller lifecycle harness completed", false, String(error));

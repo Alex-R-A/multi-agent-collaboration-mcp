@@ -1205,11 +1205,12 @@
                 id="join-name"
                 placeholder="Your name"
                 aria-label="Your name"
-                maxlength="200"
+                maxlength="177"
                 autocomplete="off"
                 spellcheck="false"
               />
               <button id="join-btn" class="btn-accent">Join room</button>
+              <button id="join-change-btn" class="linkish" hidden>Change name</button>
               <span class="compose-hint"
                 >no password: identity is self-asserted, like the agents</span
               >
@@ -1242,8 +1243,27 @@
     <script>
       "use strict";
 
-      const ROOM_KEY = "agent-chat.room";
-      const SEEN_KEY = "agent-chat.seen";
+      const OLD_KEYS = [
+        "agent-chat.room",
+        "agent-chat.seen",
+        "agent-chat.identity",
+        "agent-chat.joined",
+        "agent-chat.ghosts",
+      ];
+      const ROOM_KEY = "agent-chat.v2.room";
+      const SEEN_KEY = "agent-chat.v2.seen";
+      const IDENT_KEY = "agent-chat.v2.identity";
+      const JOINED_KEY = "agent-chat.v2.joined";
+      const GHOST_KEY = "agent-chat.v2.ghosts";
+      const IDENTITY_VERSION = 2;
+      // This release replaces the database instead of migrating it. Remove
+      // state whose room ids and identities belong to the deleted database
+      // before any recovery, retry, or network request can use it.
+      for (const key of OLD_KEYS) {
+        try {
+          localStorage.removeItem(key);
+        } catch {}
+      }
       const POLL_MS = 1500;
       const ROOMS_MS = 30000;
       const PAGE = 400;
@@ -1258,7 +1278,7 @@
         "room-head", "room-name", "room-desc", "room-stats",
         "pinned", "pinned-preview", "pinned-body",
         "banner", "stream-wrap", "stream", "older", "markall", "msgs", "jump", "placeholder",
-        "composer", "compose-join", "join-name", "join-btn", "join-error",
+        "composer", "compose-join", "join-name", "join-btn", "join-change-btn", "join-error",
         "compose-box", "reply-target", "compose-text", "send", "compose-ident",
         "ident-btn", "leave-btn", "compose-error",
         "search", "search-bar", "search-info", "search-back", "results",
@@ -1316,15 +1336,13 @@
         roomEpoch: 0,
         searchSeq: 0, // orders concurrent search requests
         searchController: null, // aborts the superseded/abandoned search request
+        changingIdentity: false,
+        changingFrom: null,
         // A rename that lands WHILE search mode hides the stream cannot rebuild
         // the (hidden) rows' identity-derived decoration then; this defers it
         // to exitSearch.
         needsRebuild: false,
       };
-
-      const IDENT_KEY = "agent-chat.identity";
-      const JOINED_KEY = "agent-chat.joined";
-      const GHOST_KEY = "agent-chat.ghosts";
 
       // Cross-tab serialization for EVERY membership mutation (identity,
       // joined map, ghost ledger, and the server calls they mirror). These
@@ -1342,6 +1360,80 @@
         return navigator.locks.request("agent-chat.membership", fn);
       }
 
+      function emptyIdentityState() {
+        return {
+          version: IDENTITY_VERSION,
+          current: null,
+          pending_allocation: null,
+        };
+      }
+
+      function readIdentityState() {
+        try {
+          const v = JSON.parse(localStorage.getItem(IDENT_KEY));
+          const currentOk =
+            v?.current === null ||
+            (v?.current &&
+              typeof v.current.base_name === "string" &&
+              typeof v.current.agent_id === "string");
+          const p = v?.pending_allocation;
+          const pendingOk =
+            p === null ||
+            (p &&
+              typeof p.operation_id === "string" &&
+              Number.isSafeInteger(p.room) &&
+              p.room > 0 &&
+              typeof p.base_name === "string" &&
+              (p.previous_agent_id === null ||
+                typeof p.previous_agent_id === "string") &&
+              Array.isArray(p.previous_memberships) &&
+              p.previous_memberships.every(
+                (m) =>
+                  m &&
+                  Number.isSafeInteger(m.room) &&
+                  m.room > 0 &&
+                  typeof m.agent_id === "string",
+              ));
+          if (
+            v &&
+            v.version === IDENTITY_VERSION &&
+            currentOk &&
+            pendingOk
+          ) {
+            return v;
+          }
+        } catch {}
+        return emptyIdentityState();
+      }
+
+      let browserIdentity = readIdentityState();
+
+      function reloadIdentityState() {
+        browserIdentity = readIdentityState();
+        return browserIdentity;
+      }
+
+      // The current identity and its pending replacement share one atomic
+      // localStorage value. Update the in-memory view only after persistence
+      // succeeds, so a thrown write cannot make this tab outrun reload.
+      function saveIdentityState(next) {
+        try {
+          localStorage.setItem(IDENT_KEY, JSON.stringify(next));
+          browserIdentity = next;
+          return true;
+        } catch {
+          return false;
+        }
+      }
+
+      function currentIdentity() {
+        return browserIdentity.current;
+      }
+
+      function identity() {
+        return currentIdentity()?.agent_id || "";
+      }
+
       // Memberships whose soft-leave failed (e.g. server briefly down during
       // a rename): tracked so later joins can retry the leave instead of the
       // ghost becoming permanently unaddressable.
@@ -1354,7 +1446,10 @@
           return Array.isArray(v)
             ? v.filter(
                 (g) =>
-                  g && typeof g.room === "number" && typeof g.name === "string",
+                  g &&
+                  Number.isSafeInteger(g.room) &&
+                  g.room > 0 &&
+                  typeof g.agent_id === "string",
               )
             : [];
         } catch {
@@ -1364,7 +1459,10 @@
       function saveGhosts(g) {
         try {
           localStorage.setItem(GHOST_KEY, JSON.stringify(g));
-        } catch {}
+          return true;
+        } catch {
+          return false;
+        }
       }
       let ghostRetryActive = false;
       async function retryGhosts() {
@@ -1373,23 +1471,31 @@
         try {
           // The membership lock is held ACROSS each leave's round trip: the
           // stale-check below is only race-free if no other tab can re-adopt
-          // the (room, name) while the leave is in flight.
+          // the (room, agent id) while the leave is in flight.
           await withMembershipLock(async () => {
+            reloadIdentityState();
+            // Pending allocation recovery must establish the new current
+            // identity and its cleanup ledger before any old leave can run.
+            if (browserIdentity.pending_allocation) return;
             for (const g of loadGhosts()) {
-              // A ghost whose (room, name) is the CURRENT mapping again is not
-              // stale: the user re-adopted the name and rejoined, and leaving
+              // A ghost whose (room, agent id) is the CURRENT mapping again is
+              // not stale: the user re-adopted the identity and rejoined, and leaving
               // now would evict that live membership seconds after it was
               // created. Purge the entry instead of retrying it.
-              if (loadJoined()[String(g.room)] === g.name) {
+              if (loadJoined()[String(g.room)] === g.agent_id) {
                 saveGhosts(
                   loadGhosts().filter(
-                    (x) => !(x.room === g.room && x.name === g.name),
+                    (x) =>
+                      !(x.room === g.room && x.agent_id === g.agent_id),
                   ),
                 );
                 continue;
               }
               try {
-                await postJson("/api/leave", { room: g.room, name: g.name });
+                await postJson("/api/leave", {
+                  room: g.room,
+                  agent_id: g.agent_id,
+                });
               } catch {
                 continue; // still unreachable; keep the entry for the next sweep
               }
@@ -1398,7 +1504,8 @@
               // these retries were in flight.
               saveGhosts(
                 loadGhosts().filter(
-                  (x) => !(x.room === g.room && x.name === g.name),
+                  (x) =>
+                    !(x.room === g.room && x.agent_id === g.agent_id),
                 ),
               );
             }
@@ -1408,9 +1515,6 @@
         }
       }
 
-      function identity() {
-        return localStorage.getItem(IDENT_KEY) || "";
-      }
       function loadJoined() {
         try {
           const v = JSON.parse(localStorage.getItem(JOINED_KEY));
@@ -1457,7 +1561,11 @@
         try {
           const r = await fetch(url, { ...options, signal: controller.signal });
           const data = await r.json().catch(() => ({}));
-          if (!r.ok) throw new Error(data.error || "HTTP " + r.status);
+          if (!r.ok) {
+            const error = new Error(data.error || "HTTP " + r.status);
+            error.httpStatus = r.status;
+            throw error;
+          }
           return data;
         } finally {
           clearTimeout(timeout);
@@ -1986,11 +2094,13 @@
           const who = document.createElement("span");
           who.className = "who";
           who.textContent = label(m);
+          who.title = m.from;
           head.append(who);
           if (label(m) !== m.from) {
             const id = document.createElement("span");
             id.className = "who-id";
             id.textContent = m.from;
+            id.title = m.from;
             head.append(id);
           }
           if (identity() && m.from === identity()) {
@@ -2307,11 +2417,13 @@
         const who = document.createElement("span");
         who.className = "who";
         who.textContent = label(m);
+        who.title = m.from;
         head.append(who);
         if (label(m) !== m.from) {
           const id = document.createElement("span");
           id.className = "who-id";
           id.textContent = m.from;
+          id.title = m.from;
           head.append(id);
         }
         const meta = document.createElement("span");
@@ -2430,19 +2542,164 @@
 
       // ---- participation ------------------------------------------------------
 
+      function recordedMemberships(agentId) {
+        if (!agentId) return [];
+        return Object.entries(loadJoined())
+          .filter(([, storedAgentId]) => storedAgentId === agentId)
+          .map(([room]) => ({ room: Number(room), agent_id: agentId }))
+          .filter((m) => Number.isSafeInteger(m.room) && m.room > 0);
+      }
+
+      async function completePendingAllocationLocked(pending) {
+        let j;
+        try {
+          j = await postJson("/api/join", {
+            room: pending.room,
+            base_name: pending.base_name,
+            operation_id: pending.operation_id,
+          });
+        } catch (error) {
+          // A delivered 4xx is a final rejection, not an uncertain response:
+          // the server's allocation paths commit nothing on these statuses.
+          // Drop only that request so the user can correct it. Transport
+          // failures and 5xx responses keep the UUID for safe replay.
+          if (
+            error?.httpStatus >= 400 &&
+            error.httpStatus < 500
+          ) {
+            saveIdentityState({
+              version: IDENTITY_VERSION,
+              current: browserIdentity.current,
+              pending_allocation: null,
+            });
+          }
+          throw error;
+        }
+        if (
+          typeof j.agent_id !== "string" ||
+          j.base_name !== pending.base_name ||
+          j.room_id !== pending.room ||
+          typeof j.joined !== "boolean"
+        ) {
+          throw new Error("allocation response did not match the pending request");
+        }
+
+        const oldMemberships = pending.previous_memberships.filter(
+          (m) => m.agent_id !== j.agent_id,
+        );
+        if (oldMemberships.length) {
+          const ghosts = loadGhosts();
+          for (const old of oldMemberships) {
+            if (
+              !ghosts.some(
+                (g) =>
+                  g.room === old.room && g.agent_id === old.agent_id,
+              )
+            ) {
+              ghosts.push(old);
+            }
+          }
+          if (!saveGhosts(ghosts)) {
+            throw new Error(
+              "the new identity was allocated, but cleanup state could not be saved; free browser storage and retry",
+            );
+          }
+        }
+
+        // Save the new membership map before switching the atomic identity
+        // object. If this write fails, pending_allocation remains durable and
+        // reload can replay the same server allocation.
+        const joined = loadJoined();
+        for (const old of oldMemberships) {
+          const key = String(old.room);
+          if (joined[key] === old.agent_id) delete joined[key];
+        }
+        if (j.joined) joined[String(pending.room)] = j.agent_id;
+        if (!saveJoined(joined)) {
+          throw new Error(
+            "the new identity was allocated, but room state could not be saved; free browser storage and retry",
+          );
+        }
+
+        const nextIdentity = {
+          version: IDENTITY_VERSION,
+          current: {
+            base_name: j.base_name,
+            agent_id: j.agent_id,
+          },
+          pending_allocation: null,
+        };
+        if (!saveIdentityState(nextIdentity)) {
+          throw new Error(
+            "the new identity was allocated, but identity state could not be saved; free browser storage and retry",
+          );
+        }
+
+        // Only the durable ghost ledger and switched identity make it safe to
+        // leave old memberships. A failed leave stays in the ledger.
+        for (const old of oldMemberships) {
+          try {
+            await postJson("/api/leave", {
+              room: old.room,
+              agent_id: old.agent_id,
+            });
+          } catch {
+            continue;
+          }
+          saveGhosts(
+            loadGhosts().filter(
+              (g) =>
+                !(g.room === old.room && g.agent_id === old.agent_id),
+            ),
+          );
+        }
+        return j;
+      }
+
+      async function recoverPendingAllocationLocked() {
+        const pending = browserIdentity.pending_allocation;
+        return pending
+          ? completePendingAllocationLocked(pending)
+          : null;
+      }
+
+      async function recoverPendingAllocation() {
+        try {
+          await withMembershipLock(async () => {
+            reloadIdentityState();
+            await recoverPendingAllocationLocked();
+          });
+          return true;
+        } catch {
+          reloadIdentityState();
+          return browserIdentity.pending_allocation === null;
+        }
+      }
+
       function renderComposer() {
         el.composer.hidden = !state.current;
         if (!state.current) return;
         const joined = joinedHere();
-        el.composeJoin.hidden = joined;
-        el.composeBox.hidden = !joined;
+        const current = currentIdentity();
+        const allocationMode = !current || state.changingIdentity;
+        el.composeJoin.hidden = joined && !state.changingIdentity;
+        el.composeBox.hidden = !joined || state.changingIdentity;
         el.joinError.textContent = "";
         el.composeError.textContent = "";
-        if (joined) {
+        if (joined && !state.changingIdentity) {
           el.composeIdent.textContent = identity();
+          el.composeIdent.title = identity();
         } else {
-          if (!el.joinName.value) el.joinName.value = identity();
-          el.joinBtn.textContent = "Join " + state.current.name;
+          el.joinName.hidden = !allocationMode;
+          el.joinChangeBtn.hidden = allocationMode || !current;
+          if (allocationMode) {
+            if (!el.joinName.value && current) {
+              el.joinName.value = current.base_name;
+            }
+            el.joinBtn.textContent = current ? "Change name" : "Join room";
+          } else {
+            el.joinBtn.textContent = "Join as " + current.agent_id;
+          }
         }
         renderReplyTarget();
       }
@@ -2476,109 +2733,115 @@
       }
 
       async function joinCurrent() {
-        // The Enter key in the name field bypasses the button's disabled
-        // state; gate on it here so two rename loops can never interleave
-        // over the shared localStorage maps.
         if (el.joinBtn.disabled) return;
         const room = state.current;
-        const name = el.joinName.value.trim().replace(/^@/, "");
-        if (!room || !name) {
-          el.joinError.textContent = "pick a name first";
-          el.joinName.focus();
-          return;
-        }
+        if (!room) return;
+        const requestedBase = el.joinName.value;
+        const explicitChange = state.changingIdentity;
+        const changingFrom = state.changingFrom;
+        const previousUiIdentity = identity();
         el.joinBtn.disabled = true;
         const epoch = state.roomEpoch;
         try {
-          // The whole join/rename sequence (server calls INCLUDED) runs under
-          // the cross-tab membership lock: its localStorage read-modify-write
-          // steps are only merge-safe against writes that happen strictly
-          // before or after, not interleaved between read and save.
-          const { j, prevIdentity, saved } = await withMembershipLock(async () => {
-          const prevIdentity = identity();
-          // Join FIRST: the server validates the new name, and an invalid
-          // rename must not have already torn down the old memberships.
-          const j = await postJson("/api/join", { room: room.id, name });
-          try {
-            localStorage.setItem(IDENT_KEY, name);
-          } catch {}
-          // Renaming: soft-leave EVERY membership recorded under another name
-          // (else the abandoned identity lingers as a present ghost member,
-          // blocking prune's unread-refusal). Failed leaves go to the ghost
-          // ledger for retry on later joins, INCLUDING the current room's
-          // old name, which the map overwrite below would otherwise orphan.
-          const joinedMap = loadJoined();
-          const newGhosts = [];
-          const removed = [];
-          for (const [rid, storedName] of Object.entries(joinedMap)) {
-            if (!storedName || storedName === name) continue;
-            try {
-              await postJson("/api/leave", { room: Number(rid), name: storedName });
-            } catch {
-              newGhosts.push({ room: Number(rid), name: storedName });
+          const { j, saved, newIdentity } = await withMembershipLock(async () => {
+            // Web Locks serialize same-origin tabs, but the decision must use
+            // the state read INSIDE the lock. Two initially empty tabs should
+            // share the first allocation, not mint one identity each.
+            reloadIdentityState();
+            const recovered = await recoverPendingAllocationLocked();
+            if (recovered) {
+              return {
+                j: recovered,
+                saved: true,
+                newIdentity: identity(),
+              };
             }
-            removed.push([rid, storedName]);
-          }
-          // Merge the new failures into the CURRENT ledger at save time: a
-          // snapshot-wholesale save would erase entries another tab (or a
-          // concurrent retry sweep) touched since this function started.
-          if (newGhosts.length) {
-            const ledger = loadGhosts();
-            for (const g of newGhosts) {
-              if (!ledger.some((x) => x.room === g.room && x.name === g.name)) {
-                ledger.push(g);
+            const current = currentIdentity();
+
+            // An explicit rename was chosen for one visible identity. If a
+            // different tab replaced it while this form was open, do not turn
+            // the stale click into an unintended second rename.
+            if (
+              explicitChange &&
+              changingFrom &&
+              current?.agent_id !== changingFrom
+            ) {
+              throw new Error(
+                "the identity changed in another tab; review the current name and try again",
+              );
+            }
+
+            let j;
+            let saved = true;
+            if (
+              current &&
+              (!explicitChange || requestedBase === current.base_name)
+            ) {
+              j = await postJson("/api/join", {
+                room: room.id,
+                agent_id: current.agent_id,
+              });
+              if (j.agent_id !== current.agent_id || j.room_id !== room.id) {
+                throw new Error(
+                  "canonical join response did not match the requested identity",
+                );
               }
+              const joined = loadJoined();
+              joined[String(room.id)] = current.agent_id;
+              saved = saveJoined(joined);
+              if (saved) {
+                const ghosts = loadGhosts();
+                const kept = ghosts.filter(
+                  (g) =>
+                    !(
+                      g.room === room.id &&
+                      g.agent_id === current.agent_id
+                    ),
+                );
+                if (kept.length !== ghosts.length) saveGhosts(kept);
+              }
+            } else {
+              if (!requestedBase) {
+                throw new Error("enter a base name first");
+              }
+              const previousAgentId = current?.agent_id || null;
+              const pending = {
+                operation_id: crypto.randomUUID(),
+                room: room.id,
+                base_name: requestedBase,
+                previous_agent_id: previousAgentId,
+                previous_memberships:
+                  recordedMemberships(previousAgentId),
+              };
+              if (
+                !saveIdentityState({
+                  version: IDENTITY_VERSION,
+                  current,
+                  pending_allocation: pending,
+                })
+              ) {
+                throw new Error(
+                  "browser storage is unavailable; no identity was allocated",
+                );
+              }
+              j = await completePendingAllocationLocked(pending);
             }
-            saveGhosts(ledger);
-          }
-          // Same merge discipline for the joined map: re-read it and delete
-          // only the entries we actually left AND that still hold the value
-          // we left under (defense in depth under the lock).
-          const freshMap = loadJoined();
-          for (const [rid, storedName] of removed) {
-            if (freshMap[rid] === storedName) delete freshMap[rid];
-          }
-          freshMap[String(room.id)] = name;
-          const saved = saveJoined(freshMap);
-          // Re-adopting a previously-ghosted (room, name): the mapping above
-          // makes that pair live again, so drop any stale ledger entry for it
-          // before the next sweep can leave the room we just joined.
-          const ledgerNow = loadGhosts();
-          const keptGhosts = ledgerNow.filter(
-            (x) => !(x.room === room.id && x.name === name),
-          );
-          if (keptGhosts.length !== ledgerNow.length) saveGhosts(keptGhosts);
-          return { j, prevIdentity, saved };
+            return { j, saved, newIdentity: identity() };
           });
-          // Fire-and-forget AFTER the lock releases: retryGhosts takes the
-          // same (non-reentrant) lock, so awaiting it here would deadlock.
+          state.changingIdentity = false;
+          state.changingFrom = null;
           retryGhosts();
-          // Local storage write failed (e.g. quota): the server join committed
-          // but the client cannot record it, so joinedHere() will read false
-          // and the composer would silently show "not joined". Surface it
-          // instead of leaving the user confused.
+          renderComposer();
           if (!saved) {
             el.joinError.textContent =
-              "joined on the server, but this browser could not save it locally (storage full?); free space and rejoin";
+              "joined on the server, but this browser could not save the room membership; free browser storage and retry";
           }
-          // The composer reflects the GLOBAL identity for whatever room is
-          // shown now; re-render it even after a room switch so a stale
-          // successful rename cannot leave it showing the old identity.
-          renderComposer();
-          // A rename invalidates identity-derived DECORATION on already-
-          // rendered rows ("you" badges, directed-at-me styling); rebuild
-          // whatever stream is currently shown from its cached rows, or defer
-          // to exitSearch when the stream is hidden behind search results.
-          if (prevIdentity !== name) {
+          if (previousUiIdentity !== newIdentity) {
             if (state.searchMode) state.needsRebuild = true;
             else rebuildStream();
           }
-          // A delayed response must not mutate another visit's marker/UI --
-          // but a RENAME was global, so the room shown now still carries the
-          // old identity's marker state: reset it and re-baseline (fetchMarker
-          // no-ops unless the new identity is joined there).
           if (!sameView(room, epoch)) {
-            if (prevIdentity !== name) {
+            if (previousUiIdentity !== newIdentity) {
               state.lastReadSent = 0;
               state.marker = -1;
               state.markerIdent = null;
@@ -2587,18 +2850,32 @@
             }
             return;
           }
-          // An identity change invalidates every in-flight operation that
-          // was issued under the OLD identity in this same room (their
-          // markers belong to the old name); a first join must not, or it
-          // would drop its own visit's in-flight initial load.
-          if (prevIdentity && prevIdentity !== name) state.roomEpoch += 1;
+          if (
+            previousUiIdentity &&
+            previousUiIdentity !== newIdentity
+          ) {
+            state.roomEpoch += 1;
+          }
           state.lastReadSent = 0;
-          state.marker = j.last_read_seq ?? 0;
-          state.markerIdent = name;
+          state.marker = saved && j.joined ? (j.last_read_seq ?? 0) : -1;
+          state.markerIdent = saved && j.joined ? newIdentity : null;
           computeGap();
           maybeMarkRead();
-          el.composeText.focus();
+          if (joinedHere()) el.composeText.focus();
         } catch (e) {
+          if (previousUiIdentity !== identity()) {
+            state.changingIdentity = false;
+            state.changingFrom = null;
+            state.lastReadSent = 0;
+            state.marker = -1;
+            state.markerIdent = null;
+            state.gap = false;
+            renderComposer();
+            if (state.searchMode) state.needsRebuild = true;
+            else rebuildStream();
+            computeGap();
+            fetchMarker();
+          }
           if (sameView(room, epoch)) el.joinError.textContent = e.message;
         } finally {
           el.joinBtn.disabled = false;
@@ -2608,17 +2885,20 @@
       async function leaveCurrent() {
         const room = state.current;
         const epoch = state.roomEpoch;
-        const name = identity();
-        if (!room || !name) return;
+        const agentId = identity();
+        if (!room || !agentId) return;
         try {
           // Same lock as join/rename: the leave plus its map update must not
           // interleave with another tab's read-modify-write.
           await withMembershipLock(async () => {
-            await postJson("/api/leave", { room: room.id, name });
+            await postJson("/api/leave", {
+              room: room.id,
+              agent_id: agentId,
+            });
             // Drop the mapping only while it still records THIS leave's
             // identity: a rename in another tab must not lose its mapping.
             const joined = loadJoined();
-            if (joined[String(room.id)] === name) {
+            if (joined[String(room.id)] === agentId) {
               delete joined[String(room.id)];
               saveJoined(joined);
             }
@@ -2645,7 +2925,7 @@
         try {
           await postJson("/api/post", {
             room: room.id,
-            name: identity(),
+            agent_id: identity(),
             body,
             reply_to_seq: state.replyTo ? state.replyTo.seq : null,
           });
@@ -2708,9 +2988,9 @@
       async function fetchMarker() {
         const room = state.current;
         const epoch = state.roomEpoch;
-        const name = identity();
-        if (!room || !name || !joinedHere()) return;
-        const retryKey = `${room.id}:${epoch}:${name}`;
+        const agentId = identity();
+        if (!room || !agentId || !joinedHere()) return;
+        const retryKey = `${room.id}:${epoch}:${agentId}`;
         if (state.markerLoading) return;
         if (
           state.markerRetryKey === retryKey &&
@@ -2721,7 +3001,7 @@
         state.markerLoading = true;
         try {
           const me = await fetchJson(
-            `/api/me?room=${room.id}&name=${encodeURIComponent(name)}`,
+            `/api/me?room=${room.id}&agent_id=${encodeURIComponent(agentId)}`,
           );
           if (me.error) throw new Error(me.error);
           if (!sameView(room, epoch)) return;
@@ -2729,23 +3009,23 @@
           // request and this completion; the epoch bump from the storage
           // listener usually catches that, but its event delivery is async,
           // so re-check before baselining the wrong identity's marker.
-          if (identity() !== name) return;
+          if (identity() !== agentId) return;
           // Never LOWER a marker a same-epoch same-identity writer (join,
           // markall) advanced while this response was in flight: the server
           // marker is monotonic, so the max is the truth; a stale value
           // would resurrect a cleared gap and suspend auto-marking.
           state.marker = me.joined
-            ? state.markerIdent === name && state.marker >= 0
+            ? state.markerIdent === agentId && state.marker >= 0
               ? Math.max(state.marker, me.last_read_seq)
               : me.last_read_seq
             : -1;
-          state.markerIdent = name;
+          state.markerIdent = agentId;
           state.markerRetryKey = "";
           state.markerRetryAt = 0;
           computeGap();
           maybeMarkRead();
         } catch {
-          if (sameView(room, epoch) && identity() === name) {
+          if (sameView(room, epoch) && identity() === agentId) {
             state.markerRetryKey = retryKey;
             state.markerRetryAt = Date.now() + 5_000;
           }
@@ -2757,8 +3037,8 @@
       function maybeMarkRead() {
         const room = state.current;
         const epoch = state.roomEpoch;
-        const name = identity();
-        if (!room || !name || !joinedHere()) return;
+        const agentId = identity();
+        if (!room || !agentId || !joinedHere()) return;
         // Search mode hides the live stream: follow/scroll state describes
         // the RESULTS layout, and the stream tail was never on screen, so
         // marking it read here would claim unseen messages (monotonically,
@@ -2768,7 +3048,7 @@
         // tab renames, marker/gap state still describes the old name until
         // fetchMarker re-baselines; posting meanwhile would graft the old
         // identity's read position onto the new name.
-        if (state.markerIdent !== name) return;
+        if (state.markerIdent !== agentId) return;
         if (document.visibilityState !== "visible") return;
         // Only claim messages as read while pinned to the bottom: arrivals
         // above the jump pill have not been seen, and agents treat this
@@ -2787,7 +3067,11 @@
           : 0;
         if (last <= state.lastReadSent) return;
         state.lastReadSent = last;
-        postJson("/api/read", { room: room.id, name, seq: last })
+        postJson("/api/read", {
+          room: room.id,
+          agent_id: agentId,
+          seq: last,
+        })
           .then((r) => {
             // A delayed response must not mutate another visit's state.
             if (sameView(room, epoch)) state.marker = r.last_read_seq;
@@ -2875,6 +3159,8 @@
         state.gap = false;
         state.noOlderHistory = false;
         state.needsRebuild = false; // a deferred rebuild belongs to the old room
+        state.changingIdentity = false;
+        state.changingFrom = null;
         state.roomEpoch += 1;
         try {
           localStorage.setItem(ROOM_KEY, JSON.stringify({ id: room.id }));
@@ -2961,18 +3247,18 @@
         // whole room read (same semantics as an agent's bare mark_read).
         const room = state.current;
         const epoch = state.roomEpoch;
-        const name = identity();
+        const agentId = identity();
         const last = state.msgs.length
           ? state.msgs[state.msgs.length - 1].seq
           : 0;
-        if (!room || !name || !joinedHere() || !last) return;
+        if (!room || !agentId || !joinedHere() || !last) return;
         // Same identity guard as maybeMarkRead: never advance a marker whose
         // baseline was fetched for a different (pre-rename) identity.
-        if (state.markerIdent !== name) return;
+        if (state.markerIdent !== agentId) return;
         try {
           const r = await postJson("/api/read", {
             room: room.id,
-            name,
+            agent_id: agentId,
             seq: last,
           });
           // A delayed response must not mutate another visit's state.
@@ -2995,13 +3281,18 @@
         }
       });
       el.leaveBtn.addEventListener("click", leaveCurrent);
-      el.identBtn.addEventListener("click", () => {
-        el.composeBox.hidden = true;
-        el.composeJoin.hidden = false;
-        el.joinName.value = identity();
+      function startChangingIdentity() {
+        const current = currentIdentity();
+        if (!current) return;
+        state.changingIdentity = true;
+        state.changingFrom = current.agent_id;
+        el.joinName.value = current.base_name;
+        renderComposer();
         el.joinName.focus();
         el.joinName.select();
-      });
+      }
+      el.identBtn.addEventListener("click", startChangingIdentity);
+      el.joinChangeBtn.addEventListener("click", startChangingIdentity);
       el.replyTarget.addEventListener("click", clearReply);
       el.send.addEventListener("click", sendMessage);
       el.composeText.addEventListener("input", autosize);
@@ -3013,8 +3304,11 @@
         if (e.key === "Escape") clearReply();
       });
       el.joinName.addEventListener("keydown", (e) => {
-        // Escape backs out of "Change name" when already joined.
-        if (e.key === "Escape" && joinedHere()) renderComposer();
+        if (e.key === "Escape" && currentIdentity()) {
+          state.changingIdentity = false;
+          state.changingFrom = null;
+          renderComposer();
+        }
       });
       el.search.addEventListener("keydown", (e) => {
         if (e.key === "Enter") {
@@ -3047,6 +3341,11 @@
       // a discarded in-flight initial load re-arms via pendingInitial.)
       window.addEventListener("storage", (e) => {
         if (e.key !== IDENT_KEY && e.key !== JOINED_KEY) return;
+        if (e.key === IDENT_KEY) {
+          reloadIdentityState();
+          state.changingIdentity = false;
+          state.changingFrom = null;
+        }
         state.roomEpoch += 1;
         state.lastReadSent = 0;
         state.marker = -1;
@@ -3064,6 +3363,24 @@
           computeGap();
           fetchMarker();
         }
+        if (e.key === IDENT_KEY && browserIdentity.pending_allocation) {
+          recoverPendingAllocation().then((recovered) => {
+            if (!recovered) return;
+            state.roomEpoch += 1;
+            state.lastReadSent = 0;
+            state.marker = -1;
+            state.markerIdent = null;
+            state.gap = false;
+            renderComposer();
+            if (state.current) {
+              if (state.searchMode) state.needsRebuild = true;
+              else rebuildStream();
+              computeGap();
+              fetchMarker();
+            }
+            retryGhosts();
+          });
+        }
       });
 
       setInterval(() => {
@@ -3075,7 +3392,8 @@
 
       (async function init() {
         showPlaceholder("Loading...", "");
-        retryGhosts(); // clean up any leaves that failed in a prior session
+        const recovered = await recoverPendingAllocation();
+        if (recovered) retryGhosts();
         await loadRooms();
         let savedId = null;
         try {

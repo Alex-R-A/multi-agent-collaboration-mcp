@@ -280,6 +280,55 @@ function dbUnavailableError() {
 
 const NAME_RE = /^[\w][\w.-]{0,199}$/; // sane self-asserted ids, no whitespace
 
+// Human identity grammar, mirrored from the agents CHECK in src/db.ts.
+//
+// DUPLICATED ON PURPOSE. This file is a standalone ESM script with no build
+// step -- that is the whole reason the viewer needs no dist -- so it cannot
+// import an unbuilt TypeScript constant. A shared constants layer would exist
+// only to carry two literals across that boundary. The database CHECK remains
+// the authority; these exist to produce a 400 with a readable reason instead of
+// a raw constraint failure.
+const MAX_HUMAN_BASE_CHARS = 177;
+const HUMAN_BASE_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]*$/;
+// Same lowercase canonical shape src/db.ts assertConnectionId requires. No
+// version or variant semantics are invented here: the browser generates these
+// with crypto.randomUUID().
+const OPERATION_ID_RE =
+  /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+
+/** Reason `v` is not a valid human base name, or "" when it is. NEVER trims or
+ *  case-folds: the base is the user's chosen visible name, and normalizing it
+ *  here would make two different requests mean the same identity on one path
+ *  and different identities on another. */
+function badBaseName(v) {
+  if (typeof v !== "string") return "base_name must be a string";
+  if (v.length < 1 || v.length > MAX_HUMAN_BASE_CHARS) {
+    return `base_name must be 1-${MAX_HUMAN_BASE_CHARS} characters`;
+  }
+  if (!HUMAN_BASE_RE.test(v)) {
+    return "base_name must start with a letter, digit, or underscore and contain only letters, digits, underscore, dot, or dash";
+  }
+  // Case-insensitive: 'Human-' must not squat the reserved namespace either.
+  if (v.slice(0, 6).toLowerCase() === "human-") {
+    return 'base_name must not begin with "human-" (reserved prefix)';
+  }
+  return "";
+}
+
+/** The agents row for `id` if it is a HUMAN participant, else null. The
+ *  is_human test is load-bearing: this API takes the actor from the request
+ *  body, so without it a caller could name an LLM persona and post, advance its
+ *  durable read marker, or leave its rooms. */
+function humanRow(d, id) {
+  if (typeof id !== "string" || !NAME_RE.test(id)) return null;
+  const row = d
+    .prepare(
+      "SELECT id, is_human, human_base, human_ordinal FROM agents WHERE id = ?",
+    )
+    .get(id);
+  return row && row.is_human === 1 ? row : null;
+}
+
 // Return a human reason if `s` holds text SQLite cannot round-trip (an
 // embedded NUL -- substr/length truncate at it -- or a lone surrogate), else
 // "". Mirrors the store's assertStorable so a web post is rejected the same way
@@ -318,12 +367,12 @@ function readBody(req, cap = 700_000) {
   });
 }
 
-function membership(d, roomId, name) {
+function membership(d, roomId, agentId) {
   return d
     .prepare(
       "SELECT left_at FROM memberships WHERE room_id = ? AND agent_id = ?",
     )
-    .get(roomId, name);
+    .get(roomId, agentId);
 }
 
 // A web actor must be a HUMAN participant with a present membership.
@@ -333,73 +382,156 @@ function membership(d, roomId, name) {
 // LLM persona's id and post, mark read, or advance that persona's durable read
 // marker over messages it has never seen. Membership alone is not enough,
 // because an LLM persona joined through MCP has exactly that. The two
-// populations are disjoint (this file's joinRoom refuses a human join onto an
-// existing LLM id, and create_persona/resume_persona refuse a human id), so
-// "is this row human" is a complete and stable answer.
-// Gates /api/post, /api/read, and /api/me.
-function webJoined(d, roomId, name) {
-  const who = d.prepare("SELECT is_human FROM agents WHERE id = ?").get(name);
-  if (!who || who.is_human !== 1) return false;
-  const m = membership(d, roomId, name);
+// populations are disjoint (a human id is server-allocated under the reserved
+// `human-` prefix, and identify_persona escapes any LLM slug that would land
+// there), so "is this row human" is a complete and stable answer.
+// Gates /api/post and /api/read.
+function webJoined(d, roomId, agentId) {
+  if (!humanRow(d, agentId)) return false;
+  const m = membership(d, roomId, agentId);
   return !!m && m.left_at === null;
 }
 
-// { error } results become 400s; { status: ... } results become 200s.
-function joinRoom(d, roomId, name) {
-  // One IMMEDIATE transaction: with the room-exists check outside it, a
-  // concurrent agent delete_room between statements surfaced as an uncaught
-  // FK throw (a 500) and left a stray agents row behind.
-  const tx = d.transaction(() => {
-  const room = d.prepare("SELECT id FROM rooms WHERE id = ?").get(roomId);
-  if (!room) return { error: `no room ${roomId}` };
-  // A human joins under a self-chosen name and carries no LLM metadata and no
-  // resume word. Create the row only if the name is free; if it is taken,
-  // REJECT unless it is already a human. Silently reusing an existing row would
-  // let a human typing a plausible name adopt an LLM persona wholesale -- its
-  // rooms, read position, and claims -- and post under it. There is no
-  // authentication here by design, so this collision check is the only thing
-  // standing between the two populations.
-  const existing = d
-    .prepare("SELECT is_human FROM agents WHERE id = ?")
-    .get(name);
-  if (existing && existing.is_human !== 1) {
-    return {
-      error: `"${name}" is an LLM persona, not a human participant; choose a different name`,
-    };
-  }
-  if (!existing) {
-    d.prepare(
-      "INSERT INTO agents (id, is_human) VALUES (?, 1) ON CONFLICT(id) DO NOTHING",
-    ).run(name);
-    // Re-read inside the same transaction: a concurrent MCP create_persona
-    // could have taken the name between the check and the insert, in which
-    // case DO NOTHING left THAT row in place and this join must still refuse.
-    const after = d
-      .prepare("SELECT is_human FROM agents WHERE id = ?")
-      .get(name);
-    if (!after || after.is_human !== 1) {
-      return {
-        error: `"${name}" was just taken by an LLM persona; choose a different name`,
-      };
-    }
-  }
+/** Insert-or-revive THIS membership, preserving cursor, role, and original
+ *  join time. Shared by fresh allocation and canonical rejoin; deliberately
+ *  NOT reached by an allocation replay, which must not reopen anything. */
+function upsertMembership(d, roomId, agentId) {
   d.prepare(
     "INSERT OR IGNORE INTO memberships (room_id, agent_id) VALUES (?, ?)",
-  ).run(roomId, name);
+  ).run(roomId, agentId);
   d.prepare(
     "UPDATE memberships SET left_at = NULL, last_seen = datetime('now') WHERE room_id = ? AND agent_id = ?",
-  ).run(roomId, name);
-  const m = d
+  ).run(roomId, agentId);
+  return d
     .prepare(
       "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
     )
-    .get(roomId, name);
-  return {
-    joined: true,
-    agent_id: name,
-    room_id: roomId,
-    last_read_seq: m.last_read_seq,
-  };
+    .get(roomId, agentId).last_read_seq;
+}
+
+/**
+ * Join by one of two EXPLICIT forms, in one IMMEDIATE transaction.
+ *
+ * fresh:     { room, base_name, operation_id }  -> allocate human-<base>-<N>
+ * canonical: { room, agent_id }                 -> rejoin an existing human
+ *
+ * There is no name alias and no fallback between them. The old single-field
+ * form let the browser send whatever it had stored and let the server guess;
+ * guessing is what allowed a typed name to land on someone else's row.
+ *
+ * The allocation lookup comes FIRST, before the room check, so a committed
+ * allocation whose room was later deleted still replays to the identity it
+ * created instead of allocating a second ordinal for one user action. That
+ * ordering is the whole point of the table.
+ */
+function joinRoom(d, roomId, form) {
+  const tx = d.transaction(() => {
+    if (form.kind === "fresh") {
+      const existing = d
+        .prepare(
+          "SELECT room_id, human_base, result_agent_id FROM human_allocations WHERE operation_id = ?",
+        )
+        .get(form.operationId);
+      if (existing) {
+        // The operation id is bound to its EXACT payload. Reuse with a
+        // different room or base is a second allocation request wearing a
+        // retry's clothes, not idempotency.
+        if (existing.room_id !== roomId || existing.human_base !== form.baseName) {
+          return {
+            error:
+              "operation_id was already used with a different room or base_name",
+          };
+        }
+        const agent = d
+          .prepare(
+            "SELECT id, is_human, human_base, human_ordinal FROM agents WHERE id = ?",
+          )
+          .get(existing.result_agent_id);
+        if (!agent || agent.is_human !== 1) {
+          // NEVER fall through to allocation. The allocation committed; a
+          // missing or non-human result row means the database disagrees with
+          // itself, and allocating again would mint a second identity for one
+          // user action on top of that.
+          return {
+            http: 500,
+            error:
+              "allocation record exists but its human identity is missing or invalid",
+          };
+        }
+        // Report state, change nothing: no insert, no revive, no cursor move.
+        const m = d
+          .prepare(
+            "SELECT last_read_seq, left_at FROM memberships WHERE room_id = ? AND agent_id = ?",
+          )
+          .get(existing.room_id, agent.id);
+        return {
+          joined: !!m && m.left_at === null,
+          agent_id: agent.id,
+          base_name: agent.human_base,
+          human_ordinal: agent.human_ordinal,
+          room_id: existing.room_id,
+          last_read_seq: m ? m.last_read_seq : 0,
+        };
+      }
+
+      const room = d.prepare("SELECT id FROM rooms WHERE id = ?").get(roomId);
+      if (!room) return { error: `no room ${roomId}` };
+      // Exact, case-sensitive base match: SQLite compares TEXT with BINARY
+      // collation by default, so "Alex" and "alex" are separate namespaces,
+      // which is what preserving the user's chosen case requires.
+      const { max } = d
+        .prepare(
+          "SELECT MAX(human_ordinal) AS max FROM agents WHERE is_human = 1 AND human_base = ?",
+        )
+        .get(form.baseName);
+      const ordinal = (max ?? 0) + 1;
+      if (!Number.isSafeInteger(ordinal) || ordinal > Number.MAX_SAFE_INTEGER) {
+        return { error: `no ordinal remains for base_name "${form.baseName}"` };
+      }
+      const agentId = `human-${form.baseName}-${ordinal}`;
+      if (agentId.length > 200) {
+        return { error: "the resulting canonical id would exceed 200 characters" };
+      }
+      // No collision retry. IMMEDIATE serializes writers and the partial unique
+      // index on (human_base, human_ordinal) rejects a duplicate outright, so a
+      // retry loop would only paper over a real conflict.
+      d.prepare(
+        "INSERT INTO agents (id, is_human, human_base, human_ordinal) VALUES (?, 1, ?, ?)",
+      ).run(agentId, form.baseName, ordinal);
+      const lastRead = upsertMembership(d, roomId, agentId);
+      d.prepare(
+        "INSERT INTO human_allocations (operation_id, room_id, human_base, result_agent_id) VALUES (?, ?, ?, ?)",
+      ).run(form.operationId, roomId, form.baseName, agentId);
+      return {
+        joined: true,
+        agent_id: agentId,
+        base_name: form.baseName,
+        human_ordinal: ordinal,
+        room_id: roomId,
+        last_read_seq: lastRead,
+      };
+    }
+
+    // canonical rejoin
+    const room = d.prepare("SELECT id FROM rooms WHERE id = ?").get(roomId);
+    if (!room) return { error: `no room ${roomId}` };
+    const agent = humanRow(d, form.agentId);
+    if (!agent) {
+      return {
+        error: `"${form.agentId}" is not an existing human participant`,
+      };
+    }
+    // Presence is deliberately NOT required: reviving a left membership is
+    // exactly what this form is for.
+    const lastRead = upsertMembership(d, roomId, agent.id);
+    return {
+      joined: true,
+      agent_id: agent.id,
+      base_name: agent.human_base,
+      human_ordinal: agent.human_ordinal,
+      room_id: roomId,
+      last_read_seq: lastRead,
+    };
   });
   try {
     return tx.immediate();
@@ -408,7 +540,7 @@ function joinRoom(d, roomId, name) {
   }
 }
 
-function postMessage(d, roomId, name, body, replyToSeq, mentions) {
+function postMessage(d, roomId, agentId, body, replyToSeq, mentions) {
   const mentionsJson =
     mentions && mentions.length > 0 ? JSON.stringify(mentions) : null;
   // Same shape as ChatStore.postMessage: validate membership and the reply
@@ -417,7 +549,7 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
   // reply reference cannot dangle against a racing prune, and a concurrent
   // delete_room yields this clean error instead of a raw FK failure.
   const tx = d.transaction(() => {
-    if (!webJoined(d, roomId, name)) {
+    if (!webJoined(d, roomId, agentId)) {
       throw new Error("join the room first (POST /api/join)");
     }
     let replyToAgent = null;
@@ -434,7 +566,7 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
       .prepare(
         "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
       )
-      .get(roomId, name);
+      .get(roomId, agentId);
     // A backward "latest peer" search becomes quadratic when one unread peer is
     // followed by a growing self tail: every post re-walks that tail. Probe
     // forward instead, stopping at the first peer. If one exists, conservatively
@@ -447,7 +579,7 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
          WHERE room_id = ? AND seq > ? AND agent_id != ?
          ORDER BY seq ASC LIMIT 1`,
       )
-      .get(roomId, from, name);
+      .get(roomId, from, agentId);
     const canNormalize = unreadPeer ? 0 : 1;
     const { next } = d
       .prepare(
@@ -460,7 +592,7 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
     d.prepare(
       `INSERT INTO messages (room_id, seq, agent_id, format, body, body_len, mentions, reply_to_seq, reply_to_agent)
        VALUES (?, ?, ?, 'text', ?, ?, ?, ?, ?)`,
-    ).run(roomId, next, name, body, body.length, mentionsJson, replyToSeq, replyToAgent);
+    ).run(roomId, next, agentId, body, body.length, mentionsJson, replyToSeq, replyToAgent);
     // Own rows are excluded from unread delivery. Move only cursors at/after the
     // proven safe floor through this row; a lagging peer remains unread.
     d.prepare(
@@ -469,7 +601,7 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
               THEN max(last_read_seq, ?) ELSE last_read_seq END,
            last_seen = datetime('now')
        WHERE room_id = ? AND agent_id = ?`,
-    ).run(canNormalize, from, next, roomId, name);
+    ).run(canNormalize, from, next, roomId, agentId);
     return next;
   });
   try {
@@ -479,14 +611,14 @@ function postMessage(d, roomId, name, body, replyToSeq, mentions) {
   }
 }
 
-function markRead(d, roomId, name, seq) {
+function markRead(d, roomId, agentId, seq) {
   // One IMMEDIATE transaction (read-then-write), so a concurrent room
   // deletion cannot vanish the membership row between statements.
   const tx = d.transaction(() => {
     // Gate on the live WEB session, not bare membership: a read landing after
     // this web session left (a stale tab, an in-flight auto-mark) advanced
     // the monotonic durable marker over messages nobody had seen.
-    if (!webJoined(d, roomId, name)) {
+    if (!webJoined(d, roomId, agentId)) {
       return { error: "join the room first (POST /api/join)" };
     }
     // Clamp to the room's latest seq (parity with the MCP server's mark_read):
@@ -504,12 +636,12 @@ function markRead(d, roomId, name, seq) {
     d.prepare(
       `UPDATE memberships SET last_read_seq = max(last_read_seq, ?), last_seen = datetime('now')
        WHERE room_id = ? AND agent_id = ?`,
-    ).run(eff, roomId, name);
+    ).run(eff, roomId, agentId);
     const row = d
       .prepare(
         "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
       )
-      .get(roomId, name);
+      .get(roomId, agentId);
     return { last_read_seq: row ? row.last_read_seq : eff };
   });
   try {
@@ -550,14 +682,22 @@ function deleteRoomFull(d, roomId) {
 // position) survives so rejoining resumes it. No twin reconciliation is needed
 // any more -- a human name cannot be shared with an LLM persona, so the only
 // participant behind this row is this one.
-function leaveRoom(d, roomId, name) {
+function leaveRoom(d, roomId, agentId) {
   const tx = d.transaction(() => {
+    // Identity is required, presence is not. This endpoint was the one
+    // ungated write: it updated ANY matching membership, so a crafted local
+    // request could soft-leave an LLM persona's room. Idempotent by design --
+    // already-left and never-joined both report left:false rather than an
+    // error, because a retried leave is a normal browser event.
+    if (!humanRow(d, agentId)) {
+      return { error: `"${agentId}" is not an existing human participant` };
+    }
     const info = d
       .prepare(
         `UPDATE memberships SET left_at = datetime('now'), last_seen = datetime('now')
          WHERE room_id = ? AND agent_id = ? AND left_at IS NULL`,
       )
-      .run(roomId, name);
+      .run(roomId, agentId);
     return { left: info.changes > 0, room_id: roomId };
   });
   try {
@@ -685,20 +825,81 @@ async function handlePost(url, req, res) {
     return sendJson(res, r.error ? 400 : 200, r);
   }
 
-  const name = typeof payload.name === "string" ? payload.name.trim() : "";
-  if (!NAME_RE.test(name)) {
+  if (url.pathname === "/api/join") {
+    // FORM BY FIELD PRESENCE, not by value. A key present with null or the
+    // wrong type fails the form it selected rather than falling through to the
+    // other one; silent fallback is how the old single-field join let a
+    // stored value mean whatever the server found convenient.
+    const has = (k) => Object.prototype.hasOwnProperty.call(payload, k);
+    if (has("name")) {
+      return sendJson(res, 400, {
+        error:
+          "`name` is not accepted: send { room, base_name, operation_id } to allocate a new identity, or { room, agent_id } to rejoin an existing one",
+      });
+    }
+    const wantsFresh = has("base_name") || has("operation_id");
+    const wantsCanonical = has("agent_id");
+    if (wantsFresh && wantsCanonical) {
+      return sendJson(res, 400, {
+        error:
+          "send either { base_name, operation_id } or { agent_id }, not both",
+      });
+    }
+    if (!wantsFresh && !wantsCanonical) {
+      return sendJson(res, 400, {
+        error:
+          "join requires { room, base_name, operation_id } or { room, agent_id }",
+      });
+    }
+    let form;
+    if (wantsFresh) {
+      if (!has("base_name") || !has("operation_id")) {
+        return sendJson(res, 400, {
+          error: "a fresh join requires BOTH base_name and operation_id",
+        });
+      }
+      const bad = badBaseName(payload.base_name);
+      if (bad) return sendJson(res, 400, { error: bad });
+      if (
+        typeof payload.operation_id !== "string" ||
+        !OPERATION_ID_RE.test(payload.operation_id)
+      ) {
+        return sendJson(res, 400, {
+          error: "operation_id must be a lowercase canonical UUID string",
+        });
+      }
+      form = {
+        kind: "fresh",
+        baseName: payload.base_name,
+        operationId: payload.operation_id,
+      };
+    } else {
+      // No trim and no case-fold: the canonical id is the server's own value
+      // and must round-trip exactly as issued.
+      if (typeof payload.agent_id !== "string" || !NAME_RE.test(payload.agent_id)) {
+        return sendJson(res, 400, {
+          error:
+            "agent_id must be an existing canonical human id (1-200 chars: letters, digits, underscore, dot or dash)",
+        });
+      }
+      form = { kind: "canonical", agentId: payload.agent_id };
+    }
+    const r = joinRoom(d, roomId, form);
+    return sendJson(res, r.error ? (r.http ?? 400) : 200, r);
+  }
+
+  // Every other participation endpoint acts as a CANONICAL id. There is no
+  // base-name form here: a base is what a user types, an agent_id is who acts.
+  const actor = typeof payload.agent_id === "string" ? payload.agent_id : "";
+  if (!NAME_RE.test(actor)) {
     return sendJson(res, 400, {
       error:
-        "name must be 1-200 chars: letters, digits, underscore, dot or dash (no spaces)",
+        "agent_id must be 1-200 chars: letters, digits, underscore, dot or dash (no spaces)",
     });
   }
 
-  if (url.pathname === "/api/join") {
-    const r = joinRoom(d, roomId, name);
-    return sendJson(res, r.error ? 400 : 200, r);
-  }
   if (url.pathname === "/api/leave") {
-    const r = leaveRoom(d, roomId, name);
+    const r = leaveRoom(d, roomId, actor);
     return sendJson(res, r.error ? 400 : 200, r);
   }
   if (url.pathname === "/api/read") {
@@ -711,7 +912,7 @@ async function handlePost(url, req, res) {
         error: "seq must be a non-negative safe integer",
       });
     }
-    const r = markRead(d, roomId, name, seq);
+    const r = markRead(d, roomId, actor, seq);
     return sendJson(res, r.error ? 400 : 200, r);
   }
   if (url.pathname === "/api/post") {
@@ -740,7 +941,7 @@ async function handlePost(url, req, res) {
         });
       }
     }
-    const r = postMessage(d, roomId, name, body, replyTo, parseMentions(body));
+    const r = postMessage(d, roomId, actor, body, replyTo, parseMentions(body));
     return sendJson(res, r.error ? 400 : 200, r);
   }
   res.writeHead(404, { "Content-Type": "text/plain" });
@@ -860,27 +1061,35 @@ const server = createServer(async (req, res) => {
       });
     }
     if (url.pathname === "/api/me") {
-      // Membership state for a (room, name): lets the client learn its read
+      // Membership state for a (room, agent_id): lets the client learn its read
       // marker after a reload so gap-aware read marking works.
       const roomId = Number(url.searchParams.get("room"));
-      const name = (url.searchParams.get("name") || "").trim();
-      if (!Number.isSafeInteger(roomId) || roomId <= 0 || !name)
-        return sendJson(res, 400, { error: "room (id) and name are required" });
+      const actor = url.searchParams.get("agent_id") || "";
+      if (!Number.isSafeInteger(roomId) || roomId <= 0 || !NAME_RE.test(actor))
+        return sendJson(res, 400, {
+          error: "room (id) and agent_id are required",
+        });
       const d = getDb();
       if (!d)
         // Distinguish "no database yet" from a genuine not-joined: a bare
         // joined:false hid the real remedy and made gap logic silently wrong.
         return sendJson(res, 200, { joined: false, error: dbUnavailableError() });
+      // Unknown and LLM ids are a 400, NOT joined:false. Answering with a
+      // marker for an id this endpoint refuses to act for would leak another
+      // participant's read position behind a friendly-looking negative.
+      if (!humanRow(d, actor))
+        return sendJson(res, 400, {
+          error: `"${actor}" is not an existing human participant`,
+        });
       const m = d
         .prepare(
           "SELECT last_read_seq, left_at FROM memberships WHERE room_id = ? AND agent_id = ?",
         )
-        .get(roomId, name);
+        .get(roomId, actor);
       return sendJson(res, 200, {
-        // Same gate as post/read: joined means THIS web session, so the
-        // client never believes it can act on the strength of an MCP twin's
-        // membership.
-        joined: webJoined(d, roomId, name),
+        // joined means PRESENT here; a retained left row still reports its
+        // marker so the client can resume without reopening the membership.
+        joined: !!m && m.left_at === null,
         last_read_seq: m ? m.last_read_seq : 0,
       });
     }

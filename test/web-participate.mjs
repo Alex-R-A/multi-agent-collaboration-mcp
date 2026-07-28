@@ -2,6 +2,7 @@
 // join/post/read/leave, mention parsing, reply validation, join gating,
 // and interop (an agent's catch_up sees a web-posted message as directed).
 import { spawn } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { request as httpRequest } from "node:http";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -10,7 +11,7 @@ import { fileURLToPath } from "node:url";
 import { dirname } from "node:path";
 import Database from "better-sqlite3";
 import { ChatStore } from "../dist/db.js";
-import { EPOCH1, mkAgent, mkRoom } from "./persona-helpers.mjs";
+import { mkAgent, mkHuman, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
@@ -59,18 +60,46 @@ check(
     !viewerSource.includes("m.model || m.brand"),
   null,
 );
+check(
+  "viewer uses only the v2 state namespace and removes old keys before state initialization",
+  [
+    'const ROOM_KEY = "agent-chat.v2.room";',
+    'const SEEN_KEY = "agent-chat.v2.seen";',
+    'const IDENT_KEY = "agent-chat.v2.identity";',
+    'const JOINED_KEY = "agent-chat.v2.joined";',
+    'const GHOST_KEY = "agent-chat.v2.ghosts";',
+  ].every((line) => viewerSource.includes(line)) &&
+    viewerSource.indexOf("for (const key of OLD_KEYS)") <
+      viewerSource.indexOf("const state ="),
+  null,
+);
+check(
+  "viewer persists a pending allocation and sends canonical participation fields",
+  viewerSource.includes("pending_allocation") &&
+    viewerSource.includes("crypto.randomUUID()") &&
+    viewerSource.includes("base_name: pending.base_name") &&
+    viewerSource.includes("operation_id: pending.operation_id") &&
+    viewerSource.includes("agent_id: identity()") &&
+    !/postJson\("\/api\/(?:join|leave|post|read)",[\s\S]{0,180}?\bname\s*:/.test(
+      viewerSource,
+    ) &&
+    !viewerSource.includes("&name="),
+  null,
+);
 
 const dir = mkdtempSync(join(tmpdir(), "aichat-web-"));
 const DB = join(dir, "web.db");
+let ghostId;
 
 // Seed: one room, one agent with two messages so seq starts at 3 for the web user.
 {
   const s = new ChatStore(DB);
   mkRoom(s, "r", null, null);
   mkAgent(s, "bot");
-  s.joinRoom(1, "bot", EPOCH1, {});
-  s.postMessage(1, "bot", "first", "text", null, null, null, EPOCH1);
-  s.postMessage(1, "bot", "second", "text", null, null, null, EPOCH1, {
+  ghostId = mkHuman(s, "ghost");
+  s.joinRoom(1, "bot", {});
+  s.postMessage(1, "bot", "first", "text", null, null, null);
+  s.postMessage(1, "bot", "second", "text", null, null, null, {
     priority: true,
   });
   s.close();
@@ -116,28 +145,192 @@ async function post(path, payload) {
   return { status: r.status, data: await r.json() };
 }
 
+function freshJoin(room, baseName, operationId = randomUUID()) {
+  return post("/api/join", {
+    room,
+    base_name: baseName,
+    operation_id: operationId,
+  });
+}
+
 try {
   // join
-  const j = await post("/api/join", { room: 1, name: "alex" });
-  check("join succeeds", j.status === 200 && j.data.joined === true && j.data.agent_id === "alex", j);
+  const alexOperation = randomUUID();
+  const j = await freshJoin(1, "alex", alexOperation);
+  const alexId = j.data.agent_id;
+  check(
+    "join allocates the canonical human id",
+    j.status === 200 && j.data.joined === true &&
+      alexId === "human-alex-1" && j.data.base_name === "alex" &&
+      j.data.human_ordinal === 1,
+    j,
+  );
+  const replay = await freshJoin(1, "alex", alexOperation);
+  {
+    const raw = new Database(DB);
+    const counts = {
+      agents: raw
+        .prepare(
+          "SELECT COUNT(*) AS c FROM agents WHERE is_human = 1 AND human_base = 'alex'",
+        )
+        .get().c,
+      allocations: raw
+        .prepare(
+          "SELECT COUNT(*) AS c FROM human_allocations WHERE operation_id = ?",
+        )
+        .get(alexOperation).c,
+    };
+    raw.close();
+    check(
+      "an exact allocation replay returns one recorded identity without allocating again",
+      replay.status === 200 &&
+        replay.data.agent_id === alexId &&
+        replay.data.human_ordinal === 1 &&
+        replay.data.joined === true &&
+        counts.agents === 1 &&
+        counts.allocations === 1,
+      { replay, counts },
+    );
+  }
 
-  // post before join is rejected for another name
-  const ghost = await post("/api/post", { room: 1, name: "ghost", body: "hi" });
+  let alternateRoom;
+  {
+    const s = new ChatStore(DB);
+    alternateRoom = mkRoom(s, "allocation-payload-binding", null, null).id;
+    s.close();
+  }
+  const wrongBase = await freshJoin(1, "sam", alexOperation);
+  const wrongRoom = await freshJoin(
+    alternateRoom,
+    "alex",
+    alexOperation,
+  );
+  let payloadBindingCounts;
+  {
+    const raw = new Database(DB);
+    payloadBindingCounts = {
+      alex: raw
+        .prepare(
+          "SELECT COUNT(*) AS c FROM agents WHERE is_human = 1 AND human_base = 'alex'",
+        )
+        .get().c,
+      sam: raw
+        .prepare(
+          "SELECT COUNT(*) AS c FROM agents WHERE is_human = 1 AND human_base = 'sam'",
+        )
+        .get().c,
+      allocations: raw
+        .prepare(
+          "SELECT COUNT(*) AS c FROM human_allocations WHERE operation_id = ?",
+        )
+        .get(alexOperation).c,
+    };
+    raw.close();
+  }
+  check(
+    "an allocation operation id is bound to its exact room and base",
+    wrongBase.status === 400 &&
+      wrongRoom.status === 400 &&
+      /different room or base_name/.test(wrongBase.data.error) &&
+      /different room or base_name/.test(wrongRoom.data.error) &&
+      payloadBindingCounts.alex === 1 &&
+      payloadBindingCounts.sam === 0 &&
+      payloadBindingCounts.allocations === 1,
+    { wrongBase, wrongRoom, payloadBindingCounts },
+  );
+
+  // A valid, joined identity makes every old `name` request otherwise
+  // actionable. All five forms must still reject it without mutating state.
+  let legacyBefore;
+  {
+    const raw = new Database(DB);
+    legacyBefore = {
+      messages: raw
+        .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = 1")
+        .get().c,
+      membership: raw
+        .prepare(
+          "SELECT last_read_seq, left_at FROM memberships WHERE room_id = 1 AND agent_id = ?",
+        )
+        .get(alexId),
+    };
+    raw.close();
+  }
+  const legacy = {
+    join: await post("/api/join", { room: 1, name: alexId }),
+    post: await post("/api/post", {
+      room: 1,
+      name: alexId,
+      body: "legacy write",
+    }),
+    read: await post("/api/read", { room: 1, name: alexId, seq: 2 }),
+    leave: await post("/api/leave", { room: 1, name: alexId }),
+    me: await fetch(
+      `${base}/api/me?room=1&name=${encodeURIComponent(alexId)}`,
+    ),
+  };
+  let legacyAfter;
+  {
+    const raw = new Database(DB);
+    legacyAfter = {
+      messages: raw
+        .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = 1")
+        .get().c,
+      membership: raw
+        .prepare(
+          "SELECT last_read_seq, left_at FROM memberships WHERE room_id = 1 AND agent_id = ?",
+        )
+        .get(alexId),
+    };
+    raw.close();
+  }
+  check(
+    "legacy name participation forms are rejected without mutation",
+    legacy.join.status === 400 &&
+      legacy.post.status === 400 &&
+      legacy.read.status === 400 &&
+      legacy.leave.status === 400 &&
+      legacy.me.status === 400 &&
+      JSON.stringify(legacyAfter) === JSON.stringify(legacyBefore),
+    {
+      statuses: {
+        join: legacy.join.status,
+        post: legacy.post.status,
+        read: legacy.read.status,
+        leave: legacy.leave.status,
+        me: legacy.me.status,
+      },
+      legacyBefore,
+      legacyAfter,
+    },
+  );
+
+  // An existing human who has not joined this room cannot post into it.
+  const ghost = await post("/api/post", {
+    room: 1,
+    agent_id: ghostId,
+    body: "hi",
+  });
   check("posting without joining is rejected", ghost.status === 400 && /join the room first/.test(ghost.data.error), ghost);
 
-  // invalid name rejected
-  const bad = await post("/api/join", { room: 1, name: "bad name!" });
-  check("invalid name rejected", bad.status === 400, bad);
+  // invalid base name rejected
+  const bad = await freshJoin(1, "bad name!");
+  check("invalid base name rejected", bad.status === 400, bad);
 
   // post with reply + mention
-  const p = await post("/api/post", { room: 1, name: "alex", body: "hello @bot from the web", reply_to_seq: 1 });
+  const p = await post("/api/post", {
+    room: 1,
+    agent_id: alexId,
+    body: "hello @bot from the web",
+    reply_to_seq: 1,
+  });
   check("post succeeds with seq 3", p.status === 200 && p.data.seq === 3, p);
   {
     const s = new ChatStore(DB);
     check(
       "web post does not normalize across the two unseen bot messages",
-      s.getMembership(1, "alex").last_read_seq === 0,
-      s.getMembership(1, "alex"),
+      s.getMembership(1, alexId).last_read_seq === 0,
+      s.getMembership(1, alexId),
     );
     s.close();
   }
@@ -155,15 +348,28 @@ try {
   );
 
   // reply to a nonexistent message rejected
-  const dangling = await post("/api/post", { room: 1, name: "alex", body: "x", reply_to_seq: 999 });
+  const dangling = await post("/api/post", {
+    room: 1,
+    agent_id: alexId,
+    body: "x",
+    reply_to_seq: 999,
+  });
   check("dangling reply rejected", dangling.status === 400 && /does not exist/.test(dangling.data.error), dangling);
 
   // A body with an embedded NUL or a lone surrogate is rejected: the web writes
   // SQL directly, so it must enforce the same round-trip safety the store does
   // (SQLite substr/length truncate at a NUL, silently dropping the tail).
-  const nulPost = await post("/api/post", { room: 1, name: "alex", body: "abc" + String.fromCharCode(0) + "def" });
+  const nulPost = await post("/api/post", {
+    room: 1,
+    agent_id: alexId,
+    body: "abc" + String.fromCharCode(0) + "def",
+  });
   check("web rejects a NUL body (was silent truncation)", nulPost.status === 400 && /NUL/.test(nulPost.data.error), nulPost);
-  const lonePost = await post("/api/post", { room: 1, name: "alex", body: "x\ud800y" });
+  const lonePost = await post("/api/post", {
+    room: 1,
+    agent_id: alexId,
+    body: "x\ud800y",
+  });
   check("web rejects a lone-surrogate body", lonePost.status === 400 && /surrogate/.test(lonePost.data.error), lonePost);
 
   // the message reads back flagged as human, with parsed mentions and reply ref
@@ -171,7 +377,7 @@ try {
   const msg = list.messages.find((m) => m.seq === 3);
   check(
     "message readable with is_human/mentions/reply",
-    msg && msg.from === "alex" && msg.is_human === 1 &&
+    msg && msg.from === alexId && msg.is_human === 1 &&
       msg.brand === null && msg.model === null &&
       Array.isArray(msg.mentions) && msg.mentions[0] === "bot" && msg.reply_to_seq === 1,
     msg,
@@ -184,36 +390,73 @@ try {
   );
 
   // read marker: monotonic
-  const r1 = await post("/api/read", { room: 1, name: "alex", seq: 3 });
-  const r2 = await post("/api/read", { room: 1, name: "alex", seq: 1 });
+  const r1 = await post("/api/read", { room: 1, agent_id: alexId, seq: 3 });
+  const r2 = await post("/api/read", { room: 1, agent_id: alexId, seq: 1 });
   check("read marker advances and is monotonic", r1.data.last_read_seq === 3 && r2.data.last_read_seq === 3, { r1: r1.data, r2: r2.data });
 
   // interop: the agent's catch_up sees the web post as a directed message
   {
     const s = new ChatStore(DB);
-    const got = s.catchUp(1, "bot", 50, undefined, 100000, EPOCH1);
+    const got = s.catchUp(1, "bot", 50, undefined, 100000);
     const m = got.messages.find((x) => x.seq === 3);
     check(
       "agent catch_up receives the web post with its mention",
-      !!m && m.from === "alex" && Array.isArray(m.to) && m.to.includes("bot"),
+      !!m && m.from === alexId && Array.isArray(m.to) && m.to.includes("bot"),
       got.messages.map((x) => x.seq),
     );
-    check("web read marker visible to store layer", s.getMembership(1, "alex").last_read_seq === 3, s.getMembership(1, "alex"));
+    check("web read marker visible to store layer", s.getMembership(1, alexId).last_read_seq === 3, s.getMembership(1, alexId));
     s.close();
   }
 
   // leave: gated posting again
-  const l = await post("/api/leave", { room: 1, name: "alex" });
-  const afterLeave = await post("/api/post", { room: 1, name: "alex", body: "still here?" });
+  const l = await post("/api/leave", { room: 1, agent_id: alexId });
+  const afterLeave = await post("/api/post", {
+    room: 1,
+    agent_id: alexId,
+    body: "still here?",
+  });
   check("leave then post is rejected", l.data.left === true && afterLeave.status === 400, { l: l.data, afterLeave });
 
-  // rejoin resumes (idempotent join, membership revived)
-  const rejoin = await post("/api/join", { room: 1, name: "alex" });
-  const again = await post("/api/post", { room: 1, name: "alex", body: "back" });
+  const replayAfterLeave = await freshJoin(1, "alex", alexOperation);
+  const afterReplay = await post("/api/post", {
+    room: 1,
+    agent_id: alexId,
+    body: "replay must not revive me",
+  });
+  {
+    const raw = new Database(DB);
+    const membership = raw
+      .prepare(
+        "SELECT left_at FROM memberships WHERE room_id = 1 AND agent_id = ?",
+      )
+      .get(alexId);
+    raw.close();
+    check(
+      "allocation replay reports but does not revive a left membership",
+      replayAfterLeave.status === 200 &&
+        replayAfterLeave.data.agent_id === alexId &&
+        replayAfterLeave.data.joined === false &&
+        membership.left_at !== null &&
+        afterReplay.status === 400,
+      { replayAfterLeave, membership, afterReplay },
+    );
+  }
+
+  // Canonical rejoin resumes the same membership and identity.
+  const rejoin = await post("/api/join", { room: 1, agent_id: alexId });
+  const again = await post("/api/post", {
+    room: 1,
+    agent_id: alexId,
+    body: "back",
+  });
   check("rejoin revives posting", rejoin.status === 200 && again.status === 200 && again.data.seq === 4, { rejoin: rejoin.data, again: again.data });
 
   // mention parsing strips trailing punctuation ("@bot." tags bot)
-  const punct = await post("/api/post", { room: 1, name: "alex", body: "thanks @bot." }); // seq 5
+  const punct = await post("/api/post", {
+    room: 1,
+    agent_id: alexId,
+    body: "thanks @bot.",
+  }); // seq 5
   const tail = await (await fetch(`${base}/api/messages?room=1&after=4`)).json();
   check(
     "trailing punctuation stripped from mentions",
@@ -224,8 +467,8 @@ try {
     const s = new ChatStore(DB);
     check(
       "web own-only posts advance the durable baseline",
-      s.getMembership(1, "alex").last_read_seq === punct.data.seq,
-      s.getMembership(1, "alex"),
+      s.getMembership(1, alexId).last_read_seq === punct.data.seq,
+      s.getMembership(1, alexId),
     );
     s.close();
   }
@@ -240,7 +483,11 @@ try {
 
   // the read marker clamps to the room's latest seq (monotonic max would
   // otherwise make an oversized value permanent)
-  const big = await post("/api/read", { room: 1, name: "alex", seq: 9_999_999 });
+  const big = await post("/api/read", {
+    room: 1,
+    agent_id: alexId,
+    seq: 9_999_999,
+  });
   check("read marker clamped to latest", big.data.last_read_seq === punct.data.seq, big.data);
 
   // full-text search: finds the web post, surfaces FTS syntax errors as 400
@@ -254,27 +501,59 @@ try {
   const evil = await fetch(base + "/api/post", {
     method: "POST",
     headers: { "Content-Type": "application/json", Origin: "https://evil.example" },
-    body: JSON.stringify({ room: 1, name: "alex", body: "csrf attempt" }),
+    body: JSON.stringify({
+      room: 1,
+      agent_id: alexId,
+      body: "csrf attempt",
+    }),
   });
   check("foreign-origin write rejected", evil.status === 403, evil.status);
   const localOk = await fetch(base + "/api/post", {
     method: "POST",
     headers: { "Content-Type": "application/json", Origin: `http://127.0.0.1:${port}` },
-    body: JSON.stringify({ room: 1, name: "alex", body: "local origin ok" }),
+    body: JSON.stringify({
+      room: 1,
+      agent_id: alexId,
+      body: "local origin ok",
+    }),
   });
   check("local-origin write allowed", localOk.status === 200, localOk.status);
 
   // /api/me reports membership + marker (gap-aware read marking baseline)
-  const me = await (await fetch(`${base}/api/me?room=1&name=alex`)).json();
+  const me = await (
+    await fetch(
+      `${base}/api/me?room=1&agent_id=${encodeURIComponent(alexId)}`,
+    )
+  ).json();
   check("/api/me reports joined with a marker", me.joined === true && me.last_read_seq >= 3, me);
-  const me2 = await (await fetch(`${base}/api/me?room=1&name=stranger`)).json();
+  const me2 = await (
+    await fetch(
+      `${base}/api/me?room=1&agent_id=${encodeURIComponent(ghostId)}`,
+    )
+  ).json();
   check("/api/me for a non-member reports not joined", me2.joined === false, me2);
 
   // supersession annotations surface in the viewer API
   {
     const s = new ChatStore(DB);
-    const wrong = s.postMessage(1, "bot", "wrong figure", "text", null, null, null, EPOCH1).seq;
-    s.postMessage(1, "bot", "corrected figure", "text", null, null, wrong, EPOCH1);
+    const wrong = s.postMessage(
+      1,
+      "bot",
+      "wrong figure",
+      "text",
+      null,
+      null,
+      null,
+    ).seq;
+    s.postMessage(
+      1,
+      "bot",
+      "corrected figure",
+      "text",
+      null,
+      null,
+      wrong,
+    );
     s.close();
     const list = await (await fetch(`${base}/api/messages?room=1`)).json();
     const old = list.messages.find((m) => m.seq === wrong);
@@ -297,7 +576,12 @@ try {
 
   // web replies stamp the denormalized reply author (prune-safe direction)
   {
-    const rep = await post("/api/post", { room: 1, name: "alex", body: "web reply", reply_to_seq: 1 });
+    const rep = await post("/api/post", {
+      room: 1,
+      agent_id: alexId,
+      body: "web reply",
+      reply_to_seq: 1,
+    });
     const raw = new Database(DB);
     const row = raw
       .prepare("SELECT reply_to_agent FROM messages WHERE room_id = 1 AND seq = ?")
@@ -306,13 +590,59 @@ try {
     check("web reply stamps reply_to_agent", row.reply_to_agent === "bot", row);
   }
 
+  // A room deletion removes membership but deliberately retains the browser's
+  // allocation answer. Replaying the lost response must recover that exact
+  // identity without creating or joining anything.
+  {
+    const s = new ChatStore(DB);
+    const rid = mkRoom(s, "allocation-replay-deleted-room", null, null).id;
+    s.close();
+    const operationId = randomUUID();
+    const allocated = await freshJoin(rid, "recover", operationId);
+    const del = await post("/api/delete-room", { room: rid, confirm: true });
+    const replayDeleted = await freshJoin(rid, "recover", operationId);
+    const raw = new Database(DB);
+    const remains = {
+      room: raw
+        .prepare("SELECT COUNT(*) AS c FROM rooms WHERE id = ?")
+        .get(rid).c,
+      membership: raw
+        .prepare("SELECT COUNT(*) AS c FROM memberships WHERE room_id = ?")
+        .get(rid).c,
+      allocation: raw
+        .prepare(
+          "SELECT result_agent_id FROM human_allocations WHERE operation_id = ?",
+        )
+        .get(operationId),
+      agents: raw
+        .prepare(
+          "SELECT COUNT(*) AS c FROM agents WHERE is_human = 1 AND human_base = 'recover'",
+        )
+        .get().c,
+    };
+    raw.close();
+    check(
+      "allocation replay after room deletion returns the recorded unjoined identity",
+      allocated.status === 200 &&
+        del.status === 200 &&
+        replayDeleted.status === 200 &&
+        replayDeleted.data.agent_id === allocated.data.agent_id &&
+        replayDeleted.data.joined === false &&
+        remains.room === 0 &&
+        remains.membership === 0 &&
+        remains.allocation.result_agent_id === allocated.data.agent_id &&
+        remains.agents === 1,
+      { allocated, del, replayDeleted, remains },
+    );
+  }
+
   // full room deletion cascades to every related table
   {
     const s = new ChatStore(DB);
     const rid = mkRoom(s, "waiting-doomed", null, null).id;
     mkAgent(s, "waiter");
-    s.joinRoom(rid, "waiter", EPOCH1, {});
-    s.beginWaitLease(rid, "waiter", EPOCH1, 300);
+    s.joinRoom(rid, "waiter", {});
+    s.beginWaitLease(rid, "waiter", 300);
     s.close();
 
     const del = await post("/api/delete-room", { room: rid, confirm: true });
@@ -333,9 +663,9 @@ try {
     const s = new ChatStore(DB);
     const rid = mkRoom(s, "doomed", null, null).id;
     mkAgent(s, "ghost");
-    s.joinRoom(rid, "ghost", EPOCH1, {});
-    s.postMessage(rid, "ghost", "to be erased", "text", null, null, null, EPOCH1);
-    s.claimResource(rid, "file:x", "ghost", EPOCH1, 900, null);
+    s.joinRoom(rid, "ghost", {});
+    s.postMessage(rid, "ghost", "to be erased", "text", null, null, null);
+    s.claimResource(rid, "file:x", "ghost", 900, null);
     s.close();
 
     const noConfirm = await post("/api/delete-room", { room: rid, confirm: false });
@@ -364,11 +694,16 @@ try {
   {
     const floaty = await fetch(base + "/api/messages?room=1&limit=1.5");
     check("float limit is handled, not a 500", floaty.status === 200, floaty.status);
-    const coerced = await post("/api/join", { room: true, name: "coerce" });
+    const coerced = await post("/api/join", {
+      room: true,
+      base_name: "coerce",
+      operation_id: randomUUID(),
+    });
     check("room:true is rejected (no Number() coercion)", coerced.status === 400, coerced);
     const unsafeRoom = await post("/api/join", {
       room: Number.MAX_SAFE_INTEGER + 1,
-      name: "unsafe-room",
+      base_name: "unsafe-room",
+      operation_id: randomUUID(),
     });
     check(
       "unsafe integer room ids are rejected instead of rounded",
@@ -391,11 +726,15 @@ try {
       unsafeAfter.status === 400,
       unsafeAfter.status,
     );
-    const nullSeq = await post("/api/read", { room: 1, name: "alex", seq: null });
+    const nullSeq = await post("/api/read", {
+      room: 1,
+      agent_id: alexId,
+      seq: null,
+    });
     check("seq:null is rejected", nullSeq.status === 400, nullSeq);
     const unsafeSeq = await post("/api/read", {
       room: 1,
-      name: "alex",
+      agent_id: alexId,
       seq: Number.MAX_SAFE_INTEGER + 1,
     });
     check(
@@ -406,7 +745,11 @@ try {
     const big = await fetch(base + "/api/post", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ room: 1, name: "alex", body: "a".repeat(800_000) }),
+      body: JSON.stringify({
+        room: 1,
+        agent_id: alexId,
+        body: "a".repeat(800_000),
+      }),
     });
     const bigBody = await big.json().catch(() => null);
     check(
@@ -430,7 +773,15 @@ try {
     // Body cap: a >100k body arrives cut with an honest flag.
     {
       const s = new ChatStore(DB);
-      s.postMessage(1, "bot", "capped " + "y".repeat(150_000), "text", null, null, null, EPOCH1);
+      s.postMessage(
+        1,
+        "bot",
+        "capped " + "y".repeat(150_000),
+        "text",
+        null,
+        null,
+        null,
+      );
       s.close();
       const r = await fetch(base + "/api/messages?room=1");
       const data = await r.json();
@@ -446,7 +797,11 @@ try {
     // 201-char mention runs are skipped, not mistagged as their 200-prefix.
     {
       const long = "b".repeat(201);
-      await post("/api/post", { room: 1, name: "alex", body: `hi @${long} and @carol.` });
+      await post("/api/post", {
+        room: 1,
+        agent_id: alexId,
+        body: `hi @${long} and @carol.`,
+      });
       const r = await fetch(base + "/api/messages?room=1");
       const data = await r.json();
       const m = data.messages[data.messages.length - 1];
@@ -458,29 +813,39 @@ try {
     }
   }
 
-  // Humans and LLM personas can no longer SHARE a name, which is what the old
-  // twin-eviction machinery existed to survive. The two populations are now
-  // disjoint by construction, and the web enforces that on the way in.
+  // Humans and LLM personas occupy disjoint namespaces. A human may choose a
+  // base matching an LLM id because the web allocates a canonical human prefix
+  // plus an ordinal instead of adopting the typed base as an identity.
   {
     const s = new ChatStore(DB);
     const rid = mkRoom(s, "shared-name", null, null).id;
     mkAgent(s, "pat-llm");
     s.close();
-    // A human name that collides with an LLM persona is refused outright.
-    const collide = await post("/api/join", { room: rid, name: "pat-llm" });
+    const wj = await freshJoin(rid, "pat-llm");
+    const patId = wj.data.agent_id;
     check(
-      "a human web join cannot adopt an LLM persona id",
-      collide.status === 400 && /LLM persona/.test(collide.data.error || ""),
-      collide,
+      "a human base matching an LLM id allocates a disjoint canonical id",
+      wj.status === 200 && patId === "human-pat-llm-1" &&
+        patId !== "pat-llm",
+      wj,
     );
-    // A free name works, and the human's own lifecycle is unaffected.
-    const wj = await post("/api/join", { room: rid, name: "pat" });
-    check("a human joins under a free name", wj.status === 200, wj);
-    const posted = await post("/api/post", { room: rid, name: "pat", body: "hello" });
+    const second = await freshJoin(rid, "pat-llm");
+    check(
+      "a second human choosing the same base receives the next ordinal",
+      second.status === 200 &&
+        second.data.agent_id === "human-pat-llm-2" &&
+        second.data.human_ordinal === 2,
+      second,
+    );
+    const posted = await post("/api/post", {
+      room: rid,
+      agent_id: patId,
+      body: "hello",
+    });
     check("the human can post", posted.status === 200, posted);
-    const wl = await post("/api/leave", { room: rid, name: "pat" });
+    const wl = await post("/api/leave", { room: rid, agent_id: patId });
     const s2 = new ChatStore(DB);
-    const m = s2.getMembership(rid, "pat");
+    const m = s2.getMembership(rid, patId);
     s2.close();
     check(
       "a human leave marks the membership left",
@@ -488,9 +853,12 @@ try {
       { wl: wl.data, m },
     );
     // Rejoining resumes the same membership row, not a fresh one.
-    const rejoin = await post("/api/join", { room: rid, name: "pat" });
+    const rejoin = await post("/api/join", {
+      room: rid,
+      agent_id: patId,
+    });
     const s3 = new ChatStore(DB);
-    const m2 = s3.getMembership(rid, "pat");
+    const m2 = s3.getMembership(rid, patId);
     s3.close();
     check(
       "a human rejoin resumes the membership and its read position",
@@ -502,7 +870,11 @@ try {
   // search: a page of exactly `limit` matches signals more exist (v0.8.3)
   {
     for (let i = 0; i < 4; i++) {
-      await post("/api/post", { room: 1, name: "alex", body: "needleword " + i });
+      await post("/api/post", {
+        room: 1,
+        agent_id: alexId,
+        body: "needleword " + i,
+      });
     }
     const cut = await (await fetch(`${base}/api/search?room=1&q=needleword&limit=3`)).json();
     check(
@@ -518,46 +890,75 @@ try {
     );
   }
 
-  // Web gating: acting through the web API requires a web JOIN. An LLM persona
-  // is not reachable through it at all (a human cannot name it), and a human who
+  // Web gating: acting through the web API requires a canonical human identity
+  // and a web join. An LLM id is never accepted as that actor, and a human who
   // has left cannot post or advance the durable read marker until it rejoins.
   {
     const s = new ChatStore(DB);
     const rid = mkRoom(s, "gating", null, null).id;
     mkAgent(s, "gate-bot");
-    s.joinRoom(rid, "gate-bot", EPOCH1, {}); // an LLM persona, joined via MCP
+    s.joinRoom(rid, "gate-bot", {}); // an LLM persona, joined via MCP
     s.close();
-    const meBot = await (await fetch(`${base}/api/me?room=${rid}&name=gate-bot`)).json();
-    const postBot = await post("/api/post", { room: rid, name: "gate-bot", body: "via web" });
-    const readBot = await post("/api/read", { room: rid, name: "gate-bot", seq: 1 });
-    // /api/me answers for the WEB seat, not for the room. The persona genuinely
-    // has a membership (it joined over MCP), so a membership-shaped answer would
-    // say joined:true and let the client believe it may act. It must say false,
-    // and the join that would make it true must be refused.
+    const meBotResponse = await fetch(
+      `${base}/api/me?room=${rid}&agent_id=gate-bot`,
+    );
+    const meBot = await meBotResponse.json();
+    const postBot = await post("/api/post", {
+      room: rid,
+      agent_id: "gate-bot",
+      body: "via web",
+    });
+    const readBot = await post("/api/read", {
+      room: rid,
+      agent_id: "gate-bot",
+      seq: 1,
+    });
+    // /api/me answers only for a human web seat. The persona genuinely has a
+    // membership from MCP, so a membership-shaped answer would say joined:true
+    // and let the client believe it may act. The endpoint must reject it.
     check(
-      "/api/me reports an LLM persona as NOT web-joined despite its membership",
-      meBot.joined === false,
+      "/api/me refuses an LLM persona despite its membership",
+      meBotResponse.status === 400 &&
+        /not an existing human participant/.test(meBot.error),
       meBot,
     );
     check(
       "an LLM persona cannot be web-joined",
-      (await post("/api/join", { room: rid, name: "gate-bot" })).status === 400,
+      (
+        await post("/api/join", {
+          room: rid,
+          agent_id: "gate-bot",
+        })
+      ).status === 400,
       meBot,
     );
     check("posting as an LLM persona through the web is refused", postBot.status === 400, postBot);
     check("marking read as an LLM persona through the web is refused", readBot.status === 400, readBot);
 
     // A human who left cannot act until it rejoins.
-    await post("/api/join", { room: rid, name: "meg" });
+    const megJoin = await freshJoin(rid, "meg");
+    const megId = megJoin.data.agent_id;
     const s2 = new ChatStore(DB);
-    s2.postMessage(rid, "gate-bot", "unseen", "text", null, null, null, EPOCH1);
+    s2.postMessage(rid, "gate-bot", "unseen", "text", null, null, null);
     s2.close();
-    await post("/api/leave", { room: rid, name: "meg" });
-    const meMeg = await (await fetch(`${base}/api/me?room=${rid}&name=meg`)).json();
-    const postMeg = await post("/api/post", { room: rid, name: "meg", body: "after leave" });
-    const readMeg = await post("/api/read", { room: rid, name: "meg", seq: 99 });
+    await post("/api/leave", { room: rid, agent_id: megId });
+    const meMeg = await (
+      await fetch(
+        `${base}/api/me?room=${rid}&agent_id=${encodeURIComponent(megId)}`,
+      )
+    ).json();
+    const postMeg = await post("/api/post", {
+      room: rid,
+      agent_id: megId,
+      body: "after leave",
+    });
+    const readMeg = await post("/api/read", {
+      room: rid,
+      agent_id: megId,
+      seq: 99,
+    });
     const s3 = new ChatStore(DB);
-    const megRow = s3.getMembership(rid, "meg");
+    const megRow = s3.getMembership(rid, megId);
     s3.close();
     check("a left web session reports not joined", meMeg.joined === false, meMeg);
     check("a left web session cannot post", postMeg.status === 400, postMeg);

@@ -15,7 +15,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { ChatStore } from "../dist/db.js";
-import { EPOCH1, mkAgent, mkRoom } from "./persona-helpers.mjs";
+import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
 let failures = 0;
 const check = (n, c, x) => {
@@ -31,8 +31,8 @@ const check = (n, c, x) => {
     const s = new ChatStore(DB);
     const r = mkRoom(s, "r", null, null).id;
     mkAgent(s, "b");
-    s.joinRoom(r, "b", EPOCH1, {});
-    s.postMessage(r, "b", "needle in a haystack", "text", null, null, null, EPOCH1);
+    s.joinRoom(r, "b", {});
+    s.postMessage(r, "b", "needle in a haystack", "text", null, null, null);
     s.close();
   }
   // Damage: index emptied while the table exists (what a crash between
@@ -57,10 +57,10 @@ const check = (n, c, x) => {
   const s = new ChatStore(":memory:");
   const r = mkRoom(s, "emoji", null, null).id;
   mkAgent(s, "b");
-  s.joinRoom(r, "b", EPOCH1, {});
+  s.joinRoom(r, "b", {});
   const body = "\u{1F600}".repeat(100); // 200 UTF-16 units
-  s.postMessage(r, "b", body, "text", null, null, null, EPOCH1); // seq 1
-  s.postMessage(r, "b", "reply target", "text", null, 1, null, EPOCH1); // seq 2, preview of 1
+  s.postMessage(r, "b", body, "text", null, null, null); // seq 1
+  s.postMessage(r, "b", "reply target", "text", null, 1, null); // seq 2, preview of 1
 
   const loneHigh = (str) => {
     const c = str.charCodeAt(str.length - 1);
@@ -111,10 +111,10 @@ const check = (n, c, x) => {
   const r = mkRoom(s, "r", null, null).id;
   mkAgent(s, "a");
   mkAgent(s, "b");
-  s.joinRoom(r, "a", EPOCH1, {});
-  s.joinRoom(r, "b", EPOCH1, {});
-  s.postMessage(r, "b", "z".repeat(5000), "text", null, null, null, EPOCH1);
-  const page = s.catchUp(r, "a", 50, undefined, 1000, EPOCH1);
+  s.joinRoom(r, "a", {});
+  s.joinRoom(r, "b", {});
+  s.postMessage(r, "b", "z".repeat(5000), "text", null, null, null);
+  const page = s.catchUp(r, "a", 50, undefined, 1000);
   check(
     "lone oversized head: delivered shrunk, byte_limited truthfully absent",
     page.messages.length === 1 && page.remaining === 0 && page.byte_limited === undefined,
@@ -129,12 +129,12 @@ const check = (n, c, x) => {
   const r = mkRoom(s, "r", null, null).id;
   mkAgent(s, "author");
   mkAgent(s, "away");
-  s.joinRoom(r, "author", EPOCH1, {});
-  s.joinRoom(r, "away", EPOCH1, {});
-  for (let i = 1; i <= 10; i++) s.postMessage(r, "author", "m" + i, "text", null, null, null, EPOCH1);
-  s.markRead(r, "away", EPOCH1, 3);
-  s.leaveRoom(r, "away", EPOCH1); // soft leave preserves the read position
-  const refused = s.pruneMessages(r, "author", EPOCH1, 5, false);
+  s.joinRoom(r, "author", {});
+  s.joinRoom(r, "away", {});
+  for (let i = 1; i <= 10; i++) s.postMessage(r, "author", "m" + i, "text", null, null, null);
+  s.markRead(r, "away", 3);
+  s.leaveRoom(r, "away"); // soft leave preserves the read position
+  const refused = s.pruneMessages(r, "author", 5, false);
   check(
     "prune refuses for a SOFT-LEFT member's unread (documented, previously untested)",
     refused.refused === true && refused.would_delete_unread === 2,
@@ -145,7 +145,7 @@ const check = (n, c, x) => {
     refused.min_read_seq === 3,
     refused,
   );
-  const clamped = s.pruneMessages(r, "author", EPOCH1, 0, true);
+  const clamped = s.pruneMessages(r, "author", 0, true);
   check(
     "keepLast=0 clamps to keeping the newest message (seq monotonicity)",
     clamped.kept === 1 && clamped.deleted === 9,
@@ -161,8 +161,8 @@ const check = (n, c, x) => {
   // The filter now matches the ROOM-LOCAL role (plus id/brand/model/description).
   mkAgent(s, "pct");
   mkAgent(s, "plain");
-  s.joinRoom(r, "pct", EPOCH1, { role: "rate x50%y" });
-  s.joinRoom(r, "plain", EPOCH1, { role: "rate x50zy" });
+  s.joinRoom(r, "pct", { role: "rate x50%y" });
+  s.joinRoom(r, "plain", { role: "rate x50zy" });
   const { agents: hits } = s.listAgents(r, 5, "50%");
   check(
     "agent filter treats % as a literal, not a wildcard",
@@ -177,17 +177,17 @@ const check = (n, c, x) => {
   const s = new ChatStore(":memory:");
   const r = mkRoom(s, "r", null, null).id;
   mkAgent(s, "a");
-  s.joinRoom(r, "a", EPOCH1, {});
-  s.postMessage(r, "a", "v1", "text", null, null, null, EPOCH1); // seq 1
-  s.postMessage(r, "a", "v2", "text", null, null, 1, EPOCH1); // seq 2 supersedes 1
-  s.postMessage(r, "a", "v3", "text", null, null, 2, EPOCH1); // seq 3 supersedes 2
-  s.postMessage(r, "a", "v2b late correction", "text", null, null, 1, EPOCH1); // seq 4 ALSO supersedes 1
+  s.joinRoom(r, "a", {});
+  s.postMessage(r, "a", "v1", "text", null, null, null); // seq 1
+  s.postMessage(r, "a", "v2", "text", null, null, 1); // seq 2 supersedes 1
+  s.postMessage(r, "a", "v3", "text", null, null, 2); // seq 3 supersedes 2
+  s.postMessage(r, "a", "v2b late correction", "text", null, null, 1); // seq 4 ALSO supersedes 1
   check("chain hop 1 resolves to the LATEST superseder", s.getMessage(r, 1).superseded_by === 4, s.getMessage(r, 1));
   check("chain hop 2 intact", s.getMessage(r, 2).superseded_by === 3, s.getMessage(r, 2));
   check("chain tip is unsuperseded", s.getMessage(r, 3).superseded_by === undefined, s.getMessage(r, 3));
   // Prune the chain's base; readers of survivors must not break.
-  for (let i = 0; i < 6; i++) s.postMessage(r, "a", "filler", "text", null, null, null, EPOCH1); // seqs 5-10
-  const pr = s.pruneMessages(r, "a", EPOCH1, 7, true); // cutoff removes seqs 1-3
+  for (let i = 0; i < 6; i++) s.postMessage(r, "a", "filler", "text", null, null, null); // seqs 5-10
+  const pr = s.pruneMessages(r, "a", 7, true); // cutoff removes seqs 1-3
   check("prune removed the chain base", pr.deleted === 3, pr);
   const survivor = s.getMessage(r, 4);
   check(

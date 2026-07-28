@@ -16,7 +16,7 @@ import {
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { EPOCH1, mkAgent, bindArgs, mkRoom } from "./persona-helpers.mjs";
+import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
@@ -33,7 +33,7 @@ function setup(name = "priority-room") {
   mkAgent(s, "me");
   for (const id of ["me", "peer"]) {
     mkAgent(s, id);
-    s.joinRoom(room, id, EPOCH1, {});
+    s.joinRoom(room, id, {});
   }
   return { s, room };
 }
@@ -42,15 +42,15 @@ function setup(name = "priority-room") {
 // It may cross own rows (which catch_up never returns), but never the next peer.
 {
   const { s, room } = setup("cursor-normalization");
-  const own1 = s.postMessage(room, "me", "own-1", "text", null, null, null, EPOCH1);
+  const own1 = s.postMessage(room, "me", "own-1", "text", null, null, null);
   check(
     "E1 an own-only post becomes the durable shared baseline",
     own1.seq === 1 && s.getMembership(room, "me").last_read_seq === 1 &&
-      s.unreadProbe(room, "me", EPOCH1) === 0,
+      s.unreadProbe(room, "me") === 0,
     s.getMembership(room, "me"),
   );
-  s.markRead(room, "me", EPOCH1, 0);
-  const repaired = s.catchUp(room, "me", 50, undefined, 100000, EPOCH1);
+  s.markRead(room, "me", 0);
+  const repaired = s.catchUp(room, "me", 50, undefined, 100000);
   check(
     "E1 an empty historical own tail is repaired once",
     repaired.messages.length === 0 && repaired.advanced === true &&
@@ -59,14 +59,14 @@ function setup(name = "priority-room") {
     repaired,
   );
 
-  s.postMessage(room, "peer", "peer-1", "text", null, null, null, EPOCH1); // seq 2
-  const blind = s.postMessage(room, "me", "own-2", "text", null, null, null, EPOCH1); // seq 3
+  s.postMessage(room, "peer", "peer-1", "text", null, null, null); // seq 2
+  const blind = s.postMessage(room, "me", "own-2", "text", null, null, null); // seq 3
   check(
     "E1 posting never normalizes across an unseen peer",
     blind.crossed === 1 && s.getMembership(room, "me").last_read_seq === 1,
     { blind, marker: s.getMembership(room, "me") },
   );
-  const caught = s.catchUp(room, "me", 50, undefined, 100000, EPOCH1);
+  const caught = s.catchUp(room, "me", 50, undefined, 100000);
   check(
     "E1 catch_up delivers the peer then absorbs its trailing own suffix",
     caught.messages.map((m) => m.seq).join(",") === "2" &&
@@ -74,17 +74,17 @@ function setup(name = "priority-room") {
     caught,
   );
 
-  s.postMessage(room, "peer", "peer-2", "text", null, null, null, EPOCH1); // seq 4
-  s.postMessage(room, "me", "own-3", "text", null, null, null, EPOCH1); // seq 5
-  s.postMessage(room, "peer", "peer-3", "text", null, null, null, EPOCH1); // seq 6
-  const one = s.catchUp(room, "me", 1, undefined, 100000, EPOCH1);
+  s.postMessage(room, "peer", "peer-2", "text", null, null, null); // seq 4
+  s.postMessage(room, "me", "own-3", "text", null, null, null); // seq 5
+  s.postMessage(room, "peer", "peer-3", "text", null, null, null); // seq 6
+  const one = s.catchUp(room, "me", 1, undefined, 100000);
   check(
     "E1 a limited page crosses own rows but stops before the next peer",
     one.messages[0]?.seq === 4 && one.new_last_read_seq === 5 &&
       one.remaining === 1 && s.getMembership(room, "me").last_read_seq === 5,
     one,
   );
-  const rest = s.catchUp(room, "me", 50, undefined, 100000, EPOCH1);
+  const rest = s.catchUp(room, "me", 50, undefined, 100000);
   check(
     "E1 the peer beyond the own suffix remains deliverable",
     rest.messages.map((m) => m.seq).join(",") === "6" && rest.remaining === 0,
@@ -96,17 +96,17 @@ function setup(name = "priority-room") {
 // S1/S2: qualifying rules, disclosed loss, trailing drain, and row paging.
 {
   const { s, room } = setup();
-  const root = s.postMessage(room, "me", "my root", "text", null, null, null, EPOCH1);
-  s.postMessage(room, "peer", "low-1", "text", null, null, null, EPOCH1);
-  s.postMessage(room, "peer", "checkpoint", "text", null, null, null, EPOCH1, {
+  const root = s.postMessage(room, "me", "my root", "text", null, null, null);
+  s.postMessage(room, "peer", "low-1", "text", null, null, null);
+  s.postMessage(room, "peer", "checkpoint", "text", null, null, null, {
     priority: true,
   });
-  s.postMessage(room, "peer", "low-2", "text", null, null, null, EPOCH1);
-  s.postMessage(room, "peer", "mention", "text", ["me"], null, null, EPOCH1);
-  s.postMessage(room, "peer", "reply", "text", null, root.seq, null, EPOCH1);
-  s.postMessage(room, "peer", "low-3", "text", null, null, null, EPOCH1);
+  s.postMessage(room, "peer", "low-2", "text", null, null, null);
+  s.postMessage(room, "peer", "mention", "text", ["me"], null, null);
+  s.postMessage(room, "peer", "reply", "text", null, root.seq, null);
+  s.postMessage(room, "peer", "low-3", "text", null, null, null);
 
-  const page = s.catchUp(room, "me", 50, undefined, 100_000, EPOCH1, {
+  const page = s.catchUp(room, "me", 50, undefined, 100_000, {
     priorityOnly: true,
   });
   check(
@@ -127,12 +127,12 @@ function setup(name = "priority-room") {
   );
   check(
     "S1 ordinary catch_up has no discarded backlog left",
-    s.catchUp(room, "me", 50, undefined, 100000, EPOCH1).messages.length === 0,
+    s.catchUp(room, "me", 50, undefined, 100000).messages.length === 0,
     null,
   );
 
-  s.markRead(room, "me", EPOCH1, 0);
-  const first = s.catchUp(room, "me", 1, undefined, 100_000, EPOCH1, {
+  s.markRead(room, "me", 0);
+  const first = s.catchUp(room, "me", 1, undefined, 100_000, {
     priorityOnly: true,
   });
   check(
@@ -142,7 +142,7 @@ function setup(name = "priority-room") {
       first.remaining === 4 && first.skipped_count === 1,
     first,
   );
-  const second = s.catchUp(room, "me", 2, undefined, 100_000, EPOCH1, {
+  const second = s.catchUp(room, "me", 2, undefined, 100_000, {
     priorityOnly: true,
   });
   check(
@@ -159,9 +159,9 @@ function setup(name = "priority-room") {
 {
   const { s, room } = setup("all-low");
   for (let i = 0; i < 25; i++) {
-    s.postMessage(room, "peer", `noise-${i}`, "text", null, null, null, EPOCH1);
+    s.postMessage(room, "peer", `noise-${i}`, "text", null, null, null);
   }
-  const page = s.catchUp(room, "me", 5, undefined, 100_000, EPOCH1, {
+  const page = s.catchUp(room, "me", 5, undefined, 100_000, {
     priorityOnly: true,
   });
   check(
@@ -177,9 +177,9 @@ function setup(name = "priority-room") {
 {
   const { s, room } = setup("priority-byte-cut");
   for (let i = 0; i < 2; i++) {
-    s.postMessage(room, "peer", String.fromCharCode(3).repeat(5000), "text", null, null, null, EPOCH1, { priority: true });
+    s.postMessage(room, "peer", String.fromCharCode(3).repeat(5000), "text", null, null, null, { priority: true });
   }
-  const page = s.catchUp(room, "me", 50, undefined, 1000, EPOCH1, {
+  const page = s.catchUp(room, "me", 50, undefined, 1000, {
     priorityOnly: true,
   });
   check(
@@ -189,7 +189,7 @@ function setup(name = "priority-room") {
       page.remaining === 1,
     { size: JSON.stringify(page).length, page },
   );
-  const rest = s.catchUp(room, "me", 50, 20, 100_000, EPOCH1, {
+  const rest = s.catchUp(room, "me", 50, 20, 100_000, {
     priorityOnly: true,
   });
   check(
@@ -209,10 +209,10 @@ function setup(name = "priority-room") {
 // direct-caller guard untested.
 {
   const { s, room } = setup("direct-boundaries");
-  s.postMessage(room, "peer", "important", "text", null, null, null, EPOCH1, {
+  s.postMessage(room, "peer", "important", "text", null, null, null, {
     priority: true,
   });
-  const zeroLimit = s.catchUp(room, "me", 0, undefined, 100_000, EPOCH1, {
+  const zeroLimit = s.catchUp(room, "me", 0, undefined, 100_000, {
     priorityOnly: true,
   });
   check(
@@ -223,14 +223,14 @@ function setup(name = "priority-room") {
     zeroLimit,
   );
 
-  const emoji = s.postMessage(room, "peer", "\u{1f600}z", "text", null, null, null, EPOCH1);
+  const emoji = s.postMessage(room, "peer", "\u{1f600}z", "text", null, null, null);
   const tinyPage = s.getMessage(room, emoji.seq, 0, 1);
   check(
     "D1 tiny get_message pages always advance across an astral codepoint",
     tinyPage?.content === "\u{1f600}" && tinyPage.next_offset === 1,
     tinyPage,
   );
-  const ascii = s.postMessage(room, "peer", "ab", "text", null, null, null, EPOCH1);
+  const ascii = s.postMessage(room, "peer", "ab", "text", null, null, null);
   const tinyAscii = s.getMessage(room, ascii.seq, 0, 1);
   check(
     "D1 tiny get_message still honors a one-codepoint ASCII window",
@@ -251,7 +251,7 @@ function setup(name = "priority-room") {
 
   let oversizedCatchUpError = "";
   try {
-    s.catchUp(room, "me", 50, undefined, 400_001, EPOCH1);
+    s.catchUp(room, "me", 50, undefined, 400_001);
   } catch (error) {
     oversizedCatchUpError = String(error?.message ?? error);
   }
@@ -263,7 +263,7 @@ function setup(name = "priority-room") {
 
   let nanCasError = "";
   try {
-    s.postMessage(room, "me", "unsafe NaN decision", "text", null, null, null, EPOCH1, {
+    s.postMessage(room, "me", "unsafe NaN decision", "text", null, null, null, {
       ifLastReadSeq: Number.NaN,
     });
   } catch (error) {
@@ -278,8 +278,8 @@ function setup(name = "priority-room") {
     nanCasError,
   );
 
-  s.markRead(room, "me", EPOCH1);
-  s.postMessage(room, "peer", "x".repeat(5000), "text", null, null, null, EPOCH1);
+  s.markRead(room, "me");
+  s.postMessage(room, "peer", "x".repeat(5000), "text", null, null, null);
   const boundedCrossing = s.postMessage(
     room,
     "me",
@@ -288,7 +288,6 @@ function setup(name = "priority-room") {
     null,
     null,
     null,
-    EPOCH1,
     { crossedPreviewChars: 1_000_000 },
   );
   check(
@@ -311,9 +310,9 @@ function setup(name = "priority-room") {
     const room = mkRoom(s, `${n}-${String.fromCharCode(1).repeat(190)}`, null, null).id;
     const worker = `worker-${n}-${"\\".repeat(180)}`;
     mkAgent(s, worker);
-    s.joinRoom(room, "boss", EPOCH1, {});
-    s.joinRoom(room, worker, EPOCH1, {});
-    s.postMessage(room, "boss", "work", "text", [worker], null, null, EPOCH1);
+    s.joinRoom(room, "boss", {});
+    s.joinRoom(room, worker, {});
+    s.postMessage(room, "boss", "work", "text", [worker], null, null);
   }
   const keys = [];
   let after;
@@ -347,9 +346,9 @@ function setup(name = "priority-room") {
   mkAgent(s, "same-target");
   for (let i = 0; i < 3; i++) {
     const room = mkRoom(s, `tie-${i}`, null, null).id;
-    s.joinRoom(room, "boss", EPOCH1, {});
-    s.joinRoom(room, "same-target", EPOCH1, {});
-    s.postMessage(room, "boss", "work", "text", ["same-target"], null, null, EPOCH1);
+    s.joinRoom(room, "boss", {});
+    s.joinRoom(room, "same-target", {});
+    s.postMessage(room, "boss", "work", "text", ["same-target"], null, null);
   }
   const rooms = [];
   let after;
@@ -450,9 +449,13 @@ await (async () => {
   const store = new ChatStore(DB);
   const room = mkRoom(store, "mcp-priority", null, null).id;
   mkAgent(store, "peer");
-  store.joinRoom(room, "peer", EPOCH1, {});
-  mkAgent(store, "me");
-  await call("resume_persona", bindArgs("me"));
+  store.joinRoom(room, "peer", {});
+  const identified = await call("identify_persona", {
+    brand: "priority",
+    model: "triage-client",
+    version: "1.0",
+  });
+  const mcpAgentId = identified.data.agent_id;
   await call("join_room", { room: "mcp-priority" });
   const posted = await call("post_message", {
     content: "my checkpoint",
@@ -464,12 +467,12 @@ await (async () => {
       store.readHistory(room, 10).messages[0].priority === true,
     posted.data,
   );
-  store.postMessage(room, "peer", "low", "text", null, null, null, EPOCH1);
-  store.postMessage(room, "peer", "important", "text", null, null, null, EPOCH1, {
+  store.postMessage(room, "peer", "low", "text", null, null, null);
+  store.postMessage(room, "peer", "important", "text", null, null, null, {
     priority: true,
   });
-  store.postMessage(room, "peer", "direct", "text", ["me"], null, null, EPOCH1);
-  store.postMessage(room, "peer", "tail noise", "text", null, null, null, EPOCH1);
+  store.postMessage(room, "peer", "direct", "text", [mcpAgentId], null, null);
+  store.postMessage(room, "peer", "tail noise", "text", null, null, null);
   const caught = await call("catch_up", { priority_only: true, max_bytes: 2000 });
   check(
     "P1 MCP priority catch-up is explicit, bounded, directed-safe, and draining",
@@ -480,8 +483,8 @@ await (async () => {
     caught.data,
   );
 
-  store.postMessage(room, "peer", "must remain", "text", null, null, null, EPOCH1);
-  const markerBefore = store.getMembership(room, "me").last_read_seq;
+  store.postMessage(room, "peer", "must remain", "text", null, null, null);
+  const markerBefore = store.getMembership(room, mcpAgentId).last_read_seq;
   const incompatible = await call("catch_up", {
     priority_only: true,
     wait_seconds: 1,
@@ -489,7 +492,7 @@ await (async () => {
   check(
     "P2 priority-only + wait rejects before advancing",
     incompatible.isError === true && /cannot be combined/.test(incompatible.data.error) &&
-      store.getMembership(room, "me").last_read_seq === markerBefore,
+      store.getMembership(room, mcpAgentId).last_read_seq === markerBefore,
     incompatible.data,
   );
   const recovered = await call("catch_up", {});
@@ -608,7 +611,7 @@ await (async () => {
 
   const deletedActive = mkRoom(store, "deleted-active", null, null).id;
   await call("join_room", { room: "deleted-active" });
-  store.deleteRoom(deletedActive, "me", store.currentEpoch("me"));
+  store.deleteRoom(deletedActive, mcpAgentId);
   const identityAfterDelete = await call("whoami", {});
   check(
     "P3b whoami gives a possible recovery after the active room is deleted",
@@ -623,12 +626,12 @@ await (async () => {
 
   mkAgent(store, "todo-a");
   mkAgent(store, "todo-b");
-  store.joinRoom(otherRoom, "peer", EPOCH1, {});
-  store.joinRoom(otherRoom, "todo-a", EPOCH1, {});
-  store.joinRoom(unjoinedRoom, "peer", EPOCH1, {});
-  store.joinRoom(unjoinedRoom, "todo-b", EPOCH1, {});
-  store.postMessage(otherRoom, "peer", "task a", "text", ["todo-a"], null, null, EPOCH1);
-  store.postMessage(unjoinedRoom, "peer", "task b", "text", ["todo-b"], null, null, EPOCH1);
+  store.joinRoom(otherRoom, "peer", {});
+  store.joinRoom(otherRoom, "todo-a", {});
+  store.joinRoom(unjoinedRoom, "peer", {});
+  store.joinRoom(unjoinedRoom, "todo-b", {});
+  store.postMessage(otherRoom, "peer", "task a", "text", ["todo-a"], null, null);
+  store.postMessage(unjoinedRoom, "peer", "task b", "text", ["todo-b"], null, null);
   const pendingFirst = await call("pending_work", { limit: 1 });
   const pendingSecond = await call("pending_work", {
     limit: 1,

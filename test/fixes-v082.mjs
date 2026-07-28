@@ -15,7 +15,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { EPOCH1, mkAgent, mkRoom } from "./persona-helpers.mjs";
+import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
@@ -29,13 +29,13 @@ const size = (o) => JSON.stringify(o).length;
 {
   const s = new ChatStore(":memory:");
   const r = mkRoom(s, "room", null, null).id;
-  for (const id of ["m","n","o","p"]) { mkAgent(s, id); s.joinRoom(r, id, EPOCH1, {}); }
+  for (const id of ["m","n","o","p"]) { mkAgent(s, id); s.joinRoom(r, id, {}); }
   const seen = new Set();
   let after;
   for (let i = 0; i < 10; i++) {
     const pg = s.listAgents(r, 5, undefined, 2, after);
     for (const a of pg.agents) seen.add(a.id);
-    if (i === 0) { mkAgent(s, "a"); s.joinRoom(r, "a", EPOCH1, {}); } // id below the cursor
+    if (i === 0) { mkAgent(s, "a"); s.joinRoom(r, "a", {}); } // id below the cursor
     if (pg.next_after === undefined) break;
     after = pg.next_after;
   }
@@ -50,10 +50,10 @@ const size = (o) => JSON.stringify(o).length;
   const s = new ChatStore(":memory:");
   const r = mkRoom(s, "room", null, null).id;
   mkAgent(s, "a");
-  s.joinRoom(r, "a", EPOCH1, {});
+  s.joinRoom(r, "a", {});
   const K = 500; // max claim key length
   for (let i = 0; i < 400; i++) {
-    s.claimResource(r, "k" + String(i).padStart(3, "0") + "x".repeat(K - 4), "a", EPOCH1, 900, null);
+    s.claimResource(r, "k" + String(i).padStart(3, "0") + "x".repeat(K - 4), "a", 900, null);
   }
   const page = s.listClaims(r, 1000, "");
   const whole = { claims: page.claims, total: page.total, ...(page.next_key !== undefined ? { next_key: page.next_key, truncated: true } : {}) };
@@ -93,10 +93,10 @@ await (async () => {
   // call never reaches the room-reference length cap, so this check passed
   // whether or not the cap existed. The point is the SCHEMA rejection: an
   // oversized reference must not be echoed back inside a 250k error response.
-  const persona = await call("create_persona", {
+  const persona = await call("identify_persona", {
     brand: "testbrand",
     model: "testmodel",
-    version: "1",
+    version: "1.0",
   });
   check(
     "#8 the cap test actually has a bound persona (else it never reaches the cap)",

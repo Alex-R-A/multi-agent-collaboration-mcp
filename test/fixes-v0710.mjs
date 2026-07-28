@@ -13,7 +13,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
-import { EPOCH1, mkAgent, mkRoom } from "./persona-helpers.mjs";
+import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
@@ -27,10 +27,10 @@ const check = (n, c, x) => {
   const s = new ChatStore(":memory:");
   const r = mkRoom(s, "room", null, null).id;
   mkAgent(s, "w"); mkAgent(s, "p");
-  s.joinRoom(r, "w", EPOCH1, {}); s.joinRoom(r, "p", EPOCH1, {});
-  s.postMessage(r, "p", "x".repeat(150000), "text", null, null, null, EPOCH1); // alone fills the raw budget
-  s.postMessage(r, "p", "y".repeat(150000), "text", null, null, null, EPOCH1); // becomes the sentinel; also the last row
-  const page = s.catchUp(r, "w", 500, 20, 100000, EPOCH1);               // preview 20 shrinks both to fit
+  s.joinRoom(r, "w", {}); s.joinRoom(r, "p", {});
+  s.postMessage(r, "p", "x".repeat(150000), "text", null, null, null); // alone fills the raw budget
+  s.postMessage(r, "p", "y".repeat(150000), "text", null, null, null); // becomes the sentinel; also the last row
+  const page = s.catchUp(r, "w", 500, 20, 100000);               // preview 20 shrinks both to fit
   check(
     "#10 catch_up: nothing left => byte_limited is absent, not a false positive",
     page.messages.length === 2 && page.remaining === 0 && page.byte_limited === undefined,
@@ -42,13 +42,13 @@ const check = (n, c, x) => {
 // --- #11: store rejects a nested lone surrogate; nested NUL still allowed -----
 {
   const s = new ChatStore(":memory:");
-  mkRoom(s, "room", null, null); mkAgent(s, "p"); s.joinRoom(1, "p", EPOCH1, {});
+  mkRoom(s, "room", null, null); mkAgent(s, "p"); s.joinRoom(1, "p", {});
   let rejected = false;
-  try { s.postMessage(1, "p", '{"x":"\\ud800"}', "json", null, null, null, EPOCH1); }
+  try { s.postMessage(1, "p", '{"x":"\\ud800"}', "json", null, null, null); }
   catch (e) { rejected = /lone surrogate/.test(e.message); }
   check("#11 store rejects json body with a nested lone surrogate", rejected, null);
   let okNul = true;
-  try { s.postMessage(1, "p", '{"x":"a\\u0000b"}', "json", null, null, null, EPOCH1); } catch { okNul = false; }
+  try { s.postMessage(1, "p", '{"x":"a\\u0000b"}', "json", null, null, null); } catch { okNul = false; }
   check("#11 nested NUL (valid Unicode, escaped) still stored", okNul, null);
   s.close();
 }
@@ -85,12 +85,12 @@ await (async () => {
     const r = await w(id);
     try { return JSON.parse(r.result.content[0].text); } catch { return { raw: r.result.content[0].text }; }
   };
-  // Bind FIRST: room administration is epoch-fenced, so create_room needs a
-  // live persona. Rooms must precede JOINS, not bindings.
+  // Identify first because room administration requires a live persona.
+  // Rooms must precede joins, not identification.
   await call(
     21,
-    "create_persona",
-    '{"brand":"testbrand","model":"testmodel","version":"1"}',
+    "identify_persona",
+    '{"brand":"testbrand","model":"testmodel","version":"1.0"}',
   );
   await call(2, "create_room", '{"name":"proto-room"}');
   await call(3, "join_room", '{"room":"proto-room"}');
