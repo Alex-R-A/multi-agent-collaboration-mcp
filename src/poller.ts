@@ -646,8 +646,6 @@ try {
       });
     } catch {}
   };
-  heartbeat();
-
   const deadline = Date.now() + args.timeoutSeconds * 1000;
   for (;;) {
     if (args.ownerPid !== undefined && !processIsAlive(args.ownerPid)) {

@@ -13,6 +13,7 @@ import {
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import Database from "better-sqlite3";
 import { ChatStore } from "../dist/db.js";
 import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
@@ -184,6 +185,39 @@ try {
     "removing the named stale lock allows the watcher retry",
     staleRetryResult.code === 124 && remainingLocks().length === 0,
     { staleRetryResult, remainingLocks: remainingLocks() },
+  );
+
+  // A generated watcher whose MCP owner is already dead must reject before
+  // presenting the seat as recently listening.
+  const observer = new Database(DB);
+  observer
+    .prepare(
+      "UPDATE memberships SET last_seen = ? WHERE room_id = ? AND agent_id = ?",
+    )
+    .run("2000-01-01 00:00:00", room, "me");
+  const deadOwnerWatcher = startPoller([
+    ...base,
+    "--owner-pid",
+    String(deadOwnerPid),
+    "--timeout",
+    "10",
+  ]);
+  active.add(deadOwnerWatcher.child);
+  const deadOwnerResult = await deadOwnerWatcher.wait(2_000);
+  active.delete(deadOwnerWatcher.child);
+  const seenAfterDeadOwner = observer
+    .prepare(
+      "SELECT last_seen FROM memberships WHERE room_id = ? AND agent_id = ?",
+    )
+    .get(room, "me").last_seen;
+  observer.close();
+  check(
+    "an already-dead MCP owner cannot refresh watcher liveness",
+    deadOwnerResult.code === 2 &&
+      /owner MCP process.*ended/.test(deadOwnerResult.stderr) &&
+      seenAfterDeadOwner === "2000-01-01 00:00:00" &&
+      remainingLocks().length === 0,
+    { deadOwnerResult, seenAfterDeadOwner, remainingLocks: remainingLocks() },
   );
 
   // A genuine duplicate remains fail-closed, but reports the exact lock so a
