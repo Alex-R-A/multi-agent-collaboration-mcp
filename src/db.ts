@@ -703,6 +703,41 @@ export function directedAt(alias: string): string {
            OR IFNULL(${alias}.reply_to_agent = ?, 0))`;
 }
 
+function chmodBestEffort(path: string, mode: number): void {
+  try {
+    chmodSync(path, mode);
+  } catch {}
+}
+
+function enableWalWithRetry(db: Database.Database): void {
+  // Switching a brand-new rollback-journal file to WAL needs an exclusive
+  // lock, and SQLite can return SQLITE_BUSY here WITHOUT consulting the
+  // busy handler (better-sqlite3's default 5s timeout does not cover this
+  // path), so two fresh processes racing to convert the same file
+  // intermittently crashed on startup (reproduced ~1 in 24 synchronized
+  // opens). This is a STARTUP RACE, not a compatibility path: retry with a
+  // short synchronous backoff and the loser finds the file already in WAL
+  // and succeeds immediately. A no-op on already-WAL files, i.e. every
+  // startup after the first.
+  for (let attempt = 1; ; attempt++) {
+    try {
+      db.pragma("journal_mode = WAL");
+      break;
+    } catch (e) {
+      // Prefix match: better-sqlite3 surfaces EXTENDED result codes (e.g.
+      // SQLITE_BUSY_RECOVERY when another connection is mid-WAL-recovery,
+      // plausible in exactly this conversion race), and all of them mean
+      // the same thing here: someone else holds the file, try again.
+      const code = (e as { code?: string }).code ?? "";
+      if (attempt >= 20 || !code.startsWith("SQLITE_BUSY")) {
+        throw e;
+      }
+      // Synchronous sleep (constructor context); ~4.75s worst-case total.
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25 * attempt);
+    }
+  }
+}
+
 export class ChatStore {
   readonly path: string;
   private db: Database.Database;
@@ -720,49 +755,20 @@ export class ChatStore {
       // already existed; chmod only that. Best-effort: permissions are a
       // hardening layer, not a startup gate (and a no-op concept on Windows).
       const created = mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-      try {
-        if (created) chmodSync(created, 0o700);
-        for (const p of [path, `${path}-wal`, `${path}-shm`]) {
-          if (existsSync(p)) chmodSync(p, 0o600);
-        }
-      } catch {}
+      if (created) chmodBestEffort(created, 0o700);
+      for (const p of [path, `${path}-wal`, `${path}-shm`]) {
+        if (existsSync(p)) chmodBestEffort(p, 0o600);
+      }
     }
     this.db = new Database(path);
     try {
       if (path !== ":memory:") {
-        try {
-          chmodSync(path, 0o600);
-        } catch {}
+        chmodBestEffort(path, 0o600);
       }
-    // Switching a brand-new rollback-journal file to WAL needs an exclusive
-    // lock, and SQLite can return SQLITE_BUSY here WITHOUT consulting the
-    // busy handler (better-sqlite3's default 5s timeout does not cover this
-    // path), so two fresh processes racing to convert the same file
-    // intermittently crashed on startup (reproduced ~1 in 24 synchronized
-    // opens). This is a STARTUP RACE, not a compatibility path: retry with a
-    // short synchronous backoff and the loser finds the file already in WAL
-    // and succeeds immediately. A no-op on already-WAL files, i.e. every
-    // startup after the first.
-    for (let attempt = 1; ; attempt++) {
-      try {
-        this.db.pragma("journal_mode = WAL");
-        break;
-      } catch (e) {
-        // Prefix match: better-sqlite3 surfaces EXTENDED result codes (e.g.
-        // SQLITE_BUSY_RECOVERY when another connection is mid-WAL-recovery,
-        // plausible in exactly this conversion race), and all of them mean
-        // the same thing here: someone else holds the file, try again.
-        const code = (e as { code?: string }).code ?? "";
-        if (attempt >= 20 || !code.startsWith("SQLITE_BUSY")) {
-          throw e;
-        }
-        // Synchronous sleep (constructor context); ~4.75s worst-case total.
-        Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25 * attempt);
-      }
-    }
-    this.db.pragma("busy_timeout = 5000");
-    this.db.pragma("foreign_keys = ON");
-    // Initialize the current schema atomically and serialize concurrent starts.
+      enableWalWithRetry(this.db);
+      this.db.pragma("busy_timeout = 5000");
+      this.db.pragma("foreign_keys = ON");
+      // Initialize the current schema atomically and serialize concurrent starts.
       this.db.transaction(() => this.initializeSchema()).immediate();
     } catch (error) {
       // A constructor that throws has no caller-visible instance on which to

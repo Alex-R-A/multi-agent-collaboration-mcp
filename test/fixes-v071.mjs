@@ -12,12 +12,14 @@
 //   one persona -- so the case cannot arise and its test was deleted. The
 //   surviving half, per-room read markers, is covered by fixes-v064.)
 //  7  search: g.id tie-break + limit+1 probe (no false next_offset)
-//  8  chmod tightens only directories WE create, never a pre-existing parent
+//  8  chmod tightens only directories WE create, never a pre-existing parent,
+//     and one failed chmod does not skip later independent targets
 //  12 delete_room on an already-deleted room fails cleanly
 //  13 lone surrogates are rejected at write
 import { ChatStore } from "../dist/db.js";
 import Database from "better-sqlite3";
 import { mkdtempSync, mkdirSync, rmSync, statSync } from "node:fs";
+import { spawnSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { mkAgent, mkRoom, rmRoom } from "./persona-helpers.mjs";
@@ -258,6 +260,56 @@ if (process.platform !== "win32") {
   const s2 = new ChatStore(madeDb);
   s2.close();
   check("a directory we created is 0700", (statSync(join(base, "made")).mode & 0o777) === 0o700, null);
+
+  const faultDb = join(base, "fault.db");
+  new Database(faultDb).close();
+  const faultProbe = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `
+        import fs from "node:fs";
+        import { syncBuiltinESMExports } from "node:module";
+        const dbPath = process.env.TEST_DB_PATH;
+        const realChmod = fs.chmodSync;
+        const realExists = fs.existsSync;
+        const calls = [];
+        let failedDb = false;
+        fs.existsSync = (candidate) =>
+          String(candidate).startsWith(dbPath) ? true : realExists(candidate);
+        fs.chmodSync = (candidate, mode) => {
+          const value = String(candidate);
+          calls.push(value);
+          if (value === dbPath && !failedDb) {
+            failedDb = true;
+            throw new Error("forced chmod failure");
+          }
+          if (value === dbPath + "-wal" || value === dbPath + "-shm") return;
+          realChmod(candidate, mode);
+        };
+        syncBuiltinESMExports();
+        const { ChatStore } = await import(process.env.TEST_DB_MODULE);
+        const store = new ChatStore(dbPath);
+        store.close();
+        process.stdout.write(JSON.stringify(calls));
+      `,
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        TEST_DB_PATH: faultDb,
+        TEST_DB_MODULE: new URL("../dist/db.js", import.meta.url).href,
+      },
+    },
+  );
+  const chmodCalls = faultProbe.status === 0 ? JSON.parse(faultProbe.stdout) : [];
+  check(
+    "one chmod failure does not skip later database sidecars",
+    chmodCalls.includes(faultDb + "-wal") && chmodCalls.includes(faultDb + "-shm"),
+    { status: faultProbe.status, stderr: faultProbe.stderr, chmodCalls },
+  );
   rmSync(base, { recursive: true, force: true });
 }
 
