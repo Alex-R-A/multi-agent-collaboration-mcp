@@ -3630,11 +3630,10 @@ export class ChatStore {
         | null = null;
       if (unreadSummary !== null && messages.length === 0) {
         const fetched = this.unreadByRoom(agentId, UNREAD_SUMMARY_MAX, roomId);
-        // The v0.9 summary was appended after catch_up had already spent the
-        // entire page budget. Twenty legal, control-heavy room names could
-        // inflate a declared 1k response past 25k. Bound the summary within
-        // the same result budget, using the same measured-fit/name-halving
-        // pattern as my_mentions.by_room.
+        // The room summary shares catch_up's page budget. Twenty legal,
+        // control-heavy room names could otherwise inflate a declared 1k
+        // response past 25k. Bound the summary using the same measured-fit
+        // and name-halving pattern as my_mentions.by_room.
         const roomBudget =
           maxBytes -
           (priorityOnly

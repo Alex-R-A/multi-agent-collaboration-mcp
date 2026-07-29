@@ -1998,9 +1998,9 @@ server.registerTool(
       touchCapturedRoom(roomId, agentId);
       const signal = extra?.signal;
       // max_bytes bounds the COMPLETE JSON text returned to the MCP client,
-      // not merely ChatStore.catchUp's inner object. v0.9 added routing fields
-      // and v0.10 added wait fields after the store had spent the full budget;
-      // an advancing page could then be rejected after its marker committed.
+      // not merely ChatStore.catchUp's inner object. Routing and optional wait
+      // fields sit outside that store result; without reserving them, an
+      // advancing page could be rejected after its marker committed.
       // Reserve their exact serialized cost BEFORE the advancing transaction.
       const responseIdentity = {
         agent_id: agentId,
