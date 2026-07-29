@@ -19,6 +19,9 @@
 //  M11 two waiters (separate server processes) both receive one post
 //  M12 active-room change mid-wait: captured room and identity govern
 //  M13 concurrent leave ends a quiet wait and drops its lease
+//  M14 one liveness write per operation: the active-room touch and the resolved
+//      target share a single (room, identity) throttle, and a different-room
+//      operation still refreshes both rooms
 import { ChatStore, PersonaLostError } from "../dist/db.js";
 import Database from "better-sqlite3";
 import { spawn } from "node:child_process";
@@ -268,7 +271,11 @@ await (async () => {
     version: "1.0",
   });
   const mcpAgentId = identified.data.agent_id;
-  await srv.call("join_room", { room: "wait-b" });
+  // Join wait-b from THIS process, not through the server: touchSession() now
+  // shares the per-(room, identity) throttle, so a server-side join that made
+  // wait-b the active room would leave a throttle entry that suppresses the
+  // captured-room heartbeat M4c is written to observe.
+  s.joinRoom(rB, mcpAgentId, {});
   await srv.call("join_room", { room: "wait-a" }); // active = A
 
   // M1: backlog present -> no sleep.
@@ -649,6 +656,96 @@ await (async () => {
   s2.close();
   srv1.child.kill();
   srv2.child.kill();
+  rmSync(dir, { recursive: true, force: true });
+})();
+
+// --- M14: one liveness write per operation --------------------------------------
+// touchSession() used to keep its own PROCESS-GLOBAL throttle while handlers also
+// called touchCapturedRoom() for the resolved target. Whenever that target IS the
+// active room -- the common case -- a single tool call issued two liveness write
+// transactions against the same membership row. last_seen cannot witness this
+// (both writes carry the same second), so count the UPDATEs directly with a
+// trigger installed AFTER setup.
+await (async () => {
+  const dir = mkdtempSync(join(tmpdir(), "v0100-touch-"));
+  const DB = join(dir, "t.db");
+  const srv = startServer(DB);
+  await srv.init();
+  const s = new ChatStore(DB);
+  const rA = mkRoom(s, "touch-a", null, null).id;
+  const rB = mkRoom(s, "touch-b", null, null).id;
+  const rC = mkRoom(s, "touch-c", null, null).id;
+  const identified = await srv.call("identify_persona", {
+    brand: "touch",
+    model: "throttle-client",
+    version: "1.0",
+  });
+  const agentId = identified.data.agent_id;
+  // The FIRST room this process binds: join_room's own touchSession() sees a
+  // null active room and returns, so no throttle entry for rA exists yet. That
+  // is exactly the state a freshly joined runtime is in.
+  await srv.call("join_room", { room: "touch-a" });
+
+  // A non-TEMP trigger is required: TEMP triggers are connection-local and would
+  // never fire for the server process's writes.
+  const probe = new Database(DB);
+  probe.exec(
+    `CREATE TABLE touch_probe (room_id INTEGER NOT NULL, agent_id TEXT NOT NULL);
+     CREATE TRIGGER touch_probe_trg AFTER UPDATE ON memberships
+     BEGIN
+       INSERT INTO touch_probe (room_id, agent_id) VALUES (NEW.room_id, NEW.agent_id);
+     END;`,
+  );
+  const touched = () =>
+    probe
+      .prepare(
+        "SELECT room_id FROM touch_probe WHERE agent_id = ? ORDER BY room_id",
+      )
+      .all(agentId)
+      .map((r) => r.room_id);
+  const resetProbe = () => probe.prepare("DELETE FROM touch_probe").run();
+
+  // list_claims is the smallest handler on the touchSession -> touchCapturedRoom
+  // path that writes nothing else to memberships: no marker advance, no post.
+  await srv.call("list_claims", {});
+  const firstOp = touched();
+  check(
+    "M14 an active-room operation performs exactly one liveness write",
+    firstOp.length === 1 && firstOp[0] === rA,
+    { rooms: firstOp },
+  );
+
+  // The surviving throttle must still suppress the repeat inside the interval.
+  resetProbe();
+  await srv.call("list_claims", {});
+  const repeatOp = touched();
+  check(
+    "M14 a repeat same-room operation inside the interval writes nothing",
+    repeatOp.length === 0,
+    { rooms: repeatOp },
+  );
+
+  // A different-room operation must still refresh BOTH the active room and the
+  // explicit target. rC becomes active via join_room; rB is joined from THIS
+  // process, so the server never touched it and its throttle entry stays cold.
+  await srv.call("join_room", { room: "touch-c" });
+  s.joinRoom(rB, agentId, {});
+  resetProbe();
+  const cross = await srv.call("list_claims", { room: "touch-b" });
+  const crossOp = touched();
+  check(
+    "M14 an explicit different-room operation touches active and target once each",
+    cross.isError !== true &&
+      crossOp.length === 2 &&
+      crossOp.includes(rB) &&
+      crossOp.includes(rC),
+    { rooms: crossOp, isError: cross.isError, data: cross.data },
+  );
+
+  probe.exec("DROP TRIGGER touch_probe_trg; DROP TABLE touch_probe;");
+  probe.close();
+  s.close();
+  srv.child.kill();
   rmSync(dir, { recursive: true, force: true });
 })();
 

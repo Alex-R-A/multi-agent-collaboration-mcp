@@ -568,39 +568,21 @@ function resolveJoinedRoom(room?: string): {
   return resolved;
 }
 
-/**
- * Mark the bound persona alive in its active room on tool invocations.
- * Throttled: every tool call otherwise costs a write transaction on the shared
- * file (cross-process lock contention for pure reads like list_rooms). 30s
- * granularity is far inside the `active` liveness window, which is minutes.
- *
- * LIVE-IDENTITY-FENCED through store.touch(), which keeps a retired runtime
- * from refreshing liveness: its PersonaLostError lands in the catch below and
- * the write never happens. A stale read therefore leaves last_seen alone.
- */
-let lastTouchMs = 0;
-const TOUCH_INTERVAL_MS = 30_000;
+/** Mark the bound persona alive in its active room. Shares the throttle below,
+ *  so an operation touching the active room and then the same room as its
+ *  resolved target writes once; a different target still gets its own write.
+ *  Fenced through store.touch(): a retired runtime cannot refresh liveness. */
 function touchSession(): void {
   if (session.agentId === null) return;
   if (session.roomId === null) return;
-  const now = Date.now();
-  if (now - lastTouchMs < TOUCH_INTERVAL_MS) return;
-  lastTouchMs = now;
-  try {
-    store.touch(session.roomId, session.agentId);
-  } catch {
-    // Liveness is best-effort: a briefly-locked database must not fail the
-    // tool call this touch piggybacks on (pure reads included). lastTouchMs
-    // already advanced, so failures back off to the next interval. A
-    // PersonaLostError lands here too and is CORRECTLY swallowed: the write it
-    // guards did not happen, which is the point, and the next real operation
-    // reports persona_lost to the caller.
-  }
+  touchCapturedRoom(session.roomId, session.agentId);
 }
 
-// Cross-room operations capture a target that can differ from mutable active
-// session state. Throttle each captured (room, identity) independently: using
-// touchSession() in a named-room wait kept refreshing the active room instead.
+// One throttle per (room, identity). Without it every tool call costs a write
+// transaction on the shared file, and 30s is far inside the minutes-scale
+// `active` window. Keyed per pair rather than per process so a cross-room
+// operation refreshes its captured target and not the active room.
+const TOUCH_INTERVAL_MS = 30_000;
 const capturedTouchMs = new Map<string, number>();
 function touchCapturedRoom(roomId: number, agentId: string): void {
   const key = roomKey(roomId, agentId);
@@ -622,7 +604,10 @@ function touchCapturedRoom(roomId: number, agentId: string): void {
     // touch refreshes only a present membership and cannot rejoin a room.
     store.touch(roomId, agentId);
   } catch {
-    // Best-effort heartbeat, matching touchSession().
+    // Best-effort: a briefly-locked database must not fail the tool call this
+    // piggybacks on. The throttle entry already advanced, so failures back off
+    // to the next interval; a PersonaLostError lands here too, and the next
+    // real operation reports the loss to the caller.
   }
 }
 
