@@ -1182,6 +1182,14 @@ export class ChatStore {
         "room name must be non-empty with no leading or trailing whitespace",
       );
     }
+    // Numeric references resolve as ids first, so an all-digit name can retarget
+    // reads and destructive operations to a different room.
+    if (/^\d+$/.test(name)) {
+      throw new Error(
+        "room names cannot be all digits (ambiguous with room ids); " +
+          "pick a descriptive kebab-case topic name",
+      );
+    }
     assertStorable(description, "room description");
     assertMaxLen(description, "room description", 2000);
     assertStorable(pinned, "room pinned intro");

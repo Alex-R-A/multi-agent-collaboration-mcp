@@ -667,6 +667,11 @@ try {
             room_id: hit.room_id,
             room_name: hit.room_name,
             mentions_only: args.mentionsOnly,
+            next:
+              `catch_up room ${hit.room_id} until \`remaining\` is 0 or stops ` +
+              "falling; then re-run this command before working. The watcher " +
+              "checks before sleeping, so unread traffic makes it exit " +
+              "immediately.",
           }) + "\n",
           (error) => (error ? rejectWrite(error) : resolveWrite()),
         );
@@ -678,7 +683,11 @@ try {
       if (args.timeoutOk) {
         await new Promise<void>((resolveWrite, rejectWrite) => {
           process.stdout.write(
-            '{"has_updates":false,"timed_out":true}\n',
+            JSON.stringify({
+              has_updates: false,
+              timed_out: true,
+              next: "re-run this same command immediately to keep watching.",
+            }) + "\n",
             (error) => (error ? rejectWrite(error) : resolveWrite()),
           );
         });

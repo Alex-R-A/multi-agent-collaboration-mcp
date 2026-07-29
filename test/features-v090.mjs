@@ -720,6 +720,19 @@ await (async () => {
     },
   );
 
+  // A quiet deadline has nothing to drain, so its guidance is the bare re-arm.
+  // Gated on the SAME run having actually completed quietly (status 0,
+  // has_updates false): a `next` assertion against a died/errored process
+  // would pass on an empty parse just as readily.
+  check(
+    "C1 quiet stdout carries re-arm guidance",
+    boundedPoll.status === 0 &&
+      boundedJson?.has_updates === false &&
+      typeof boundedJson?.next === "string" &&
+      /re-run this same command/i.test(boundedJson.next),
+    { status: boundedPoll.status, parsed: boundedJson },
+  );
+
   // The room summary is capped for a small status line, but callers route
   // catch_up calls from it; disclose when additional firing rooms were cut.
   {

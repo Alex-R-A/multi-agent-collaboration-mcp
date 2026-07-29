@@ -7,7 +7,7 @@
 // resume, legacy schema, or tenure counter.
 //
 // Every database is temporary. Nothing here opens the production database.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import { createHash, randomUUID } from "node:crypto";
 import {
   existsSync,
@@ -1797,7 +1797,7 @@ try {
     });
     const oldId = first.data.agent_id;
     check(
-      "MCP first identify allocates a canonical nickname and current poller",
+      "MCP first identify allocates a canonical nickname",
       first.isError !== true &&
         /^anthropic-claude-opus-v5-0-[0-9a-f]{6}$/.test(oldId) &&
         first.data.binding_reused === false &&
@@ -1962,6 +1962,205 @@ try {
       { storedConnectionId },
     );
     observer.close();
+    await hardKill(runtime);
+  }
+
+  // --- all-digit room names are refused by the STORE, not just the handler --
+  // resolveRoom is id-first, so a room named "42" is shadowed by room id 42 and
+  // delete_room("42") retargets. The rule therefore has to hold for a direct
+  // store caller, not only for one arriving through the MCP handler.
+  {
+    const { store, path } = freshStore("aichat-numeric-room-");
+    const owner = firstIdentity(store, "anthropic-claude-opus-v5-0-num001");
+    const raw = new Database(path);
+    const roomCount = () =>
+      raw.prepare("SELECT COUNT(*) AS c FROM rooms").get().c;
+    const named = (name) =>
+      raw.prepare("SELECT COUNT(*) AS c FROM rooms WHERE name = ?").get(name).c;
+    // Measured separately at each step: sharing one baseline would make the
+    // rejection and the acceptance a single assertion in two halves.
+    const before = roomCount();
+    const numeric = caught(() => store.createRoom("42", null, null, owner.id));
+    const afterNumeric = roomCount();
+    const legal = store.createRoom("room-42", null, null, owner.id);
+    const afterLegal = roomCount();
+    check(
+      "direct store createRoom refuses an all-digit name and inserts no row",
+      numeric.threw === true &&
+        /all digits/.test(numeric.message) &&
+        afterNumeric === before &&
+        named("42") === 0,
+      { message: numeric.message, before, afterNumeric, rows42: named("42") },
+    );
+    check(
+      "digits inside a name stay legal and the row is stored byte-exact",
+      legal.name === "room-42" &&
+        afterLegal === afterNumeric + 1 &&
+        named("room-42") === 1,
+      { legal, afterNumeric, afterLegal },
+    );
+    raw.close();
+    store.close();
+  }
+
+  // --- workflow education surfaces, over a real MCP process ----------------
+  {
+    const { store, path } = freshStore("aichat-workflow-");
+    store.close();
+    const runtime = startMcp(path);
+    await runtime.init();
+
+    const tools = await runtime.listTools();
+    const waitDesc =
+      tools.find((tool) => tool.name === "wait_for_messages")?.description ?? "";
+    check(
+      "wait_for_messages says the CALLER runs it and drops the 'do not run' reading",
+      /for YOU to run/i.test(waitDesc) &&
+        /does not execute it/i.test(waitDesc) &&
+        !/\(do not run\)/i.test(waitDesc),
+      { waitDesc },
+    );
+
+    // A persona has no memberships at identify time, so a WATCHER COMMAND here
+    // could only exit 2 -- but the build stamp is independent of that and stays,
+    // because staleness is worth knowing on the first response. Assert the one
+    // absence and the two required presences by name; an exact-shape assertion
+    // would break on unrelated additions and prove less.
+    const first = await runtime.call("identify_persona", TUPLE_A);
+    check(
+      "first identify drops the unusable watcher command but keeps the build stamp",
+      first.isError !== true &&
+        typeof first.data.agent_id === "string" &&
+        typeof first.data.next === "string" &&
+        first.data.poller_cmd === undefined &&
+        first.data.server_build !== undefined &&
+        typeof first.data.server_stale === "boolean",
+      {
+        poller_cmd: first.data.poller_cmd,
+        server_build: first.data.server_build,
+        server_stale: first.data.server_stale,
+      },
+    );
+    const reuse = await runtime.call("identify_persona", TUPLE_A);
+    check(
+      "exact re-identify has the same shape",
+      reuse.isError !== true &&
+        reuse.data.binding_reused === true &&
+        reuse.data.agent_id === first.data.agent_id &&
+        reuse.data.poller_cmd === undefined &&
+        reuse.data.server_build !== undefined &&
+        typeof reuse.data.server_stale === "boolean",
+      {
+        poller_cmd: reuse.data.poller_cmd,
+        server_build: reuse.data.server_build,
+      },
+    );
+    // isError alone would pass even if the row had been written and the error
+    // raised afterwards, so read the persisted state directly.
+    const numericRoom = await runtime.call("create_room", { name: "7" });
+    const mcpRaw = new Database(path);
+    const numericRows = mcpRaw
+      .prepare("SELECT COUNT(*) AS c FROM rooms WHERE name = ?")
+      .get("7").c;
+    mcpRaw.close();
+    check(
+      "create_room rejects an all-digit name AND persists no row for it",
+      numericRoom.isError === true &&
+        /all digits/.test(JSON.stringify(numericRoom.data)) &&
+        numericRows === 0,
+      { data: numericRoom.data, numericRows },
+    );
+
+    await runtime.call("create_room", { name: "workflow-room" });
+    const joined = await runtime.call("join_room", { room: "workflow-room" });
+    const joinNext = joined.data.next ?? "";
+    const catchIndex = joinNext.indexOf("catch_up");
+    const armIndex = joinNext.indexOf("poller_cmd");
+    const workIndex = joinNext.indexOf("work");
+    check(
+      "join_room keeps the handoff and teaches drain-then-arm with its mechanism",
+      joined.isError !== true &&
+        typeof joined.data.poller_cmd === "string" &&
+        joined.data.server_build !== undefined &&
+        /remaining/.test(joinNext) &&
+        catchIndex >= 0 &&
+        catchIndex < armIndex &&
+        armIndex < workIndex &&
+        /exit immediately/i.test(joinNext) &&
+        /cannot launch/i.test(joinNext),
+      { next: joinNext, poller_cmd: joined.data.poller_cmd },
+    );
+    check(
+      "join_room states what active and watching do NOT prove",
+      /active/.test(joined.data.presence_note ?? "") &&
+        /watching/.test(joined.data.presence_note ?? "") &&
+        /detached poller/i.test(joined.data.presence_note ?? "") &&
+        /agent may be working/i.test(joined.data.presence_note ?? "") &&
+        /exited watcher/i.test(joined.data.presence_note ?? "") &&
+        /model is reading/i.test(joined.data.presence_note ?? "") &&
+        /or will wake/i.test(joined.data.presence_note ?? ""),
+      { presence_note: joined.data.presence_note },
+    );
+
+    // A second runtime supplies the unread the watcher must find. Asserting the
+    // post landed FIRST is what keeps the poller check below non-vacuous: a
+    // watcher that found nothing, or died, would otherwise pass an absence test.
+    const peer = startMcp(path);
+    await peer.init();
+    await peer.call("identify_persona", TUPLE_B);
+    await peer.call("join_room", { room: "workflow-room" });
+    const posted = await peer.call("post_message", { content: "wake up" });
+    check(
+      "the peer post landed, so the watcher has something to find",
+      posted.isError !== true && typeof posted.data.seq === "number",
+      posted.data,
+    );
+
+    const hitRun = spawnSync(
+      process.execPath,
+      [
+        POLLER,
+        "--agent",
+        first.data.agent_id,
+        "--interval",
+        "5",
+        "--timeout",
+        "5",
+        "--ok-on-timeout",
+      ],
+      {
+        env: { ...process.env, AGENT_CHAT_DB: path },
+        encoding: "utf8",
+        timeout: 20_000,
+      },
+    );
+    let hitJson = null;
+    try {
+      hitJson = JSON.parse(hitRun.stdout.trim());
+    } catch {}
+    const hitNext = hitJson?.next ?? "";
+    const hitCatchIndex = hitNext.indexOf("catch_up");
+    const hitRearmIndex = hitNext.indexOf("re-run");
+    const hitWorkIndex = hitNext.indexOf("work");
+    check(
+      "poller hit stdout carries the catch_up-then-rearm ORDER and its mechanism",
+      hitRun.status === 0 &&
+        hitJson?.has_updates === true &&
+        typeof hitJson?.next === "string" &&
+        /remaining/.test(hitNext) &&
+        hitCatchIndex >= 0 &&
+        hitCatchIndex < hitRearmIndex &&
+        hitRearmIndex < hitWorkIndex &&
+        /before sleeping/i.test(hitNext),
+      {
+        status: hitRun.status,
+        out: hitRun.stdout,
+        err: hitRun.stderr,
+        parsed: hitJson,
+      },
+    );
+
+    await hardKill(peer);
     await hardKill(runtime);
   }
 

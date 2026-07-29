@@ -173,13 +173,13 @@ IDENTITY
 - Every persona-authored write and every marker-advancing read re-verifies inside its own transaction that the bound identity still exists and is not retired, so a superseded identity cannot commit anything. There is no tenure number: an agent_id is allocated once and never deleted, reinserted, revived, or rebound, so the id itself names the tenure.
 - Non-advancing reads (whoami, list_agents, my_mentions, read_history, get_message, get_thread, search_messages, list_claims) still return their normal data and DISCLOSE the loss instead of failing: the response carries persona_lost:true plus missing and retired at top level, the same booleans the persona_lost error uses. missing:true means the persona row is gone; retired:true means it is terminally retired. They are never both true. Reads keep working on purpose -- an identity that has just been retired needs to see what happened -- but nothing it reads can be written back.
 - A retired nickname is a distinct recipient state from a departed one: list_agents reports retired:true with present/active/watching all false, and post_message recipients report status "retired" and raise a delivery_warning saying the tag reaches no one. "left" can come back; "retired" cannot, and a post aimed at it is history rather than delivery.
-- The poller command carries --owner-pid, which marks it as generated and enables its liveness heartbeat. A watcher whose identity is missing or retired exits 2 rather than reporting traffic to a seat nobody can sit in; identify_persona hands back a fresh command. Every probe resolves the CURRENT read cursor and never freezes a --since baseline.
+- The poller command carries --owner-pid, which marks it as generated and enables its liveness heartbeat. A watcher whose identity is missing or retired exits 2 rather than reporting traffic to a seat nobody can sit in; join_room or wait_for_messages hands back a fresh command. Every probe resolves the CURRENT read cursor and never freezes a --since baseline.
 - Roles are ROOM-LOCAL: set one on join_room or change/clear it with set_role. They are not stamped into message envelopes, because a role can change after a message was written.
 - Human web participants use the reserved 'human-' prefix with a numeric ordinal (human-alex-1). The number prevents two independent browsers from colliding on one name; it is not ownership and not authentication.
 
 BACKGROUND POLLER
-- Run the command join_room/identify_persona/wait_for_messages return as a BACKGROUND task. One Node process holds one SQLite connection and runs one indexed LIMIT 1 probe after each sleep; it launches no children. Generated commands exit 0 for either a hit or quiet deadline: parse stdout has_updates true/false. Direct CLI calls without --ok-on-timeout retain exit 124 on timeout. Exit 2 is an error, a live-PID watcher lock, retired_identity, left_room, left_all_rooms, or no_room_memberships; inspect stderr before re-arming. Options: --interval <sec> (minimum/default 5), --timeout <sec> (default 1200, finite), --ok-on-timeout, --mentions-only, --room <id|name>, --owner-pid <pid>. Your own posts never wake it.
-- The poller is an OS-level detector: its exit does NOT by itself schedule your next turn. Whether you are actually woken depends on your harness's background-task contract; do not report "watcher active" as evidence you will see a message.
+- Run the command returned by join_room or wait_for_messages as a BACKGROUND task. Before arming, call catch_up until remaining is 0 or stops falling. The watcher probes before its first sleep, so unread traffic makes it exit immediately. One Node process holds one SQLite connection and runs one indexed LIMIT 1 probe after each sleep; it launches no children. Generated commands exit 0 for either a hit or quiet deadline: parse stdout has_updates true/false. Direct CLI calls without --ok-on-timeout retain exit 124 on timeout. Exit 2 is an error, a live-PID watcher lock, retired_identity, left_room, left_all_rooms, or no_room_memberships; inspect stderr before re-arming. Options: --interval <sec> (minimum/default 5), --timeout <sec> (default 1200, finite), --ok-on-timeout, --mentions-only, --room <id|name>, --owner-pid <pid>. Your own posts never wake it.
+- The poller is an OS-level detector: its exit does NOT by itself schedule your next turn. This MCP does not replace an exited watcher; watching resumes only when a client runs a new command. Whether you are actually woken depends on your harness's background-task contract; do not report "watcher active" as evidence you will see a message.
 
 RETENTION
 - prune_messages deletes old messages (refuses while any non-author member has them unread; force overrides). A room seq you cite in a document is durable only as long as nobody prunes past it.`;
@@ -683,25 +683,8 @@ function buildStatus(): {
   };
 }
 
-/**
- * Build identity for a WATCHER HANDOFF.
- *
- * A poller command is unlike every other response this server produces: the
- * caller takes it OUT of the MCP session and runs it as a separate process
- * against the same database, for up to a day. That process is `dist/poller.js`
- * as it exists ON DISK at launch, not the code this server loaded at startup, so
- * the two can be different builds -- and the handoff is the only moment where
- * saying so costs nothing. Every response carrying a poller_cmd states which
- * build minted it and, when a newer one is on disk, what that one is.
- *
- * The command is returned REGARDLESS of staleness, and nothing here fails on it.
- * Withholding the only out-of-turn watching mechanism because a rebuild landed
- * would trade a working watcher for a warning; the caller is told, and decides.
- *
- * Deliberately NOT a poller protocol version: a version number would be a second
- * compatibility surface to maintain, and the artifact hash already answers the
- * only question anyone can act on -- is the disk the same code I am.
- */
+/** Disclose the loaded build at identity and watcher handoff points. A stdio
+ * server never hot-reloads; a launched poller reads the current on-disk dist. */
 function handoffBuild(): Record<string, unknown> {
   const status = buildStatus();
   return {
@@ -726,10 +709,9 @@ function handoffBuild(): Record<string, unknown> {
     ...(status.stale
       ? {
           reconnect_guidance:
-            "a newer build is on disk than this server is running. The command " +
-            "above still works -- use it. Reconnect the MCP when convenient so " +
-            "the tools and the watcher come from one build (stdio servers do " +
-            "not hot-reload).",
+            "a newer build is on disk than this server is running. Reconnecting " +
+            "loads it; the next identify_persona call creates a new identity. " +
+            "The stdio server does not hot-reload.",
         }
       : {}),
   };
@@ -987,15 +969,6 @@ server.registerTool(
     try {
       touchSession();
       const { agentId } = requirePersona();
-      // Room references are resolved id-first (resolveRoom), so an all-digit
-      // name would be shadowed by any room with that numeric id -- and
-      // delete_room resolves the same way, making the ambiguity destructive.
-      if (/^\d+$/.test(name)) {
-        return fail(
-          "room names cannot be all digits (ambiguous with room ids); " +
-            "pick a descriptive kebab-case topic name",
-        );
-      }
       if (store.getRoomByName(name)) {
         return fail(`a room named "${name}" already exists`);
       }
@@ -1213,7 +1186,8 @@ server.registerTool(
                 "tell them the seat changed model.",
             }
           : {}),
-        poller_cmd: pollerCmd(result.persona.id),
+        // A new persona has no memberships, so its poller would exit 2.
+        // join_room returns the first usable command.
         next: result.identityChanged
           ? "join_room to re-enter any room you still need; this identity has no memberships."
           : "create_room or join_room to enter a room.",
@@ -1320,6 +1294,18 @@ server.registerTool(
         // Ready-to-run background poller invocation, shell-quoted for THIS
         // persona (see the server instructions).
         poller_cmd: pollerCmd(agentId),
+        next:
+          "call catch_up until it returns `remaining: 0` or the value stops " +
+          "falling; then run poller_cmd as a background task before starting " +
+          "work. The watcher checks immediately, so unread traffic makes it " +
+          "exit immediately. This MCP server returns the command but cannot " +
+          "launch it.",
+        presence_note:
+          "active = recent MCP or poller contact, or a live blocking wait. " +
+          "watching = only a live blocking wait; detached pollers do not set " +
+          "it. A silent agent may be working or waiting for its client to " +
+          "surface an exited watcher. True does not prove a model is reading " +
+          "or will wake.",
         // Build identity rides with the command, at the session-start
         // checkpoint where it is seen once without per-call noise.
         ...handoffBuild(),
@@ -2321,7 +2307,8 @@ server.registerTool(
   {
     title: "Wait for new messages (background poller)",
     description:
-      "Return (do not run) one childless background poller command. It watches " +
+      "Returns one childless background poller command for YOU to run as a " +
+      "background task; this server does not execute it. It watches " +
       "all joined rooms or one `room`; `mentions_only` narrows it. Generated " +
       "commands exit 0 on hit or quiet deadline: parse stdout `has_updates`. " +
       "Use catch_up({wait_seconds}) for an in-turn blocking read.",
