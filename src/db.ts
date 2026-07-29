@@ -1711,24 +1711,7 @@ export class ChatStore {
               WHERE id = ? AND connection_id = ? AND retired_at IS NULL`,
           )
           .run(agentId, connectionId);
-        // Soft leave: the rows, roles, join times, and final cursors stay as
-        // the only durable record that this participant was ever in the room.
-        this.db
-          .prepare(
-            `UPDATE memberships
-                SET left_at = datetime('now'), last_seen = datetime('now')
-              WHERE agent_id = ? AND left_at IS NULL`,
-          )
-          .run(agentId);
-        // Leases first: the retirement already dooms the old waiter, but a row
-        // left behind advertises a watcher that cannot wake.
-        this.db.prepare("DELETE FROM wait_leases WHERE agent_id = ?").run(agentId);
-        // Claims are deleted, not transferred. A terminal identity cannot
-        // release its own claim and the TTL ceiling is 86,400s, so keeping it
-        // would block a live participant for a day on behalf of a persona that
-        // can never come back. This is the contested call in the design: it
-        // does trade away exclusivity for work that outlived its holder.
-        this.db.prepare("DELETE FROM claims WHERE agent_id = ?").run(agentId);
+        this.retireParticipation(agentId);
 
         const persona = this.allocatePersona({ ...a, maxAttempts });
         return {
@@ -1742,6 +1725,28 @@ export class ChatStore {
         };
       })
       .immediate();
+  }
+
+  /**
+   * Participation effects shared by every terminal retirement, applied only
+   * after the caller's own guarded agents UPDATE proved this runtime still
+   * describes the row, in that same transaction. Memberships are soft-left, so
+   * the rows stay as durable history. Leases and claims are deleted because
+   * their holder is terminal: it can never wake to serve the lease, and can
+   * never release the claim, whose TTL ceiling would otherwise block a live
+   * participant for up to 24h. Deleting claims is the contested call -- it
+   * trades exclusivity away for work that outlived its holder.
+   */
+  private retireParticipation(agentId: string): void {
+    this.db
+      .prepare(
+        `UPDATE memberships
+            SET left_at = datetime('now'), last_seen = datetime('now')
+          WHERE agent_id = ? AND left_at IS NULL`,
+      )
+      .run(agentId);
+    this.db.prepare("DELETE FROM wait_leases WHERE agent_id = ?").run(agentId);
+    this.db.prepare("DELETE FROM claims WHERE agent_id = ?").run(agentId);
   }
 
   /**
@@ -1776,15 +1781,7 @@ export class ChatStore {
           )
           .run(a.agentId, a.connectionId);
         if (info.changes === 0) return false;
-        this.db
-          .prepare(
-            `UPDATE memberships
-                SET left_at = datetime('now'), last_seen = datetime('now')
-              WHERE agent_id = ? AND left_at IS NULL`,
-          )
-          .run(a.agentId);
-        this.db.prepare("DELETE FROM wait_leases WHERE agent_id = ?").run(a.agentId);
-        this.db.prepare("DELETE FROM claims WHERE agent_id = ?").run(a.agentId);
+        this.retireParticipation(a.agentId);
         return true;
       })
       .immediate();

@@ -707,7 +707,7 @@ try {
 
   // --- graceful retirement is exact-binding guarded -----------------------
   {
-    const { store } = freshStore();
+    const { store, path } = freshStore();
     const current = firstIdentity(
       store,
       "anthropic-claude-opus-v5-0-retire",
@@ -718,6 +718,36 @@ try {
     store.claimResource(room, "held", current.id, 600, null);
     store.beginWaitLease(room, current.id, 30);
 
+    // Read the three affected rows straight from the file on a separate
+    // connection. Store accessors mask what this needs to see: once an identity
+    // is retired, listAgents reports watching:false whether or not the lease row
+    // survived, so only the raw row proves the delete happened.
+    const raw = new Database(path, { readonly: true });
+    const rawRows = () => {
+      // Report row EXISTENCE separately from left_at. Collapsing a missing row
+      // to left_at:null would let a membership DELETE masquerade as a present,
+      // never-left membership, and the refusal assertion below would pass on it.
+      const membership = raw
+        .prepare(
+          "SELECT left_at FROM memberships WHERE room_id = ? AND agent_id = ?",
+        )
+        .get(room, current.id);
+      return {
+        membershipRow: membership !== undefined,
+        left_at: membership === undefined ? "<no row>" : membership.left_at,
+        claim: raw
+          .prepare(
+            "SELECT COUNT(*) AS c FROM claims WHERE room_id = ? AND key = ? AND agent_id = ?",
+          )
+          .get(room, "held", current.id).c,
+        lease: raw
+          .prepare(
+            "SELECT COUNT(*) AS c FROM wait_leases WHERE room_id = ? AND agent_id = ?",
+          )
+          .get(room, current.id).c,
+      };
+    };
+
     const wrongConnection = store.retireConnection({
       agentId: current.id,
       connectionId: randomUUID(),
@@ -726,12 +756,21 @@ try {
       agentId: "no-such-agent",
       connectionId: current.connectionId,
     });
+    const afterRefusals = rawRows();
     check(
       "graceful retirement refuses either guard mismatch",
       wrongConnection === false &&
         wrongId === false &&
         store.getPersona(current.id).retired_at === null,
       { wrongConnection, wrongId, row: store.getPersona(current.id) },
+    );
+    check(
+      "a refused retirement leaves membership, claim, and lease rows untouched",
+      afterRefusals.membershipRow === true &&
+        afterRefusals.left_at === null &&
+        afterRefusals.claim === 1 &&
+        afterRefusals.lease === 1,
+      afterRefusals,
     );
     const retired = store.retireConnection(current.expected);
     const row = store.getPersona(current.id);
@@ -743,7 +782,19 @@ try {
         store.retireConnection(current.expected) === false,
       row,
     );
+    const afterRetire = rawRows();
     check(
+      "exact retirement performs all three effects in the file itself",
+      afterRetire.membershipRow === true &&
+        typeof afterRetire.left_at === "string" &&
+        afterRetire.claim === 0 &&
+        afterRetire.lease === 0,
+      afterRetire,
+    );
+    check(
+      // watching:false here is retired-display masking, NOT lease evidence:
+      // listAgents forces it false for any retired row. The raw lease count
+      // above is what proves the delete.
       "exact retirement soft-leaves and clears claims and waits",
       store.getMembership(room, current.id).left_at !== null &&
         store.listClaims(room).total === 0 &&
@@ -764,6 +815,7 @@ try {
         agents: store.listAgents(room, 5),
       },
     );
+    raw.close();
     store.close();
   }
 
