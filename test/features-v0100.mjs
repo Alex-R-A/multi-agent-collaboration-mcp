@@ -11,13 +11,14 @@
 //  M4 wait_seconds omitted keeps the exact v0.9 response shape
 //  M4b concurrent waits in one process keep independent leases
 //  M4c named-room waits heartbeat the captured room, not the active room
-//  M5 active-room change mid-wait: captured room governs
 //  M7 a concurrent read consumes mid-wait: no stale refire, later message delivered
 //  M8 client cancellation: response suppressed, marker NOT advanced, lease
 //     dropped, backlog recoverable
 //  M9 room deleted mid-wait: clean error, not a raw constraint failure
 //  M10 120s server cap returns immediate backlog; 121 is rejected
 //  M11 two waiters (separate server processes) both receive one post
+//  M12 active-room change mid-wait: captured room and identity govern
+//  M13 concurrent leave ends a quiet wait and drops its lease
 import { ChatStore, PersonaLostError } from "../dist/db.js";
 import Database from "better-sqlite3";
 import { spawn } from "node:child_process";
@@ -318,33 +319,58 @@ await (async () => {
   // M4b: two concurrent calls from one runtime share one lease row per room
   // and persona. The short one finishing must not delete it while the long one
   // is still live. The runtime closes the lease only after the last wait ends.
-  const short4b = srv.sendCall("catch_up", { wait_seconds: 1 });
+  const leaseProbe = new Database(DB);
+  const leaseStatement = leaseProbe.prepare(
+    `SELECT started_at, expires_at
+       FROM wait_leases
+      WHERE room_id = ? AND agent_id = ?`,
+  );
+  const readLease = (roomId = rA) => leaseStatement.get(roomId, mcpAgentId);
+  const waitForLease = async (roomId = rA) => {
+    const deadline = Date.now() + 3_000;
+    let row;
+    do {
+      row = readLease(roomId);
+      if (row) return row;
+      await sleep(20);
+    } while (Date.now() < deadline);
+    return row;
+  };
+
+  const short4b = srv.sendCall("catch_up", { wait_seconds: 2 });
+  const initialShort4b = await waitForLease();
+  // SQLite timestamps have one-second resolution. Two adjacent wait starts can
+  // therefore look equal even if the conflict update wrongly resets
+  // started_at. Force an older existing value so preservation is observable
+  // without depending on scheduler timing.
+  const forcedStart4b = "2000-01-01 00:00:00";
+  leaseProbe
+    .prepare(
+      `UPDATE wait_leases SET started_at = ?
+        WHERE room_id = ? AND agent_id = ?`,
+    )
+    .run(forcedStart4b, rA, mcpAgentId);
+  const preservedShort4b = readLease();
   const long4b = srv.sendCall("catch_up", { wait_seconds: 10 });
-  await sleep(700);
-  {
-    const raw = new Database(DB);
-    const leases = raw
-      .prepare(
-        `SELECT COUNT(*) AS c,
-                MAX(strftime('%s', expires_at) - strftime('%s', started_at))
-                  AS lease_seconds
-           FROM wait_leases
-          WHERE room_id = ? AND agent_id = ?`,
-      )
-      .get(rA, mcpAgentId);
-    raw.close();
-    check(
-      "M4b both overlapping waits established one lease with the long deadline",
-      leases.c === 1 && leases.lease_seconds >= 12,
-      leases,
-    );
-  }
   const shortResult4b = srv.parse(await srv.waitFor(short4b));
+  const afterShort4b = readLease();
   const between4b = s.recipientStatus(rA, [mcpAgentId], 5)[0];
   check(
-    "M4b first timeout leaves the second wait watching",
-    shortResult4b.data.timed_out === true && between4b.watching === true,
-    { short: shortResult4b.data, between: between4b },
+    "M4b long wait extends the shared lease without resetting its start",
+    shortResult4b.data.timed_out === true &&
+      initialShort4b &&
+      preservedShort4b?.started_at === forcedStart4b &&
+      afterShort4b &&
+      afterShort4b.started_at === forcedStart4b &&
+      afterShort4b.expires_at > initialShort4b.expires_at &&
+      between4b.watching === true,
+    {
+      short: shortResult4b.data,
+      initial: initialShort4b,
+      preserved: preservedShort4b,
+      after: afterShort4b,
+      between: between4b,
+    },
   );
   s.postMessage(rA, "peer", "for the surviving wait", "text", null, null, null);
   const longResult4b = srv.parse(await srv.waitFor(long4b));
@@ -355,6 +381,37 @@ await (async () => {
     longResult4b.data,
   );
 
+  // Reverse the arrival order. A last-writer-wins lease passes the case above
+  // because the long wait opens last, but it shortens the lease here.
+  const longFirst4b = srv.sendCall("catch_up", { wait_seconds: 10 });
+  const initialLong4b = await waitForLease();
+  const shortSecond4b = srv.sendCall("catch_up", { wait_seconds: 1 });
+  const shortSecondResult4b = srv.parse(await srv.waitFor(shortSecond4b));
+  const afterShortSecond4b = readLease();
+  check(
+    "M4b reverse-arrival short wait changes neither aggregate timestamp",
+    shortSecondResult4b.data.timed_out === true &&
+      initialLong4b &&
+      afterShortSecond4b &&
+      afterShortSecond4b.started_at === initialLong4b.started_at &&
+      afterShortSecond4b.expires_at === initialLong4b.expires_at &&
+      s.recipientStatus(rA, [mcpAgentId], 5)[0].watching === true,
+    {
+      short: shortSecondResult4b.data,
+      initial: initialLong4b,
+      after: afterShortSecond4b,
+    },
+  );
+  s.postMessage(rA, "peer", "for the long-first wait", "text", null, null, null);
+  const longFirstResult4b = srv.parse(await srv.waitFor(longFirst4b));
+  check(
+    "M4b reverse-arrival long wait receives the later post",
+    longFirstResult4b.data.messages.some(
+      (m) => m.content === "for the long-first wait",
+    ) &&
+      s.recipientStatus(rA, [mcpAgentId], 5)[0].watching === false,
+    longFirstResult4b.data,
+  );
   // M4c: explicit-room activity must refresh the room the wait captured,
   // while leaving the active-room selection alone.
   {
@@ -386,23 +443,6 @@ await (async () => {
       who4c.data.room_id === rA,
     { result: result4c.data, who: who4c.data },
   );
-
-  // M5: active-room change mid-wait; the captured room governs.
-  const id5 = srv.sendCall("catch_up", { wait_seconds: 10 });
-  await sleep(600);
-  await srv.call("join_room", { room: "wait-b" }); // active moves to B mid-wait
-  s.postMessage(rA, "peer", "for the captured room", "text", null, null, null);
-  const m5 = srv.parse(await srv.waitFor(id5));
-  const who5 = await srv.call("whoami", {});
-  check(
-    "M5 wait returns the CAPTURED room's message after an active-room switch",
-    m5.data.room_id === rA && m5.data.room_name === "wait-a" &&
-      m5.data.messages.length === 1 &&
-      m5.data.messages[0].content === "for the captured room",
-    m5.data,
-  );
-  check("M5 the concurrent join still moved the active room", who5.data.room_id === rB, who5.data);
-  await srv.call("join_room", { room: "wait-a" }); // back to A
 
   // M7: a concurrent read consumes mid-wait (atomically, so the outcome is
   // deterministic): the waiter must NOT refire on the consumed message and
@@ -524,6 +564,34 @@ await (async () => {
     who12.data,
   );
 
+  // M13: observe the lease before sending leave, so a delayed wait start cannot
+  // turn this into a test of a call that began after the room was already left.
+  const before13 = s.getMembership(rB, mcpAgentId).last_read_seq;
+  const id13 = srv.sendCall("catch_up", { wait_seconds: 10 });
+  const armed13 = await waitForLease(rB);
+  const leave13 = await srv.call("leave_room", {});
+  const m13 = srv.parse(await srv.waitFor(id13, 3_000));
+  const after13 = s.getMembership(rB, mcpAgentId);
+  check(
+    "M13 concurrent leave ends the quiet wait without consuming or retaining a lease",
+    !!armed13 &&
+      leave13.data.left === true &&
+      m13.isError === true &&
+      /LEFT room/.test(m13.data.error) &&
+      after13.left_at !== null &&
+      after13.last_read_seq === before13 &&
+      readLease(rB) === undefined,
+    {
+      armed: armed13,
+      leave: leave13.data,
+      wait: m13.data,
+      before: before13,
+      after: after13,
+      lease: readLease(rB),
+    },
+  );
+  leaseProbe.close();
+
   s.close();
   srv.child.kill();
 
@@ -534,16 +602,33 @@ await (async () => {
   const srv2 = startServer(DB);
   await srv1.init();
   await srv2.init();
-  await srv1.call("identify_persona", {
+  const sameTuple = {
     brand: "waiter",
-    model: "one",
+    model: "same-model",
     version: "1.0",
-  });
-  await srv2.call("identify_persona", {
-    brand: "waiter",
-    model: "two",
-    version: "1.0",
-  });
+  };
+  const identified1 = await srv1.call("identify_persona", sameTuple);
+  const identified2 = await srv2.call("identify_persona", sameTuple);
+  const identityProbe = new Database(DB, { readonly: true });
+  const connectionRows = identityProbe
+    .prepare(
+      `SELECT id, connection_id FROM agents
+        WHERE id IN (?, ?) ORDER BY id`,
+    )
+    .all(identified1.data.agent_id, identified2.data.agent_id);
+  identityProbe.close();
+  check(
+    "M11 same-tuple processes receive distinct ids and connection bindings",
+    identified1.data.agent_id !== identified2.data.agent_id &&
+      connectionRows.length === 2 &&
+      connectionRows.every((row) => typeof row.connection_id === "string") &&
+      new Set(connectionRows.map((row) => row.connection_id)).size === 2,
+    {
+      first: identified1.data.agent_id,
+      second: identified2.data.agent_id,
+      connectionRows,
+    },
+  );
   await srv1.call("join_room", { room: "wait-a" });
   await srv2.call("join_room", { room: "wait-a" });
   await srv1.call("catch_up", {}); // drain backlogs so both waits block

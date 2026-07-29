@@ -297,6 +297,42 @@ function setup(name = "priority-room") {
       boundedCrossing.crossed_messages[0].truncated === true,
     boundedCrossing,
   );
+
+  const invalidClaimTtls = [-1, 0, 1.5, Number.NaN, 86_401].map((ttl) => {
+    try {
+      return { ttl, result: s.claimResource(room, `ttl-${ttl}`, "me", ttl, null) };
+    } catch (error) {
+      return { ttl, error: String(error?.message ?? error) };
+    }
+  });
+  const minimumClaim = s.claimResource(room, "ttl-minimum", "me", 1, null);
+  const maximumClaim = s.claimResource(room, "ttl-maximum", "me", 86_400, null);
+  check(
+    "D1 direct claim TTLs enforce the MCP integer range",
+    invalidClaimTtls.every(
+      ({ error }) =>
+        typeof error === "string" && /integer from 1 to 86400/.test(error),
+    ) &&
+      minimumClaim.granted === true &&
+      maximumClaim.granted === true,
+    { invalidClaimTtls, minimumClaim, maximumClaim },
+  );
+
+  s.catchUp(room, "me", 50, undefined, 100_000);
+  const numericBody = "9".repeat(5000);
+  s.postMessage(room, "peer", numericBody, "json", null, null, null);
+  const cappedJson = s.catchUp(room, "me", 50, undefined, 1000);
+  const cappedNumeric = cappedJson.messages[0];
+  check(
+    "D1 a fetch-capped JSON body stays raw and discloses truncation",
+    typeof cappedNumeric?.content === "string" &&
+      cappedNumeric.content.length > 0 &&
+      numericBody.startsWith(cappedNumeric.content) &&
+      cappedNumeric.truncated === true &&
+      cappedNumeric.length === numericBody.length &&
+      JSON.stringify(cappedJson).length <= 1000,
+    { cappedNumeric, size: JSON.stringify(cappedJson).length },
+  );
   s.close();
 }
 

@@ -183,12 +183,14 @@ function acquireLock(path: string, token: string): void {
     } catch {}
     if (processIsAlive(owner)) {
       argumentError(
-        `an equivalent watcher is already running (pid ${owner}; lock: ${path})`,
+        `watcher lock references live pid ${owner}; refusing a duplicate (lock: ${path})`,
       );
     }
     // Fail closed. Automatic stale-lock stealing needs a second interprocess
     // lock to avoid two reapers deleting each other's replacement.
-    argumentError(`stale watcher lock requires removal: ${path}`);
+    argumentError(
+      `stale watcher lock file: ${path}; remove only this exact file, then retry`,
+    );
   }
 }
 

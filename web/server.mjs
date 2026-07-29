@@ -5,8 +5,8 @@
 // query_only handle; participation (join/post/read/leave) uses a separate
 // writable handle whose message insert mirrors ChatStore.postMessage's
 // IMMEDIATE-transaction seq allocation, so web posts are safe against
-// concurrent agent writers. No auth, bound to localhost: identity is
-// self-asserted by design, exactly like the agents themselves.
+// concurrent agent writers. No auth, bound to localhost: human canonical ids
+// are self-asserted; LLM identities remain bound to their MCP connections.
 //
 //   Run:  node web/server.mjs     (or: npm run web)
 //   Port: AGENT_CHAT_VIEWER_PORT  (default 8787)
@@ -278,6 +278,14 @@ function dbUnavailableError() {
   return `No database at ${DB_PATH}. Start an agent-chat MCP server first.`;
 }
 
+function unexpectedErrorStatus(error) {
+  const code =
+    error && typeof error === "object" && typeof error.code === "string"
+      ? error.code
+      : "";
+  return /^SQLITE_(?:BUSY|LOCKED)(?:_|$)/.test(code) ? 503 : 500;
+}
+
 const NAME_RE = /^[\w][\w.-]{0,199}$/; // sane self-asserted ids, no whitespace
 
 // Human identity grammar, mirrored from the agents CHECK in src/db.ts.
@@ -533,11 +541,7 @@ function joinRoom(d, roomId, form) {
       last_read_seq: lastRead,
     };
   });
-  try {
-    return tx.immediate();
-  } catch (e) {
-    return { error: String((e && e.message) || e) };
-  }
+  return tx.immediate();
 }
 
 function postMessage(d, roomId, agentId, body, replyToSeq, mentions) {
@@ -550,7 +554,7 @@ function postMessage(d, roomId, agentId, body, replyToSeq, mentions) {
   // delete_room yields this clean error instead of a raw FK failure.
   const tx = d.transaction(() => {
     if (!webJoined(d, roomId, agentId)) {
-      throw new Error("join the room first (POST /api/join)");
+      return { error: "join the room first (POST /api/join)" };
     }
     let replyToAgent = null;
     if (replyToSeq !== null) {
@@ -558,7 +562,9 @@ function postMessage(d, roomId, agentId, body, replyToSeq, mentions) {
         .prepare("SELECT agent_id FROM messages WHERE room_id = ? AND seq = ?")
         .get(roomId, replyToSeq);
       if (!parent) {
-        throw new Error(`reply_to_seq ${replyToSeq} does not exist in this room`);
+        return {
+          error: `reply_to_seq ${replyToSeq} does not exist in this room`,
+        };
       }
       replyToAgent = parent.agent_id;
     }
@@ -602,13 +608,9 @@ function postMessage(d, roomId, agentId, body, replyToSeq, mentions) {
            last_seen = datetime('now')
        WHERE room_id = ? AND agent_id = ?`,
     ).run(canNormalize, from, next, roomId, agentId);
-    return next;
+    return { seq: next };
   });
-  try {
-    return { seq: tx.immediate() };
-  } catch (e) {
-    return { error: String((e && e.message) || e) };
-  }
+  return tx.immediate();
 }
 
 function markRead(d, roomId, agentId, seq) {
@@ -644,11 +646,7 @@ function markRead(d, roomId, agentId, seq) {
       .get(roomId, agentId);
     return { last_read_seq: row ? row.last_read_seq : eff };
   });
-  try {
-    return tx.immediate();
-  } catch (e) {
-    return { error: String((e && e.message) || e) };
-  }
+  return tx.immediate();
 }
 
 // Full room deletion, mirroring ChatStore.deleteRoom: messages first (so the
@@ -700,11 +698,7 @@ function leaveRoom(d, roomId, agentId) {
       .run(roomId, agentId);
     return { left: info.changes > 0, room_id: roomId };
   });
-  try {
-    return tx.immediate();
-  } catch (e) {
-    return { error: String((e && e.message) || e) };
-  }
+  return tx.immediate();
 }
 
 // Mentions are parsed server-side from @tokens so every client gets the same
@@ -734,18 +728,28 @@ function searchMessages(roomId, q, limit) {
   // Fetch one MORE than asked (parity with the MCP search): a page of exactly
   // `limit` matches otherwise carried no "more exist" signal at all -- the
   // trimmed flag only fired on a byte cut.
-  const taken = takeBudgeted(
-    d
-      .prepare(
-        `SELECT ${MSG_COLS}
-         FROM messages_fts f
-         JOIN messages g ON g.id = f.rowid
-         LEFT JOIN agents a ON a.id = g.agent_id
-         WHERE f.body MATCH ? AND g.room_id = ?
-         ORDER BY rank, g.id LIMIT ?`,
-      )
-      .iterate(q, roomId, limit + 1),
-  );
+  const searchSql =
+    `SELECT ${MSG_COLS}
+     FROM messages_fts f
+     JOIN messages g ON g.id = f.rowid
+     LEFT JOIN agents a ON a.id = g.agent_id
+     WHERE f.body MATCH ? AND g.room_id = ?
+     ORDER BY rank, g.id LIMIT ?`;
+  const statement = d.prepare(searchSql);
+  let taken;
+  try {
+    taken = takeBudgeted(statement.iterate(q, roomId, limit + 1));
+  } catch (error) {
+    if (error?.code === "SQLITE_ERROR") {
+      // FTS reports malformed MATCH text and some schema failures with the
+      // same result code at execution time. Run the exact statement once with
+      // known-valid MATCH text: success isolates the original query as bad
+      // input; failure is a database problem and must remain a 5xx.
+      d.prepare(searchSql).get('"agentchatvalidftsprobe"', roomId, 1);
+      return { bad_query: String((error && error.message) || error) };
+    }
+    throw error;
+  }
   if (taken.rows.length > limit) {
     taken.rows.length = limit;
     taken.trimmed = true;
@@ -1112,14 +1116,18 @@ const server = createServer(async (req, res) => {
             matches: [],
             error: dbUnavailableError(),
           });
+        if (result.bad_query) {
+          return sendJson(res, 400, { error: result.bad_query });
+        }
         return sendJson(res, 200, {
           matches: result.rows,
           q,
           ...(result.trimmed ? { trimmed: true } : {}),
         });
       } catch (e) {
-        // Most commonly an FTS5 syntax error in q; a 400 the UI can display.
-        return sendJson(res, 400, { error: String((e && e.message) || e) });
+        return sendJson(res, unexpectedErrorStatus(e), {
+          error: String((e && e.message) || e),
+        });
       }
     }
     res.writeHead(404, { "Content-Type": "text/plain" });
@@ -1129,7 +1137,9 @@ const server = createServer(async (req, res) => {
       res.destroy();
       return;
     }
-    sendJson(res, 500, { error: String((err && err.message) || err) });
+    sendJson(res, unexpectedErrorStatus(err), {
+      error: String((err && err.message) || err),
+    });
   }
 });
 

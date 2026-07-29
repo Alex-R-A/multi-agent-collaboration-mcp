@@ -21,6 +21,7 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 import Database from "better-sqlite3";
 import {
   ChatStore,
+  ConnectionNonceCollisionError,
   NicknameExhaustedError,
   PersonaLostError,
 } from "../dist/db.js";
@@ -248,6 +249,32 @@ try {
       store.getPersona(first.id).description === "first description",
       store.getPersona(first.id),
     );
+    check(
+      "the exact 5.0 string survives store creation and reuse",
+      first.result.persona.version === "5.0" &&
+        reused.result.persona.version === "5.0" &&
+        store.getPersona(first.id).version === "5.0",
+      {
+        first: first.result.persona.version,
+        reused: reused.result.persona.version,
+        stored: store.getPersona(first.id).version,
+      },
+    );
+    const nonceCollision = caught(() =>
+      store.identifyPersona({
+        connectionId: first.connectionId,
+        ...TUPLE_B,
+        description: null,
+        expected: null,
+        nextCandidateId: () => "must-not-adopt-colliding-connection",
+      }),
+    );
+    check(
+      "an unbound caller cannot adopt a row through a colliding connection nonce",
+      nonceCollision.error instanceof ConnectionNonceCollisionError &&
+        store.getPersona("must-not-adopt-colliding-connection") === undefined,
+      nonceCollision,
+    );
 
     const raw = new Database(path);
     const agentColumns = raw
@@ -309,6 +336,203 @@ try {
         .run(),
     );
     check("a canonical human row is accepted", !goodHuman.threw, goodHuman);
+    const invalidAgentShapes = [
+      {
+        name: "null primary key",
+        run: () =>
+          raw
+            .prepare(
+              `INSERT INTO agents
+                 (id, is_human, brand, model, version, connection_id)
+               VALUES (NULL, 0, 'a', 'b', '1', ?)`,
+            )
+            .run(randomUUID()),
+      },
+      {
+        name: "duplicate live connection",
+        run: () =>
+          raw
+            .prepare(
+              `INSERT INTO agents
+                 (id, is_human, brand, model, version, connection_id)
+               VALUES ('duplicate-connection', 0, 'a', 'b', '1', ?)`,
+            )
+            .run(first.connectionId),
+      },
+      {
+        name: "fractional human ordinal",
+        run: () =>
+          raw
+            .prepare(
+              `INSERT INTO agents
+                 (id, is_human, human_base, human_ordinal)
+               VALUES ('human-fraction-1.5', 1, 'fraction', 1.5)`,
+            )
+            .run(),
+      },
+      {
+        name: "human id does not match its base and ordinal",
+        run: () =>
+          raw
+            .prepare(
+              `INSERT INTO agents
+                 (id, is_human, human_base, human_ordinal)
+               VALUES ('human-mismatch-2', 1, 'mismatch', 1)`,
+            )
+            .run(),
+      },
+      {
+        name: "human base uses the reserved prefix",
+        run: () =>
+          raw
+            .prepare(
+              `INSERT INTO agents
+                 (id, is_human, human_base, human_ordinal)
+               VALUES ('human-human-name-1', 1, 'human-name', 1)`,
+            )
+            .run(),
+      },
+      {
+        name: "human ordinal exceeds the JavaScript-safe bound",
+        run: () =>
+          raw
+            .prepare(
+              `INSERT INTO agents
+                 (id, is_human, human_base, human_ordinal)
+               VALUES ('human-overflow-9007199254740992', 1, 'overflow',
+                       9007199254740992)`,
+            )
+            .run(),
+      },
+      {
+        name: "retired LLM still carries a connection",
+        run: () =>
+          raw
+            .prepare(
+              `INSERT INTO agents
+                 (id, is_human, brand, model, version, connection_id,
+                  retired_at)
+               VALUES ('retired-and-bound', 0, 'a', 'b', '1', ?,
+                       datetime('now'))`,
+            )
+            .run(randomUUID()),
+      },
+      {
+        name: "LLM id enters the human namespace",
+        run: () =>
+          raw
+            .prepare(
+              `INSERT INTO agents
+                 (id, is_human, brand, model, version, connection_id)
+               VALUES ('human-llm-1', 0, 'a', 'b', '1', ?)`,
+            )
+            .run(randomUUID()),
+      },
+      {
+        name: "LLM tuple contains a NUL",
+        run: () =>
+          raw
+            .prepare(
+              `INSERT INTO agents
+                 (id, is_human, brand, model, version, connection_id)
+               VALUES ('nul-tuple', 0, ?, 'b', '1', ?)`,
+            )
+            .run("a\u0000tail", randomUUID()),
+      },
+    ].map(({ name, run }) => ({ name, ...caught(run) }));
+    check(
+      "direct writers cannot create any tested invalid agent shape",
+      invalidAgentShapes.every((result) => result.threw),
+      invalidAgentShapes,
+    );
+    const invalidConnection = caught(() =>
+      store.identifyPersona({
+        connectionId: "not-a-uuid",
+        ...TUPLE_B,
+        description: null,
+        expected: null,
+        nextCandidateId: () => "invalid-connection",
+      }),
+    );
+    const untrimmedTuple = caught(() =>
+      store.identifyPersona({
+        connectionId: randomUUID(),
+        brand: " Anthropic",
+        model: TUPLE_B.model,
+        version: TUPLE_B.version,
+        description: null,
+        expected: null,
+        nextCandidateId: () => "untrimmed-tuple",
+      }),
+    );
+    check(
+      "the store rejects invalid connection UUIDs and untrimmed tuple fields",
+      invalidConnection.threw &&
+        /lowercase UUID/.test(invalidConnection.message) &&
+        untrimmedTuple.threw &&
+        /trimmed, non-empty/.test(untrimmedTuple.message),
+      { invalidConnection, untrimmedTuple },
+    );
+    const mismatchedAllocation = caught(() =>
+      raw
+        .prepare(
+          `INSERT INTO human_allocations
+             (operation_id, room_id, human_base, result_agent_id)
+           VALUES ('00000000-0000-4000-8000-000000000001', 1, 'sam',
+                   'human-alex-1')`,
+        )
+        .run(),
+    );
+    check(
+      "an allocation record must match the referenced human base",
+      mismatchedAllocation.threw,
+      mismatchedAllocation,
+    );
+    const allocationId = "00000000-0000-4000-8000-000000000002";
+    raw
+      .prepare(
+        `INSERT INTO human_allocations
+           (operation_id, room_id, human_base, result_agent_id)
+         VALUES (?, 1, 'alex', 'human-alex-1')`,
+      )
+      .run(allocationId);
+    const allocationBefore = raw
+      .prepare(
+        "SELECT human_base, result_agent_id FROM human_allocations WHERE operation_id = ?",
+      )
+      .get(allocationId);
+    const allocationUpdate = caught(() =>
+      raw
+        .prepare(
+          "UPDATE human_allocations SET human_base = 'sam' WHERE operation_id = ?",
+        )
+        .run(allocationId),
+    );
+    const allocationDelete = caught(() =>
+      raw
+        .prepare("DELETE FROM human_allocations WHERE operation_id = ?")
+        .run(allocationId),
+    );
+    const allocationAfter = raw
+      .prepare(
+        "SELECT human_base, result_agent_id FROM human_allocations WHERE operation_id = ?",
+      )
+      .get(allocationId);
+    check(
+      "a matched allocation row rejects update and delete and remains exact",
+      allocationBefore?.human_base === "alex" &&
+        allocationBefore?.result_agent_id === "human-alex-1" &&
+        allocationUpdate.threw &&
+        allocationDelete.threw &&
+        allocationAfter?.human_base === "alex" &&
+        allocationAfter?.result_agent_id === "human-alex-1",
+      {
+        allocationBefore,
+        allocationUpdate,
+        allocationDelete,
+        allocationAfter,
+      },
+    );
     raw.close();
     store.close();
   }
@@ -523,13 +747,75 @@ try {
       "exact retirement soft-leaves and clears claims and waits",
       store.getMembership(room, current.id).left_at !== null &&
         store.listClaims(room).total === 0 &&
-        store.listAgents(room, 5).agents.find((a) => a.id === current.id)
-          ?.watching === false,
+        (() => {
+          const listed = store
+            .listAgents(room, 5)
+            .agents.find((agent) => agent.id === current.id);
+          return (
+            listed?.retired === true &&
+            listed.present === false &&
+            listed.active === false &&
+            listed.watching === false
+          );
+        })(),
       {
         membership: store.getMembership(room, current.id),
         claims: store.listClaims(room),
         agents: store.listAgents(room, 5),
       },
+    );
+    store.close();
+  }
+
+  // --- retired unread memberships never block non-forced pruning ----------
+  {
+    const { store } = freshStore();
+    const retiree = firstIdentity(
+      store,
+      "anthropic-claude-opus-v5-0-prune-retiree",
+      TUPLE_A,
+    );
+    const author = firstIdentity(
+      store,
+      "openai-gpt-v5-0-prune-author",
+      { brand: "OpenAI", model: "GPT", version: "5.0" },
+    );
+    const liveLaggard = firstIdentity(
+      store,
+      "google-gemini-v3-prune-laggard",
+      { brand: "Google", model: "Gemini", version: "3" },
+    );
+    const room = store.createRoom(
+      "retired-prune-room",
+      null,
+      null,
+      retiree.id,
+    ).id;
+    for (const identity of [retiree, author, liveLaggard]) {
+      store.joinRoom(room, identity.id, {});
+    }
+    for (const body of ["one", "two", "three"]) {
+      store.postMessage(room, author.id, body, "text", null, null, null);
+    }
+    store.markRead(room, liveLaggard.id, 1);
+    store.retireConnection(retiree.expected);
+
+    const refused = store.pruneMessages(room, author.id, 1, false);
+    check(
+      "prune blockers ignore the retired marker but retain the live laggard",
+      refused.refused === true &&
+        refused.would_delete_unread === 1 &&
+        refused.min_read_seq === 1,
+      refused,
+    );
+    store.markRead(room, liveLaggard.id);
+    const pruned = store.pruneMessages(room, author.id, 1, false);
+    check(
+      "non-forced pruning proceeds once only the retired unread member remains",
+      pruned.refused === undefined &&
+        pruned.deleted === 2 &&
+        pruned.kept === 1,
+      pruned,
     );
     store.close();
   }
@@ -1085,9 +1371,9 @@ try {
     check(
       "a duplicate within each watcher class is rejected",
       duplicateDiagnosticResult.code === 2 &&
-        /equivalent watcher/.test(duplicateDiagnosticResult.err) &&
+        /watcher lock references live pid/.test(duplicateDiagnosticResult.err) &&
         duplicateOwnedResult.code === 2 &&
-        /equivalent watcher/.test(duplicateOwnedResult.err),
+        /watcher lock references live pid/.test(duplicateOwnedResult.err),
       {
         diagnostic: duplicateDiagnosticResult,
         owned: duplicateOwnedResult,
@@ -1415,16 +1701,32 @@ try {
     const identifySchema = tools.find(
       (tool) => tool.name === "identify_persona",
     )?.inputSchema;
+    const identifyProperties = Object.keys(
+      identifySchema?.properties ?? {},
+    ).sort();
     check(
       "the MCP exposes only the current identity entry point",
       names.includes("identify_persona") &&
         !names.includes("create_persona") &&
         !names.includes("resume_persona") &&
-        identifySchema?.properties?.version?.type === "string",
+        identifySchema?.properties?.version?.type === "string" &&
+        identifySchema?.additionalProperties === false &&
+        identifyProperties.join(",") === "brand,description,model,version",
       {
         names,
+        identifyProperties,
+        additionalProperties: identifySchema?.additionalProperties,
         version: identifySchema?.properties?.version,
       },
+    );
+    const forbiddenIdentity = await runtime.call("identify_persona", {
+      ...TUPLE_A,
+      agent_id: "copied-nickname",
+    });
+    check(
+      "identify_persona rejects a caller-supplied nickname field",
+      forbiddenIdentity.isError === true,
+      forbiddenIdentity,
     );
     const numericVersion = await runtime.call("identify_persona", {
       brand: TUPLE_A.brand,
@@ -1447,7 +1749,10 @@ try {
       first.isError !== true &&
         /^anthropic-claude-opus-v5-0-[0-9a-f]{6}$/.test(oldId) &&
         first.data.binding_reused === false &&
-        first.data.identity_changed === false,
+        first.data.identity_changed === false &&
+        first.data.version === "5.0" &&
+        first.data.previous_retired === undefined &&
+        first.data.retired === undefined,
       first.data,
     );
     const reuse = await runtime.call("identify_persona", TUPLE_A);
@@ -1456,7 +1761,10 @@ try {
       reuse.isError !== true &&
         reuse.data.agent_id === oldId &&
         reuse.data.binding_reused === true &&
-        reuse.data.identity_changed === false,
+        reuse.data.identity_changed === false &&
+        reuse.data.version === "5.0" &&
+        reuse.data.previous_retired === undefined &&
+        reuse.data.retired === undefined,
       reuse.data,
     );
 
@@ -1464,11 +1772,14 @@ try {
       name: "mcp-wait-room",
     });
     const roomId = createdRoom.data.room_id;
-    await runtime.call("join_room", {
+    const initialJoin = await runtime.call("join_room", {
       room: "mcp-wait-room",
       role: "writer",
     });
     const observer = new Database(path, { readonly: true });
+    const storedConnectionId = observer
+      .prepare("SELECT connection_id FROM agents WHERE id = ?")
+      .get(oldId).connection_id;
     const lease = (agentId) =>
       observer
         .prepare(
@@ -1509,6 +1820,15 @@ try {
           .get(oldId).retired_at !== null,
       transition.data,
     );
+    check(
+      "MCP transition scopes the retired boolean to the previous identity",
+      transition.data.previous_retired === true &&
+        typeof transition.data.previous_retired === "boolean" &&
+        transition.data.retired === undefined &&
+        typeof transition.data.previous_retired_note === "string" &&
+        /terminally retired/.test(transition.data.previous_retired_note),
+      transition.data,
+    );
 
     // Send both frames immediately. The server's handler-start gate runs the
     // synchronous join before the wait captures its room and writes its lease.
@@ -1523,7 +1843,7 @@ try {
         successorPending = false;
         return result;
       });
-    await successorJoin;
+    const successorJoinResult = await successorJoin;
     const successorBeforeOldCleanup = await waitUntil(
       () => oldPending && lease(newId) !== undefined,
       3_000,
@@ -1580,6 +1900,14 @@ try {
         who.data.agent_id === newId &&
         who.data.persona_lost === undefined,
       who.data,
+    );
+    check(
+      "successful identity responses never expose the stored connection nonce",
+      typeof storedConnectionId === "string" &&
+        [first, reuse, initialJoin, transition, successorJoinResult, who].every(
+          (result) => !JSON.stringify(result.data).includes(storedConnectionId),
+        ),
+      { storedConnectionId },
     );
     observer.close();
     await hardKill(runtime);

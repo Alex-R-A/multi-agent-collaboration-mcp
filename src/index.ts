@@ -144,19 +144,19 @@ ROUTING
 
 IN-CALL WAIT
 - catch_up wait_seconds (0..${WAIT_CAP_SECONDS} effective max) blocks that one call until a message from another agent lands in the target room, then returns it and advances. The safe default max is 25s; an operator may set AGENT_CHAT_MAX_WAIT_SECONDS up to 120 only after measuring end-to-end behavior on that host. wait_seconds bounds the polling deadline, not total RPC wall time: SQLite contention, lease cleanup, and serialization can add several bounded busy-timeout windows. On timeout: timed_out:true, call_again:true, rooms_with_unread. Normal hit/timeout responses carry waited_ms; cancellation/deletion errors may not.
-- The best-effort watching lease expires wait_seconds+5s after it begins. Raising the cap therefore also lengthens the maximum stale watching:true window after a hard-killed host; this is part of the operator opt-in.
+- A best-effort watching lease expires at the furthest deadline of the overlapping waits it represents, including 5s grace. Raising the cap therefore also lengthens the maximum stale watching:true window after a hard-killed host; this is part of the operator opt-in.
 - While your wait is open and its lease write succeeds, peers see watching:true for you (list_agents, post_message recipients): evidence that a blocking call was open, not a delivery guarantee. It drops on normal return/cancellation; TTL bounds a hard-kill ghost. A detached poller never produces it -- an armed watcher refreshes last_seen only, which is the weaker signal.
 - A wait is fenced: every 500ms probe re-reads your identity's live state, so a retirement ends the wait with terminal persona_lost within one probe rather than at the deadline.
 - The wait holds your turn open, so it fits "I am waiting for a reply and have nothing else to do". To be notified while doing other work, or for watches longer than the cap, use the background poller.
 
 SIZE AND PAGING
 - Bulk reads are byte-bounded (default ${DEFAULT_MAX_BYTES} serialized chars; max_bytes tunes it, see limits). byte_limited:true = more remain: catch_up/read_history call again, my_mentions pages with after_id. Priority-only catch_up never advances past an unseen qualifying row when a row/byte cap cuts the page. Oversized bodies arrive truncated:true with length; fetch the rest via get_message offset -> next_offset (codepoints), passing room when the source row came from a non-active room. A truncated json body is a partial raw string, not an object.
-- Shared size and response budgets are in server_info limits; each tool schema states its own local cap. Message bodies cap at ${MAX_MESSAGE_BODY_BYTES} UTF-8 bytes; the newline-delimited stdio frame has a separate ${MAX_MCP_FRAME_BYTES}-byte wire cap to allow JSON escaping without unbounded pre-parse buffering.
+- Shared size and response budgets are in server_info limits; each tool schema states its own local cap. Message bodies cap at ${MAX_MESSAGE_BODY_BYTES} UTF-8 bytes; newline-delimited stdio line content has a separate ${MAX_MCP_FRAME_BYTES}-byte cap excluding the LF delimiter, allowing JSON escaping without unbounded pre-parse buffering.
 
 POSTING
 - crossed counts ALL unread from others past your marker at post time (old backlog included, not only mid-composition arrivals); crossed_directed says how many are aimed at you; crossed_range gives the seq span. If crossed > 0, catch_up before acting on replies. crossed_preview_chars opts into bounded previews of the crossed messages in the same response.
 - Dispositive posts (verdicts, commissions, dispositions): if_last_read_seq is a conditional post -- rejected (posted:false) if ANYTHING from others landed past your token, with bounded crossed previews returned; call catch_up for the complete delta before retrying. If pruning removed evidence after the token, it rejects conservatively with rejected:evidence_pruned and no invented previews. A token ahead of the target room's effective cursor is invalid and fails before posting. client_message_id makes an exact lost-response retry return the original seq instead of inserting twice; its guarantee lasts while that message is retained. Repeat the same explicit room or expected_room on retry so active-room drift cannot create a post in another room; a deduplicated response does not replay the original crossed/recipient snapshot, so catch_up for current state. room: posts to a named joined room without switching the active room; expected_room asserts which room is active. Never use the CAS on routine traffic: crossing is normal, the CAS is for posts whose validity depends on having read everything.
-- recipients reports factual room-local state: status, idle_seconds, last_read_seq, marker_behind. A new unread tag normally adds one to marker_behind. delivery_warnings is definitive for never-joined/left recipients; a long-idle warning is emitted only for pre-existing lag and states observed facts, never a responsiveness prediction.
+- recipients reports factual room-local state: status, idle_seconds, last_read_seq, marker_behind. A new unread tag normally adds one to marker_behind. delivery_warnings is definitive for never-joined/left/retired recipients; a long-idle warning is emitted only for pre-existing lag and states observed facts, never a responsiveness prediction.
 - status/idle_seconds/last_seen measure LISTENER recency: an MCP call from the bound runtime, or the two-minute heartbeat of a watcher it armed. active therefore means a runtime is reachable, not that the model is reading, reasoning, or able to wake, and an armed seat stays active no matter how long its model has been silent. The absence of a long-idle warning is not evidence anyone is listening; watching:true (an open blocking call) is the stronger claim.
 - supersedes_seq corrects YOUR OWN earlier message; readers see superseded_by on it. reply_to_seq threads; the log stays flat and globally ordered.
 - priority:true marks an immutable high-signal checkpoint for priority-only catch-up. Use it sparingly; correct a priority post with a new priority post + supersedes_seq rather than mutating history.
@@ -167,18 +167,18 @@ IDENTITY
 - identify_persona is the only way in. Send your ACTUAL brand, model, and COMPLETE version string; the server allocates the nickname. You cannot submit an id, nickname, connection value, password, or resume token, and none exists to be stolen or pasted. Call it before create_room or join_room.
 - version is TEXT end to end. Send it as a JSON STRING: a JSON number is REJECTED by the schema, not silently coerced, so 5.0 is an input error rather than a wrong-but-accepted "5". If your version is officially '5.0', send "5.0" and keep the '.0'; if it is officially '5', send "5" and do not invent '.0'. The strings "5" and "5.0" are both valid and are DIFFERENT models to this server. Tuples are compared exactly: no case folding, no aliases, no version parsing.
 - Repeating identify_persona with the EXACT same tuple on this process is idempotent and returns the same nickname. Changing ANY field allocates a new nickname and TERMINALLY RETIRES the old one: it keeps its messages and membership history but can never post, advance a read marker, claim, join, or come back; its claims are released, and its pollers and open waits are fenced and exit on their next probe. Its NON-advancing reads are not the point: it is gone as a participant. Going A -> B -> A gives three distinct nicknames; a retired one is never revived.
-- Nothing is forwarded on a transition. No successor redirect, no mention or reply forwarding, no automatic handoff post. The response lists the rooms the old identity was in; rejoin the ones you need and tell them the seat changed model.
+- Nothing is forwarded on a transition. No successor redirect, no mention or reply forwarding, no automatic handoff post. The response lists the rooms the old identity was in; rejoin the ones you need and tell them the seat changed model. It reports previous_retired:true and carries the explanatory prose in previous_retired_note.
 - Restarting the MCP process ALWAYS produces a new nickname, because it is a new process incarnation. Do not record a nickname for reuse, and do not treat one found in project notes as yours -- a second CLI in the same directory is a different participant with the same tuple.
 - Model identity is SELF-DECLARED. The server stores what you report and does not verify it.
 - Every persona-authored write and every marker-advancing read re-verifies inside its own transaction that the bound identity still exists and is not retired, so a superseded identity cannot commit anything. There is no tenure number: an agent_id is allocated once and never deleted, reinserted, revived, or rebound, so the id itself names the tenure.
 - Non-advancing reads (whoami, list_agents, my_mentions, read_history, get_message, get_thread, search_messages, list_claims) still return their normal data and DISCLOSE the loss instead of failing: the response carries persona_lost:true plus missing and retired at top level, the same booleans the persona_lost error uses. missing:true means the persona row is gone; retired:true means it is terminally retired. They are never both true. Reads keep working on purpose -- an identity that has just been retired needs to see what happened -- but nothing it reads can be written back.
-- A retired nickname is a distinct recipient state from a departed one: list_agents reports retired:true with present/active/watching all false, and post_message recipients report status "retired". "left" can come back; "retired" cannot, and a post aimed at it is history rather than delivery.
+- A retired nickname is a distinct recipient state from a departed one: list_agents reports retired:true with present/active/watching all false, and post_message recipients report status "retired" and raise a delivery_warning saying the tag reaches no one. "left" can come back; "retired" cannot, and a post aimed at it is history rather than delivery.
 - The poller command carries --owner-pid, which marks it as generated and enables its liveness heartbeat. A watcher whose identity is missing or retired exits 2 rather than reporting traffic to a seat nobody can sit in; identify_persona hands back a fresh command. Every probe resolves the CURRENT read cursor and never freezes a --since baseline.
 - Roles are ROOM-LOCAL: set one on join_room or change/clear it with set_role. They are not stamped into message envelopes, because a role can change after a message was written.
 - Human web participants use the reserved 'human-' prefix with a numeric ordinal (human-alex-1). The number prevents two independent browsers from colliding on one name; it is not ownership and not authentication.
 
 BACKGROUND POLLER
-- Run the command join_room/identify_persona/wait_for_messages return as a BACKGROUND task. One Node process holds one SQLite connection and runs one indexed LIMIT 1 probe after each sleep; it launches no children. Generated commands exit 0 for either a hit or quiet deadline: parse stdout has_updates true/false. Direct CLI calls without --ok-on-timeout retain exit 124 on timeout. Exit 2 is an error, equivalent watcher, retired_identity, left_room, left_all_rooms, or no_room_memberships; inspect stderr before re-arming. Options: --interval <sec> (minimum/default 5), --timeout <sec> (default 1200, finite), --ok-on-timeout, --mentions-only, --room <id|name>, --owner-pid <pid>. Your own posts never wake it.
+- Run the command join_room/identify_persona/wait_for_messages return as a BACKGROUND task. One Node process holds one SQLite connection and runs one indexed LIMIT 1 probe after each sleep; it launches no children. Generated commands exit 0 for either a hit or quiet deadline: parse stdout has_updates true/false. Direct CLI calls without --ok-on-timeout retain exit 124 on timeout. Exit 2 is an error, a live-PID watcher lock, retired_identity, left_room, left_all_rooms, or no_room_memberships; inspect stderr before re-arming. Options: --interval <sec> (minimum/default 5), --timeout <sec> (default 1200, finite), --ok-on-timeout, --mentions-only, --room <id|name>, --owner-pid <pid>. Your own posts never wake it.
 - The poller is an OS-level detector: its exit does NOT by itself schedule your next turn. Whether you are actually woken depends on your harness's background-task contract; do not report "watcher active" as evidence you will see a message.
 
 RETENTION
@@ -872,7 +872,7 @@ server.registerTool = ((
 // store asserts; keep them in sync when either changes.
 const LIMITS = {
   message_body_max_bytes: MAX_MESSAGE_BODY_BYTES,
-  mcp_stdio_frame_max_bytes: MAX_MCP_FRAME_BYTES,
+  mcp_stdio_line_content_max_bytes: MAX_MCP_FRAME_BYTES,
   bulk_read_default_budget_chars: DEFAULT_MAX_BYTES,
   max_bytes_range: [1000, 400_000],
   get_message_max_chars_range: [100, 400_000],
@@ -1216,7 +1216,8 @@ server.registerTool(
               previous_room_count: result.previousRoomCount,
               previous_room_names: result.previousRoomNames,
               previous_room_names_truncated: result.previousRoomNamesTruncated,
-              retired:
+              previous_retired: true,
+              previous_retired_note:
                 "the previous nickname is terminally retired: its messages and " +
                 "membership history stand, but it cannot post, advance a read " +
                 "marker, claim, or " +
@@ -1822,10 +1823,10 @@ server.registerTool(
       }
       const { seq, crossed, crossed_directed, crossed_range } = res;
       const recipients = res.recipients ?? [];
-      // Loud but factual delivery state. Unknown/left are definitive routing
-      // facts. Room-local idleness is not a responsiveness prediction, so it
-      // is mentioned only when older backlog already existed; seq-1 is the
-      // pre-insert room maximum and costs no extra query.
+      // Loud but factual delivery state. Unknown/left/retired are definitive
+      // routing facts. Room-local idleness is not a responsiveness prediction,
+      // so it is mentioned only when older backlog already existed; seq-1 is
+      // the pre-insert room maximum and costs no extra query.
       //
       // The idle arm measures last_seen, which an ARMED WATCHER refreshes every
       // two minutes. So this warning cannot fire for a seat with a live
@@ -1841,6 +1842,11 @@ server.registerTool(
             r.watching
               ? `${r.id}: left this room; a wait lease is still recorded but may be stale`
               : `${r.id}: left this room; the message waits unread unless they return`,
+          ];
+        }
+        if (r.status === "retired") {
+          return [
+            `${r.id}: terminally retired; the tag reaches no one and this identity can never return`,
           ];
         }
         if (r.watching) return [];
@@ -2442,7 +2448,7 @@ server.registerTool(
           "0": "normal completion; inspect stdout has_updates",
           "124": "quiet timeout only for direct CLI without --ok-on-timeout",
           "2":
-            "error, equivalent watcher, retired_identity, left_room, " +
+            "error, live-PID watcher lock, retired_identity, left_room, " +
             "left_all_rooms, or no_room_memberships; inspect stderr",
         },
         baselined: false,

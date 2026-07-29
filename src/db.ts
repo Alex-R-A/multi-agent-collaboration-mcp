@@ -23,8 +23,6 @@ function resolveDbPath(): string {
   return join(homedir(), ".agent-chat-mcp", "chat.db");
 }
 
-/** SQLite's default maximum string/blob byte length (SQLITE_MAX_LENGTH). */
-export const SQLITE_MAX_LENGTH = 1_000_000_000;
 /** Application safety cap. SQLite's ~1 GB theoretical ceiling is not a safe
  * API limit: JSON parsing, validation, binding, WAL, and FTS can hold several
  * copies of one body at once. */
@@ -164,8 +162,9 @@ const THREAD_ENVELOPE =
   }).length -
   2 -
   2;
-/** Serialized-size allowance below which shrinkToFit is guaranteed to fit any
- *  legal row as a stub (fixed fields ~430 worst case); budgets floor here. */
+/** Serialized array allowance within which boundByBytes can fit any legal
+ *  first row as a stub. It includes the array's two brackets, so boundByBytes
+ *  passes STUB_ALLOWANCE - 2 as the row budget (fixed fields ~430 worst case). */
 const STUB_ALLOWANCE = 500;
 
 /** Smallest budget that can safely carry catch_up's fixed fields plus one
@@ -1002,12 +1001,16 @@ export class ChatStore {
         SELECT RAISE(ABORT, 'human_allocations.result_agent_id must name a human agent whose human_base equals the recorded base');
       END;
 
-      -- Append-only. Denying UPDATE outright is smaller than re-validating it,
+      -- Append-only. Denying UPDATE and DELETE outright is smaller than re-validating either,
       -- and there is no legitimate reason to rewrite a committed allocation:
       -- its whole purpose is to be the durable answer a replay returns.
       CREATE TRIGGER IF NOT EXISTS human_allocations_append_only
       BEFORE UPDATE ON human_allocations BEGIN
         SELECT RAISE(ABORT, 'human_allocations is append-only: a committed allocation record cannot be modified');
+      END;
+      CREATE TRIGGER IF NOT EXISTS human_allocations_no_delete
+      BEFORE DELETE ON human_allocations BEGIN
+        SELECT RAISE(ABORT, 'human_allocations is append-only: a committed allocation record cannot be deleted');
       END;
     `);
     this.db.exec(`
@@ -1964,11 +1967,13 @@ export class ChatStore {
         .run(roomId);
       this.db
         .prepare(
+          // Overlapping waits share one row: keep the aggregate's first start
+          // and furthest deadline rather than letting a later short wait
+          // advertise that the still-open long wait expired.
           `INSERT INTO wait_leases (room_id, agent_id, expires_at)
            VALUES (?, ?, datetime('now', '+' || ? || ' seconds'))
            ON CONFLICT(room_id, agent_id) DO UPDATE SET
-             started_at = datetime('now'),
-             expires_at = excluded.expires_at`,
+             expires_at = max(wait_leases.expires_at, excluded.expires_at)`,
         )
         .run(roomId, agentId, Math.max(1, Math.floor(ttlSeconds)));
     });
@@ -2656,15 +2661,22 @@ export class ChatStore {
     // reported length (an emoji counts once). Deciding on codepointLen (the full
     // codepoint count) rather than a UTF-16 length keeps the threshold in the
     // same unit as the cut.
+    // The SQL fetch itself is capped before this mapper runs. body_len is the
+    // exact full UTF-16 length stamped at write time, so it detects that cut
+    // without scanning the body again. A cut JSON body must stay raw: parsing
+    // a valid-looking prefix can change it (a huge numeric prefix becomes
+    // Infinity, then serializes as null) while hiding that bytes remain.
+    const fetchedTruncate = r.body.length < r.body_len;
     const truncate =
-      previewChars !== undefined && codepointLen(r) > previewChars;
+      fetchedTruncate ||
+      (previewChars !== undefined && codepointLen(r) > previewChars);
     // A truncated body is returned as a raw (possibly partial) string even for
     // json: a sliced JSON string does not parse, so the caller must fetch the
     // full body with get_message. `truncated`/`length` signal exactly that.
-    // A body larger than the fetch cap arrives here already cut; it can never
-    // fit the byte budget anyway, so shrinkToFit re-flags it downstream.
     const content = truncate
-      ? cutToCodepoints(r.body, previewChars)
+      ? previewChars === undefined
+        ? r.body
+        : cutToCodepoints(r.body, previewChars)
       : r.format === "json"
         ? safeParse(r.body)
         : r.body;
@@ -2704,7 +2716,7 @@ export class ChatStore {
    * measured size fits -- a single code-unit cut under-counts JSON escaping,
    * which is how control-heavy room names kept escaping the budget. Every
    * stage measures the real serialized output, so for any budget >=
-   * STUB_ALLOWANCE the result is guaranteed to fit.
+   * STUB_ALLOWANCE - 2 the result is guaranteed to fit.
    */
   private shrinkToFit<T extends MessageRow>(
     r: RawMessage,
@@ -2733,7 +2745,11 @@ export class ChatStore {
     // there. Stage 4 sets this explicitly, but stage 2's escaping correction can
     // reach keep=0 on its own for a control-heavy body, and a caller that reads
     // `oversized` to decide "fetch this with get_message" must not miss those.
-    if (h.content === "" && codepointLen(r) > 0) h.oversized = true;
+    if (h.content === "" && codepointLen(r) > 0) {
+      h.oversized = true;
+      // The flag changes the size that gates mention shedding and stubbing.
+      sz = JSON.stringify(head).length;
+    }
     // Stage 3: shed mentions (down to none if needed); size can live
     // entirely in a legal `to` list. Flags set before the deciding measure.
     if (sz > budget && Array.isArray(h.to) && h.to.length > 0) {
@@ -3323,21 +3339,29 @@ export class ChatStore {
   unreadProbe(roomId: number, agentId: string): number {
     const row = this.db
       .prepare(
-        `SELECT a.retired_at,
-                (SELECT mb.last_read_seq FROM memberships mb
-                  WHERE mb.room_id = @room AND mb.agent_id = @agent)
-                  AS last_read_seq
-         FROM agents a WHERE a.id = @agent`,
+        `SELECT a.retired_at, mb.last_read_seq, mb.left_at
+         FROM agents a
+         LEFT JOIN memberships mb
+           ON mb.room_id = @room AND mb.agent_id = a.id
+         WHERE a.id = @agent`,
       )
       .get({ room: roomId, agent: agentId }) as
-      | { retired_at: string | null; last_read_seq: number | null }
+      | {
+          retired_at: string | null;
+          last_read_seq: number | null;
+          left_at: string | null;
+        }
       | undefined;
-    // Same fence as requireLive, and this is the path a detached poller runs:
-    // a retired identity's watcher must EXIT rather than keep reporting
-    // traffic to a seat that can never act on it.
+    // Same identity fence as requireLive: a quiet in-call wait must stop after
+    // retirement rather than keep advertising a seat that can never act.
     if (!row) throw new PersonaLostError(agentId, "missing");
     if (row.retired_at !== null) throw new PersonaLostError(agentId, "retired");
     if (row.last_read_seq === null) throw new Error("not a member of this room");
+    if (row.left_at !== null) {
+      throw new Error(
+        `persona "${agentId}" LEFT room ${roomId} while waiting; rejoin before waiting on it again`,
+      );
+    }
     // A wait only needs a yes/no wake signal. COUNT(*) rescanned the complete
     // unread tail twice per second per wait (including a large self-authored
     // tail that never advances); the room/seq index lets this stop at one row.
@@ -4117,6 +4141,15 @@ export class ChatStore {
     assertMaxLen(key, "claim key", 500);
     assertStorable(note, "claim note");
     assertMaxLen(note, "claim note", 2000);
+    if (
+      !Number.isSafeInteger(ttlSeconds) ||
+      ttlSeconds < 1 ||
+      ttlSeconds > 86_400
+    ) {
+      throw new Error(
+        "claim ttl_seconds must be an integer from 1 to 86400 seconds",
+      );
+    }
     const tx = this.db.transaction(() => {
       this.requireLive(agentId);
       // Taking a claim requires presence; releasing one remains cleanup.

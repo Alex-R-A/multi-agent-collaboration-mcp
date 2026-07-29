@@ -331,6 +331,9 @@ The response must include:
 - `previous_room_count` when a transition retired present memberships
 - `previous_room_names`, limited to 200 names
 - `previous_room_names_truncated`, true when the count exceeds that limit
+- `previous_retired`, true when a transition terminally retired the previous
+  identity
+- `previous_retired_note`, explaining that the previous identity cannot return
 - the current build/staleness handoff fields already used by identity responses
 - a next-action instruction to create or join a room
 
@@ -872,8 +875,10 @@ correlation data:
 - process start time
 - client-reported name and version only after MCP initialization has supplied
   them
-- identify outcome: created, reused, transitioned, or gracefully retired
-- canonical agent ID and tuple involved in that outcome
+- identity outcome: created, reused, transitioned, or gracefully retired
+- canonical agent ID for every identity outcome
+- self-reported tuple for identify outcomes; graceful retirement refers to the
+  earlier identify record instead of reading and repeating the tuple at shutdown
 
 Never write diagnostics to stdout because stdout carries MCP JSON-RPC. Cap
 every free-form field before serialization so a self-reported tuple or client

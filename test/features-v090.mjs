@@ -409,6 +409,20 @@ await (async () => {
   mkAgent(s, "watcher");
   s.joinRoom(rA, "watcher", {});
   s.markRead(rA, "watcher");
+  const retireeConnection = "11111111-1111-4111-8111-111111111111";
+  const retiree = s.identifyPersona({
+    connectionId: retireeConnection,
+    brand: "testbrand",
+    model: "retired-recipient",
+    version: "1",
+    description: null,
+    expected: null,
+    nextCandidateId: () => "retiree",
+  }).persona.id;
+  s.retireConnection({
+    agentId: retiree,
+    connectionId: retireeConnection,
+  });
   s.postMessage(rA, "peer", "older backlog", "text", null, null, null);
   mkAgent(s, "idle-caught-up");
   s.joinRoom(rA, "idle-caught-up", {});
@@ -424,14 +438,27 @@ await (async () => {
   s.touch(rA, "peer");
   const post = await call("post_message", {
     content: "fanout",
-    to: ["ghost", "leaver", "stale", "idle-caught-up", "watcher", "peer"],
+    to: [
+      "ghost",
+      "leaver",
+      "retiree",
+      "stale",
+      "idle-caught-up",
+      "watcher",
+      "peer",
+    ],
   });
   const w = post.data.delivery_warnings ?? [];
   check(
-    "B2 warnings for ghost (unknown), leaver (left), stale (idle)",
-    w.length === 3 &&
+    "B2 warnings for unknown, left, retired, and stale-idle recipients",
+    w.length === 4 &&
       w.some((x) => x.startsWith("ghost:") && /never joined/.test(x)) &&
       w.some((x) => x.startsWith("leaver:") && /left/.test(x)) &&
+      w.some((x) =>
+        x.startsWith("retiree:") &&
+        /terminally retired/.test(x) &&
+        /reaches no one/.test(x),
+      ) &&
       // The wording names WHAT was measured. "no observed activity" read as a
       // claim about the model; the signal is only that nothing -- neither an
       // MCP call nor an armed watcher's heartbeat -- touched this seat.
@@ -456,6 +483,7 @@ await (async () => {
       post.data.recipients.find((r) => r.id === "ghost").marker_behind === null &&
       post.data.recipients.find((r) => r.id === "leaver").status === "left" &&
       post.data.recipients.find((r) => r.id === "leaver").watching === true &&
+      post.data.recipients.find((r) => r.id === "retiree").status === "retired" &&
       post.data.recipients.find((r) => r.id === "stale").marker_behind === 2 &&
       post.data.recipients.find((r) => r.id === "idle-caught-up").marker_behind === 1 &&
       post.data.recipients.find((r) => r.id === "watcher").marker_behind === 2 &&
@@ -485,6 +513,8 @@ await (async () => {
   check(
     "B3 server_info publishes limits and the manual",
       info.data.limits?.message_body_max_bytes === 10_000_000 &&
+      info.data.limits?.mcp_stdio_line_content_max_bytes === 64 * 1024 * 1024 &&
+      info.data.limits?.mcp_stdio_frame_max_bytes === undefined &&
       info.data.limits?.bulk_read_default_budget_chars === 100_000 &&
       info.data.limits?.wait_seconds_max === 25 &&
       info.data.limits?.wait_seconds_default_max === 25 &&

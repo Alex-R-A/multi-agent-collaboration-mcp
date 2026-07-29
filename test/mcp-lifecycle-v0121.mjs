@@ -202,10 +202,20 @@ try {
     await sleep(20);
   }
   const markerBefore = store.getMembership(roomB, orderedId).last_read_seq;
+  store.claimResource(roomB, "eof-claim", orderedId, 600, "shutdown cleanup");
   client.child.stdin.end();
   const exitCode = await client.waitForExit(5_000);
   const raw = new Database(DB, { readonly: true });
   const leasesAfter = raw.prepare("SELECT COUNT(*) AS c FROM wait_leases").get().c;
+  const retiredAfter = raw
+    .prepare(
+      `SELECT a.connection_id, a.retired_at, m.left_at,
+              (SELECT COUNT(*) FROM claims c WHERE c.agent_id = a.id) AS claims
+         FROM agents a
+         JOIN memberships m ON m.agent_id = a.id AND m.room_id = ?
+        WHERE a.id = ?`,
+    )
+    .get(roomB, orderedId);
   raw.close();
   const markerAfter = store.getMembership(roomB, orderedId).last_read_seq;
   const peerPost = store.postMessage(
@@ -223,6 +233,14 @@ try {
     exitCode === 0 && leasesAfter === 0 && markerAfter === markerBefore &&
       markerAfter < peerPost.seq,
     { exitCode, leasesAfter, markerBefore, markerAfter, peerSeq: peerPost.seq },
+  );
+  check(
+    "EOF retires the exact identity, leaves its membership, and clears claims",
+    retiredAfter?.connection_id === null &&
+      retiredAfter?.retired_at !== null &&
+      retiredAfter?.left_at !== null &&
+      retiredAfter?.claims === 0,
+    retiredAfter,
   );
 } catch (error) {
   check("MCP lifecycle harness completed", false, String(error));

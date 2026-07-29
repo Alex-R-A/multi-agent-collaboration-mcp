@@ -25,6 +25,11 @@ const check = (n, c, x) => {
 // integration tests: an old jump freezes ordinary polling and only an explicit
 // tail action performs a full bounded refresh.
 const viewerSource = readFileSync(join(ROOT, "web", "index.html"), "utf8");
+const viewerSection = (start, end) => {
+  const from = viewerSource.indexOf(start);
+  const to = viewerSource.indexOf(end, from + start.length);
+  return from >= 0 && to > from ? viewerSource.slice(from, to) : "";
+};
 check(
   "historical viewer snapshots do not poll through the intervening backlog",
   viewerSource.includes("state.historicalWindow = true;") &&
@@ -84,6 +89,106 @@ check(
       viewerSource,
     ) &&
     !viewerSource.includes("&name="),
+  null,
+);
+{
+  const leaveSource = viewerSection(
+    "async function leaveCurrent()",
+    "async function sendMessage()",
+  );
+  const ledgerWrite = leaveSource.indexOf("if (!saveGhosts(ghosts))");
+  const mapWrite = leaveSource.indexOf("if (!saveJoined(joined))");
+  const serverLeave = leaveSource.indexOf('await postJson("/api/leave"');
+  const ledgerClear = leaveSource.indexOf("if (!saveGhosts(kept))");
+  check(
+    "explicit leave persists a typed ghost and checked local state before the server call",
+    leaveSource.includes("explicit_leave: true") &&
+      ledgerWrite >= 0 &&
+      mapWrite > ledgerWrite &&
+      serverLeave > mapWrite &&
+      ledgerClear > serverLeave,
+    { ledgerWrite, mapWrite, serverLeave, ledgerClear },
+  );
+  check(
+    "leaveCurrent remains wired to the UI",
+    viewerSource.includes(
+      'el.leaveBtn.addEventListener("click", leaveCurrent)',
+    ),
+    null,
+  );
+}
+{
+  const retrySource = viewerSection(
+    "async function retryGhosts()",
+    "function loadJoined()",
+  );
+  const joinSource = viewerSection(
+    "async function joinCurrent()",
+    "async function leaveCurrent()",
+  );
+  const storageSource = viewerSection(
+    'window.addEventListener("storage"',
+    "setInterval(() =>",
+  );
+  check(
+    "ghost recovery distinguishes explicit leave and verifies its map cleanup",
+    retrySource.includes("!g.explicit_leave") &&
+      retrySource.includes("if (g.explicit_leave)") &&
+      retrySource.includes("if (!saveJoined(joined))") &&
+      retrySource.includes("!saveGhosts(") &&
+      retrySource.includes("error?.httpStatus !== 400"),
+    null,
+  );
+  check(
+    "same-tab ghost recovery invalidates stale UI after removing its current membership",
+    retrySource.includes("currentMembershipChanged = true") &&
+      retrySource.includes("state.roomEpoch += 1") &&
+      retrySource.includes("clearReply()") &&
+      retrySource.includes("renderComposer()"),
+    null,
+  );
+  const rollbackWrite = joinSource.indexOf("existing.explicit_leave = false");
+  const serverJoin = joinSource.indexOf('j = await postJson("/api/join"');
+  const mapWrite = joinSource.indexOf("saved = saveJoined(joined)");
+  const rollbackClear = joinSource.indexOf(
+    "const kept = loadGhosts().filter",
+    mapWrite,
+  );
+  check(
+    "canonical rejoin journals rollback before the server and clears it after the map",
+    joinSource.includes("explicit_leave: false") &&
+      rollbackWrite >= 0 &&
+      serverJoin > rollbackWrite &&
+      mapWrite > serverJoin &&
+      rollbackClear > mapWrite,
+    { rollbackWrite, serverJoin, mapWrite, rollbackClear },
+  );
+  check(
+    "a completed cross-tab identity switch promptly retries ghost cleanup",
+    /if \(browserIdentity\.pending_allocation\) \{[\s\S]+?\} else \{\s*retryGhosts\(\);\s*\}/.test(
+      storageSource,
+    ),
+    null,
+  );
+  check(
+    "a cross-tab explicit leave promptly retries its durable ghost",
+    storageSource.includes(
+      "if (e.key === GHOST_KEY) {\n          retryGhosts();\n          return;",
+    ),
+    null,
+  );
+  check(
+    "visible room polling retries durable membership cleanup without another user action",
+    /if \(!document\.hidden\) \{\s*loadRooms\(\);\s*[\s\S]{0,180}?loadGhosts\(\)\.length > 0\) retryGhosts\(\);/.test(
+      viewerSource,
+    ),
+    null,
+  );
+}
+check(
+  "viewer describes only human identity as self-asserted",
+  viewerSource.includes("no password: human identity is self-asserted") &&
+    !viewerSource.includes("self-asserted, like the agents"),
   null,
 );
 

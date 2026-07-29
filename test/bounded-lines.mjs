@@ -44,7 +44,8 @@ function check(name, condition, detail) {
   const [error] = await failed;
   check(
     "a frame split across chunks fails as soon as it exceeds the bound",
-    /8-byte safety limit/.test(error.message),
+    error.message ===
+      "MCP stdio line content exceeds the configured 8-byte limit (LF delimiter excluded)",
     error.message,
   );
 }
@@ -59,7 +60,8 @@ function check(name, condition, detail) {
   check(
     "a valid first frame is emitted before a later oversized frame fails",
     frames.length === 1 && frames[0] === "ok\n" &&
-      /8-byte safety limit/.test(error.message),
+      error.message ===
+        "MCP stdio line content exceeds the configured 8-byte limit (LF delimiter excluded)",
     { frames, error: error.message },
   );
 }

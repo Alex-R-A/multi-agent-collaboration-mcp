@@ -112,6 +112,48 @@ const size = (o) => JSON.stringify(o).length;
   s.close();
 }
 
+// --- adding oversized:true participates in the deciding measurement ----------
+// The control-heavy body makes the first content cut empty. At this exact
+// 500-character row budget, the pre-flag row is 500 characters and the flag
+// adds 17. A stale pre-flag measurement therefore returns 517 unless the
+// mention-shedding stage runs. Use a real stored row and production mapper so
+// the assertion cannot pass on a synthetic shape that rowToMessage never emits.
+{
+  const s = new ChatStore(":memory:");
+  const room = mkRoom(s, "flag-boundary", null, null).id;
+  const sender = "s".repeat(200);
+  const mention = "m".repeat(150);
+  mkAgent(s, sender);
+  s.joinRoom(room, sender, {});
+  s.postMessage(
+    room,
+    sender,
+    "\u0001".repeat(1200),
+    "text",
+    [mention],
+    null,
+    null,
+  );
+  const raw = s.getRawMessage(room, 1);
+  const row = s.shrinkToFit(
+    raw,
+    undefined,
+    500,
+    (message, previewChars) => s.rowToMessage(message, previewChars),
+  );
+  check(
+    "oversized flag is measured before the 500-char row decision",
+    row.oversized === true &&
+      row.content === "" &&
+      row.to_truncated === true &&
+      row.to_total === 1 &&
+      row.to.length === 0 &&
+      size(row) <= 500,
+    { size: size(row), row },
+  );
+  s.close();
+}
+
 // --- control-heavy metadata: the stub itself is measured, not sliced ----------
 // A control char serializes as 6 chars (\u0001); fixed code-unit cuts of the
 // room name / sender type / role let stubs escape a 1000-char budget.

@@ -8,6 +8,7 @@ import {
   mkdtempSync,
   realpathSync,
   rmSync,
+  writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
@@ -149,6 +150,42 @@ try {
   );
   store.markRead(room, "me");
 
+  // A dead owner leaves the lock fail-closed. The error must make the manual
+  // recovery precise without deleting or replacing the stale file itself.
+  const deadOwner = spawn(process.execPath, ["-e", ""], { stdio: "ignore" });
+  const deadOwnerPid = deadOwner.pid;
+  await new Promise((resolve) => deadOwner.once("close", resolve));
+  writeFileSync(
+    lockPath,
+    JSON.stringify({ pid: deadOwnerPid, token: "stale-lock-test" }),
+    { mode: 0o600 },
+  );
+  const stale = startPoller([...base, "--timeout", "1"]);
+  active.add(stale.child);
+  const staleResult = await stale.wait(2_000);
+  active.delete(stale.child);
+  const staleLockRemained = existsSync(lockPath);
+  const staleInstruction =
+    `stale watcher lock file: ${lockPath}; ` +
+    "remove only this exact file, then retry";
+  check(
+    "dead-owner lock stays fail-closed and reports exact manual recovery",
+    staleResult.code === 2 &&
+      staleLockRemained &&
+      staleResult.stderr.includes(staleInstruction),
+    { staleResult, staleLockRemained, staleInstruction },
+  );
+  rmSync(lockPath);
+  const staleRetry = startPoller([...base, "--timeout", "1"]);
+  active.add(staleRetry.child);
+  const staleRetryResult = await staleRetry.wait(2_500);
+  active.delete(staleRetry.child);
+  check(
+    "removing the named stale lock allows the watcher retry",
+    staleRetryResult.code === 124 && remainingLocks().length === 0,
+    { staleRetryResult, remainingLocks: remainingLocks() },
+  );
+
   // A genuine duplicate remains fail-closed, but reports the exact lock so a
   // PID-reuse false positive is diagnosable. Both children are bounded and
   // explicitly reaped here.
@@ -165,8 +202,10 @@ try {
     active.delete(primary.child);
     check("duplicate watcher test established the primary lock", primaryLock, primary.output());
     check(
-      "duplicate watcher error names its inspectable lock",
+      "live-pid lock error names the inspectable lock without claiming ownership proof",
       duplicateResult.code === 2 &&
+        duplicateResult.stderr.includes("watcher lock references live pid") &&
+        !duplicateResult.stderr.includes("equivalent watcher") &&
         expectedLockPaths.some((path) => duplicateResult.stderr.includes(path)) &&
         primaryResult.code === 143 && remainingLocks().length === 0,
       { duplicateResult, primaryResult, remainingLocks: remainingLocks() },
@@ -193,7 +232,7 @@ try {
   const replacementResult = await replacement.wait(2_500);
   active.delete(replacement.child);
   check(
-    "an equivalent watcher starts normally after SIGHUP cleanup",
+    "a replacement watcher starts normally after SIGHUP cleanup",
     replacementResult.code === 124,
     replacementResult,
   );

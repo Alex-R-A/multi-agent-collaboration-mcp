@@ -1212,7 +1212,7 @@
               <button id="join-btn" class="btn-accent">Join room</button>
               <button id="join-change-btn" class="linkish" hidden>Change name</button>
               <span class="compose-hint"
-                >no password: identity is self-asserted, like the agents</span
+                >no password: human identity is self-asserted</span
               >
               <span id="join-error" class="compose-hint" style="color: var(--danger)"></span>
             </div>
@@ -1444,13 +1444,19 @@
         try {
           const v = JSON.parse(localStorage.getItem(GHOST_KEY));
           return Array.isArray(v)
-            ? v.filter(
-                (g) =>
-                  g &&
-                  Number.isSafeInteger(g.room) &&
-                  g.room > 0 &&
-                  typeof g.agent_id === "string",
-              )
+            ? v
+                .filter(
+                  (g) =>
+                    g &&
+                    Number.isSafeInteger(g.room) &&
+                    g.room > 0 &&
+                    typeof g.agent_id === "string",
+                )
+                .map((g) => ({
+                  room: g.room,
+                  agent_id: g.agent_id,
+                  explicit_leave: g.explicit_leave === true,
+                }))
             : [];
         } catch {
           return [];
@@ -1468,6 +1474,7 @@
       async function retryGhosts() {
         if (ghostRetryActive) return; // overlapping sweeps would race the ledger
         ghostRetryActive = true;
+        let currentMembershipChanged = false;
         try {
           // The membership lock is held ACROSS each leave's round trip: the
           // stale-check below is only race-free if no other tab can re-adopt
@@ -1478,17 +1485,25 @@
             // identity and its cleanup ledger before any old leave can run.
             if (browserIdentity.pending_allocation) return;
             for (const g of loadGhosts()) {
-              // A ghost whose (room, agent id) is the CURRENT mapping again is
-              // not stale: the user re-adopted the identity and rejoined, and leaving
-              // now would evict that live membership seconds after it was
-              // created. Purge the entry instead of retrying it.
-              if (loadJoined()[String(g.room)] === g.agent_id) {
-                saveGhosts(
-                  loadGhosts().filter(
-                    (x) =>
-                      !(x.room === g.room && x.agent_id === g.agent_id),
-                  ),
-                );
+              // A cleanup ghost whose (room, agent id) is the CURRENT mapping
+              // again is not stale: the user re-adopted the identity and
+              // rejoined. An explicit-leave ghost is different: the matching
+              // map can be the crash point between recording the leave intent
+              // and deleting that map entry, so it must still be processed.
+              if (
+                !g.explicit_leave &&
+                loadJoined()[String(g.room)] === g.agent_id
+              ) {
+                if (
+                  !saveGhosts(
+                    loadGhosts().filter(
+                      (x) =>
+                        !(x.room === g.room && x.agent_id === g.agent_id),
+                    ),
+                  )
+                ) {
+                  return;
+                }
                 continue;
               }
               try {
@@ -1496,20 +1511,62 @@
                   room: g.room,
                   agent_id: g.agent_id,
                 });
-              } catch {
-                continue; // still unreachable; keep the entry for the next sweep
+              } catch (error) {
+                // Generated fields cannot become valid through retry. A 400
+                // means the room or human no longer exists, or stored state is
+                // malformed, so finish local cleanup instead of keeping an
+                // immortal request. Transport and server failures remain
+                // retryable.
+                if (error?.httpStatus !== 400) continue;
+              }
+              if (g.explicit_leave) {
+                const joined = loadJoined();
+                const key = String(g.room);
+                if (joined[key] === g.agent_id) {
+                  delete joined[key];
+                  if (!saveJoined(joined)) {
+                    return;
+                  }
+                  if (
+                    state.current?.id === g.room &&
+                    identity() === g.agent_id
+                  ) {
+                    currentMembershipChanged = true;
+                  }
+                }
               }
               // Remove exactly this entry from the CURRENT ledger: a wholesale
               // save of a pre-loop snapshot would erase entries recorded while
               // these retries were in flight.
-              saveGhosts(
-                loadGhosts().filter(
-                  (x) =>
-                    !(x.room === g.room && x.agent_id === g.agent_id),
-                ),
-              );
+              if (
+                !saveGhosts(
+                  loadGhosts().filter(
+                    (x) =>
+                      !(x.room === g.room && x.agent_id === g.agent_id),
+                  ),
+                )
+              ) {
+                return;
+              }
             }
           });
+          // localStorage notifies only OTHER tabs. When this tab recovered the
+          // leave, refresh its own UI and invalidate work captured while the
+          // membership still appeared present.
+          if (
+            currentMembershipChanged &&
+            state.current &&
+            !joinedHere()
+          ) {
+            state.roomEpoch += 1;
+            state.lastReadSent = 0;
+            state.marker = -1;
+            state.markerIdent = null;
+            state.gap = false;
+            clearReply();
+            renderComposer();
+            computeGap();
+          }
         } finally {
           ghostRetryActive = false;
         }
@@ -2777,6 +2834,31 @@
               current &&
               (!explicitChange || requestedBase === current.base_name)
             ) {
+              // Journal an uncertain rejoin before the server write. Until the
+              // joined map is durable, recovery may safely undo it with leave.
+              // After the map is saved, this non-explicit ghost is discarded
+              // without touching the live membership.
+              const ghosts = loadGhosts();
+              const existing = ghosts.find(
+                (g) =>
+                  g.room === room.id &&
+                  g.agent_id === current.agent_id,
+              );
+              if (existing) {
+                existing.explicit_leave = false;
+              } else {
+                ghosts.push({
+                  room: room.id,
+                  agent_id: current.agent_id,
+                  explicit_leave: false,
+                });
+              }
+              if (!saveGhosts(ghosts)) {
+                throw new Error(
+                  "browser storage is unavailable; the room was not joined",
+                );
+              }
+
               j = await postJson("/api/join", {
                 room: room.id,
                 agent_id: current.agent_id,
@@ -2790,15 +2872,16 @@
               joined[String(room.id)] = current.agent_id;
               saved = saveJoined(joined);
               if (saved) {
-                const ghosts = loadGhosts();
-                const kept = ghosts.filter(
+                const kept = loadGhosts().filter(
                   (g) =>
                     !(
                       g.room === room.id &&
                       g.agent_id === current.agent_id
                     ),
                 );
-                if (kept.length !== ghosts.length) saveGhosts(kept);
+                // Safe if this write fails: retryGhosts sees the matching map
+                // and removes the non-explicit record without leaving.
+                saveGhosts(kept);
               }
             } else {
               if (!requestedBase) {
@@ -2891,20 +2974,58 @@
           // Same lock as join/rename: the leave plus its map update must not
           // interleave with another tab's read-modify-write.
           await withMembershipLock(async () => {
+            const ghosts = loadGhosts();
+            const existing = ghosts.find(
+              (g) => g.room === room.id && g.agent_id === agentId,
+            );
+            if (existing) {
+              existing.explicit_leave = true;
+            } else {
+              ghosts.push({
+                room: room.id,
+                agent_id: agentId,
+                explicit_leave: true,
+              });
+            }
+            if (!saveGhosts(ghosts)) {
+              throw new Error(
+                "browser storage is unavailable; the room was not left",
+              );
+            }
+
+            // Persist the local leave before the request. If the request or
+            // page dies afterward, the ghost entry retries the server leave.
+            const joined = loadJoined();
+            if (joined[String(room.id)] === agentId) {
+              delete joined[String(room.id)];
+              if (!saveJoined(joined)) {
+                throw new Error(
+                  "leave is recorded, but browser room state could not be updated; it will retry",
+                );
+              }
+            }
+
             await postJson("/api/leave", {
               room: room.id,
               agent_id: agentId,
             });
-            // Drop the mapping only while it still records THIS leave's
-            // identity: a rename in another tab must not lose its mapping.
-            const joined = loadJoined();
-            if (joined[String(room.id)] === agentId) {
-              delete joined[String(room.id)];
-              saveJoined(joined);
+
+            const kept = loadGhosts().filter(
+              (g) => !(g.room === room.id && g.agent_id === agentId),
+            );
+            if (!saveGhosts(kept)) {
+              throw new Error(
+                "the room was left, but cleanup state could not be saved; free browser storage and retry",
+              );
             }
           });
         } catch (e) {
-          if (sameView(room, epoch)) el.composeError.textContent = e.message;
+          if (sameView(room, epoch)) {
+            if (!joinedHere()) clearReply();
+            renderComposer();
+            const target = joinedHere() ? el.composeError : el.joinError;
+            target.textContent = e.message;
+          }
           return;
         }
         // Composer/reply belong to whatever room is shown NOW.
@@ -3340,6 +3461,10 @@
       // only for OTHER documents, so same-tab writes never loop through here;
       // a discarded in-flight initial load re-arms via pendingInitial.)
       window.addEventListener("storage", (e) => {
+        if (e.key === GHOST_KEY) {
+          retryGhosts();
+          return;
+        }
         if (e.key !== IDENT_KEY && e.key !== JOINED_KEY) return;
         if (e.key === IDENT_KEY) {
           reloadIdentityState();
@@ -3363,23 +3488,27 @@
           computeGap();
           fetchMarker();
         }
-        if (e.key === IDENT_KEY && browserIdentity.pending_allocation) {
-          recoverPendingAllocation().then((recovered) => {
-            if (!recovered) return;
-            state.roomEpoch += 1;
-            state.lastReadSent = 0;
-            state.marker = -1;
-            state.markerIdent = null;
-            state.gap = false;
-            renderComposer();
-            if (state.current) {
-              if (state.searchMode) state.needsRebuild = true;
-              else rebuildStream();
-              computeGap();
-              fetchMarker();
-            }
+        if (e.key === IDENT_KEY) {
+          if (browserIdentity.pending_allocation) {
+            recoverPendingAllocation().then((recovered) => {
+              if (!recovered) return;
+              state.roomEpoch += 1;
+              state.lastReadSent = 0;
+              state.marker = -1;
+              state.markerIdent = null;
+              state.gap = false;
+              renderComposer();
+              if (state.current) {
+                if (state.searchMode) state.needsRebuild = true;
+                else rebuildStream();
+                computeGap();
+                fetchMarker();
+              }
+              retryGhosts();
+            });
+          } else {
             retryGhosts();
-          });
+          }
         }
       });
 
@@ -3387,7 +3516,12 @@
         if (!document.hidden) loadNew(false);
       }, POLL_MS);
       setInterval(() => {
-        if (!document.hidden) loadRooms();
+        if (!document.hidden) {
+          loadRooms();
+          // Failed leaves and uncertain rejoins must converge even when the
+          // user keeps this page open and performs no later identity action.
+          if (loadGhosts().length > 0) retryGhosts();
+        }
       }, ROOMS_MS);
 
       (async function init() {

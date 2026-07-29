@@ -42,7 +42,7 @@ export class BoundedLineTransform extends Transform {
         this.reset(true);
         callback(
           new Error(
-            `MCP stdio frame exceeds the ${this.maxLineBytes}-byte safety limit`,
+            `MCP stdio line content exceeds the configured ${this.maxLineBytes}-byte limit (LF delimiter excluded)`,
           ),
         );
         return;

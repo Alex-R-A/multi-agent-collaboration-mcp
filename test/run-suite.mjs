@@ -34,6 +34,7 @@ const files = [
   "features-v0120.mjs",
   "mcp-lifecycle-v0121.mjs",
   "poller-lifecycle-v0121.mjs",
+  "web-error-status.mjs",
   "web-participate.mjs",
   "features-persona.mjs",
 ];
