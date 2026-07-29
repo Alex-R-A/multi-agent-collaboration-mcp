@@ -595,6 +595,7 @@ await (async () => {
       info.data.limits?.wait_seconds_configurable_hard_max === 120 &&
       info.data.limits?.crossed_preview_chars_max === 2000 &&
       info.data.limits?.client_message_id_max_chars === 200 &&
+      info.data.limits?.default_page_limits?.pending_work === 50 &&
       info.data.limits?.metadata_caps_chars?.claim_key === 500 &&
       typeof info.data.manual === "string" &&
       info.data.manual.includes("OPERATING MANUAL") &&

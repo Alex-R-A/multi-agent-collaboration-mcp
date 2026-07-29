@@ -871,6 +871,7 @@ const LIMITS = {
     read_history: 50,
     my_mentions: 50,
     search_messages: 20,
+    pending_work: 50,
     listings: 200,
   },
   metadata_caps_chars: {
