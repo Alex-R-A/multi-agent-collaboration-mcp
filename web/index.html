@@ -2806,7 +2806,13 @@
             // share the first allocation, not mint one identity each.
             reloadIdentityState();
             const recovered = await recoverPendingAllocationLocked();
-            if (recovered) {
+            // A recovery satisfies this click only if it joined the visible
+            // room; a foreign-room or joined:false replay falls through below.
+            if (
+              recovered &&
+              recovered.room_id === room.id &&
+              recovered.joined === true
+            ) {
               return {
                 j: recovered,
                 saved: true,

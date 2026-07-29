@@ -92,6 +92,22 @@ check(
   null,
 );
 {
+  // Both conjuncts are load-bearing: room_id alone consumes a membership-less
+  // same-room replay, joined alone lets another room's join seed this marker.
+  // Source matching cannot prove the branch is reachable; Chrome covers that.
+  const joinSource = viewerSection(
+    "async function joinCurrent()",
+    "async function leaveCurrent()",
+  );
+  check(
+    "a recovered allocation answers the click only when it joined this room",
+    /if \(\s*recovered &&\s*recovered\.room_id === room\.id &&\s*recovered\.joined === true\s*\) \{/.test(
+      joinSource,
+    ) && !/if \(recovered\) \{/.test(joinSource),
+    { section: joinSource.length },
+  );
+}
+{
   const leaveSource = viewerSection(
     "async function leaveCurrent()",
     "async function sendMessage()",
