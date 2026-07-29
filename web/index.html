@@ -1423,9 +1423,7 @@
       // a rename): tracked so later joins can retry the leave instead of the
       // ghost becoming permanently unaddressable.
       function loadGhosts() {
-        // Type-check, not just parse-check: valid-but-wrong-typed JSON (a
-        // bare number, an object) written by devtools or version skew would
-        // otherwise throw deep inside consumers as an unhandled rejection.
+        // Reject valid JSON with the wrong shape before consumers assume an array.
         try {
           const v = JSON.parse(localStorage.getItem(GHOST_KEY));
           return Array.isArray(v)

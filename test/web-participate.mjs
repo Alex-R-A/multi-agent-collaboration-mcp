@@ -92,7 +92,7 @@ check(
 {
   // Both conjuncts are load-bearing: room_id alone consumes a membership-less
   // same-room replay, joined alone lets another room's join seed this marker.
-  // Source matching cannot prove the branch is reachable; Chrome covers that.
+  // Source matching cannot prove that the branch is reachable.
   const joinSource = viewerSection(
     "async function joinCurrent()",
     "async function leaveCurrent()",
