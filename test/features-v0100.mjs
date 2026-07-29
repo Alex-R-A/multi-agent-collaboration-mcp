@@ -315,7 +315,7 @@ await (async () => {
     m3.data,
   );
 
-  // M4: omitted wait keeps the v0.9 shape (no waited_ms/timed_out).
+  // M4: omitted wait adds no wait-only metadata.
   const m4 = await srv.call("catch_up", {});
   check(
     "M4 omitted wait_seconds adds no wait fields",
