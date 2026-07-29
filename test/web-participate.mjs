@@ -250,6 +250,39 @@ async function post(path, payload) {
   return { status: r.status, data: await r.json() };
 }
 
+function rawPost(path, body) {
+  return new Promise((resolve, reject) => {
+    const req = httpRequest(
+      {
+        host: "127.0.0.1",
+        port,
+        path,
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": Buffer.byteLength(body),
+        },
+      },
+      (res) => {
+        const chunks = [];
+        res.on("data", (chunk) => chunks.push(chunk));
+        res.on("end", () => {
+          try {
+            resolve({
+              status: res.statusCode,
+              data: JSON.parse(Buffer.concat(chunks).toString("utf8")),
+            });
+          } catch (error) {
+            reject(error);
+          }
+        });
+      },
+    );
+    req.on("error", reject);
+    req.end(body);
+  });
+}
+
 function freshJoin(room, baseName, operationId = randomUUID()) {
   return post("/api/join", {
     room,
@@ -344,12 +377,12 @@ try {
     { wrongBase, wrongRoom, payloadBindingCounts },
   );
 
-  // A valid, joined identity makes every old `name` request otherwise
-  // actionable. All five forms must still reject it without mutating state.
-  let legacyBefore;
+  // Requests that omit the current actor/form identity must fail without
+  // mutating a valid joined participant's state.
+  let actorlessBefore;
   {
     const raw = new Database(DB);
-    legacyBefore = {
+    actorlessBefore = {
       messages: raw
         .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = 1")
         .get().c,
@@ -361,23 +394,20 @@ try {
     };
     raw.close();
   }
-  const legacy = {
-    join: await post("/api/join", { room: 1, name: alexId }),
+  const actorless = {
+    join: await post("/api/join", { room: 1 }),
     post: await post("/api/post", {
       room: 1,
-      name: alexId,
-      body: "legacy write",
+      body: "actorless write",
     }),
-    read: await post("/api/read", { room: 1, name: alexId, seq: 2 }),
-    leave: await post("/api/leave", { room: 1, name: alexId }),
-    me: await fetch(
-      `${base}/api/me?room=1&name=${encodeURIComponent(alexId)}`,
-    ),
+    read: await post("/api/read", { room: 1, seq: 2 }),
+    leave: await post("/api/leave", { room: 1 }),
+    me: await fetch(`${base}/api/me?room=1`),
   };
-  let legacyAfter;
+  let actorlessAfter;
   {
     const raw = new Database(DB);
-    legacyAfter = {
+    actorlessAfter = {
       messages: raw
         .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = 1")
         .get().c,
@@ -390,23 +420,23 @@ try {
     raw.close();
   }
   check(
-    "legacy name participation forms are rejected without mutation",
-    legacy.join.status === 400 &&
-      legacy.post.status === 400 &&
-      legacy.read.status === 400 &&
-      legacy.leave.status === 400 &&
-      legacy.me.status === 400 &&
-      JSON.stringify(legacyAfter) === JSON.stringify(legacyBefore),
+    "actorless participation requests are rejected without mutation",
+    actorless.join.status === 400 &&
+      actorless.post.status === 400 &&
+      actorless.read.status === 400 &&
+      actorless.leave.status === 400 &&
+      actorless.me.status === 400 &&
+      JSON.stringify(actorlessAfter) === JSON.stringify(actorlessBefore),
     {
       statuses: {
-        join: legacy.join.status,
-        post: legacy.post.status,
-        read: legacy.read.status,
-        leave: legacy.leave.status,
-        me: legacy.me.status,
+        join: actorless.join.status,
+        post: actorless.post.status,
+        read: actorless.read.status,
+        leave: actorless.leave.status,
+        me: actorless.me.status,
       },
-      legacyBefore,
-      legacyAfter,
+      actorlessBefore,
+      actorlessAfter,
     },
   );
 
@@ -1071,6 +1101,75 @@ try {
       "a left web session cannot advance the durable marker",
       readMeg.status === 400 && megRow.last_read_seq === 0,
       { status: readMeg.status, marker: megRow.last_read_seq },
+    );
+  }
+
+  // The decoder must distinguish malformed bytes from a literal replacement
+  // character, and must preserve the pre-existing rejection of a leading BOM.
+  {
+    const raw = new Database(DB);
+    const before = raw
+      .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = 1")
+      .get().c;
+    raw.close();
+
+    const prefix = Buffer.from(
+      `{"room":1,"agent_id":${JSON.stringify(alexId)},"body":"bad `,
+    );
+    const suffix = Buffer.from('"}');
+    const malformed = await rawPost(
+      "/api/post",
+      Buffer.concat([prefix, Buffer.from([0xc3, 0x28]), suffix]),
+    );
+    const bom = await rawPost(
+      "/api/post",
+      Buffer.concat([
+        Buffer.from([0xef, 0xbb, 0xbf]),
+        Buffer.from(
+          JSON.stringify({
+            room: 1,
+            agent_id: alexId,
+            body: "BOM must remain rejected",
+          }),
+        ),
+      ]),
+    );
+    const replacementBody = "valid replacement \ufffd";
+    const replacement = await rawPost(
+      "/api/post",
+      Buffer.from(
+        JSON.stringify({
+          room: 1,
+          agent_id: alexId,
+          body: replacementBody,
+        }),
+      ),
+    );
+
+    const afterDb = new Database(DB);
+    const after = afterDb
+      .prepare("SELECT COUNT(*) AS c FROM messages WHERE room_id = 1")
+      .get().c;
+    const stored = afterDb
+      .prepare(
+        "SELECT COUNT(*) AS c FROM messages WHERE room_id = 1 AND agent_id = ? AND body = ?",
+      )
+      .get(alexId, replacementBody).c;
+    afterDb.close();
+    const alive = await fetch(base + "/api/rooms");
+
+    check(
+      "malformed UTF-8 and a leading BOM are rejected without storing messages",
+      malformed.status === 400 &&
+        bom.status === 400 &&
+        replacement.status === 200 &&
+        after === before + 1,
+      { malformed, bom, replacement, before, after },
+    );
+    check(
+      "valid UTF-8 U+FFFD is stored exactly and the server remains alive",
+      stored === 1 && alive.status === 200,
+      { stored, alive: alive.status },
     );
   }
 } finally {

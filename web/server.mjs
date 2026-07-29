@@ -370,17 +370,22 @@ function readBody(req, cap = 700_000) {
       }
       chunks.push(c);
     });
-    req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));
+    req.on("end", () => {
+      try {
+        // Keep Buffer.toString's BOM behavior. TextDecoder's default strips a
+        // leading BOM, which would widen the JSON accepted by this endpoint.
+        resolve(
+          new TextDecoder("utf-8", {
+            fatal: true,
+            ignoreBOM: true,
+          }).decode(Buffer.concat(chunks)),
+        );
+      } catch (error) {
+        reject(error);
+      }
+    });
     req.on("error", reject);
   });
-}
-
-function membership(d, roomId, agentId) {
-  return d
-    .prepare(
-      "SELECT left_at FROM memberships WHERE room_id = ? AND agent_id = ?",
-    )
-    .get(roomId, agentId);
 }
 
 // A web actor must be a HUMAN participant with a present membership.
@@ -393,11 +398,16 @@ function membership(d, roomId, agentId) {
 // populations are disjoint (a human id is server-allocated under the reserved
 // `human-` prefix, and identify_persona escapes any LLM slug that would land
 // there), so "is this row human" is a complete and stable answer.
-// Gates /api/post and /api/read.
-function webJoined(d, roomId, agentId) {
-  if (!humanRow(d, agentId)) return false;
-  const m = membership(d, roomId, agentId);
-  return !!m && m.left_at === null;
+// Gates /api/post and /api/read, and returns the cursor postMessage needs.
+function webMembership(d, roomId, agentId) {
+  return d
+    .prepare(
+      `SELECT m.last_read_seq
+         FROM memberships m
+         JOIN agents a ON a.id = m.agent_id AND a.is_human = 1
+        WHERE m.room_id = ? AND m.agent_id = ? AND m.left_at IS NULL`,
+    )
+    .get(roomId, agentId);
 }
 
 /** Insert-or-revive THIS membership, preserving cursor, role, and original
@@ -423,9 +433,8 @@ function upsertMembership(d, roomId, agentId) {
  * fresh:     { room, base_name, operation_id }  -> allocate human-<base>-<N>
  * canonical: { room, agent_id }                 -> rejoin an existing human
  *
- * There is no name alias and no fallback between them. The old single-field
- * form let the browser send whatever it had stored and let the server guess;
- * guessing is what allowed a typed name to land on someone else's row.
+ * There is no alias or fallback between them: a base name is allocation input,
+ * while an agent id names the canonical human who may rejoin.
  *
  * The allocation lookup comes FIRST, before the room check, so a committed
  * allocation whose room was later deleted still replays to the identity it
@@ -553,7 +562,8 @@ function postMessage(d, roomId, agentId, body, replyToSeq, mentions) {
   // reply reference cannot dangle against a racing prune, and a concurrent
   // delete_room yields this clean error instead of a raw FK failure.
   const tx = d.transaction(() => {
-    if (!webJoined(d, roomId, agentId)) {
+    const member = webMembership(d, roomId, agentId);
+    if (!member) {
       return { error: "join the room first (POST /api/join)" };
     }
     let replyToAgent = null;
@@ -568,11 +578,7 @@ function postMessage(d, roomId, agentId, body, replyToSeq, mentions) {
       }
       replyToAgent = parent.agent_id;
     }
-    const { last_read_seq: from } = d
-      .prepare(
-        "SELECT last_read_seq FROM memberships WHERE room_id = ? AND agent_id = ?",
-      )
-      .get(roomId, agentId);
+    const from = member.last_read_seq;
     // A backward "latest peer" search becomes quadratic when one unread peer is
     // followed by a growing self tail: every post re-walks that tail. Probe
     // forward instead, stopping at the first peer. If one exists, conservatively
@@ -620,7 +626,7 @@ function markRead(d, roomId, agentId, seq) {
     // Gate on the live WEB session, not bare membership: a read landing after
     // this web session left (a stale tab, an in-flight auto-mark) advanced
     // the monotonic durable marker over messages nobody had seen.
-    if (!webJoined(d, roomId, agentId)) {
+    if (!webMembership(d, roomId, agentId)) {
       return { error: "join the room first (POST /api/join)" };
     }
     // Clamp to the room's latest seq (parity with the MCP server's mark_read):
@@ -832,15 +838,8 @@ async function handlePost(url, req, res) {
   if (url.pathname === "/api/join") {
     // FORM BY FIELD PRESENCE, not by value. A key present with null or the
     // wrong type fails the form it selected rather than falling through to the
-    // other one; silent fallback is how the old single-field join let a
-    // stored value mean whatever the server found convenient.
+    // other one.
     const has = (k) => Object.prototype.hasOwnProperty.call(payload, k);
-    if (has("name")) {
-      return sendJson(res, 400, {
-        error:
-          "`name` is not accepted: send { room, base_name, operation_id } to allocate a new identity, or { room, agent_id } to rejoin an existing one",
-      });
-    }
     const wantsFresh = has("base_name") || has("operation_id");
     const wantsCanonical = has("agent_id");
     if (wantsFresh && wantsCanonical) {
@@ -1109,26 +1108,20 @@ const server = createServer(async (req, res) => {
         1,
         Math.min(Math.floor(Number(url.searchParams.get("limit"))) || 30, 100),
       );
-      try {
-        const result = searchMessages(roomId, q, limit);
-        if (result === null)
-          return sendJson(res, 200, {
-            matches: [],
-            error: dbUnavailableError(),
-          });
-        if (result.bad_query) {
-          return sendJson(res, 400, { error: result.bad_query });
-        }
+      const result = searchMessages(roomId, q, limit);
+      if (result === null)
         return sendJson(res, 200, {
-          matches: result.rows,
-          q,
-          ...(result.trimmed ? { trimmed: true } : {}),
+          matches: [],
+          error: dbUnavailableError(),
         });
-      } catch (e) {
-        return sendJson(res, unexpectedErrorStatus(e), {
-          error: String((e && e.message) || e),
-        });
+      if (result.bad_query) {
+        return sendJson(res, 400, { error: result.bad_query });
       }
+      return sendJson(res, 200, {
+        matches: result.rows,
+        q,
+        ...(result.trimmed ? { trimmed: true } : {}),
+      });
     }
     res.writeHead(404, { "Content-Type": "text/plain" });
     res.end("not found");
