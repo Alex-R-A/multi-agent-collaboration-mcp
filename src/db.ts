@@ -762,9 +762,7 @@ export class ChatStore {
     }
     this.db.pragma("busy_timeout = 5000");
     this.db.pragma("foreign_keys = ON");
-    // One process initializes the schema at a time. Without an IMMEDIATE
-    // transaction, concurrent MCP startups could all find the FTS index
-    // missing and each repeat a full-corpus rebuild.
+    // Initialize the current schema atomically and serialize concurrent starts.
       this.db.transaction(() => this.initializeSchema()).immediate();
     } catch (error) {
       // A constructor that throws has no caller-visible instance on which to
@@ -1144,27 +1142,6 @@ export class ChatStore {
           VALUES ('delete', old.id, old.body);
       END;
     `);
-    // Rebuild decision by INDEX CONSISTENCY, not table existence: a process
-    // dying between the CREATE above and the rebuild below leaves a database
-    // where every later start sees the table and skips the rebuild forever,
-    // making everything written before the crash permanently invisible to
-    // search. The empty/nonempty mismatch repairs that window in O(1), with no
-    // corpus scan. The index row count MUST come from the messages_fts_docsize
-    // shadow table: with external content, COUNT(*) on the virtual table itself
-    // reads the content table and always matches. BOTH counts are read in ONE
-    // statement (a single consistent snapshot): two separate SELECTs could
-    // straddle a concurrent insert -- messages counted pre-insert, fts counted
-    // post-trigger -- making an already-inconsistent {2,1} file read as {2,2}
-    // and skip the rebuild it actually needed.
-    const { hasMessages, hasFtsRows } = this.db
-      .prepare(
-        `SELECT EXISTS(SELECT 1 FROM messages LIMIT 1) AS hasMessages,
-                EXISTS(SELECT 1 FROM messages_fts_docsize LIMIT 1) AS hasFtsRows`,
-      )
-      .get() as { hasMessages: number; hasFtsRows: number };
-    if (hasMessages !== hasFtsRows) {
-      this.db.exec("INSERT INTO messages_fts(messages_fts) VALUES('rebuild')");
-    }
   }
 
   // --- rooms -------------------------------------------------------------

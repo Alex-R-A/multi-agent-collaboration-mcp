@@ -1,8 +1,7 @@
 // Regression tests for the self-review round (v0.6.4):
 // - sticky read positions: a rejoin must not destroy the persona's read
 //   position for that room (driven over real MCP stdio JSON-RPC)
-// - FTS index self-heal: a crash between CREATE and rebuild left search
-//   permanently and silently broken for pre-FTS messages
+// - FTS search survives closing and reopening the current database
 // - surrogate-safe truncation: previews and offset paging never emit a lone
 //   surrogate; offset walks still reassemble bodies exactly
 // - truthful byte_limited on a lone oversized head row
@@ -13,7 +12,6 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import Database from "better-sqlite3";
 import { ChatStore } from "../dist/db.js";
 import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
@@ -23,9 +21,9 @@ const check = (n, c, x) => {
   if (!c) failures++;
 };
 
-// --- FTS self-heal after the historical crash window --------------------------
+// --- FTS persists across a current database reopen -----------------------------
 {
-  const dir = mkdtempSync(join(tmpdir(), "aichat-ftsheal-"));
+  const dir = mkdtempSync(join(tmpdir(), "aichat-fts-reopen-"));
   const DB = join(dir, "t.db");
   {
     const s = new ChatStore(DB);
@@ -35,18 +33,12 @@ const check = (n, c, x) => {
     s.postMessage(r, "b", "needle in a haystack", "text", null, null, null);
     s.close();
   }
-  // Damage: index emptied while the table exists (what a crash between
-  // CREATE VIRTUAL TABLE and the rebuild left behind).
-  {
-    const raw = new Database(DB);
-    raw.exec("INSERT INTO messages_fts(messages_fts) VALUES('delete-all')");
-    raw.close();
-  }
-  const s = new ChatStore(DB); // schema init must detect and rebuild
+  const s = new ChatStore(DB);
+  const search = s.searchMessages(1, "needle", 10);
   check(
-    "search self-heals on reopen after index damage",
-    s.searchMessages(1, "needle", 10).matches.length === 1,
-    s.searchMessages(1, "needle", 10),
+    "search index persists across a current database reopen",
+    search.matches.length === 1,
+    search,
   );
   s.close();
   rmSync(dir, { recursive: true, force: true });
