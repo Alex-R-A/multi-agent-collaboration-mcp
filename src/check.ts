@@ -30,8 +30,11 @@ type Args = {
 
 function fail(msg: string): never {
   // This CLI exits immediately after one small status line. A synchronous fd
-  // write prevents piped output from being truncated by process.exit().
-  writeFileSync(2, `agent-chat-check: ${msg}\n`);
+  // write prevents piped output from being truncated by process.exit(). If
+  // stderr itself is broken, preserve the documented error exit code.
+  try {
+    writeFileSync(2, `agent-chat-check: ${msg}\n`);
+  } catch {}
   process.exit(2);
 }
 
@@ -128,12 +131,6 @@ if (args.since !== undefined && args.room === undefined) {
 }
 if (args.mentionsOnly && !args.agent) {
   fail("--mentions-only requires --agent");
-}
-if (
-  args.since !== undefined &&
-  (!Number.isInteger(args.since) || args.since < 0)
-) {
-  fail("--since must be a non-negative integer");
 }
 
 const path = resolveDbPath(args.db);

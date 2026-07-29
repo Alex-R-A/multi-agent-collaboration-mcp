@@ -142,6 +142,50 @@ function probe(args) {
   );
   const ghost = probe(["--agent", "nobody"]);
   check("unknown agent is an error (exit 2), not a quiet room", ghost.code === 2, ghost);
+  const brokenStderr = spawnSync(
+    process.execPath,
+    [
+      "--input-type=module",
+      "--eval",
+      `
+        import fs from "node:fs";
+        import { syncBuiltinESMExports } from "node:module";
+        const realWrite = fs.writeFileSync;
+        fs.writeFileSync = (fd, ...args) => {
+          if (fd === 2) {
+            const error = new Error("write EPIPE");
+            error.code = "EPIPE";
+            throw error;
+          }
+          return realWrite(fd, ...args);
+        };
+        syncBuiltinESMExports();
+        process.argv = [
+          process.execPath,
+          process.env.TEST_CHECK_MODULE,
+          "--db",
+          process.env.TEST_CHECK_DB,
+          "--agent",
+          "nobody",
+        ];
+        await import(process.env.TEST_CHECK_MODULE);
+      `,
+    ],
+    {
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        TEST_CHECK_DB: DB,
+        TEST_CHECK_MODULE: new URL("../dist/check.js", import.meta.url).href,
+      },
+      timeout: 5_000,
+    },
+  );
+  check(
+    "a broken stderr preserves the checker's error exit code",
+    brokenStderr.status === 2,
+    { status: brokenStderr.status, signal: brokenStderr.signal },
+  );
   const sinceNoRoom = probe(["--agent", "hero", "--since", "3"]);
   check("--since without --room is rejected", sinceNoRoom.code === 2, sinceNoRoom);
   const scoped = probe(["--room", "beta", "--agent", "hero"]);
