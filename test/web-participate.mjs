@@ -106,6 +106,19 @@ check(
   );
 }
 {
+  const removeGhostSource = viewerSection(
+    "function removeGhost(",
+    "let ghostRetryActive",
+  );
+  check(
+    "ghost removal filters the current ledger before saving",
+    removeGhostSource.includes("return saveGhosts(") &&
+      removeGhostSource.includes("loadGhosts().filter(") &&
+      removeGhostSource.includes(
+        "!(g.room === room && g.agent_id === agentId)",
+      ),
+    { section: removeGhostSource.length },
+  );
   const leaveSource = viewerSection(
     "async function leaveCurrent()",
     "async function sendMessage()",
@@ -113,7 +126,9 @@ check(
   const ledgerWrite = leaveSource.indexOf("if (!saveGhosts(ghosts))");
   const mapWrite = leaveSource.indexOf("if (!saveJoined(joined))");
   const serverLeave = leaveSource.indexOf('await postJson("/api/leave"');
-  const ledgerClear = leaveSource.indexOf("if (!saveGhosts(kept))");
+  const ledgerClear = leaveSource.indexOf(
+    "if (!removeGhost(room.id, agentId))",
+  );
   check(
     "explicit leave persists a typed ghost and checked local state before the server call",
     leaveSource.includes("explicit_leave: true") &&
@@ -149,7 +164,7 @@ check(
     retrySource.includes("!g.explicit_leave") &&
       retrySource.includes("if (g.explicit_leave)") &&
       retrySource.includes("if (!saveJoined(joined))") &&
-      retrySource.includes("!saveGhosts(") &&
+      retrySource.includes("!removeGhost(") &&
       retrySource.includes("error?.httpStatus !== 400"),
     null,
   );
@@ -165,7 +180,7 @@ check(
   const serverJoin = joinSource.indexOf('j = await postJson("/api/join"');
   const mapWrite = joinSource.indexOf("saved = saveJoined(joined)");
   const rollbackClear = joinSource.indexOf(
-    "const kept = loadGhosts().filter",
+    "removeGhost(room.id, current.agent_id)",
     mapWrite,
   );
   check(

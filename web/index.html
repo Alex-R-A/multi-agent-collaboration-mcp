@@ -1455,6 +1455,15 @@
           return false;
         }
       }
+      // Always filter the current ledger: callers may have awaited network
+      // work since they last loaded it, while another tab added an entry.
+      function removeGhost(room, agentId) {
+        return saveGhosts(
+          loadGhosts().filter(
+            (g) => !(g.room === room && g.agent_id === agentId),
+          ),
+        );
+      }
       let ghostRetryActive = false;
       async function retryGhosts() {
         if (ghostRetryActive) return; // overlapping sweeps would race the ledger
@@ -1479,16 +1488,7 @@
                 !g.explicit_leave &&
                 loadJoined()[String(g.room)] === g.agent_id
               ) {
-                if (
-                  !saveGhosts(
-                    loadGhosts().filter(
-                      (x) =>
-                        !(x.room === g.room && x.agent_id === g.agent_id),
-                    ),
-                  )
-                ) {
-                  return;
-                }
+                if (!removeGhost(g.room, g.agent_id)) return;
                 continue;
               }
               try {
@@ -1520,19 +1520,7 @@
                   }
                 }
               }
-              // Remove exactly this entry from the CURRENT ledger: a wholesale
-              // save of a pre-loop snapshot would erase entries recorded while
-              // these retries were in flight.
-              if (
-                !saveGhosts(
-                  loadGhosts().filter(
-                    (x) =>
-                      !(x.room === g.room && x.agent_id === g.agent_id),
-                  ),
-                )
-              ) {
-                return;
-              }
+              if (!removeGhost(g.room, g.agent_id)) return;
             }
           });
           // localStorage notifies only OTHER tabs. When this tab recovered the
@@ -2697,12 +2685,7 @@
           } catch {
             continue;
           }
-          saveGhosts(
-            loadGhosts().filter(
-              (g) =>
-                !(g.room === old.room && g.agent_id === old.agent_id),
-            ),
-          );
+          removeGhost(old.room, old.agent_id);
         }
         return j;
       }
@@ -2872,16 +2855,9 @@
               joined[String(room.id)] = current.agent_id;
               saved = saveJoined(joined);
               if (saved) {
-                const kept = loadGhosts().filter(
-                  (g) =>
-                    !(
-                      g.room === room.id &&
-                      g.agent_id === current.agent_id
-                    ),
-                );
                 // Safe if this write fails: retryGhosts sees the matching map
                 // and removes the non-explicit record without leaving.
-                saveGhosts(kept);
+                removeGhost(room.id, current.agent_id);
               }
             } else {
               if (!requestedBase) {
@@ -3010,10 +2986,7 @@
               agent_id: agentId,
             });
 
-            const kept = loadGhosts().filter(
-              (g) => !(g.room === room.id && g.agent_id === agentId),
-            );
-            if (!saveGhosts(kept)) {
+            if (!removeGhost(room.id, agentId)) {
               throw new Error(
                 "the room was left, but cleanup state could not be saved; free browser storage and retry",
               );
