@@ -130,6 +130,29 @@ await (async () => {
     ),
     null,
   );
+  // Exact room identifiers reject edge whitespace instead of normalizing it.
+  const countRooms = () =>
+    s.db.prepare("SELECT COUNT(*) AS c FROM rooms").get().c;
+  const roomsBefore = countRooms();
+  const badNames = ["", " ", "\t", " leading", "trailing\n"];
+  const rejections = badNames.map((n) => threw(() => mkRoom(s, n, null, null)));
+  check(
+    "#3 store rejects empty, blank, and edge-whitespace room names",
+    rejections.every((m) => /non-empty.*leading or trailing/.test(m)) &&
+      countRooms() === roomsBefore,
+    { rejections, roomsBefore, roomsAfter: countRooms() },
+  );
+  // Prove only the edges are illegal.
+  const spaced = mkRoom(s, "inner spaces kept", null, null);
+  check(
+    "#3 internal spaces remain legal and are stored byte-exact",
+    spaced.name === "inner spaces kept" &&
+      s.db
+        .prepare("SELECT COUNT(*) AS c FROM rooms WHERE name = ?")
+        .get("inner spaces kept").c === 1 &&
+      countRooms() === roomsBefore + 1,
+    spaced,
+  );
   // At-cap values still pass (the MCP schema allows exactly these lengths).
   const ok = s.claimResource(r, "k".repeat(500), "a", 900, null);
   check("#3 at-cap 500-char key is still granted", ok.granted === true, ok);

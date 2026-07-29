@@ -1193,6 +1193,12 @@ export class ChatStore {
   ): RoomRow {
     assertStorable(name, "room name");
     assertMaxLen(name, "room name", 200);
+    // Room names are exact identifiers, so reject edge whitespace, do not trim.
+    if (name.length === 0 || name !== name.trim()) {
+      throw new Error(
+        "room name must be non-empty with no leading or trailing whitespace",
+      );
+    }
     assertStorable(description, "room description");
     assertMaxLen(description, "room description", 2000);
     assertStorable(pinned, "room pinned intro");
