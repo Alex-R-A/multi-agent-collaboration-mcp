@@ -636,7 +636,7 @@ function messageCols(bodyCap: number): string {
           length(g.body) AS body_cp,
           g.mentions, g.reply_to_seq,
           datetime(g.created_at, 'localtime') AS created_local,
-          CAST(strftime('%s', g.created_at) AS INTEGER) AS created_unix,
+          unixepoch(g.created_at) AS created_unix,
           g.supersedes_seq,
           (SELECT s.seq FROM messages s
             WHERE s.room_id = g.room_id AND s.supersedes_seq = g.seq
@@ -1238,10 +1238,10 @@ export class ChatStore {
   currentTime(): { unix: number; at: string; iso: string } {
     const r = this.db
       .prepare(
-        `SELECT CAST(strftime('%s','now') AS INTEGER) AS unix,
+        `SELECT unixepoch('now') AS unix,
                 datetime('now','localtime') AS at,
-                CAST(strftime('%s', datetime('now','localtime')) AS INTEGER)
-                  - CAST(strftime('%s','now') AS INTEGER) AS offset_seconds`,
+                unixepoch(datetime('now','localtime'))
+                  - unixepoch('now') AS offset_seconds`,
       )
       .get() as { unix: number; at: string; offset_seconds: number };
     // ISO 8601 local time with explicit offset, e.g. 2026-07-08T03:35:13-04:00.
@@ -2103,7 +2103,7 @@ export class ChatStore {
                          CASE WHEN length(a.description) > ${PREVIEW} THEN 1 ELSE 0 END AS description_cut,
                          m.joined_at, m.rowid AS _rid,
                          m.last_read_seq, m.last_seen, m.left_at,
-                         (strftime('%s','now') - strftime('%s', m.last_seen)) AS idle_seconds,
+                         (unixepoch('now') - unixepoch(m.last_seen)) AS idle_seconds,
                          EXISTS(SELECT 1 FROM wait_leases wl
                                 WHERE wl.room_id = m.room_id AND wl.agent_id = m.agent_id
                                   AND wl.expires_at > datetime('now')) AS watching
@@ -2938,11 +2938,12 @@ export class ChatStore {
     // but returning it is the only progress-safe interpretation of SQLite's
     // one-CODEPOINT window; shrinking it to "" made next_offset repeat forever.
     const firstCodepointUnits = (chunk.codePointAt(0) ?? 0) > 0xffff ? 2 : 1;
-    while (
-      chunk.length > firstCodepointUnits &&
-      JSON.stringify(chunk).length - 2 > cap
-    ) {
-      const ratio = cap / (JSON.stringify(chunk).length - 2);
+    // Serializing is the expensive step here, so measure each chunk once and
+    // re-measure only after cutting it.
+    while (chunk.length > firstCodepointUnits) {
+      const serialized = JSON.stringify(chunk).length - 2;
+      if (serialized <= cap) break;
+      const ratio = cap / serialized;
       chunk = safeCut(
         chunk,
         Math.min(chunk.length - 1, Math.max(1, Math.floor(chunk.length * ratio))),
@@ -2994,7 +2995,7 @@ export class ChatStore {
     const rows = this.db
       .prepare(
         `SELECT agent_id, last_read_seq, left_at,
-                (strftime('%s','now') - strftime('%s', last_seen)) AS idle_seconds,
+                (unixepoch('now') - unixepoch(last_seen)) AS idle_seconds,
                 EXISTS(SELECT 1 FROM wait_leases wl
                        WHERE wl.room_id = memberships.room_id
                          AND wl.agent_id = memberships.agent_id
@@ -3102,8 +3103,8 @@ export class ChatStore {
          SELECT mb.agent_id AS agent_id, mb.room_id AS room_id, r.name AS room_name,
                 COUNT(*) AS directed_unread,
                 MIN(g.seq) AS oldest_seq,
-                MIN(CAST(strftime('%s', g.created_at) AS INTEGER)) AS oldest_unix,
-                (strftime('%s','now') - strftime('%s', mb.last_seen)) AS idle_seconds,
+                MIN(unixepoch(g.created_at)) AS oldest_unix,
+                (unixepoch('now') - unixepoch(mb.last_seen)) AS idle_seconds,
                 mb.last_read_seq AS last_read_seq
          FROM memberships mb
          JOIN rooms r ON r.id = mb.room_id
@@ -4158,7 +4159,7 @@ export class ChatStore {
         .prepare(
           `SELECT agent_id, note,
                   strftime('%Y-%m-%dT%H:%M:%SZ', expires_at) AS expires_at,
-                  (strftime('%s', expires_at) - strftime('%s', 'now')) AS remaining
+                  (unixepoch(expires_at) - unixepoch('now')) AS remaining
            FROM claims WHERE room_id = ? AND key = ?`,
         )
         .get(roomId, key) as
@@ -4218,7 +4219,7 @@ export class ChatStore {
       const row = this.db
         .prepare(
           `SELECT agent_id,
-                  (strftime('%s', expires_at) - strftime('%s', 'now')) AS remaining
+                  (unixepoch(expires_at) - unixepoch('now')) AS remaining
            FROM claims WHERE room_id = ? AND key = ?`,
         )
         .get(roomId, key) as
@@ -4282,7 +4283,7 @@ export class ChatStore {
                   substr(note, 1, ${PREVIEW}) AS note,
                   CASE WHEN length(note) > ${PREVIEW} THEN 1 ELSE 0 END AS note_cut,
                   strftime('%Y-%m-%dT%H:%M:%SZ', expires_at) AS expires_at,
-                  (strftime('%s', expires_at) - strftime('%s', 'now')) AS expires_in_seconds
+                  (unixepoch(expires_at) - unixepoch('now')) AS expires_in_seconds
            FROM claims WHERE room_id = ? AND key > ? ORDER BY key LIMIT ?`,
         )
         .all(roomId, afterKey, lim + 1) as {

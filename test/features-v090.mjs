@@ -181,7 +181,17 @@ const check = (n, c, x) => {
   s.postMessage(r1, "w1", "w1 speaks", "text", null, null, null);
   const w1msg = s.catchUp(r1, "boss", 50, undefined, 100000); // boss reads so boss has no pending
   // catch_up excludes boss's own post, so w1's message is the only row.
-  s.postMessage(r1, "boss", "re: w1", "text", null, w1msg.messages[0].seq, null);
+  const reply = s.postMessage(r1, "boss", "re: w1", "text", null, w1msg.messages[0].seq, null);
+  // Lexical order is the REVERSE of chronological order for these two stamps:
+  // ' ' (0x20) sorts before 'T' (0x54), so 03:04 is first as text while 01:00
+  // is genuinely older. MIN(unixepoch(created_at)) gives 1577926800;
+  // unixepoch(MIN(created_at)) would give 1577934245. The older stamp goes on
+  // the LATER seq, so oldest_unix cannot be read off oldest_seq's row either.
+  const stamp = s.db.prepare(
+    "UPDATE messages SET created_at = ? WHERE room_id = ? AND seq = ?",
+  );
+  stamp.run("2020-01-02 03:04:05", r1, first.seq);
+  stamp.run("2020-01-02T01:00:00Z", r1, reply.seq);
 
   let view = s.pendingDirected(50);
   check(
@@ -200,6 +210,11 @@ const check = (n, c, x) => {
     "A4 oldest_seq points at the earliest pending directed message",
     w1row.oldest_seq === first.seq,
     w1row,
+  );
+  check(
+    "A4 oldest_unix is the chronological minimum, not the lexical one",
+    w1row.oldest_unix === 1577926800,
+    { oldest_unix: w1row.oldest_unix, oldest_seq: w1row.oldest_seq },
   );
   check("A4 truncation flag with limit 1", s.pendingDirected(1).truncated === true, null);
 
