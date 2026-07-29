@@ -711,7 +711,8 @@ function handoffBuild(): Record<string, unknown> {
           reconnect_guidance:
             "a newer build is on disk than this server is running. Reconnecting " +
             "loads it; the next identify_persona call creates a new identity. " +
-            "The stdio server does not hot-reload.",
+            "Any poller_cmd or membership state already returned belongs to the " +
+            "old identity. The stdio server does not hot-reload.",
         }
       : {}),
   };
