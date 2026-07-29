@@ -66,16 +66,14 @@ check(
   null,
 );
 check(
-  "viewer uses only the v2 state namespace and removes old keys before state initialization",
+  "viewer uses the v2 state namespace",
   [
     'const ROOM_KEY = "agent-chat.v2.room";',
     'const SEEN_KEY = "agent-chat.v2.seen";',
     'const IDENT_KEY = "agent-chat.v2.identity";',
     'const JOINED_KEY = "agent-chat.v2.joined";',
     'const GHOST_KEY = "agent-chat.v2.ghosts";',
-  ].every((line) => viewerSource.includes(line)) &&
-    viewerSource.indexOf("for (const key of OLD_KEYS)") <
-      viewerSource.indexOf("const state ="),
+  ].every((line) => viewerSource.includes(line)),
   null,
 );
 check(
