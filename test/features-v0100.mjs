@@ -8,7 +8,7 @@
 //  M2 one-call handoff: wait -> peer posts -> pending call returns it;
 //     watching:true while open, false after
 //  M3 timeout carries timed_out/call_again/waited_ms/rooms_with_unread
-//  M4 wait_seconds omitted keeps the exact v0.9 response shape
+//  M4 wait_seconds omitted adds no wait-only response fields
 //  M4b concurrent waits in one process keep independent leases
 //  M4c named-room waits heartbeat the captured room, not the active room
 //  M7 a concurrent read consumes mid-wait: no stale refire, later message delivered
