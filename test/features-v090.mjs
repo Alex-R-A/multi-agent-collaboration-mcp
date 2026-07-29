@@ -140,6 +140,65 @@ const check = (n, c, x) => {
   s.close();
 }
 
+// --- A2c: shared room-summary fitting, both consumers ---------------------------
+// catch_up's rooms_with_unread and my_mentions' by_room fit the same rows with
+// the same helper. One room only, so whole-row dropping cannot apply and the
+// name-halving path is the only way to fit. Asserting size alone would pass if
+// the row vanished, so each response must still carry the room_id and a
+// nonempty, shortened name, and each must raise its OWN truncation flag.
+{
+  const s = new ChatStore(":memory:");
+  mkAgent(s, "a");
+  mkAgent(s, "b");
+  const home = mkRoom(s, "home", null, null).id;
+  s.joinRoom(home, "a", {});
+  // Legal and control-heavy: only NUL and lone surrogates are rejected, so
+  // each escapes to six characters on the wire, so the 200-char cap (the
+  // longest legal room name) still serializes to roughly 1200.
+  const loud = "\u0001".repeat(200);
+  const noisy = mkRoom(s, loud, null, null).id;
+  s.joinRoom(noisy, "a", {});
+  s.joinRoom(noisy, "b", {});
+  s.postMessage(noisy, "b", "ping", "text", ["a"], null, null);
+
+  const BUDGET = 1200;
+  const cu = s.catchUp(home, "a", 50, undefined, BUDGET, {});
+  const mm = s.myMentions("a", 50, undefined, BUDGET);
+  const cuRoom = cu.rooms_with_unread?.[0];
+  const mmRoom = mm.by_room?.[0];
+  check(
+    "A2c catch_up fits the whole response and keeps a shortened named row",
+    JSON.stringify(cu).length <= BUDGET &&
+      cu.rooms_with_unread.length === 1 &&
+      cuRoom.room_id === noisy &&
+      cuRoom.name.length > 0 &&
+      cuRoom.name.length < loud.length &&
+      cu.rooms_with_unread_truncated === true,
+    {
+      size: JSON.stringify(cu).length,
+      n: cu.rooms_with_unread?.length,
+      name: cuRoom?.name.length,
+      flag: cu.rooms_with_unread_truncated,
+    },
+  );
+  check(
+    "A2c my_mentions fits the whole response and keeps a shortened named row",
+    JSON.stringify(mm).length <= BUDGET &&
+      mm.by_room.length === 1 &&
+      mmRoom.room_id === noisy &&
+      mmRoom.name.length > 0 &&
+      mmRoom.name.length < loud.length &&
+      mm.by_room_truncated === true,
+    {
+      size: JSON.stringify(mm).length,
+      n: mm.by_room?.length,
+      name: mmRoom?.name.length,
+      flag: mm.by_room_truncated,
+    },
+  );
+  s.close();
+}
+
 // --- A3: marker_behind ---------------------------------------------------------
 {
   const s = new ChatStore(":memory:");

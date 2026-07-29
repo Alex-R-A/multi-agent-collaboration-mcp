@@ -394,6 +394,33 @@ function fitRows<T>(rows: T[], budget: number): { rows: T[]; sizeTrimmed: boolea
   return { rows: kept, sizeTrimmed };
 }
 
+/**
+ * Fit an unread-room summary to a byte budget: drop whole rows with fitRows,
+ * then, because fitRows always keeps one, halve a lone survivor's `name` until
+ * the MEASURED serialized size fits. A fixed code-unit cut under-counts JSON
+ * escaping, so a control-heavy name slipped past it; room_id stays the stable
+ * key, and the caller keeps its own reason-for-truncation flag separate.
+ */
+function fitRoomSummary<T extends { name: string }>(
+  rooms: T[],
+  budget: number,
+): { rooms: T[]; sizeTrimmed: boolean } {
+  const fitted = fitRows(rooms, budget);
+  const kept = fitted.rows;
+  if (kept.length === 1 && JSON.stringify(kept).length > budget) {
+    let entry = { ...kept[0] };
+    while (JSON.stringify([entry]).length > budget && entry.name.length > 0) {
+      entry = {
+        ...entry,
+        name: safeCut(entry.name, Math.floor(entry.name.length / 2)),
+      };
+    }
+    kept[0] = entry;
+    return { rooms: kept, sizeTrimmed: true };
+  }
+  return { rooms: kept, sizeTrimmed: fitted.sizeTrimmed };
+}
+
 export type RoomRow = {
   id: number;
   name: string;
@@ -3627,24 +3654,12 @@ export class ChatStore {
           (priorityOnly
             ? PRIORITY_CATCH_UP_SUMMARY_ENVELOPE
             : CATCH_UP_SUMMARY_ENVELOPE);
-        const fitted = fitRows(fetched.rooms, roomBudget);
-        const rooms = fitted.rows;
-        let truncated = fetched.truncated || fitted.sizeTrimmed;
-        if (rooms.length === 1 && JSON.stringify(rooms).length > roomBudget) {
-          let entry = { ...rooms[0] };
-          while (
-            JSON.stringify([entry]).length > roomBudget &&
-            entry.name.length > 0
-          ) {
-            entry = {
-              ...entry,
-              name: safeCut(entry.name, Math.floor(entry.name.length / 2)),
-            };
-          }
-          rooms[0] = entry;
-          truncated = true;
-        }
-        summary = { rooms, truncated };
+        const fitted = fitRoomSummary(fetched.rooms, roomBudget);
+        summary = {
+          rooms: fitted.rooms,
+          // fetched.truncated is the SQL-side drop; sizeTrimmed is the fit.
+          truncated: fetched.truncated || fitted.sizeTrimmed,
+        };
       }
       return {
         messages,
@@ -3758,35 +3773,13 @@ export class ChatStore {
       // lives in unreadByRoom, shared with catch_up's rooms_with_unread.
       const BY_ROOM_MAX = 4000;
       const byRoomFetch = this.unreadByRoom(agentId, BY_ROOM_MAX);
-      let byRoom = byRoomFetch.rooms;
       // Rooms past BY_ROOM_MAX (the least-directed) were dropped -- flag it.
       const roomLimitHit = byRoomFetch.truncated;
       const roomBudget = Math.floor(maxBytes / 3);
-      // Trim off the end (least-directed rooms, already SQL-ordered) with the
-      // LINEAR fitRows, not an O(n^2) re-serialize-per-pop loop. It always keeps
-      // at least one row, so the single-entry name-halving below still handles a
-      // lone oversized room.
-      const trimmed = fitRows(byRoom, roomBudget);
-      byRoom = trimmed.rows;
-      let by_room_truncated = trimmed.sizeTrimmed || roomLimitHit;
-      // A single long-named room can still overflow a small budget: halve
-      // the display name until the MEASURED serialized size fits (a fixed
-      // code-unit cut under-counts JSON escaping, so a control-heavy name
-      // slipped past it); room_id remains the stable key.
-      if (byRoom.length === 1 && JSON.stringify(byRoom).length > roomBudget) {
-        let entry = { ...byRoom[0] };
-        while (
-          JSON.stringify([entry]).length > roomBudget &&
-          entry.name.length > 0
-        ) {
-          entry = {
-            ...entry,
-            name: safeCut(entry.name, Math.floor(entry.name.length / 2)),
-          };
-        }
-        byRoom[0] = entry;
-        by_room_truncated = true;
-      }
+      // Rows arrive most-directed first, so fitting drops the least-directed.
+      const trimmed = fitRoomSummary(byRoomFetch.rooms, roomBudget);
+      const byRoom = trimmed.rooms;
+      const by_room_truncated = trimmed.sizeTrimmed || roomLimitHit;
 
       // Joint budget with an exact envelope: messages get what by_room and
       // the fixed response fields leave, floored at the stub allowance
