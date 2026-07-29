@@ -89,6 +89,9 @@ function getDb() {
 // ROOMS_MAX are listed. Exact message
 // counts are deliberately absent: recounting history for decorative UI text is
 // recurring work with no bearing on room selection.
+//
+// last_activity displays and sorts the latest-seq row. last_seq identifies new
+// activity because timestamps collide within a second and seq is room-local.
 const ROOM_DESC_SNIPPET = 200;
 const ROOMS_MAX = 1000;
 function listRooms() {
@@ -100,7 +103,8 @@ function listRooms() {
               substr(r.description, 1, ${ROOM_DESC_SNIPPET}) AS description,
               (SELECT COUNT(*) FROM memberships m WHERE m.room_id = r.id AND m.left_at IS NULL) AS members,
               (SELECT created_at FROM messages g WHERE g.room_id = r.id
-               ORDER BY seq DESC LIMIT 1) AS last_activity
+               ORDER BY seq DESC LIMIT 1) AS last_activity,
+              (SELECT MAX(seq) FROM messages g WHERE g.room_id = r.id) AS last_seq
        FROM rooms r ORDER BY last_activity DESC, r.id DESC LIMIT ${ROOMS_MAX}`,
     )
     .all();
@@ -121,7 +125,8 @@ function getRoomDetail(roomId) {
                 (SELECT COUNT(*) FROM memberships m
                  WHERE m.room_id = r.id AND m.left_at IS NULL) AS members,
                 (SELECT created_at FROM messages g WHERE g.room_id = r.id
-                 ORDER BY seq DESC LIMIT 1) AS last_activity
+                 ORDER BY seq DESC LIMIT 1) AS last_activity,
+                (SELECT MAX(seq) FROM messages g WHERE g.room_id = r.id) AS last_seq
          FROM rooms r WHERE r.id = ?`,
       )
       .get(roomId) ?? null
@@ -151,9 +156,9 @@ const MSG_COLS = `g.seq, g.agent_id AS "from",
               g.format, g.priority,
               g.mentions, g.reply_to_seq, g.reply_to_agent, g.supersedes_seq,
               g.created_at AS at,
-              (SELECT s.seq FROM messages s
-                WHERE s.room_id = g.room_id AND s.supersedes_seq = g.seq
-                ORDER BY s.seq DESC LIMIT 1) AS superseded_by`;
+              (SELECT MAX(s.seq)
+                 FROM messages s INDEXED BY idx_messages_supersedes
+                WHERE s.room_id = g.room_id AND s.supersedes_seq = g.seq) AS superseded_by`;
 
 // Aggregate SERIALIZED budget per response: the per-row cap alone let a 400-row
 // page of legal 100k bodies serialize to ~40 MB, and counting only body.length

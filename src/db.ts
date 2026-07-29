@@ -665,9 +665,9 @@ function messageCols(bodyCap: number): string {
           datetime(g.created_at, 'localtime') AS created_local,
           unixepoch(g.created_at) AS created_unix,
           g.supersedes_seq,
-          (SELECT s.seq FROM messages s
-            WHERE s.room_id = g.room_id AND s.supersedes_seq = g.seq
-            ORDER BY s.seq DESC LIMIT 1) AS superseded_by,
+          (SELECT MAX(s.seq)
+             FROM messages s INDEXED BY idx_messages_supersedes
+            WHERE s.room_id = g.room_id AND s.supersedes_seq = g.seq) AS superseded_by,
           p.agent_id AS reply_from, substr(p.body, 1, 101) AS reply_preview`;
 }
 
@@ -1307,6 +1307,8 @@ export class ChatStore {
     // a further page without a tail COUNT.
     const { rows, total } = this.db
       .transaction(() => {
+        // Activity means the timestamp on the highest-seq message, not the
+        // greatest wall-clock value. Clocks can move backward between posts.
         const rows = this.db
           .prepare(
             `SELECT r.id, r.name,
@@ -1317,7 +1319,8 @@ export class ChatStore {
                     r.created_at,
                     (SELECT COUNT(*) FROM memberships m WHERE m.room_id = r.id AND m.left_at IS NULL) AS members,
                     (SELECT COUNT(*) FROM messages g WHERE g.room_id = r.id) AS messages,
-                    (SELECT MAX(created_at) FROM messages g WHERE g.room_id = r.id) AS last_activity
+                    (SELECT created_at FROM messages g
+                      WHERE g.room_id = r.id ORDER BY g.seq DESC LIMIT 1) AS last_activity
              FROM rooms r WHERE r.id > ? ORDER BY r.id LIMIT ?`,
           )
           .all(Math.max(0, Math.floor(afterId)), lim + 1) as (RoomSummary & {
@@ -2571,22 +2574,27 @@ export class ChatStore {
           );
         }
       }
-      // Crossing report: computed before the insert so "unread" excludes the
-      // message being posted. The directedAt pair binds FIRST (it sits in the
-      // SELECT list, ahead of the WHERE placeholders).
-      const crossing = this.db
-        .prepare(
-          `SELECT COUNT(*) AS c, MIN(seq) AS mn, MAX(seq) AS mx,
-                  SUM(CASE WHEN ${directedAt("messages")} THEN 1 ELSE 0 END) AS d
-           FROM messages
-           WHERE room_id = ? AND seq > ? AND agent_id != ?`,
-        )
-        .get(agentId, agentId, roomId, from, agentId) as {
+      // A surviving CAS already proved stale.c === 0 after a token no newer
+      // than `from`, so it also proved there are no crossings after `from`.
+      // Ordinary posts still need the cursor-relative aggregate.
+      let crossing: {
         c: number;
         mn: number | null;
         mx: number | null;
         d: number | null;
-      };
+      } = { c: 0, mn: null, mx: null, d: null };
+      if (ifToken === null) {
+        // The directedAt pair binds FIRST (it sits in the SELECT list, ahead of
+        // the WHERE placeholders).
+        crossing = this.db
+          .prepare(
+            `SELECT COUNT(*) AS c, MIN(seq) AS mn, MAX(seq) AS mx,
+                    SUM(CASE WHEN ${directedAt("messages")} THEN 1 ELSE 0 END) AS d
+             FROM messages
+             WHERE room_id = ? AND seq > ? AND agent_id != ?`,
+          )
+          .get(agentId, agentId, roomId, from, agentId) as typeof crossing;
+      }
       const { next } = this.db
         .prepare(
           "SELECT COALESCE(MAX(seq), 0) + 1 AS next FROM messages WHERE room_id = ?",
@@ -3226,102 +3234,111 @@ export class ChatStore {
         byte_limited?: boolean;
       }
     | undefined {
-    const focalRow = this.getRawMessage(roomId, seq);
-    if (!focalRow) return undefined;
-    const mapPlain = (r: RawMessage, pc?: number) => this.rowToMessage(r, pc);
-    const budget = DEFAULT_MAX_BYTES - THREAD_ENVELOPE;
-    // Reserve the parent's slot before spending on the focal message: a stub
-    // allowance when a parent exists, 4 chars of literal null otherwise. The
-    // trailing 2 covers an empty replies array.
-    const parentSeq = focalRow.reply_to_seq;
-    const parentReserve = parentSeq === null ? 4 : STUB_ALLOWANCE + 2;
-    const message = this.shrinkToFit(
-      focalRow,
-      undefined,
-      budget - parentReserve - 2,
-      mapPlain,
-    );
-    let remaining = budget - JSON.stringify(message).length;
-    let parent: MessageRow | null = null;
-    if (parentSeq !== null) {
-      const parentRow = this.getRawMessage(roomId, parentSeq);
-      if (parentRow) {
-        // Leave a stub allowance (plus array brackets) for the replies when
-        // more than that remains; otherwise the parent gets a stub itself.
-        parent = this.shrinkToFit(
-          parentRow,
-          undefined,
-          Math.max(STUB_ALLOWANCE, remaining - STUB_ALLOWANCE - 2),
-          mapPlain,
-        );
+    const tx = this.db.transaction(() => {
+      const focalRow = this.getRawMessage(roomId, seq);
+      if (!focalRow) return undefined;
+      const mapPlain = (r: RawMessage, pc?: number) => this.rowToMessage(r, pc);
+      const budget = DEFAULT_MAX_BYTES - THREAD_ENVELOPE;
+      // Reserve the parent's slot before spending on the focal message: a stub
+      // allowance when a parent exists, 4 chars of literal null otherwise. The
+      // trailing 2 covers an empty replies array.
+      const parentSeq = focalRow.reply_to_seq;
+      const parentReserve = parentSeq === null ? 4 : STUB_ALLOWANCE + 2;
+      const message = this.shrinkToFit(
+        focalRow,
+        undefined,
+        budget - parentReserve - 2,
+        mapPlain,
+      );
+      let remaining = budget - JSON.stringify(message).length;
+      let parent: MessageRow | null = null;
+      if (parentSeq !== null) {
+        const parentRow = this.getRawMessage(roomId, parentSeq);
+        if (parentRow) {
+          // Leave a stub allowance (plus array brackets) for the replies when
+          // more than that remains; otherwise the parent gets a stub itself.
+          parent = this.shrinkToFit(
+            parentRow,
+            undefined,
+            Math.max(STUB_ALLOWANCE, remaining - STUB_ALLOWANCE - 2),
+            mapPlain,
+          );
+        }
       }
-    }
-    remaining -= parent ? JSON.stringify(parent).length : 4;
+      remaining -= parent ? JSON.stringify(parent).length : 4;
 
-    const cap = 500;
-    // Recursive walk of the reply subtree. `path` (zero-padded seq per level)
-    // orders siblings numerically and yields pre-order DFS when sorted. Fetch
-    // cap+1 rows to detect (without a separate COUNT) that more were available,
-    // but memory-bound via fetchBounded so 500 large replies do not all
-    // materialize (~50 MB) just to trim to the thread budget: it stops after
-    // ~budget raw body plus a sentinel. When it stops by SIZE, replies_capped
-    // may under-report (byte_limited then carries "more replies exist"); when
-    // replies are small it fetches the full cap+1 and reports capping exactly.
-    const { rows, exhausted } = this.fetchBounded<RawMessage & { depth: number }>(
-      this.db.prepare(
-        `WITH RECURSIVE descendants(seq, depth, path) AS (
-           SELECT g.seq, 1, printf('%010d', g.seq)
-             FROM messages g
-            WHERE g.room_id = @room AND g.reply_to_seq = @root
-           UNION ALL
-           SELECT c.seq, d.depth + 1, d.path || '/' || printf('%010d', c.seq)
-             FROM messages c
-             JOIN descendants d ON c.reply_to_seq = d.seq
-            WHERE c.room_id = @room AND d.depth < @maxDepth
-         )
-         SELECT ${messageCols(DEFAULT_MAX_BYTES)}, d.depth AS depth
-           FROM descendants d
-           JOIN messages g ON g.room_id = @room AND g.seq = d.seq
-           LEFT JOIN messages p ON p.room_id = g.room_id AND p.seq = g.reply_to_seq
-          ORDER BY d.path
-          LIMIT @lim`,
-      ),
-      [{ room: roomId, root: seq, maxDepth, lim: cap + 1 }],
-      Math.max(STUB_ALLOWANCE, remaining),
-    );
+      const cap = 500;
+      // `path` uses the fixed width needed through Number.MAX_SAFE_INTEGER, the
+      // supported writer bound, so sorting it yields numeric pre-order DFS.
+      // The recursive ORDER/LIMIT keeps at most cap+1 rows for the expensive
+      // message joins and final sort. It bounds the recursive result table, not
+      // candidate discovery: wide fanout may still be enumerated and sorted.
+      // fetchBounded separately stops large bodies at the response budget.
+      const { rows, exhausted } = this.fetchBounded<
+        RawMessage & { depth: number }
+      >(
+        this.db.prepare(
+          `WITH RECURSIVE descendants(seq, depth, path) AS (
+             SELECT g.seq, 1, printf('%016d', g.seq)
+               FROM messages g
+              WHERE g.room_id = @room AND g.reply_to_seq = @root
+             UNION ALL
+             SELECT c.seq, d.depth + 1,
+                    d.path || '/' || printf('%016d', c.seq) AS path
+               FROM descendants d
+               CROSS JOIN messages c INDEXED BY idx_messages_reply
+              WHERE c.reply_to_seq = d.seq
+                AND c.room_id = @room
+                AND d.depth < @maxDepth
+              ORDER BY path
+              LIMIT @lim
+           )
+           SELECT ${messageCols(DEFAULT_MAX_BYTES)}, d.depth AS depth
+             FROM descendants d
+             CROSS JOIN messages g
+             LEFT JOIN messages p ON p.room_id = g.room_id AND p.seq = g.reply_to_seq
+            WHERE g.room_id = @room AND g.seq = d.seq
+            ORDER BY d.path
+            LIMIT @lim`,
+        ),
+        [{ room: roomId, root: seq, maxDepth, lim: cap + 1 }],
+        Math.max(STUB_ALLOWANCE, remaining),
+      );
 
-    const replies_capped = rows.length > cap;
-    // Below a stub allowance boundByBytes cannot guarantee even its head row
-    // fits; omit the replies instead of delivering an over-budget response
-    // (byte_limited says they exist; get_thread on a reply seq fetches them).
-    let replies: (MessageRow & { depth: number })[] = [];
-    let byteLimited = false;
-    if (rows.length > 0 && remaining < STUB_ALLOWANCE + 2) {
-      byteLimited = true;
-    } else if (rows.length > 0) {
-      ({ messages: replies, byteLimited } = this.boundByBytes(
-        rows.slice(0, cap),
-        previewChars,
-        remaining,
-        (r, pc) => ({
-          ...this.rowToMessage(r, pc),
-          depth: (r as RawMessage & { depth: number }).depth,
-        }),
-      ));
-    }
-    // If fetchBounded stopped on the raw-byte budget (exhausted:false), replies
-    // were left unfetched even when boundByBytes fit everything it got (a
-    // preview_chars cut shrank them all): flag byte_limited so the omission is
-    // never silent. get_thread has no reply-offset param; the recourse is
-    // get_thread on a reply seq, which byte_limited signals is needed.
-    byteLimited = byteLimited || !exhausted;
-    return {
-      message,
-      parent,
-      replies,
-      replies_capped,
-      ...(byteLimited ? { byte_limited: true } : {}),
-    };
+      const replies_capped = rows.length > cap;
+      // Below a stub allowance boundByBytes cannot guarantee even its head row
+      // fits; omit the replies instead of delivering an over-budget response
+      // (byte_limited says they exist; get_thread on a reply seq fetches them).
+      let replies: (MessageRow & { depth: number })[] = [];
+      let byteLimited = false;
+      if (rows.length > 0 && remaining < STUB_ALLOWANCE + 2) {
+        byteLimited = true;
+      } else if (rows.length > 0) {
+        ({ messages: replies, byteLimited } = this.boundByBytes(
+          rows.slice(0, cap),
+          previewChars,
+          remaining,
+          (r, pc) => ({
+            ...this.rowToMessage(r, pc),
+            depth: (r as RawMessage & { depth: number }).depth,
+          }),
+        ));
+      }
+      // If fetchBounded stopped on the raw-byte budget (exhausted:false), replies
+      // were left unfetched even when boundByBytes fit everything it got (a
+      // preview_chars cut shrank them all): flag byte_limited so the omission is
+      // never silent. get_thread has no reply-offset param; the recourse is
+      // get_thread on a reply seq, which byte_limited signals is needed.
+      byteLimited = byteLimited || !exhausted;
+      return {
+        message,
+        parent,
+        replies,
+        replies_capped,
+        ...(byteLimited ? { byte_limited: true } : {}),
+      };
+    });
+    return tx.deferred();
   }
 
   /** Count of messages newer than the marker that the agent did NOT write. */
@@ -3405,8 +3422,9 @@ export class ChatStore {
    * and catch_up's rooms_with_unread disclosure on an empty read. Rooms this
    * persona soft-left are muted by the membership join. excludeRoomId drops the
    * room just read (catch_up's summary lists OTHER rooms). Fetches limit+1 to
-   * report truncation without a tail COUNT. Read-only, so it is safe inside
-   * deferred and immediate transactions alike.
+   * report truncation without a tail COUNT. The returned room set is bounded;
+   * exact unread/directed counts still require scanning every candidate row.
+   * Read-only, so it is safe inside deferred and immediate transactions alike.
    */
   unreadByRoom(
     agentId: string,
@@ -3456,11 +3474,10 @@ export class ChatStore {
    * and advances over lower-priority rows through a disclosed cutoff. Directed
    * rows always qualify so advancing cannot silently erase my_mentions items.
    *
-   * unreadSummary: on an EMPTY read, include a bounded
-   * rooms_with_unread summary of every OTHER room holding unread, computed in
-   * the SAME snapshot as the empty determination -- across two separate
-   * queries a message arriving in this room could make the read report
-   * "empty" while the summary lists this very room.
+   * unreadSummary: on an EMPTY read, include a bounded rooms_with_unread
+   * summary of every OTHER room holding unread. It is advisory and computed
+   * after the current-room transaction so a large cross-room aggregation does
+   * not hold the process-wide writer reservation.
    */
   catchUp(
     roomId: number,
@@ -3510,8 +3527,9 @@ export class ChatStore {
       Math.max(1, Math.floor(limit)),
     );
     // Advancing path: read the cursor, fetch, and advance inside one IMMEDIATE
-    // transaction so a concurrent same-identity call serializes behind it and
-    // reads the updated cursor instead of returning overlapping messages.
+    // transaction. A deferred WAL transaction could let another writer commit
+    // after this read snapshot, then fail the cursor update with
+    // SQLITE_BUSY_SNAPSHOT.
     // The byte bound trims BEFORE the advance, so the cursor never covers an
     // undelivered peer row (it may later normalize across own rows, which are
     // never returned): a response the client rejects as oversized can no
@@ -3621,39 +3639,6 @@ export class ChatStore {
       if (lastSeq > from) {
         this.setCursor(roomId, agentId, lastSeq);
       }
-      // Empty read: same-snapshot disclosure of where the traffic actually
-      // is. Emitted even when no other room has unread ([]): that positively
-      // answers "is anything anywhere?", the question an empty read raises.
-      const UNREAD_SUMMARY_MAX = 20;
-      let summary:
-        | {
-            rooms: {
-              room_id: number;
-              name: string;
-              unread: number;
-              directed: number;
-            }[];
-            truncated: boolean;
-          }
-        | null = null;
-      if (unreadSummary !== null && messages.length === 0) {
-        const fetched = this.unreadByRoom(agentId, UNREAD_SUMMARY_MAX, roomId);
-        // The room summary shares catch_up's page budget. Twenty legal,
-        // control-heavy room names could otherwise inflate a declared 1k
-        // response past 25k. Bound the summary using the same measured-fit
-        // and name-halving pattern as my_mentions.by_room.
-        const roomBudget =
-          maxBytes -
-          (priorityOnly
-            ? PRIORITY_CATCH_UP_SUMMARY_ENVELOPE
-            : CATCH_UP_SUMMARY_ENVELOPE);
-        const fitted = fitRoomSummary(fetched.rooms, roomBudget);
-        summary = {
-          rooms: fitted.rooms,
-          // fetched.truncated is the SQL-side drop; sizeTrimmed is the fit.
-          truncated: fetched.truncated || fitted.sizeTrimmed,
-        };
-      }
       return {
         messages,
         new_last_read_seq: lastSeq,
@@ -3672,11 +3657,36 @@ export class ChatStore {
         // it that a preview/JSON shrink could otherwise hide. `remaining` is the
         // authoritative "more unread" count here, but keep byte_limited honest.
         ...(byteLimited || !exhausted ? { byte_limited: true } : {}),
-        ...(summary !== null ? { rooms_with_unread: summary.rooms } : {}),
-        ...(summary?.truncated ? { rooms_with_unread_truncated: true } : {}),
       };
     });
-    return tx.immediate();
+    const result = tx.immediate();
+    if (unreadSummary === null || result.messages.length > 0) return result;
+
+    // Keep the potentially large all-room aggregate outside IMMEDIATE. The
+    // summary is routing advice; like any response, it can become stale as soon
+    // as the current-room transaction commits.
+    try {
+      const UNREAD_SUMMARY_MAX = 20;
+      const fetched = this.unreadByRoom(agentId, UNREAD_SUMMARY_MAX, roomId);
+      const roomBudget =
+        maxBytes -
+        (unreadSummary.priorityOnly === true
+          ? PRIORITY_CATCH_UP_SUMMARY_ENVELOPE
+          : CATCH_UP_SUMMARY_ENVELOPE);
+      const fitted = fitRoomSummary(fetched.rooms, roomBudget);
+      return {
+        ...result,
+        rooms_with_unread: fitted.rooms,
+        ...(fetched.truncated || fitted.sizeTrimmed
+          ? { rooms_with_unread_truncated: true }
+          : {}),
+      };
+    } catch {
+      // The cursor may already be committed, including a lossy cutoff, so a
+      // thrown response would invite a retry that cannot reconstruct the old
+      // state. The advisory summary is optional; return the core result.
+      return result;
+    }
   }
 
   /**
@@ -3723,6 +3733,9 @@ export class ChatStore {
       // bulk reader with no "more remain" signal when exactly `limit` directed
       // messages fit inside the byte budget: an agent paging on byte_limited
       // (the documented signal) then silently under-read its own inbox.
+      // Keep the candidate predicates in both queries below in sync with
+      // directedAt and idx_messages_directed_candidates. It is redundant for
+      // results but required for SQLite to prove the partial index is eligible.
       const { rows: fetched, exhausted } = this.fetchBounded<
         RawMessage & { gid: number; room_id: number; room_name: string }
       >(
@@ -3734,6 +3747,7 @@ export class ChatStore {
            JOIN rooms r ON r.id = g.room_id
            WHERE g.seq > mb.last_read_seq
              AND g.id > ? AND g.agent_id != ?
+             AND (g.mentions IS NOT NULL OR g.reply_to_agent IS NOT NULL)
              AND ${directedAt("g")}
            ORDER BY g.id ASC LIMIT ?`,
         ),
@@ -3754,6 +3768,7 @@ export class ChatStore {
                 AND mb.agent_id = ? AND mb.left_at IS NULL
            WHERE g.seq > mb.last_read_seq
              AND g.agent_id != ?
+             AND (g.mentions IS NOT NULL OR g.reply_to_agent IS NOT NULL)
              AND ${directedAt("g")}`,
         )
         .get(agentId, agentId, agentId, agentId) as {

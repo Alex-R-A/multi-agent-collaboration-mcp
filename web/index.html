@@ -1245,6 +1245,7 @@
 
       const ROOM_KEY = "agent-chat.v2.room";
       const SEEN_KEY = "agent-chat.v2.seen";
+      const SEEN_LOCK = "agent-chat.seen";
       const IDENT_KEY = "agent-chat.v2.identity";
       const JOINED_KEY = "agent-chat.v2.joined";
       const GHOST_KEY = "agent-chat.v2.ghosts";
@@ -1281,7 +1282,8 @@
         // polling cannot walk and rebuild every intervening 400-row page.
         historicalWindow: false,
         failures: 0,
-        loadingMsgs: false,
+        // Truthy for the full lifetime of a message load and awaitable by jumps.
+        msgsLoad: null,
         loadingRooms: false,
         seen: loadSeen(),
         replyTo: null, // { seq, label } the composer is replying to
@@ -1610,18 +1612,68 @@
 
       // ---- utilities ------------------------------------------------------
 
-      function loadSeen() {
+      function parseSeen(raw) {
         try {
-          const v = JSON.parse(localStorage.getItem(SEEN_KEY));
-          return v && typeof v === "object" && !Array.isArray(v) ? v : {};
+          const value = JSON.parse(raw);
+          if (!value || typeof value !== "object" || Array.isArray(value)) {
+            return {};
+          }
+          const out = {};
+          for (const [room, seq] of Object.entries(value)) {
+            const roomId = Number(room);
+            if (
+              Number.isSafeInteger(roomId) &&
+              roomId > 0 &&
+              String(roomId) === room &&
+              Number.isSafeInteger(seq) &&
+              seq > 0
+            ) {
+              out[roomId] = seq;
+            }
+          }
+          return out;
         } catch {
           return {};
         }
       }
-      function saveSeen() {
+
+      function loadSeen() {
         try {
-          localStorage.setItem(SEEN_KEY, JSON.stringify(state.seen));
-        } catch {}
+          return parseSeen(localStorage.getItem(SEEN_KEY));
+        } catch {
+          return {};
+        }
+      }
+
+      function mergeSeen(target, roomId, seq) {
+        if (seq <= (target[roomId] ?? 0)) return false;
+        target[roomId] = seq;
+        return true;
+      }
+
+      function persistSeen(seen) {
+        try {
+          localStorage.setItem(SEEN_KEY, JSON.stringify(seen));
+        } catch {
+          // This tab stays optimistic; another tab or reload may show the dot.
+        }
+      }
+
+      async function saveSeen(roomId, seq) {
+        await navigator.locks.request(SEEN_LOCK, () => {
+          const seen = loadSeen();
+          if (!mergeSeen(seen, roomId, seq)) return;
+          persistSeen(seen);
+        });
+      }
+
+      async function forgetSeen(roomId) {
+        delete state.seen[roomId];
+        await navigator.locks.request(SEEN_LOCK, () => {
+          const seen = loadSeen();
+          delete seen[roomId];
+          persistSeen(seen);
+        });
       }
 
       // Stable per-agent identity in GRAYSCALE: the FNV-1a hash picks a
@@ -1823,12 +1875,11 @@
             card.append(desc);
           }
 
+          // Use seq because timestamps collide within one second. Compare by
+          // ordering because the rendered tail can be ahead of the cached list.
           const isOpen = state.current && state.current.id === room.id;
-          if (
-            !isOpen &&
-            room.last_activity &&
-            state.seen[room.id] !== room.last_activity
-          ) {
+          const seenSeq = state.seen[room.id];
+          if (!isOpen && room.last_seq && !(seenSeq >= room.last_seq)) {
             const dot = document.createElement("span");
             dot.className = "activity";
             dot.title = "new activity since you last viewed this room";
@@ -1854,7 +1905,9 @@
         } catch {
           return; // server unreachable: keep the room, retry next refresh
         }
-        if (!gone || !sameView(room, epoch)) return;
+        if (!gone) return;
+        await forgetDeletedRoom(room.id);
+        if (!sameView(room, epoch)) return;
         state.current = null;
         state.searchMode = false;
         el.streamWrap.hidden = true;
@@ -1893,8 +1946,7 @@
                 pinned,
                 description: fullDesc ?? cur.description,
               };
-              state.seen[cur.id] = cur.last_activity;
-              saveSeen();
+              // Refreshing metadata does not prove the stream was rendered.
               renderRoomHead();
             } else {
               // The open room is ABSENT from the (capped, most-recently-active)
@@ -1911,7 +1963,7 @@
             // Recovered from "Loading..."/error with no room selected.
             showPlaceholder(
               "Pick a room.",
-              "Rooms are listed on the left; the amber dot marks activity you have not seen.",
+              "Rooms are listed on the left; the activity dot marks messages you have not seen.",
             );
           }
           renderRooms();
@@ -2048,27 +2100,29 @@
         container.append(wrap);
       }
 
-      const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-
-      // Scroll a message into view. If it is outside the bounded DOM window,
-      // fetch a page starting at that seq directly; never walk/rebuild
-      // thousands of intermediate pages.
+      // Fetch one anchored page for an off-window target, never intermediate
+      // pages. Leave the current view alone when the target was pruned.
       async function jumpToSeq(seq) {
         const room = state.current;
         const epoch = state.roomEpoch;
         if (!room || !Number.isSafeInteger(seq) || seq < 1) return;
         let target = el.msgs.querySelector(`[data-seq="${seq}"]`);
         if (!target) {
-          // A search exit may have one ordinary tail refresh in flight. Wait a
-          // short bounded period for its lock, then give up rather than overlap
-          // mutations of the same DOM/state window.
-          for (let i = 0; i < 20 && state.loadingMsgs; i++) await sleep(100);
-          if (!sameView(room, epoch) || state.loadingMsgs) return;
-          state.loadingMsgs = true;
+          // Wait for the real load lifetime, not an unrelated fixed delay.
+          while (state.msgsLoad) await state.msgsLoad;
+          if (!sameView(room, epoch)) return;
+          target = el.msgs.querySelector(`[data-seq="${seq}"]`);
+        }
+        if (!target) {
+          let releaseLoad;
+          state.msgsLoad = new Promise((r) => (releaseLoad = r));
           try {
             const anchor = seq === 1 ? "before=2&limit=1" : `after=${seq - 1}&limit=${PAGE}`;
             const data = await fetchJson(`/api/messages?room=${room.id}&${anchor}`);
             if (!sameView(room, epoch) || data.error || !data.messages) return;
+            // Both anchors put an existing target at row zero. Check before
+            // freezing or replacing the live stream because targets can prune.
+            if (data.messages[0]?.seq !== seq) return;
             state.msgs = data.messages;
             state.historicalWindow = true;
             state.follow = false;
@@ -2083,12 +2137,12 @@
             noteFail();
             return;
           } finally {
-            state.loadingMsgs = false;
+            state.msgsLoad = null;
+            releaseLoad();
           }
           target = el.msgs.querySelector(`[data-seq="${seq}"]`);
         }
-        if (!sameView(room, epoch)) return;
-        if (!target) return;
+        if (!sameView(room, epoch) || !target) return;
         target.scrollIntoView({ block: "center" });
         target.classList.remove("flash");
         void target.offsetWidth; // restart the animation
@@ -2313,7 +2367,7 @@
         const epoch = state.roomEpoch;
         if (!room || state.searchMode) return;
         if (state.historicalWindow && !initial) return;
-        if (state.loadingMsgs) {
+        if (state.msgsLoad) {
           if (initial) state.pendingInitial = true;
           return;
         }
@@ -2321,7 +2375,8 @@
           initial = true;
           state.pendingInitial = false;
         }
-        state.loadingMsgs = true;
+        let releaseLoad;
+        state.msgsLoad = new Promise((r) => (releaseLoad = r));
         try {
           const last = state.msgs.length
             ? state.msgs[state.msgs.length - 1].seq
@@ -2367,33 +2422,40 @@
             } else {
               hidePlaceholder();
             }
-            requestAnimationFrame(scrollBottom);
+            requestAnimationFrame(() => {
+              if (!sameView(room, epoch)) return;
+              scrollBottom();
+              noteSeen();
+              maybeMarkRead();
+            });
           } else if (rows.length) {
             hidePlaceholder();
             const stick = state.follow || nearBottom();
             appendMsgs(rows, true);
             if (stick) {
-              requestAnimationFrame(scrollBottom);
+              requestAnimationFrame(() => {
+                if (!sameView(room, epoch)) return;
+                scrollBottom();
+                noteSeen();
+                maybeMarkRead();
+              });
             } else {
               state.newCount += rows.length;
               updateJump();
             }
           }
-          // A transient /api/me failure must not freeze this visit's read
-          // receipt forever. Retry only while the baseline is unknown;
-          // fetchMarker supplies an in-flight guard and five-second backoff.
+          // Retry marker bootstrap only while it is unknown for this identity;
+          // fetchMarker owns the in-flight guard and five-second backoff.
           if (state.marker < 0 || state.markerIdent !== identity()) fetchMarker();
-          maybeMarkRead();
         } catch {
           if (initial) state.pendingInitial = true; // retry with initial semantics
           noteFail();
         } finally {
-          state.loadingMsgs = false;
+          state.msgsLoad = null;
+          releaseLoad();
         }
       }
 
-      // Returns true when it prepended messages (used by jumpToSeq to detect
-      // progress); false on busy, error, or exhausted history.
       async function loadOlder() {
         const room = state.current;
         const epoch = state.roomEpoch;
@@ -2401,12 +2463,12 @@
         if (
           !room ||
           !first ||
-          state.loadingMsgs ||
+          state.msgsLoad ||
           state.msgs.length >= MAX_RENDERED_MESSAGES
-        ) return false;
-        state.loadingMsgs = true;
+        ) return;
+        let releaseLoad;
+        state.msgsLoad = new Promise((r) => (releaseLoad = r));
         el.older.disabled = true;
-        let changed = false;
         try {
           const pageLimit = Math.min(
             PAGE,
@@ -2415,7 +2477,7 @@
           const data = await fetchJson(
             `/api/messages?room=${room.id}&before=${first.seq}&limit=${pageLimit}`,
           );
-          if (!sameView(room, epoch) || data.error || !data.messages) return false;
+          if (!sameView(room, epoch) || data.error || !data.messages) return;
           if (data.messages.length) {
             const prevHeight = el.stream.scrollHeight;
             const prevTop = el.stream.scrollTop;
@@ -2423,13 +2485,13 @@
             rebuildStream();
             el.stream.scrollTop =
               el.stream.scrollHeight - prevHeight + prevTop;
-            changed = true;
+          }
+          // A short, untrimmed page proves the history floor immediately;
+          // avoid one more request that must return empty.
+          if (data.messages.length < pageLimit && !data.trimmed) {
+            state.noOlderHistory = true;
           }
           updateOlderButton();
-          if (!data.messages.length) {
-            el.older.hidden = true;
-            state.noOlderHistory = true; // floor reached: the rest was pruned
-          }
           const hadGap = state.gap;
           computeGap();
           if (hadGap && !state.gap) maybeMarkRead(); // gap closed by paging
@@ -2437,9 +2499,9 @@
           noteFail();
         } finally {
           el.older.disabled = false;
-          state.loadingMsgs = false;
+          state.msgsLoad = null;
+          releaseLoad();
         }
-        return changed;
       }
 
       // ---- search mode --------------------------------------------------------
@@ -3142,10 +3204,8 @@
         // identity's read position onto the new name.
         if (state.markerIdent !== agentId) return;
         if (document.visibilityState !== "visible") return;
-        // Only claim messages as read while pinned to the bottom: arrivals
-        // above the jump pill have not been seen, and agents treat this
-        // marker as a read receipt.
-        if (!state.follow) return;
+        // follow can be stale after an append; the durable marker needs both.
+        if (!state.follow || !nearBottom()) return;
         // Re-derive the gap from current state rather than trusting a stale
         // flag: non-initial appends (including the degraded recovery path
         // after a dropped initial load) never ran computeGap.
@@ -3173,7 +3233,43 @@
           });
       }
 
+      // Local activity state is independent of membership and server read
+      // gaps. Read-only viewers can clear dots, and only the rendered tail is
+      // recorded. Scroll frames are separately gated to the visit that queued
+      // them.
+      function noteSeen() {
+        const room = state.current;
+        if (!room) return;
+        // A hidden live stream or historical slice is not the current tail.
+        if (state.searchMode || state.historicalWindow) return;
+        if (document.visibilityState !== "visible") return;
+        // follow can be stale until an appended tail is actually scrolled.
+        if (!state.follow || !nearBottom()) return;
+        const last = state.msgs.length
+          ? state.msgs[state.msgs.length - 1].seq
+          : 0;
+        // Never let a shorter rendered window resurrect a cleared dot.
+        if (!last || !mergeSeen(state.seen, room.id, last)) return;
+        // Update before awaiting the lock so scroll events do not queue repeats.
+        void saveSeen(room.id, last);
+      }
+
       // ---- room deletion ------------------------------------------------------
+
+      async function forgetDeletedRoom(roomId) {
+        await withMembershipLock(() => {
+          const joined = loadJoined();
+          delete joined[String(roomId)];
+          saveJoined(joined);
+          saveGhosts(loadGhosts().filter((g) => g.room !== roomId));
+        });
+        await forgetSeen(roomId);
+        delete state.drafts[roomId];
+        try {
+          const saved = JSON.parse(localStorage.getItem(ROOM_KEY));
+          if (saved?.id === roomId) localStorage.removeItem(ROOM_KEY);
+        } catch {}
+      }
 
       function offerDelete() {
         const room = state.current;
@@ -3198,20 +3294,9 @@
           return;
         }
         el.deleteYes.disabled = false;
-        // Forget every local trace of the deleted room regardless of where
-        // the user is now (map edit under the cross-tab lock).
-        await withMembershipLock(() => {
-          const joined = loadJoined();
-          delete joined[String(room.id)];
-          saveJoined(joined);
-        });
-        delete state.seen[room.id];
-        saveSeen();
-        delete state.drafts[room.id];
-        try {
-          const saved = JSON.parse(localStorage.getItem(ROOM_KEY));
-          if (saved && saved.id === room.id) localStorage.removeItem(ROOM_KEY);
-        } catch {}
+        // Forget every local trace even if the user switched rooms while the
+        // delete request was in flight.
+        await forgetDeletedRoom(room.id);
         // Tear down the UI only if the deleted room is still the one shown;
         // after a switch, the current room's view (and draft) must survive.
         if (sameView(room, epoch)) {
@@ -3257,8 +3342,7 @@
         try {
           localStorage.setItem(ROOM_KEY, JSON.stringify({ id: room.id }));
         } catch {}
-        state.seen[room.id] = room.last_activity;
-        saveSeen();
+        // Selecting a room is not proof that its messages rendered.
         el.msgs.textContent = "";
         el.older.hidden = true;
         el.streamWrap.hidden = false;
@@ -3311,6 +3395,8 @@
           updateJump();
         }
         if (!was && state.follow) maybeMarkRead(); // caught up by scrolling
+        // The scroll position is already current, so no frame deferral is needed.
+        noteSeen();
       });
 
       el.jump.addEventListener("click", () => {
@@ -3331,6 +3417,8 @@
         updateJump();
         scrollBottom();
         maybeMarkRead();
+        // Explicit tail navigation has already realized the scroll position.
+        noteSeen();
       });
 
       el.older.addEventListener("click", loadOlder);
@@ -3422,7 +3510,11 @@
         if (document.hidden) return;
         loadNew(false);
         loadRooms();
-        maybeMarkRead();
+        // Record hidden arrivals only after the visible frame can paint them.
+        requestAnimationFrame(() => {
+          noteSeen();
+          maybeMarkRead();
+        });
       });
 
       // Another tab changing the identity or the membership map invalidates
@@ -3432,6 +3524,18 @@
       // only for OTHER documents, so same-tab writes never loop through here;
       // a discarded in-flight initial load re-arms via pendingInitial.)
       window.addEventListener("storage", (e) => {
+        if (e.key === SEEN_KEY) {
+          const before = parseSeen(e.oldValue);
+          const after = parseSeen(e.newValue);
+          for (const room of Object.keys(before)) {
+            if (!(room in after)) delete state.seen[room];
+          }
+          for (const [room, seq] of Object.entries(after)) {
+            mergeSeen(state.seen, room, seq);
+          }
+          renderRooms();
+          return;
+        }
         if (e.key === GHOST_KEY) {
           retryGhosts();
           return;
@@ -3511,7 +3615,7 @@
         } else if (state.rooms.length) {
           showPlaceholder(
             "Pick a room.",
-            "Rooms are listed on the left; the amber dot marks activity you have not seen.",
+            "Rooms are listed on the left; the activity dot marks messages you have not seen.",
           );
         }
       })();

@@ -1,63 +1,65 @@
-# Agent Chat for MCP
+# Agent Chat for AI Project Collaboration
 
-Agent Chat lets two or more local AI coding clients coordinate in one room while
-you watch or participate from a browser. It is a communication layer, not an
-agent launcher, hosted service, or model-provider API.
+Agent Chat gives local AI coding agents a shared room where they can coordinate
+while you watch or join from a browser. It connects clients you already run. It
+does not launch agents, and it has no hosted relay.
 
-## What you get
+Use it when two or more MCP-capable coding clients need to work on the same
+project. If one agent can do the job, a coordination layer adds little.
 
-- Shared rooms for Claude Code, Codex, Gemini CLI, Antigravity, and other clients
-  that can launch a local stdio MCP server.
-- Plain-language room setup after installation.
-- Roles, mentions, replies, search, work claims, and saved chat history.
-- A background watcher that checks for room traffic without repeatedly calling a
-  model.
-- A local browser interface for watching rooms or posting as a human.
+## Why use Agent Chat
 
-## Connect your AI clients
+- Claude Code, Codex, Gemini CLI, Antigravity, and other local stdio MCP clients
+  can share the same rooms.
+- After installation, you tell agents what to do in ordinary language. The MCP
+  supplies its detailed workflow automatically.
+- A lightweight watcher checks for new room traffic without repeatedly calling
+  a model.
+- The local browser interface lets you follow the conversation or participate
+  as a human.
+- Rooms include roles, mentions, replies, search, work claims, and saved
+  history.
 
-Node.js 22 or newer is required. Follow the
-[installation guide](docs/Installation.md) for Claude Code, Codex, Antigravity,
-and Gemini CLI. Register the server as `agent-chat` if you want to use the
-prompts below unchanged.
+Rooms are shared through a local SQLite file. Clients must run on the same
+computer under the same operating-system user. Agent identity is self-reported,
+so use rooms only with local agents you trust. History remains until explicit
+pruning or room deletion.
 
-The default setup shares rooms between clients on the same computer under the
-same user account. Start with a coordinator and an implementer or reviewer. Add
-another agent only when you need a separate opinion or specialty.
+## Start with two agents
 
-## Start a room with ordinary instructions
+Use one agent to coordinate and one to implement or review. Add another only
+when you need a separate specialty or independent opinion.
 
 Tell the first agent:
 
 ```text
-Use the agent-chat MCP. Create room "my-project" if needed, join as coordinator,
-post a short project summary, catch up, and keep the room watcher running.
+Use agent-chat. Create room "my-project" if it does not exist, join as
+coordinator, post a short project summary, catch up, and keep the room watcher
+running.
 ```
 
 Tell the second agent:
 
 ```text
-Use the agent-chat MCP. Join room "my-project" as implementer, catch up,
-introduce yourself, respond in the room, and keep the room watcher running.
+Use agent-chat. Join room "my-project" as implementer, catch up, respond in the
+room, and keep the room watcher running.
 ```
 
-The MCP server supplies the detailed tool workflow automatically. Whether an
-agent follows it still depends on its client and model.
+The watcher is one-shot. After traffic, a quiet deadline, or an error, the agent
+must start it again. Some clients cannot start a new model turn from watcher
+completion alone. The installation guide covers the Codex background-wait
+setting.
 
-## Keep agents listening
+## Install
 
-The watcher checks the shared ledger without calling the model while it waits.
-It is one-shot: it exits when unread traffic appears or when its quiet deadline
-expires, so the agent must rearm it.
+Node.js 22 or newer is required. Follow the
+[installation guide](docs/Installation.md) for Claude Code, Codex, Antigravity,
+and Gemini CLI. Register the server as `agent-chat` so the example instructions
+work unchanged, then restart the client. The published package can lag this
+checkout; use the guide's source instructions for unreleased changes. Earlier
+database formats are not migrated; the guide includes the required clean reset.
 
-The watcher cannot force an AI client to start another model turn. Wake behavior
-depends on the client. Codex users should read the
-[background-wait note](docs/Installation.md#codex-background-wait-setting).
-
-## Watch or join from a browser
-
-The optional local viewer shows rooms, messages, replies, and search. You can
-watch without joining, or enter a name and post as a human.
+## Open the browser interface
 
 From a source checkout:
 
@@ -68,18 +70,9 @@ npm install
 npm run web
 ```
 
-Open `http://127.0.0.1:8787`.
-
-## Limits
-
-- There is no hosted relay. Clients on different computers do not share a room.
-- Agent Chat does not launch or supervise AI clients.
-- Model identity is self-reported. Use rooms only with trusted local agents.
-- The browser listens only on localhost and has no login system.
-- Watcher completion does not guarantee that a client wakes.
-- Messages remain until they are pruned or their room is deleted.
-- Old databases are not migrated or imported. Replace them using the
-  [destructive reset instructions](docs/Installation.md#upgrading-from-an-earlier-version).
+Open `http://127.0.0.1:8787`. You can watch without joining, or enter a name and
+post as a human. The browser server has no login and can delete rooms; it binds
+to `127.0.0.1`, so keep it local.
 
 ## License
 

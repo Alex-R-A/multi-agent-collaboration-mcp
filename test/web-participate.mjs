@@ -25,6 +25,7 @@ const check = (n, c, x) => {
 // integration tests: an old jump freezes ordinary polling and only an explicit
 // tail action performs a full bounded refresh.
 const viewerSource = readFileSync(join(ROOT, "web", "index.html"), "utf8");
+const serverSource = readFileSync(join(ROOT, "web", "server.mjs"), "utf8");
 const viewerSection = (start, end) => {
   const from = viewerSource.indexOf(start);
   const to = viewerSource.indexOf(end, from + start.length);
@@ -38,6 +39,13 @@ check(
     /if \(state\.historicalWindow\) \{[\s\S]{0,400}?if \(state\.searchMode\) exitSearch\(false\);\s*state\.historicalWindow = false;[\s\S]{0,300}?loadNew\(true\);/.test(
       viewerSource,
     ),
+  null,
+);
+check(
+  "viewer supersession lookups use the dedicated index",
+  /SELECT MAX\(s\.seq\)[\s\S]{0,80}?FROM messages s INDEXED BY idx_messages_supersedes[\s\S]{0,120}?s\.supersedes_seq = g\.seq/.test(
+    serverSource,
+  ),
   null,
 );
 
@@ -76,6 +84,121 @@ check(
   ].every((line) => viewerSource.includes(line)),
   null,
 );
+
+// Narrow source contracts for browser behavior the endpoint tests cannot reach.
+{
+  check(
+    "the activity dot is keyed on seq, never on the second-resolution timestamp",
+    viewerSource.includes("const seenSeq = state.seen[room.id];") &&
+      viewerSource.includes("!(seenSeq >= room.last_seq)") &&
+      !viewerSource.includes("state.seen[room.id] !== room.last_activity") &&
+      !viewerSource.includes("state.seen[room.id] !== room.last_seq"),
+    null,
+  );
+  const seenStorageSource = viewerSection(
+    "function parseSeen(raw)",
+    "// Stable per-agent identity",
+  );
+  check(
+    "activity state is monotonic and isolated per room across browser tabs",
+    seenStorageSource.includes("navigator.locks.request(SEEN_LOCK") &&
+      seenStorageSource.includes("const seen = loadSeen();") &&
+      seenStorageSource.includes("mergeSeen(seen, roomId, seq)") &&
+      viewerSource.includes("if (e.key === SEEN_KEY)") &&
+      viewerSource.includes("mergeSeen(state.seen, room, seq)") &&
+      !viewerSource.includes("state.seen[room.id] = room.last_activity") &&
+      !viewerSource.includes("state.seen[cur.id] = cur.last_activity"),
+    { section: seenStorageSource.length },
+  );
+  const noteSeenSource = viewerSection(
+    "function noteSeen()",
+    "// ---- room deletion",
+  );
+  const markReadSource = viewerSection(
+    "function maybeMarkRead()",
+    "function noteSeen()",
+  );
+  check(
+    "noteSeen requires a visible live tail and imports neither the membership nor the durable-marker gap guard",
+    noteSeenSource.includes("state.searchMode || state.historicalWindow") &&
+      noteSeenSource.includes('document.visibilityState !== "visible"') &&
+      noteSeenSource.includes("if (!state.follow || !nearBottom()) return;") &&
+      markReadSource.includes("if (!state.follow || !nearBottom()) return;") &&
+      !noteSeenSource.includes("joinedHere()") &&
+      !/if \(state\.gap\) return;/.test(noteSeenSource) &&
+      noteSeenSource.includes("mergeSeen(state.seen, room.id, last)"),
+    { section: noteSeenSource.length },
+  );
+  const loadNewSource = viewerSection(
+    "async function loadNew(initial)",
+    "async function loadOlder()",
+  );
+  const framedMarks = (
+    loadNewSource.match(
+      /requestAnimationFrame\(\(\) => \{\s*if \(!sameView\(room, epoch\)\) return;\s*scrollBottom\(\);\s*noteSeen\(\);\s*maybeMarkRead\(\);\s*\}\);/g,
+    ) || []
+  ).length;
+  check(
+    "loadNew visit-gates both frames and marks read after realizing the scroll",
+    framedMarks === 2 &&
+      (loadNewSource.match(/maybeMarkRead\(\);/g) || []).length === 2 &&
+      !/maybeMarkRead\(\);\s*noteSeen\(\);/.test(loadNewSource),
+    { framedMarks },
+  );
+  const loadOlderSource = viewerSection(
+    "async function loadOlder()",
+    "// ---- search mode",
+  );
+  const historyFloorAt = loadOlderSource.indexOf(
+    "state.noOlderHistory = true;",
+  );
+  const olderButtonAt = loadOlderSource.indexOf("updateOlderButton();");
+  check(
+    "a short untrimmed older page closes the history floor without an empty follow-up request",
+    loadOlderSource.includes(
+      "if (data.messages.length < pageLimit && !data.trimmed)",
+    ) &&
+      historyFloorAt >= 0 &&
+      olderButtonAt > historyFloorAt,
+    { historyFloorAt, olderButtonAt },
+  );
+  const jumpSource = viewerSection(
+    "async function jumpToSeq(seq)",
+    "function buildMsg(",
+  );
+  check(
+    "jumpToSeq waits on the in-flight load instead of a fixed deadline",
+    jumpSource.includes("while (state.msgsLoad) await state.msgsLoad;") &&
+      !jumpSource.includes("await sleep(100)") &&
+      !viewerSource.includes("const sleep = (ms) =>") &&
+      !viewerSource.includes("loadingMsgs"),
+    { section: jumpSource.length },
+  );
+  const guardAt = jumpSource.indexOf("if (data.messages[0]?.seq !== seq) return;");
+  const mutateAt = jumpSource.indexOf("state.msgs = data.messages;");
+  const freezeAt = jumpSource.indexOf("state.historicalWindow = true;");
+  check(
+    "jumpToSeq proves the target is present before replacing or freezing the stream",
+    guardAt >= 0 && mutateAt > guardAt && freezeAt > guardAt,
+    { guardAt, mutateAt, freezeAt },
+  );
+  const forgetSource = viewerSection(
+    "async function forgetDeletedRoom(roomId)",
+    "function offerDelete()",
+  );
+  check(
+    "both deletion paths clear the same room-keyed browser state",
+    (
+      viewerSource.match(/await forgetDeletedRoom\(room\.id\);/g) || []
+    ).length === 2 &&
+      forgetSource.includes("delete joined[String(roomId)]") &&
+      forgetSource.includes("g.room !== roomId") &&
+      forgetSource.includes("await forgetSeen(roomId)") &&
+      forgetSource.includes("delete state.drafts[roomId]") &&
+      forgetSource.includes("localStorage.removeItem(ROOM_KEY)"),
+    { section: forgetSource.length },
+  );
+}
 check(
   "viewer persists a pending allocation and sends canonical participation fields",
   viewerSource.includes("pending_allocation") &&
@@ -1200,6 +1323,118 @@ try {
       stored === 1 && alive.status === 200,
       { stored, alive: alive.status },
     );
+  }
+
+  {
+    // The room list must carry an activity identity that two messages inside
+    // ONE SECOND cannot collide on. created_at is second-resolution, so a
+    // client keying "have I seen this room" on it loses the second message --
+    // permanently, if the room then goes quiet, since the value never changes
+    // again. The timestamps are pinned rather than raced: leaving it to the
+    // wall clock would make the ambiguity this test exists to demonstrate
+    // depend on which second the suite happened to run in.
+    const SAME_SECOND = "2026-01-01 00:00:00";
+    const roomId = 1;
+    // Written through a direct handle rather than ChatStore: this needs two
+    // rows with a CHOSEN created_at, and the store stamps its own. A direct
+    // SQL writer is a supported writer here (the schema's CHECKs and NUL
+    // triggers exist precisely because this file, sqlite3, and the viewer all
+    // hold their own handles), so this is not reaching around the store.
+    const raw = new Database(DB);
+    const pin = () =>
+      raw
+        .prepare("UPDATE messages SET created_at = ? WHERE room_id = ?")
+        .run(SAME_SECOND, roomId);
+    const appendSameSecond = (body) => {
+      const { n } = raw
+        .prepare(
+          "SELECT COALESCE(MAX(seq), 0) + 1 AS n FROM messages WHERE room_id = ?",
+        )
+        .get(roomId);
+      raw
+        .prepare(
+          `INSERT INTO messages (room_id, seq, agent_id, format, body, body_len, created_at)
+           VALUES (?, ?, 'bot', 'text', ?, ?, ?)`,
+        )
+        .run(roomId, n, body, body.length, SAME_SECOND);
+      return n;
+    };
+
+    pin();
+    const seqA = appendSameSecond("same-second-a");
+    const listA = await (await fetch(base + "/api/rooms")).json();
+    const roomA = listA.rooms.find((r) => r.id === roomId);
+
+    const seqB = appendSameSecond("same-second-b");
+    const listB = await (await fetch(base + "/api/rooms")).json();
+    const roomB = listB.rooms.find((r) => r.id === roomId);
+
+    // Both halves are load-bearing. The last_activity equality PROVES the
+    // timestamp is genuinely ambiguous here, so the last_seq assertion is
+    // testing a distinction that a timestamp key could not have made; without
+    // it this would pass for a room whose messages simply landed in different
+    // seconds, which is the case the defect does not involve.
+    check(
+      "a further message in the same second moves last_seq while last_activity cannot",
+      !!roomA &&
+        !!roomB &&
+        seqB === seqA + 1 &&
+        roomA.last_activity === SAME_SECOND &&
+        roomB.last_activity === SAME_SECOND &&
+        roomA.last_seq === seqA &&
+        roomB.last_seq === seqB,
+      { roomA, roomB, seqA, seqB },
+    );
+
+    const detail = await (await fetch(`${base}/api/room?id=${roomId}`)).json();
+    check(
+      "single-room detail carries the same activity identity as the list",
+      detail.room?.last_seq === roomB.last_seq &&
+        detail.room?.last_activity === roomB.last_activity,
+      { detail: detail.room, roomB },
+    );
+
+    // A room nobody has posted in must report NULL, not 0: the dot gate is a
+    // truthiness test, so a 0 and a NULL behave alike today, but an aggregate
+    // that started returning 0 would make "no messages" indistinguishable from
+    // "message seq 0" for any future consumer that compares rather than gates.
+    const quietStore = new ChatStore(DB);
+    const emptyRoomId = mkRoom(quietStore, "quiet-room").id;
+    quietStore.close();
+    const listC = await (await fetch(base + "/api/rooms")).json();
+    const roomC = listC.rooms.find((r) => r.id === emptyRoomId);
+    check(
+      "a room with no messages reports last_seq null alongside last_activity null",
+      !!roomC && roomC.last_seq === null && roomC.last_activity === null,
+      { roomC },
+    );
+
+    // The server-side property the client's target-present guard rests on: an
+    // `after` page is ordered ascending FROM the requested seq, so row zero IS
+    // the target whenever it exists. Tested here because it is the half of
+    // that guard an endpoint can actually observe.
+    const hit = await (
+      await fetch(`${base}/api/messages?room=${roomId}&after=${seqA - 1}&limit=50`)
+    ).json();
+    check(
+      "an after-anchored page puts the requested seq at row zero",
+      hit.messages?.[0]?.seq === seqA,
+      { first: hit.messages?.[0]?.seq, seqA },
+    );
+
+    // And when the target is gone (prune_messages is a shipped tool), row zero
+    // is some LATER message rather than nothing, which is why a non-empty-page
+    // check could never have caught this and row zero is the right predicate.
+    raw.prepare("DELETE FROM messages WHERE room_id = ? AND seq = ?").run(roomId, seqA);
+    const gone = await (
+      await fetch(`${base}/api/messages?room=${roomId}&after=${seqA - 1}&limit=50`)
+    ).json();
+    check(
+      "a pruned target yields a non-empty page whose row zero is not the requested seq",
+      gone.messages?.length > 0 && gone.messages[0].seq !== seqA,
+      { first: gone.messages?.[0]?.seq, seqA, len: gone.messages?.length },
+    );
+    raw.close();
   }
 } finally {
   child.kill();
