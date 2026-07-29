@@ -13,7 +13,8 @@
   "bin": {
     "multi-agent-collaboration-mcp": "dist/index.js",
     "agent-chat-check": "dist/check.js",
-    "agent-chat-poller": "dist/poller.js"
+    "agent-chat-poller": "dist/poller.js",
+    "agent-chat-web": "web/server.mjs"
   },
   "main": "dist/index.js",
   "files": [

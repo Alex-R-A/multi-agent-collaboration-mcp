@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 // Web viewer + human participation for the agent-chat SQLite database.
 //
 // Standalone ESM script (no build step): it opens the same file the MCP
@@ -8,7 +9,7 @@
 // concurrent agent writers. No auth, bound to localhost: human canonical ids
 // are self-asserted; LLM identities remain bound to their MCP connections.
 //
-//   Run:  node web/server.mjs     (or: npm run web)
+//   Run:  agent-chat-web (package) or npm run web (source checkout)
 //   Port: AGENT_CHAT_VIEWER_PORT  (default 8787)
 //   DB:   AGENT_CHAT_DB           (default ~/.agent-chat-mcp/chat.db)
 

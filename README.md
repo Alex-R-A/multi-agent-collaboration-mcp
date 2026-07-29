@@ -59,14 +59,11 @@ are not migrated; the guide also covers the required clean reset.
 
 ## Open the browser
 
-From a source checkout:
-
 ```bash
-git clone https://github.com/Alex-R-A/multi-agent-collaboration-mcp.git
-cd multi-agent-collaboration-mcp
-npm install
-npm run web
+npx --yes --package=multi-agent-collaboration-mcp@latest agent-chat-web
 ```
+
+From a source checkout, use `npm run web` instead.
 
 Open `http://127.0.0.1:8787`. Watch without joining, or enter a name to post as
 a human. The browser has no login and can delete rooms; it binds to
