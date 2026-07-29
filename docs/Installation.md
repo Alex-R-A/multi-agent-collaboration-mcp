@@ -1,13 +1,14 @@
 # Installation
 
-AI Chat is a local stdio MCP server. Register it with every AI client that
+Agent Chat is a local stdio MCP server. Register it with every AI client that
 should participate, then run those clients on the same machine under the same
 operating-system user. Each client starts its own server process, and those
 processes coordinate through one shared SQLite file.
 
 The published package requires Node.js 22 or newer. The commands below use
-`npx`, which downloads and starts the current package without a separate global
-installation.
+`npx`, which downloads and starts the latest published package without a
+separate global installation. The published package can lag this repository; use
+[Running from source](#running-from-source) when testing unreleased changes.
 
 ## Choose the Google client you use
 
@@ -24,7 +25,7 @@ server for Antigravity, or the reverse.
 
 ## Claude Code
 
-Register AI Chat for the current user:
+Register Agent Chat for the current user:
 
 ```bash
 claude mcp add --scope user --transport stdio agent-chat -- npx -y multi-agent-collaboration-mcp
@@ -40,7 +41,7 @@ Restart any Claude Code sessions that were already running.
 
 ## Codex
 
-Register AI Chat:
+Register Agent Chat:
 
 ```bash
 codex mcp add agent-chat -- npx -y multi-agent-collaboration-mcp
@@ -56,7 +57,7 @@ Restart Codex after registering the server.
 
 ## Codex background wait setting
 
-AI Chat's watcher is a one-shot background process. It exits when room traffic
+Agent Chat's watcher is a one-shot background process. It exits when room traffic
 arrives or when its quiet deadline expires. Codex must remain in a tracked wait
 to handle that completion in the same turn.
 
@@ -77,8 +78,9 @@ For room monitoring, Codex should:
 - Run the exact command returned by `wait_for_messages` through its tracked
   background-terminal facility.
 - Keep the current turn open by waiting on that tracked process.
-- On `has_updates:true`, call `catch_up` for the reported room and rearm the
-  watcher after processing the messages.
+- On `has_updates:true`, call `catch_up` for the reported room until `remaining`
+  reaches zero or stops falling, rearm the watcher, then act on the messages.
+  Unread traffic left behind makes a rearmed watcher exit immediately.
 - On `has_updates:false`, treat the result as a normal quiet deadline and
   rearm the watcher.
 
@@ -111,7 +113,7 @@ Antigravity session after changing the file.
 
 ## Gemini CLI
 
-Register AI Chat for the current user:
+Register Agent Chat for the current user:
 
 ```bash
 gemini mcp add --scope user agent-chat npx -- -y multi-agent-collaboration-mcp
@@ -135,17 +137,17 @@ Every client must resolve the same default database:
 
 Using the same machine but different operating-system users creates different
 home directories and therefore different ledgers. Containers, remote hosts,
-and separately configured database paths also do not share a room. AI Chat has
+and separately configured database paths also do not share a room. Agent Chat has
 no hosted relay that joins those files.
 
 ## Upgrading from an earlier version
 
-This release does not read, migrate, or preserve an earlier AI Chat database.
+This release does not read, migrate, or preserve an earlier Agent Chat database.
 The reset permanently deletes its rooms and chat history.
 
 Before starting the replacement:
 
-- Stop every AI client using AI Chat, every MCP server process, background
+- Stop every AI client using Agent Chat, every MCP server process, background
   poller, blocking wait, and HTML viewer.
 - Close every browser tab running the old viewer.
 - Delete the database and its matching `-wal` and `-shm` sidecars. The default
@@ -161,7 +163,7 @@ import path.
 ## Start the first room
 
 1. Restart each client so it starts the newly registered MCP server.
-2. Tell one agent: `Join AI Chat room "project-review". Create it if it does not
+2. Tell one agent: `Join Agent Chat room "project-review". Create it if it does not
    exist, catch up, and keep the room watcher running.`
 3. Give the other agents the same instruction with the same room name.
 
