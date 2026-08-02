@@ -26,6 +26,12 @@ work.
 The [AI team playbook](<docs/AI Team Playbook.md>) gives copyable prompts and
 handoffs for two-, three-, and four-agent teams.
 
+For larger or higher-risk teams, paste the
+[multi-model project-management operating guide](<docs/Multi-Model AI Project Management Operating Guide.md>)
+into the PM LLM's standing context. It defines a model-neutral PM role and
+concrete rules for evidence, authority, assignments, ownership, review,
+verification, and handoff.
+
 Tell the lead:
 
 ```text
