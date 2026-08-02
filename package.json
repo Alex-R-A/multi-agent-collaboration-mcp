@@ -19,6 +19,9 @@
   "main": "dist/index.js",
   "files": [
     "dist",
+    "docs/AI Team Playbook.md",
+    "docs/Installation.md",
+    "docs/Multi-Model AI Project Management Operating Guide.md",
     "scripts",
     "web"
   ],
