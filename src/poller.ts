@@ -165,6 +165,9 @@ function processIsAlive(pid: number): boolean {
   }
 }
 
+const LOCK_METADATA_READ_ATTEMPTS = 5;
+const LOCK_METADATA_RETRY_DELAY_MS = 25;
+
 function acquireLock(path: string, token: string): void {
   try {
     const fd = openSync(path, "wx", 0o600);
@@ -180,26 +183,33 @@ function acquireLock(path: string, token: string): void {
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    let owner: number;
-    try {
-      const metadata = JSON.parse(readFileSync(path, "utf8")) as {
-        pid?: unknown;
-        token?: unknown;
-      };
-      if (
-        typeof metadata.pid !== "number" ||
-        !Number.isSafeInteger(metadata.pid) ||
-        metadata.pid < 1 ||
-        typeof metadata.token !== "string" ||
-        metadata.token.length === 0
-      ) {
-        throw new Error("invalid watcher lock metadata");
+    let owner: number | undefined;
+    const retrySignal = new Int32Array(new SharedArrayBuffer(4));
+    for (let attempt = 0; attempt < LOCK_METADATA_READ_ATTEMPTS; attempt++) {
+      try {
+        const metadata = JSON.parse(readFileSync(path, "utf8")) as {
+          pid?: unknown;
+          token?: unknown;
+        };
+        if (
+          typeof metadata.pid === "number" &&
+          Number.isSafeInteger(metadata.pid) &&
+          metadata.pid > 0 &&
+          typeof metadata.token === "string" &&
+          metadata.token.length > 0
+        ) {
+          owner = metadata.pid;
+          break;
+        }
+      } catch {}
+      if (attempt + 1 < LOCK_METADATA_READ_ATTEMPTS) {
+        Atomics.wait(retrySignal, 0, 0, LOCK_METADATA_RETRY_DELAY_MS);
       }
-      owner = metadata.pid;
-    } catch {
+    }
+    if (owner === undefined) {
       // The exclusive create publishes the pathname before the tiny metadata
-      // write completes. A contender can therefore observe an empty or partial
-      // live lock. Preserve exclusion without falsely calling that lock stale.
+      // write completes. Give that bounded publication window time to settle,
+      // then preserve exclusion without falsely calling an invalid lock stale.
       argumentError(
         `watcher lock metadata could not be read or validated; the lock may be ` +
           `initializing or stale, so acquisition is refused (lock: ${path}). ` +
