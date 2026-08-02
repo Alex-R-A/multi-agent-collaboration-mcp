@@ -2065,6 +2065,7 @@ server.registerTool(
       try {
         first = advancingRead(waitSeconds === 0);
       } catch (e) {
+        if (e instanceof PersonaLostError) throw e;
         if (!store.getRoom(roomId)) return roomDeletedResult();
         throw e;
       }
@@ -2128,6 +2129,7 @@ server.registerTool(
             // so omit the cross-room exact-count summary here as well.
             hit = advancingRead(false);
           } catch (e) {
+            if (e instanceof PersonaLostError) throw e;
             if (!store.getRoom(roomId)) return roomDeletedResult(true);
             throw e;
           }
@@ -2144,6 +2146,7 @@ server.registerTool(
         try {
           last = advancingRead(true);
         } catch (e) {
+          if (e instanceof PersonaLostError) throw e;
           if (!store.getRoom(roomId)) return roomDeletedResult(true);
           throw e;
         }
@@ -2634,11 +2637,18 @@ server.registerTool(
       touchSession();
       const { agentId, roomId, roomName } = resolveJoinedRoom(room);
       touchCapturedRoom(roomId, agentId);
-      const thread = store.getThread(roomId, seq, max_depth ?? 3, preview_chars);
+      const lost = lossDisclosure(agentId);
+      const thread = store.getThread(
+        roomId,
+        seq,
+        max_depth ?? 3,
+        preview_chars,
+        DEFAULT_MAX_BYTES - disclosureReserve(lost),
+      );
       if (!thread) {
         return fail(`no message ${seq} in room "${roomName}"`);
       }
-      return ok({ ...lossDisclosure(agentId), ...thread });
+      return ok({ ...lost, ...thread });
     } catch (e) {
       return failFrom(e);
     }
@@ -2704,9 +2714,16 @@ server.registerTool(
     try {
       touchSession();
       const { agentId, roomId } = requireActive();
+      const lost = lossDisclosure(agentId);
       return ok({
-        ...lossDisclosure(agentId),
-        ...store.searchMessages(roomId, query, limit ?? 20, offset ?? 0),
+        ...lost,
+        ...store.searchMessages(
+          roomId,
+          query,
+          limit ?? 20,
+          offset ?? 0,
+          DEFAULT_MAX_BYTES - disclosureReserve(lost),
+        ),
       });
     } catch (e) {
       return failFrom(e);

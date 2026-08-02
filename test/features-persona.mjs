@@ -1965,6 +1965,231 @@ try {
     await hardKill(runtime);
   }
 
+  // --- compound final-read loss keeps persona_lost precedence -------------
+  {
+    const { store, path } = freshStore("aichat-final-read-loss-");
+    store.close();
+    const runtime = startMcp(path);
+    await runtime.init();
+    const first = await runtime.call("identify_persona", TUPLE_A);
+    const oldId = first.data.agent_id;
+    const created = await runtime.call("create_room", {
+      name: "final-read-loss",
+    });
+    const roomId = created.data.room_id;
+    await runtime.call("join_room", { room: "final-read-loss" });
+
+    const adminStore = new ChatStore(path);
+    const admin = firstIdentity(adminStore, "final-read-loss-admin");
+    const observer = new Database(path, { readonly: true });
+    const leaseExists = observer.prepare(
+      "SELECT 1 FROM wait_leases WHERE room_id = ? AND agent_id = ?",
+    );
+    let waitPending = true;
+    const startedMs = Date.now();
+    const waiting = runtime
+      .call("catch_up", { wait_seconds: 1 }, 5_000)
+      .then((result) => {
+        waitPending = false;
+        return result;
+      });
+    const armed = await waitUntil(
+      () => leaseExists.get(roomId, oldId) !== undefined,
+      3_000,
+      runtime.child,
+    );
+    // Retire and delete after the first 500 ms probe but before the 1 s
+    // deadline. The deadline path skips another probe and reaches the final
+    // advancing read, which must preserve PersonaLostError precedence.
+    await sleep(600);
+    const pendingBeforeMutation = waitPending;
+    const transition = await runtime.call("identify_persona", TUPLE_B);
+    const deletion = caught(() => adminStore.deleteRoom(roomId, admin.id));
+    const pendingAfterDeletion = waitPending;
+    const result = await waiting;
+    const elapsedMs = Date.now() - startedMs;
+    check(
+      "compound final-read loss reports persona_lost, not room deletion",
+      armed &&
+        pendingBeforeMutation &&
+        pendingAfterDeletion &&
+        transition.data.previous_agent_id === oldId &&
+        deletion.threw === false &&
+        elapsedMs >= 900 &&
+        result.isError === true &&
+        result.data.code === "persona_lost" &&
+        result.data.retired === true &&
+        !/room .*deleted/i.test(result.data.error),
+      {
+        armed,
+        pendingBeforeMutation,
+        pendingAfterDeletion,
+        transition: transition.data,
+        deletion,
+        elapsedMs,
+        result: result.data,
+      },
+    );
+    observer.close();
+    adminStore.close();
+    await hardKill(runtime);
+  }
+
+  // --- handler loss disclosure shares thread/search response budgets ------
+  {
+    const { store, path } = freshStore("aichat-loss-budget-");
+    store.close();
+    const runtime = startMcp(path);
+    await runtime.init();
+    const identified = await runtime.call("identify_persona", TUPLE_A);
+    const agentId = identified.data.agent_id;
+    const threadRoom = await runtime.call("create_room", {
+      name: "loss-budget-thread",
+    });
+    await runtime.call("join_room", { room: "loss-budget-thread" });
+    const searchRoom = await runtime.call("create_room", {
+      name: "loss-budget-search",
+    });
+    await runtime.call("join_room", { room: "loss-budget-search" });
+
+    const fixture = new ChatStore(path);
+    const author = firstIdentity(fixture, "budget-author");
+    fixture.joinRoom(threadRoom.data.room_id, author.id, {});
+    fixture.joinRoom(searchRoom.data.room_id, author.id, {});
+
+    const threadRoot = fixture.postMessage(
+      threadRoom.data.room_id,
+      author.id,
+      "root",
+      "text",
+      null,
+      null,
+      null,
+    ).seq;
+    for (let i = 0; i < 100; i++) {
+      fixture.postMessage(
+        threadRoom.data.room_id,
+        author.id,
+        "thread819 " + "x".repeat(819),
+        "text",
+        null,
+        threadRoot,
+        null,
+      );
+    }
+
+    const searchRoot = fixture.postMessage(
+      searchRoom.data.room_id,
+      author.id,
+      "root",
+      "text",
+      null,
+      null,
+      null,
+    ).seq;
+    for (let i = 0; i < 100; i++) {
+      fixture.postMessage(
+        searchRoom.data.room_id,
+        author.id,
+        "needle820 " + "x".repeat(820),
+        "text",
+        null,
+        searchRoot,
+        null,
+        { priority: i === 0 },
+      );
+    }
+
+    const disclosure = {
+      persona_lost: true,
+      missing: false,
+      retired: true,
+    };
+    const unreservedThreadChars = JSON.stringify({
+      ...disclosure,
+      ...fixture.getThread(threadRoom.data.room_id, threadRoot, 3),
+    }).length;
+    const unreservedSearchChars = JSON.stringify({
+      ...disclosure,
+      ...fixture.searchMessages(
+        searchRoom.data.room_id,
+        "needle820",
+        100,
+        0,
+      ),
+    }).length;
+    check(
+      "loss-budget fixtures exceed the handler budget without a reserve",
+      unreservedThreadChars > 100_000 && unreservedSearchChars > 100_000,
+      { unreservedThreadChars, unreservedSearchChars },
+    );
+
+    const connectionId = fixture.db
+      .prepare("SELECT connection_id FROM agents WHERE id = ?")
+      .get(agentId).connection_id;
+    const retired = fixture.retireConnection({ agentId, connectionId });
+    const thread = await runtime.call("get_thread", {
+      room: "loss-budget-thread",
+      seq: threadRoot,
+    });
+    const search = await runtime.call("search_messages", {
+      query: "needle820",
+      limit: 100,
+    });
+    const historyAtMinimum = await runtime.call("read_history", {
+      limit: 500,
+      max_bytes: 1000,
+    });
+    const mentionsAtMinimum = await runtime.call("my_mentions", {
+      limit: 500,
+      max_bytes: 1000,
+    });
+    const threadChars = JSON.stringify(thread.data).length;
+    const searchChars = JSON.stringify(search.data).length;
+    check(
+      "get_thread and search_messages reserve their persona-loss disclosure",
+      retired === true &&
+        thread.isError !== true &&
+        search.isError !== true &&
+        thread.data.persona_lost === true &&
+        thread.data.retired === true &&
+        search.data.persona_lost === true &&
+        search.data.retired === true &&
+        threadChars <= 100_000 &&
+        searchChars <= 100_000,
+      {
+        retired,
+        threadChars,
+        searchChars,
+        threadLoss: {
+          persona_lost: thread.data.persona_lost,
+          missing: thread.data.missing,
+          retired: thread.data.retired,
+        },
+        searchLoss: {
+          persona_lost: search.data.persona_lost,
+          missing: search.data.missing,
+          retired: search.data.retired,
+        },
+      },
+    );
+    check(
+      "existing disclosure reserves still accept the public minimum budget",
+      historyAtMinimum.isError !== true &&
+        mentionsAtMinimum.isError !== true &&
+        historyAtMinimum.data.persona_lost === true &&
+        mentionsAtMinimum.data.persona_lost === true &&
+        JSON.stringify(historyAtMinimum.data).length <= 1000 &&
+        JSON.stringify(mentionsAtMinimum.data).length <= 1000,
+      {
+        history: historyAtMinimum.data,
+        mentions: mentionsAtMinimum.data,
+      },
+    );
+    fixture.close();
+    await hardKill(runtime);
+  }
+
   // --- all-digit room names are refused by the STORE, not just the handler --
   // resolveRoom is id-first, so a room named "42" is shadowed by room id 42 and
   // delete_room("42") retargets. The rule therefore has to hold for a direct

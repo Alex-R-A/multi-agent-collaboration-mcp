@@ -31,6 +31,12 @@ const viewerSection = (start, end) => {
   const to = viewerSource.indexOf(end, from + start.length);
   return from >= 0 && to > from ? viewerSource.slice(from, to) : "";
 };
+const placeholderStyles = viewerSection(".placeholder {", ".placeholder .big {");
+check(
+  "the text-only empty-room placeholder does not intercept underlying controls",
+  /pointer-events:\s*none;/.test(placeholderStyles),
+  { section: placeholderStyles.length },
+);
 check(
   "historical viewer snapshots do not poll through the intervening backlog",
   viewerSource.includes("state.historicalWindow = true;") &&

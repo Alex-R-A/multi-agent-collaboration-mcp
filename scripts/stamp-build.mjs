@@ -15,20 +15,26 @@ const pkg = JSON.parse(readFileSync(join(root, "package.json"), "utf8"));
 
 let commit = "unknown";
 try {
-  commit = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
+  const head = execFileSync("git", ["rev-parse", "--short", "HEAD"], {
     cwd: root,
     encoding: "utf8",
     timeout: 10_000,
   }).trim();
   const dirty =
-    execFileSync("git", ["status", "--porcelain"], {
-      cwd: root,
-      encoding: "utf8",
-      timeout: 10_000,
-    }).trim().length > 0;
-  if (dirty) commit += "-dirty"; // built from an uncommitted tree
+    execFileSync(
+      "git",
+      ["status", "--porcelain=v1", "--untracked-files=all"],
+      {
+        cwd: root,
+        encoding: "utf8",
+        timeout: 10_000,
+      },
+    ).trim().length > 0;
+  commit = dirty ? `${head}-dirty` : head;
 } catch {
-  // Not a git checkout (e.g. dist copied without .git); leave "unknown".
+  // Neither identity nor cleanliness is trustworthy unless both commands work.
+  // Covers a copied dist without .git as well as a failed/timed-out status read.
+  commit = "unknown";
 }
 
 // A timestamp alone makes every no-change rebuild tell already-running MCP

@@ -33,11 +33,25 @@ export const MAX_CROSSED_PREVIEW_CHARS = 2_000;
 /** Public MCP/store caps used to keep direct callers from bypassing bounded
  * reads with values the tool schemas would reject. */
 const MAX_BULK_RESULT_CHARS = 400_000;
-const MAX_CATCH_UP_ROWS = 500;
+const MIN_NONADVANCING_RESULT_CHARS = 1_000;
+const MAX_BULK_READ_ROWS = 500;
 const MAX_GET_MESSAGE_CHARS = 400_000;
+const MAX_RECIPIENT_IDS = 100;
 /** Caller-supplied post idempotency keys are opaque, room/author scoped, and
  * intentionally small enough to keep the sparse unique index cheap. */
 export const MAX_CLIENT_MESSAGE_ID_CHARS = 200;
+
+function requireIntegerInRange(
+  value: number,
+  name: string,
+  min: number,
+  max: number,
+): number {
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`${name} must be an integer from ${min} to ${max}`);
+  }
+  return value;
+}
 
 /** Persona/human id cap. Exported because the server SIZES the canonical id it
  * generates against it before allocating, rather than discovering the overflow
@@ -1300,6 +1314,12 @@ export class ChatStore {
   ): { rooms: RoomSummary[]; total: number; next_id?: number; size_trimmed?: boolean } {
     const PREVIEW = 300;
     const lim = Math.max(1, Math.floor(limit));
+    const cursor = requireIntegerInRange(
+      afterId,
+      "list_rooms after_id",
+      0,
+      Number.MAX_SAFE_INTEGER,
+    );
     // Rows and total in ONE deferred snapshot: read as separate statements, a
     // concurrent create_room/delete_room BETWEEN them yields an internally
     // contradictory page (e.g. total:4 with no next_id, so the keyset pager
@@ -1323,7 +1343,7 @@ export class ChatStore {
                       WHERE g.room_id = r.id ORDER BY g.seq DESC LIMIT 1) AS last_activity
              FROM rooms r WHERE r.id > ? ORDER BY r.id LIMIT ?`,
           )
-          .all(Math.max(0, Math.floor(afterId)), lim + 1) as (RoomSummary & {
+          .all(cursor, lim + 1) as (RoomSummary & {
           description_cut: number;
           pinned_cut: number;
         })[];
@@ -1793,6 +1813,9 @@ export class ChatStore {
    *  wrong when it was real and is simply finished. */
   retiredIds(ids: string[]): Set<string> {
     if (ids.length === 0) return new Set();
+    if (ids.length > MAX_RECIPIENT_IDS) {
+      throw new Error(`retired_ids accepts at most ${MAX_RECIPIENT_IDS} ids`);
+    }
     const placeholders = ids.map(() => "?").join(",");
     const rows = this.db
       .prepare(
@@ -2173,9 +2196,14 @@ export class ChatStore {
     // rejoins (INSERT OR IGNORE keeps the row); rows come back in join order.
     let keyset = "";
     const rowParams: Record<string, unknown> = { ...base, lim: lim + 1 };
-    if (after !== undefined && Number.isFinite(after)) {
+    if (after !== undefined) {
       keyset = ` AND m.rowid > @after`;
-      rowParams.after = Math.floor(after);
+      rowParams.after = requireIntegerInRange(
+        after,
+        "list_agents after",
+        0,
+        Number.MAX_SAFE_INTEGER,
+      );
     }
     // Rows and count in ONE deferred snapshot so total cannot disagree with the
     // page (parity with listRooms). Fetch one MORE than asked to detect a page.
@@ -3012,6 +3040,11 @@ export class ChatStore {
     activeWithinMinutes: number,
   ): RecipientStatus[] {
     if (ids.length === 0) return [];
+    if (ids.length > MAX_RECIPIENT_IDS) {
+      throw new Error(
+        `recipient_status accepts at most ${MAX_RECIPIENT_IDS} ids`,
+      );
+    }
     const placeholders = ids.map(() => "?").join(",");
     // marker_behind baseline. Read alongside the rows without a transaction:
     // this is a liveness heuristic, not an invariant, and the method already
@@ -3225,6 +3258,7 @@ export class ChatStore {
     seq: number,
     maxDepth = 3,
     previewChars?: number,
+    maxBytes: number = DEFAULT_MAX_BYTES,
   ):
     | {
         message: MessageRow;
@@ -3234,11 +3268,17 @@ export class ChatStore {
         byte_limited?: boolean;
       }
     | undefined {
+    maxBytes = requireIntegerInRange(
+      maxBytes,
+      "get_thread max_bytes",
+      MIN_NONADVANCING_RESULT_CHARS,
+      DEFAULT_MAX_BYTES,
+    );
     const tx = this.db.transaction(() => {
-      const focalRow = this.getRawMessage(roomId, seq);
+      const focalRow = this.getRawMessage(roomId, seq, maxBytes);
       if (!focalRow) return undefined;
       const mapPlain = (r: RawMessage, pc?: number) => this.rowToMessage(r, pc);
-      const budget = DEFAULT_MAX_BYTES - THREAD_ENVELOPE;
+      const budget = maxBytes - THREAD_ENVELOPE;
       // Reserve the parent's slot before spending on the focal message: a stub
       // allowance when a parent exists, 4 chars of literal null otherwise. The
       // trailing 2 covers an empty replies array.
@@ -3253,7 +3293,7 @@ export class ChatStore {
       let remaining = budget - JSON.stringify(message).length;
       let parent: MessageRow | null = null;
       if (parentSeq !== null) {
-        const parentRow = this.getRawMessage(roomId, parentSeq);
+        const parentRow = this.getRawMessage(roomId, parentSeq, maxBytes);
         if (parentRow) {
           // Leave a stub allowance (plus array brackets) for the replies when
           // more than that remains; otherwise the parent gets a stub itself.
@@ -3293,7 +3333,7 @@ export class ChatStore {
               ORDER BY path
               LIMIT @lim
            )
-           SELECT ${messageCols(DEFAULT_MAX_BYTES)}, d.depth AS depth
+           SELECT ${messageCols(maxBytes)}, d.depth AS depth
              FROM descendants d
              CROSS JOIN messages g
              LEFT JOIN messages p ON p.room_id = g.room_id AND p.seq = g.reply_to_seq
@@ -3523,7 +3563,7 @@ export class ChatStore {
       throw new Error("catch_up limit must be finite");
     }
     const pageLimit = Math.min(
-      MAX_CATCH_UP_ROWS,
+      MAX_BULK_READ_ROWS,
       Math.max(1, Math.floor(limit)),
     );
     // Advancing path: read the cursor, fetch, and advance inside one IMMEDIATE
@@ -3727,6 +3767,24 @@ export class ChatStore {
     by_room_truncated?: boolean;
     byte_limited?: boolean;
   } {
+    limit = requireIntegerInRange(
+      limit,
+      "my_mentions limit",
+      1,
+      MAX_BULK_READ_ROWS,
+    );
+    maxBytes = requireIntegerInRange(
+      maxBytes,
+      "my_mentions max_bytes",
+      MIN_CATCH_UP_RESULT_BUDGET,
+      MAX_BULK_RESULT_CHARS,
+    );
+    afterId = requireIntegerInRange(
+      afterId,
+      "my_mentions after_id",
+      0,
+      Number.MAX_SAFE_INTEGER,
+    );
     const tx = this.db.transaction(() => {
       // Fetch ONE more than `limit` so a page cut by the ROW limit (not the
       // byte budget) is detectable. Without the probe, my_mentions was the only
@@ -3847,6 +3905,26 @@ export class ChatStore {
     has_more: boolean;
     byte_limited?: boolean;
   } {
+    limit = requireIntegerInRange(
+      limit,
+      "read_history limit",
+      1,
+      MAX_BULK_READ_ROWS,
+    );
+    maxBytes = requireIntegerInRange(
+      maxBytes,
+      "read_history max_bytes",
+      MIN_CATCH_UP_RESULT_BUDGET,
+      MAX_BULK_RESULT_CHARS,
+    );
+    if (beforeSeq !== undefined) {
+      requireIntegerInRange(
+        beforeSeq,
+        "read_history before_seq",
+        1,
+        Number.MAX_SAFE_INTEGER,
+      );
+    }
     const conds = ["g.room_id = ?"];
     const params: (number | string)[] = [roomId];
     if (beforeSeq !== undefined) {
@@ -3905,6 +3983,14 @@ export class ChatStore {
     agentId: string,
     seq?: number,
   ): { previous: number; new: number; latest: number } {
+    if (seq !== undefined) {
+      requireIntegerInRange(
+        seq,
+        "mark_read seq",
+        0,
+        Number.MAX_SAFE_INTEGER,
+      );
+    }
     const tx = this.db.transaction(() => {
       this.requireLive(agentId);
       // Advancing a marker requires presence and reports the prior cursor.
@@ -3942,7 +4028,14 @@ export class ChatStore {
     query: string,
     limit: number,
     offset = 0,
+    maxBytes: number = DEFAULT_MAX_BYTES,
   ): { matches: MessageRow[]; byte_limited?: boolean; next_offset?: number } {
+    maxBytes = requireIntegerInRange(
+      maxBytes,
+      "search_messages max_bytes",
+      MIN_NONADVANCING_RESULT_CHARS,
+      DEFAULT_MAX_BYTES,
+    );
     const off = Math.max(0, Math.floor(offset));
     // Fetch one MORE than asked: a full `limit` page does not by itself prove
     // more exist, so the extra row is the definitive "there is a next page"
@@ -3950,7 +4043,7 @@ export class ChatStore {
     // next_offset that returned nothing).
     const { rows, exhausted } = this.fetchBounded<RawMessage>(
       this.db.prepare(
-        `SELECT ${messageCols(DEFAULT_MAX_BYTES)}
+        `SELECT ${messageCols(maxBytes)}
          FROM messages_fts f
          JOIN messages g ON g.id = f.rowid
          LEFT JOIN messages p ON p.room_id = g.room_id AND p.seq = g.reply_to_seq
@@ -3958,14 +4051,14 @@ export class ChatStore {
          ORDER BY rank, g.id LIMIT ? OFFSET ?`,
       ),
       [query, roomId, limit + 1, off],
-      DEFAULT_MAX_BYTES,
+      maxBytes,
     );
     const hasExtra = rows.length > limit;
     const page = hasExtra ? rows.slice(0, limit) : rows;
     const { messages, byteLimited } = this.boundByBytes(
       page,
       undefined,
-      DEFAULT_MAX_BYTES - SEARCH_ENVELOPE,
+      maxBytes - SEARCH_ENVELOPE,
       (r, pc) => this.rowToMessage(r, pc),
     );
     // More remain if the byte bound cut the page, a genuine extra match exists

@@ -333,6 +333,102 @@ function setup(name = "priority-room") {
       JSON.stringify(cappedJson).length <= 1000,
     { cappedNumeric, size: JSON.stringify(cappedJson).length },
   );
+
+  const capture = (call) => {
+    try {
+      return { value: call() };
+    } catch (error) {
+      return { error: String(error?.message ?? error) };
+    }
+  };
+  const markerBeforeInvalid = s.getMembership(room, "me").last_read_seq;
+  const invalidMarkers = [-1, 0.5, Number.NaN, Number.POSITIVE_INFINITY].map(
+    (seq) => ({
+      seq,
+      result: capture(() => s.markRead(room, "me", seq)),
+      marker: s.getMembership(room, "me").last_read_seq,
+    }),
+  );
+  check(
+    "D1 invalid mark_read targets fail before changing the cursor",
+    invalidMarkers.every(
+      ({ result, marker }) =>
+        /mark_read seq must be an integer/.test(result.error ?? "") &&
+        marker === markerBeforeInvalid,
+    ),
+    { markerBeforeInvalid, invalidMarkers },
+  );
+
+  const invalidCursors = [
+    capture(() => s.listRooms(10, Number.NaN)),
+    capture(() => s.listRooms(10, Number.POSITIVE_INFINITY)),
+    capture(() => s.listRooms(10, 0.5)),
+    capture(() => s.listAgents(room, 5, undefined, 10, Number.NaN)),
+    capture(() =>
+      s.listAgents(room, 5, undefined, 10, Number.POSITIVE_INFINITY),
+    ),
+    capture(() => s.listAgents(room, 5, undefined, 10, 0.5)),
+  ];
+  check(
+    "D1 invalid listing cursors are rejected instead of restarting paging",
+    invalidCursors.every(
+      ({ error }) =>
+        /list_(rooms after_id|agents after) must be an integer/.test(error ?? "") &&
+        !/sqlite/i.test(error ?? ""),
+    ),
+    invalidCursors,
+  );
+
+  const invalidBulkReads = [
+    capture(() => s.readHistory(room, Number.NaN)),
+    capture(() => s.readHistory(room, 501)),
+    capture(() => s.readHistory(room, 50, Number.NaN)),
+    capture(() => s.readHistory(room, 50, undefined, undefined, 400_001)),
+    capture(() => s.myMentions("me", Number.NaN)),
+    capture(() => s.myMentions("me", 501)),
+    capture(() => s.myMentions("me", 50, undefined, 400_001)),
+    capture(() => s.myMentions("me", 50, undefined, 100_000, Number.NaN)),
+    capture(() => s.getThread(room, 1, 3, undefined, Number.POSITIVE_INFINITY)),
+    capture(() => s.searchMessages(room, "important", 20, 0, 100_001)),
+  ];
+  const legalHistory = capture(() =>
+    s.readHistory(room, 500, undefined, undefined, 400_000),
+  );
+  const legalMentions = capture(() =>
+    s.myMentions("me", 500, undefined, 400_000, 0),
+  );
+  check(
+    "D1 direct bulk reads enforce their public row and response budgets",
+    invalidBulkReads.every(
+      ({ error }) =>
+        /must be an integer from/.test(error ?? "") &&
+        !/sqlite/i.test(error ?? ""),
+    ) &&
+      legalHistory.error === undefined &&
+      legalMentions.error === undefined &&
+      JSON.stringify(legalHistory.value).length <= 400_000 &&
+      JSON.stringify(legalMentions.value).length <= 400_000,
+    { invalidBulkReads, legalHistory, legalMentions },
+  );
+
+  const hundredIds = Array.from({ length: 100 }, (_, i) => `unknown-${i}`);
+  const tooManyIds = [...hundredIds, "unknown-100"];
+  const legalStatuses = capture(() => s.recipientStatus(room, hundredIds, 5));
+  const legalRetired = capture(() => s.retiredIds(hundredIds));
+  const excessiveStatuses = capture(() =>
+    s.recipientStatus(room, tooManyIds, 5),
+  );
+  const excessiveRetired = capture(() => s.retiredIds(tooManyIds));
+  check(
+    "D1 recipient lookups reject oversized arrays before SQLite preparation",
+    legalStatuses.value?.length === 100 &&
+      legalRetired.value instanceof Set &&
+      /at most 100 ids/.test(excessiveStatuses.error ?? "") &&
+      /at most 100 ids/.test(excessiveRetired.error ?? "") &&
+      !/sqlite/i.test(excessiveStatuses.error ?? "") &&
+      !/sqlite/i.test(excessiveRetired.error ?? ""),
+    { legalStatuses, legalRetired, excessiveStatuses, excessiveRetired },
+  );
   s.close();
 }
 
@@ -404,18 +500,22 @@ function setup(name = "priority-room") {
 }
 
 // P1/P2: MCP schema, post/read response, and incompatible live-wait guard.
-await (async () => {
+const mcpFixture = {};
+const mcpFixtureRun = (async () => {
   const dir = mkdtempSync(join(tmpdir(), "v0120-mcp-"));
+  mcpFixture.dir = dir;
   const DB = join(dir, "t.db");
   // P5 edits build-info to exercise stale-build detection. Stage the tiny
   // dist tree in an ignored project-local directory so a forced test kill can
   // never leave the real deployed artifact modified.
   const stageRoot = mkdtempSync(join(ROOT, ".aichat-v0120-"));
+  mcpFixture.stageRoot = stageRoot;
   cpSync(join(ROOT, "dist"), join(stageRoot, "dist"), { recursive: true });
   const child = spawn("node", [join(stageRoot, "dist", "index.js")], {
     env: { ...process.env, AGENT_CHAT_DB: DB },
     stdio: ["pipe", "pipe", "ignore"],
   });
+  mcpFixture.child = child;
   const responses = new Map();
   let buffer = "";
   child.stdout.on("data", (chunk) => {
@@ -483,6 +583,7 @@ await (async () => {
   };
 
   const store = new ChatStore(DB);
+  mcpFixture.store = store;
   const room = mkRoom(store, "mcp-priority", null, null).id;
   mkAgent(store, "peer");
   store.joinRoom(room, "peer", {});
@@ -734,12 +835,92 @@ await (async () => {
   } finally {
     writeFileSync(buildInfoPath, originalBuildText);
   }
-
-  store.close();
-  child.kill();
-  rmSync(stageRoot, { recursive: true, force: true });
-  rmSync(dir, { recursive: true, force: true });
 })();
+try {
+  await mcpFixtureRun;
+} finally {
+  try {
+    mcpFixture.store?.close();
+  } finally {
+    mcpFixture.child?.kill();
+    if (mcpFixture.stageRoot) {
+      rmSync(mcpFixture.stageRoot, { recursive: true, force: true });
+    }
+    if (mcpFixture.dir) rmSync(mcpFixture.dir, { recursive: true, force: true });
+  }
+}
+
+// P6: build stamping proves both HEAD and complete working-tree cleanliness.
+{
+  const dir = mkdtempSync(join(tmpdir(), "v0120-stamp-"));
+  try {
+    const bin = join(dir, "bin");
+    const scripts = join(dir, "scripts");
+    const dist = join(dir, "dist");
+    mkdirSync(bin);
+    mkdirSync(scripts);
+    mkdirSync(dist);
+    cpSync(join(ROOT, "scripts", "stamp-build.mjs"), join(scripts, "stamp-build.mjs"));
+    writeFileSync(
+      join(dir, "package.json"),
+      JSON.stringify({ version: "0.0.0-test", dependencies: {} }),
+    );
+    writeFileSync(join(dist, "index.js"), "export const stamped = true;\n");
+    const fakeGitPath = join(bin, "git");
+    writeFileSync(
+      fakeGitPath,
+      `#!/bin/sh
+if [ "$1" = "rev-parse" ]; then
+  [ "$FAKE_GIT_FAILURE" = "rev-parse" ] && exit 31
+  printf 'abc123\n'
+  exit 0
+fi
+if [ "$1" = "status" ]; then
+  [ "$FAKE_GIT_FAILURE" = "status" ] && exit 32
+  for arg in "$@"; do
+    [ "$arg" = "--untracked-files=all" ] && { printf '?? src/new.ts\n'; exit 0; }
+  done
+  exit 0
+fi
+exit 33
+`,
+    );
+    chmodSync(fakeGitPath, 0o700);
+    const runStamp = (failure = "") => {
+      const result = spawnSync(process.execPath, [join(scripts, "stamp-build.mjs")], {
+        env: {
+          ...process.env,
+          PATH: `${bin}:${process.env.PATH ?? ""}`,
+          FAKE_GIT_FAILURE: failure,
+        },
+        encoding: "utf8",
+        timeout: 10_000,
+      });
+      let info = null;
+      try {
+        info = JSON.parse(readFileSync(join(dist, "build-info.json"), "utf8"));
+      } catch {}
+      return { result, info };
+    };
+
+    const dirty = runStamp();
+    check(
+      "P6 stamp forces complete untracked-file enumeration",
+      dirty.result.status === 0 && dirty.info?.commit === "abc123-dirty",
+      { status: dirty.result.status, info: dirty.info, stderr: dirty.result.stderr },
+    );
+    const failedStatus = runStamp("status");
+    const failedHead = runStamp("rev-parse");
+    check(
+      "P6 stamp reports unknown when either Git identity check fails",
+      failedStatus.result.status === 0 && failedStatus.info?.commit === "unknown" &&
+        failedHead.result.status === 0 && failedHead.info?.commit === "unknown",
+      { status: failedStatus, head: failedHead },
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
 
 // R1: refresh is safe in a published package and preserves registrations and
 // Antigravity-specific fields during an in-place build refresh.
