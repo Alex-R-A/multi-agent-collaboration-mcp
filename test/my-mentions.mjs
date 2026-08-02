@@ -11,6 +11,9 @@ import { fileURLToPath } from "node:url";
 import { ChatStore } from "../dist/db.js";
 import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
+import { expect, test } from "vitest";
+
+test("my-mentions.mjs", async () => {
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const CHECK = join(ROOT, "dist", "check.js");
 let failures = 0;
@@ -209,4 +212,6 @@ function probe(args) {
 
 rmSync(dir, { recursive: true, force: true });
 console.log(`\n${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"}`);
-process.exit(failures === 0 ? 0 : 1);
+
+expect(failures).toBe(0);
+});

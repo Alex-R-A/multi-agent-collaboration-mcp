@@ -26,6 +26,9 @@ import {
   PersonaLostError,
 } from "../dist/db.js";
 
+import { expect, test } from "vitest";
+
+test("features-persona.mjs", async () => {
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const DB_MODULE_URL = pathToFileURL(join(ROOT, "dist", "db.js")).href;
 const POLLER = join(ROOT, "dist", "poller.js");
@@ -2539,4 +2542,6 @@ for (const dir of dirs) {
 }
 
 console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURE(S)`);
-process.exit(failures === 0 ? 0 : 1);
+
+expect(failures).toBe(0);
+}, 90_000);

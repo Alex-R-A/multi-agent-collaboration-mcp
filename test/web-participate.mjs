@@ -13,6 +13,9 @@ import Database from "better-sqlite3";
 import { ChatStore } from "../dist/db.js";
 import { mkAgent, mkHuman, mkRoom } from "./persona-helpers.mjs";
 
+import { expect, test } from "vitest";
+
+test("web-participate.mjs", async () => {
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
 const check = (n, c, x) => {
@@ -1448,4 +1451,6 @@ try {
 }
 
 console.log(`\n${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"}`);
-process.exit(failures === 0 ? 0 : 1);
+
+expect(failures).toBe(0);
+});

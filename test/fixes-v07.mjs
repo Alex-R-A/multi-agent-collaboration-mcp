@@ -23,6 +23,9 @@ import { dirname } from "node:path";
 import { ChatStore } from "../dist/db.js";
 import { mkAgent, mkRoom, rmRoom } from "./persona-helpers.mjs";
 
+import { expect, test } from "vitest";
+
+test("fixes-v07.mjs", async () => {
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
 const check = (n, c, x) => {
@@ -695,4 +698,6 @@ if (process.platform !== "win32") {
 }
 
 console.log(`\n${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"}`);
-process.exit(failures === 0 ? 0 : 1);
+
+expect(failures).toBe(0);
+});

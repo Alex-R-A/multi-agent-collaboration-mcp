@@ -30,7 +30,9 @@
     "web": "node web/server.mjs",
     "prepare": "node scripts/prepare.mjs",
     "pretest": "node scripts/prepare.mjs",
-    "test": "node test/run-suite.mjs"
+    "test": "node test/run-suite.mjs",
+    "precoverage:v8": "node scripts/prepare.mjs",
+    "coverage:v8": "vitest run --coverage"
   },
   "engines": {
     "node": ">=22"
@@ -43,7 +45,9 @@
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^22.10.0",
+    "@vitest/coverage-v8": "^3.2.7",
     "tsx": "^4.19.0",
-    "typescript": "^5.6.0"
+    "typescript": "^5.6.0",
+    "vitest": "^3.2.7"
   }
 }

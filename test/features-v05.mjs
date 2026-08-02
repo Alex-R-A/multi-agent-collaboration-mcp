@@ -5,6 +5,9 @@
 import { ChatStore } from "../dist/db.js";
 import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
+import { expect, test } from "vitest";
+
+test("features-v05.mjs", async () => {
 let failures = 0;
 function check(cond, label) {
   if (cond) {
@@ -195,8 +198,5 @@ check(c5.granted === true, "expired claim claimable by another agent");
   v.close();
 }
 
-if (failures > 0) {
-  console.log(`\n${failures} FAILURE(S)`);
-  process.exit(1);
-}
-console.log("\nALL PASS");
+expect(failures).toBe(0);
+});

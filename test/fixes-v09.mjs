@@ -25,6 +25,9 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
+import { expect, test } from "vitest";
+
+test("fixes-v09.mjs", async () => {
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
 const check = (n, c, x) => {
@@ -349,4 +352,6 @@ const check = (n, c, x) => {
 }
 
 console.log(`\n${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"}`);
-process.exit(failures === 0 ? 0 : 1);
+
+expect(failures).toBe(0);
+});

@@ -7,6 +7,9 @@
 import { ChatStore } from "../dist/db.js";
 import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
+import { expect, test } from "vitest";
+
+test("fixes-v063.mjs", async () => {
 let failures = 0;
 const check = (n, c, x) => {
   console.log(`${c ? "PASS" : "FAIL"}  ${n}${c ? "" : "  >> " + JSON.stringify(x)}`);
@@ -247,4 +250,6 @@ const size = (o) => JSON.stringify(o).length;
 }
 
 console.log(`\n${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"}`);
-process.exit(failures === 0 ? 0 : 1);
+
+expect(failures).toBe(0);
+});

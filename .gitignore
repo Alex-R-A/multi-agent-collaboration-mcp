@@ -9,3 +9,4 @@ dist/
 .DS_Store
 .serena/
 .aichat-v0120-*/
+coverage/

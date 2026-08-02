@@ -17,6 +17,9 @@ import Database from "better-sqlite3";
 import { ChatStore } from "../dist/db.js";
 import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 
+import { expect, test } from "vitest";
+
+test("poller-lifecycle-v0121.mjs", async () => {
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const POLLER = join(ROOT, "dist", "poller.js");
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -351,4 +354,6 @@ try {
 }
 
 console.log(`\n${failures === 0 ? "ALL PASS" : `${failures} FAILURE(S)`}`);
-process.exitCode = failures === 0 ? 0 : 1;
+
+expect(failures).toBe(0);
+});

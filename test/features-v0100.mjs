@@ -31,6 +31,9 @@ import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import { mkAgent, mkRoom, rmRoom } from "./persona-helpers.mjs";
 
+import { expect, test } from "vitest";
+
+test("features-v0100.mjs", async () => {
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 let failures = 0;
 const check = (n, c, x) => {
@@ -749,8 +752,5 @@ await (async () => {
   rmSync(dir, { recursive: true, force: true });
 })();
 
-if (failures > 0) {
-  console.error(`\n${failures} failure(s)`);
-  process.exit(1);
-}
-console.log("\nall features-v0100 checks passed");
+expect(failures).toBe(0);
+});

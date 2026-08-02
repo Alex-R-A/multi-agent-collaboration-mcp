@@ -1,70 +1,103 @@
 import { once } from "node:events";
 import { BoundedLineTransform } from "../dist/bounded-lines.js";
 
-let failures = 0;
-function check(name, condition, detail) {
-  console.log(
-    `${condition ? "PASS" : "FAIL"}  ${name}${condition ? "" : "  >> " + JSON.stringify(detail)}`,
-  );
-  if (!condition) failures++;
-}
+import { describe, expect, it } from "vitest";
 
-{
-  const input = new BoundedLineTransform(32);
-  const frames = [];
-  input.on("data", (chunk) => frames.push(chunk.toString("utf8")));
-  input.write('{"jsonrpc":"2.0",');
-  input.write('"id":1}\n{}\npartial');
-  input.end();
-  await once(input, "end");
-  check(
-    "fragmented and coalesced input emits exactly one chunk per complete line",
-    frames.length === 2 &&
-      frames[0] === '{"jsonrpc":"2.0","id":1}\n' &&
-      frames[1] === "{}\n",
-    frames,
-  );
-}
+const boundMessage =
+  "MCP stdio line content exceeds the configured 8-byte limit (LF delimiter excluded)";
 
-{
-  const input = new BoundedLineTransform(8);
-  const frames = [];
-  input.on("data", (chunk) => frames.push(chunk.toString("utf8")));
-  input.end("12345678\n");
-  await once(input, "end");
-  check("the exact byte limit is accepted", frames[0] === "12345678\n", frames);
-}
+describe("BoundedLineTransform", () => {
+  it("emits one frame per LF-delimited line", async () => {
+    const input = new BoundedLineTransform(32);
+    const frames = [];
+    input.on("data", (chunk) => frames.push(chunk.toString("utf8")));
 
-{
-  const input = new BoundedLineTransform(8);
-  const failed = once(input, "error");
-  input.write("1234");
-  input.write("5678");
-  input.end("9");
-  const [error] = await failed;
-  check(
-    "a frame split across chunks fails as soon as it exceeds the bound",
-    error.message ===
+    input.write('{"jsonrpc":"2.0",');
+    input.write('"id":1}\n{}\npartial');
+    input.end();
+
+    await once(input, "end");
+    expect(frames).toHaveLength(2);
+    expect(frames[0]).toBe('{"jsonrpc":"2.0","id":1}\n');
+    expect(frames[1]).toBe("{}\n");
+  });
+
+  it("counts limit in bytes and allows an exact boundary", async () => {
+    const input = new BoundedLineTransform(8);
+    const frames = [];
+    input.on("data", (chunk) => frames.push(chunk.toString("utf8")));
+
+    input.end("12345678\n");
+    await once(input, "end");
+
+    expect(frames).toHaveLength(1);
+    expect(frames[0]).toBe("12345678\n");
+  });
+
+  it("rejects a line that exceeds the bound across chunks", async () => {
+    const input = new BoundedLineTransform(8);
+    const failed = once(input, "error");
+
+    input.write("1234");
+    input.write("5678");
+    input.end("9");
+
+    const [error] = await failed;
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toBe(
       "MCP stdio line content exceeds the configured 8-byte limit (LF delimiter excluded)",
-    error.message,
-  );
-}
+    );
+  });
 
-{
-  const input = new BoundedLineTransform(8);
-  const frames = [];
-  input.on("data", (chunk) => frames.push(chunk.toString("utf8")));
-  const failed = once(input, "error");
-  input.end("ok\n123456789");
-  const [error] = await failed;
-  check(
-    "a valid first frame is emitted before a later oversized frame fails",
-    frames.length === 1 && frames[0] === "ok\n" &&
-      error.message ===
-        "MCP stdio line content exceeds the configured 8-byte limit (LF delimiter excluded)",
-    { frames, error: error.message },
-  );
-}
+  it("emits earlier complete frames before a later oversized frame errors", async () => {
+    const input = new BoundedLineTransform(8);
+    const frames = [];
+    input.on("data", (chunk) => frames.push(chunk.toString("utf8")));
+    const failed = once(input, "error");
 
-console.log(`\n${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"}`);
-process.exit(failures === 0 ? 0 : 1);
+    input.end("ok\n123456789");
+
+    const [error] = await failed;
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toBe(boundMessage);
+    expect(frames).toHaveLength(1);
+    expect(frames[0]).toBe("ok\n");
+  });
+
+  it("supports multibyte UTF-8 payloads in byte accounting", async () => {
+    const input = new BoundedLineTransform(4);
+    const frames = [];
+    input.on("data", (chunk) => frames.push(chunk.toString("utf8")));
+    input.write("あb\n");
+    input.write("あ\n");
+    input.end();
+
+    await once(input, "end");
+    expect(frames).toHaveLength(2);
+    expect(frames[0]).toBe("あb\n");
+    expect(frames[1]).toBe("あ\n");
+  });
+
+  it("rejects a multibyte frame that exceeds the byte limit", async () => {
+    const input = new BoundedLineTransform(4);
+    const failed = once(input, "error");
+
+    input.end("ああ\n");
+
+    const [error] = await failed;
+    expect(error).toBeInstanceOf(Error);
+    expect(error.message).toBe(
+      "MCP stdio line content exceeds the configured 4-byte limit (LF delimiter excluded)",
+    );
+  });
+
+  it("does not emit a partial frame without a terminating newline", async () => {
+    const input = new BoundedLineTransform(128);
+    const frames = [];
+    input.on("data", (chunk) => frames.push(chunk.toString("utf8")));
+
+    input.end("partial-without-newline");
+    await once(input, "end");
+    expect(frames).toHaveLength(0);
+  });
+});

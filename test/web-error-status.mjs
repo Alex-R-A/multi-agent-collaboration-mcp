@@ -10,6 +10,9 @@ import { fileURLToPath } from "node:url";
 import Database from "better-sqlite3";
 import { ChatStore } from "../dist/db.js";
 
+import { expect, test } from "vitest";
+
+test("web-error-status.mjs", async () => {
 const ROOT = join(dirname(fileURLToPath(import.meta.url)), "..");
 const dir = mkdtempSync(join(tmpdir(), "aichat-web-errors-"));
 const DB = join(dir, "chat.db");
@@ -251,4 +254,6 @@ try {
 }
 
 console.log(`\n${failures === 0 ? "ALL PASS" : failures + " FAILURE(S)"}`);
-process.exitCode = failures === 0 ? 0 : 1;
+
+expect(failures).toBe(0);
+});
