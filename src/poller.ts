@@ -153,6 +153,9 @@ function dbPath(override?: string): string {
 }
 
 function processIsAlive(pid: number): boolean {
+  // Existence only, not process identity. A recycled PID is indistinguishable
+  // here from the process that originally owned it; closing that portability
+  // gap requires a process-instance protocol rather than another PID check.
   if (!Number.isSafeInteger(pid) || pid < 1) return false;
   try {
     process.kill(pid, 0);
@@ -177,10 +180,33 @@ function acquireLock(path: string, token: string): void {
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-    let owner = 0;
+    let owner: number;
     try {
-      owner = Number(JSON.parse(readFileSync(path, "utf8")).pid);
-    } catch {}
+      const metadata = JSON.parse(readFileSync(path, "utf8")) as {
+        pid?: unknown;
+        token?: unknown;
+      };
+      if (
+        typeof metadata.pid !== "number" ||
+        !Number.isSafeInteger(metadata.pid) ||
+        metadata.pid < 1 ||
+        typeof metadata.token !== "string" ||
+        metadata.token.length === 0
+      ) {
+        throw new Error("invalid watcher lock metadata");
+      }
+      owner = metadata.pid;
+    } catch {
+      // The exclusive create publishes the pathname before the tiny metadata
+      // write completes. A contender can therefore observe an empty or partial
+      // live lock. Preserve exclusion without falsely calling that lock stale.
+      argumentError(
+        `watcher lock metadata could not be read or validated; the lock may be ` +
+          `initializing or stale, so acquisition is refused (lock: ${path}). ` +
+          `Retry without removing it; inspect this exact lock before any manual ` +
+          `recovery`,
+      );
+    }
     if (processIsAlive(owner)) {
       argumentError(
         `watcher lock references live pid ${owner}; refusing a duplicate (lock: ${path})`,

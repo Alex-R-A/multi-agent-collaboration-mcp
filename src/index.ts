@@ -155,7 +155,7 @@ SIZE AND PAGING
 
 POSTING
 - crossed counts ALL unread from others past your marker at post time (old backlog included, not only mid-composition arrivals); crossed_directed says how many are aimed at you; crossed_range gives the seq span. If crossed > 0, catch_up before acting on replies. crossed_preview_chars opts into bounded previews of the crossed messages in the same response.
-- Dispositive posts (verdicts, commissions, dispositions): if_last_read_seq is a conditional post -- rejected (posted:false) if ANYTHING from others landed past your token, with bounded crossed previews returned; call catch_up for the complete delta before retrying. If pruning removed evidence after the token, it rejects conservatively with rejected:evidence_pruned and no invented previews. A token ahead of the target room's effective cursor is invalid and fails before posting. client_message_id makes an exact lost-response retry return the original seq instead of inserting twice; its guarantee lasts while that message is retained. Repeat the same explicit room or expected_room on retry so active-room drift cannot create a post in another room; a deduplicated response does not replay the original crossed/recipient snapshot, so catch_up for current state. room: posts to a named joined room without switching the active room; expected_room asserts which room is active. Never use the CAS on routine traffic: crossing is normal, the CAS is for posts whose validity depends on having read everything.
+- Use if_last_read_seq for a directive, assignment, or verdict whose validity depends on no peer message arriving after your last catch_up. It is a conditional post -- rejected (posted:false) if ANYTHING from others landed past your token, with bounded crossed previews returned; call catch_up for the complete delta before retrying. If pruning removed evidence after the token, it rejects conservatively with rejected:evidence_pruned and no invented previews. A token ahead of the target room's effective cursor is invalid and fails before posting. client_message_id makes an exact lost-response retry return the original seq instead of inserting twice; its guarantee lasts while that message is retained. Repeat the same explicit room or expected_room on retry so active-room drift cannot create a post in another room; a deduplicated response does not replay the original crossed/recipient snapshot, so catch_up for current state. room: posts to a named joined room without switching the active room; expected_room asserts which room is active. Never use the CAS on routine traffic: crossing is normal, the CAS is for posts whose validity depends on having read everything.
 - recipients reports factual room-local state: status, idle_seconds, last_read_seq, marker_behind. A new unread tag normally adds one to marker_behind. delivery_warnings is definitive for never-joined/left/retired recipients; a long-idle warning is emitted only for pre-existing lag and states observed facts, never a responsiveness prediction.
 - status/idle_seconds/last_seen measure LISTENER recency: an MCP call from the bound runtime, or the two-minute heartbeat of a watcher it armed. active therefore means a runtime is reachable, not that the model is reading, reasoning, or able to wake, and an armed seat stays active no matter how long its model has been silent. The absence of a long-idle warning is not evidence anyone is listening; watching:true (an open blocking call) is the stronger claim.
 - supersedes_seq corrects YOUR OWN earlier message; readers see superseded_by on it. reply_to_seq threads; the log stays flat and globally ordered.
@@ -178,7 +178,7 @@ IDENTITY
 - Human web participants use the reserved 'human-' prefix with a numeric ordinal (human-alex-1). The number prevents two independent browsers from colliding on one name; it is not ownership and not authentication.
 
 BACKGROUND POLLER
-- Run the command returned by join_room or wait_for_messages as a BACKGROUND task. Before arming, call catch_up until remaining is 0 or stops falling. The watcher probes before its first sleep, so unread traffic makes it exit immediately. One Node process holds one SQLite connection and runs one indexed LIMIT 1 probe after each sleep; it launches no children. Generated commands exit 0 for either a hit or quiet deadline: parse stdout has_updates true/false. Direct CLI calls without --ok-on-timeout retain exit 124 on timeout. Exit 2 is an error, a live-PID watcher lock, retired_identity, left_room, left_all_rooms, or no_room_memberships; inspect stderr before re-arming. Options: --interval <sec> (minimum/default 5), --timeout <sec> (default 1200, finite), --ok-on-timeout, --mentions-only, --room <id|name>, --owner-pid <pid>. Your own posts never wake it.
+- Launch the command returned by join_room or wait_for_messages as the tracked BACKGROUND task. The tracked task must remain attached to the poller's stdout and exit; if a wrapper is required, it must stay alive until the poller exits. Before arming, call catch_up until remaining is 0 or stops falling. The watcher probes before its first sleep, so unread traffic makes it exit immediately. One Node process holds one SQLite connection and runs one indexed LIMIT 1 probe after each sleep; it launches no children. Generated commands exit 0 for either a hit or quiet deadline: parse stdout has_updates true/false. Direct CLI calls without --ok-on-timeout retain exit 124 on timeout. Exit 2 is an error, a live-PID watcher lock, retired_identity, left_room, left_all_rooms, or no_room_memberships; inspect stderr before re-arming. Options: --interval <sec> (minimum/default 5), --timeout <sec> (default 1200, finite), --ok-on-timeout, --mentions-only, --room <id|name>, --owner-pid <pid>. Your own posts never wake it.
 - The poller is an OS-level detector: its exit does NOT by itself schedule your next turn. This MCP does not replace an exited watcher; watching resumes only when a client runs a new command. Whether you are actually woken depends on your harness's background-task contract; do not report "watcher active" as evidence you will see a message.
 
 RETENTION
@@ -1297,8 +1297,11 @@ server.registerTool(
         poller_cmd: pollerCmd(agentId),
         next:
           "call catch_up until it returns `remaining: 0` or the value stops " +
-          "falling; then run poller_cmd as a background task before starting " +
-          "work. The watcher checks immediately, so unread traffic makes it " +
+          "falling; then launch poller_cmd as the client's tracked background " +
+          "task before starting work. The tracked task must remain attached to " +
+          "the poller's stdout and exit; any wrapper must stay alive until the " +
+          "poller exits. The watcher checks " +
+          "immediately, so unread traffic makes it " +
           "exit immediately. This MCP server returns the command but cannot " +
           "launch it.",
         presence_note:
@@ -1554,8 +1557,9 @@ server.registerTool(
       "insert. `posted:true` means committed to SQLite only, not that a " +
       "recipient was woken, acknowledged, or began processing it. A " +
       "deduplicated retry returns the original seq/key only; catch " +
-      "up for current state. For a " +
-      "dispositive post, use `if_last_read_seq` + `expected_room`; use " +
+      "up for current state. For a directive, assignment, or verdict that " +
+      "would be invalid if peer traffic arrived after your last catch_up, use " +
+      "`if_last_read_seq` + `expected_room`; use " +
       "`client_message_id` to deduplicate an exact lost-response retry. " +
       "`crossed_preview_chars` max is 2000. `priority:true` survives explicit " +
       "priority-only backlog triage; `supersedes_seq` corrects your own post.",
@@ -1660,9 +1664,11 @@ server.registerTool(
         .nonnegative()
         .optional()
         .describe(
-          "Conditional post (CAS) for dispositive messages: reject if ANY " +
-            "message from others carries a seq above this (use your last " +
-            "catch_up's new_last_read_seq). A token ahead of this room's " +
+          "Conditional post (CAS) for a directive, assignment, or verdict " +
+            "that would be invalid if peer traffic arrived after your last " +
+            "catch_up: reject if ANY message from others carries a seq above " +
+            "this (use your last catch_up's new_last_read_seq). A token ahead " +
+            "of this room's " +
             "effective read cursor is invalid and rejected before posting. " +
             "A stale rejection returns posted:false with bounded crossed " +
             "previews; call catch_up for the full delta, then re-send the " +
@@ -2416,7 +2422,9 @@ server.registerTool(
         command,
         run_as: "background process (do not wait for it inline)",
         how_to:
-          "Run `command` in the background. On exit 0, parse stdout: " +
+          "Launch `command` as your client's tracked background task. The " +
+          "tracked task must remain attached to the poller's stdout and exit; " +
+          "any wrapper must stay alive until the poller exits. On exit 0, parse stdout: " +
           "has_updates:true names the room to catch_up; has_updates:false is a " +
           "normal quiet deadline. Exit 2 is an error, duplicate watcher, or a " +
           "terminal room/binding state; inspect stderr before re-arming. The " +

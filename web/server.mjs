@@ -357,7 +357,8 @@ function badChar(s) {
 }
 
 // Cap in BYTES. Sized so a maximal legal post (MAX_BODY_CHARS UTF-16 units,
-// worst case ~3 UTF-8 bytes per unit, plus JSON envelope) still fits.
+// worst case 6 JSON wire bytes per unit for escaped controls, plus the JSON
+// envelope) still fits.
 function readBody(req, cap = 700_000) {
   return new Promise((resolve, reject) => {
     let size = 0;
