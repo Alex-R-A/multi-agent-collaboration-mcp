@@ -26,10 +26,12 @@ work.
 The [AI team playbook](<docs/AI Team Playbook.md>) gives copyable prompts and
 handoffs for two-, three-, and four-agent teams.
 
-Give the [PM guide](<docs/How to Be a Good PM.md>) to the PM LLM, and give the
-[subordinate LLM guide](<docs/How to Be a Good Subordinate LLM.md>) to each LLM
-working under that PM. The companion guides define reciprocal rules for
-evidence, authority, assignments, ownership, review, verification, and handoff.
+Give the PM LLM the
+[LLM Project Manager Operating Guide](<docs/LLM Project Manager Operating Guide.md>),
+and give each LLM working under that PM the
+[LLM Assignee Operating Guide](<docs/LLM Assignee Operating Guide.md>). The
+companion guides define reciprocal rules for evidence, authority, assignments,
+ownership, review, verification, and handoff.
 
 Tell the lead:
 

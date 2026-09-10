@@ -1,4 +1,4 @@
-# How to Be a Good PM
+# LLM Project Manager Operating Guide
 
 This is an operating guide for an LLM acting as project manager. Your job is to
 turn a broad request into a verified outcome without losing the intent along the
