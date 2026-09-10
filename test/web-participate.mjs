@@ -34,6 +34,11 @@ const viewerSection = (start, end) => {
   const to = viewerSource.indexOf(end, from + start.length);
   return from >= 0 && to > from ? viewerSource.slice(from, to) : "";
 };
+const compileViewerFunction = (name, source, bindings) =>
+  Function(
+    ...Object.keys(bindings),
+    `"use strict";\n${source}\nreturn ${name};`,
+  )(...Object.values(bindings));
 const placeholderStyles = viewerSection(".placeholder {", ".placeholder .big {");
 check(
   "the text-only empty-room placeholder does not intercept underlying controls",
@@ -171,6 +176,85 @@ check(
       olderButtonAt > historyFloorAt,
     { historyFloorAt, olderButtonAt },
   );
+  {
+    const room = { id: 1 };
+    const state = {
+      current: room,
+      roomEpoch: 1,
+      searchMode: false,
+      historicalWindow: false,
+      msgsLoad: null,
+      pendingInitial: false,
+      msgs: [{ seq: 1 }],
+      noOlderHistory: true,
+      marker: 0,
+      markerIdent: "viewer",
+      gap: false,
+      follow: true,
+      newCount: 0,
+    };
+    const el = {
+      msgs: { textContent: "" },
+      markall: { hidden: true },
+      older: { classList: { toggle() {} } },
+    };
+    const computeGap = compileViewerFunction(
+      "computeGap",
+      viewerSection("function computeGap()", "function maybeMarkRead()"),
+      { state, el, joinedHere: () => true },
+    );
+    let response = {
+      messages: Array.from({ length: 400 }, (_, index) => ({ seq: index + 601 })),
+      trimmed: false,
+    };
+    const loadNew = compileViewerFunction("loadNew", loadNewSource, {
+      state,
+      el,
+      fetchJson: async () => response,
+      PAGE: 400,
+      sameView: (candidate, epoch) =>
+        candidate.id === state.current.id && epoch === state.roomEpoch,
+      sameRoom: (candidate) => candidate.id === state.current.id,
+      appendMsgs: (rows) => state.msgs.push(...rows),
+      updateOlderButton() {},
+      computeGap,
+      showPlaceholder() {},
+      hidePlaceholder() {},
+      requestAnimationFrame() {},
+      scrollBottom() {},
+      noteSeen() {},
+      maybeMarkRead() {},
+      fetchMarker() {},
+      identity: () => "viewer",
+      noteOk() {},
+      noteFail() {},
+      nearBottom: () => true,
+      updateJump() {},
+    });
+    await loadNew(true);
+    check(
+      "a full replacement page discards an exhausted historical-floor proof",
+      state.noOlderHistory === false && state.gap === true &&
+        state.msgs[0]?.seq === 601,
+      {
+        noOlderHistory: state.noOlderHistory,
+        gap: state.gap,
+        first: state.msgs[0]?.seq,
+      },
+    );
+
+    response = {
+      messages: Array.from({ length: 10 }, (_, index) => ({ seq: index + 1 })),
+      trimmed: false,
+    };
+    state.noOlderHistory = false;
+    await loadNew(true);
+    check(
+      "a short untrimmed replacement page still proves the history floor",
+      state.noOlderHistory === true && state.gap === false,
+      { noOlderHistory: state.noOlderHistory, gap: state.gap },
+    );
+  }
   const jumpSource = viewerSection(
     "async function jumpToSeq(seq)",
     "function buildMsg(",
@@ -191,6 +275,136 @@ check(
     guardAt >= 0 && mutateAt > guardAt && freezeAt > guardAt,
     { guardAt, mutateAt, freezeAt },
   );
+
+  const sendMessageSource = viewerSection(
+    "async function sendMessage()",
+    "function autosize()",
+  );
+  const makeSendHarness = () => {
+    const room = { id: 1 };
+    const submittedReply = { seq: 7, label: "first" };
+    const state = {
+      current: room,
+      roomEpoch: 1,
+      sending: false,
+      drafts: { 1: "First message" },
+      draftRevisions: { 1: 0 },
+      replyTo: submittedReply,
+      searchMode: false,
+      historicalWindow: false,
+      follow: true,
+      newCount: 0,
+    };
+    const el = {
+      composeText: { value: "First message", focus() {} },
+      send: { disabled: false },
+      composeError: { textContent: "" },
+    };
+    let posted;
+    let resolvePost;
+    const postFinished = new Promise((resolve) => {
+      resolvePost = resolve;
+    });
+    const loads = [];
+    const sendMessage = compileViewerFunction(
+      "sendMessage",
+      sendMessageSource,
+      {
+        state,
+        el,
+        joinedHere: () => true,
+        identity: () => "viewer",
+        postJson: (_url, body) => {
+          posted = body;
+          return postFinished;
+        },
+        sameView: (candidate, epoch) =>
+          candidate.id === state.current.id && epoch === state.roomEpoch,
+        autosize() {},
+        clearReply: () => {
+          state.replyTo = null;
+        },
+        exitSearch() {},
+        updateJump() {},
+        loadNew: (initial) => loads.push(initial),
+      },
+    );
+    return { state, el, sendMessage, resolvePost, loads, posted: () => posted };
+  };
+
+  {
+    const harness = makeSendHarness();
+    const pending = harness.sendMessage();
+    harness.el.composeText.value = "Next unsent draft";
+    harness.state.drafts[1] = "Next unsent draft";
+    harness.state.draftRevisions[1] += 1;
+    harness.state.replyTo = { seq: 8, label: "new reply" };
+    harness.resolvePost({ seq: 1 });
+    await pending;
+    check(
+      "a successful post preserves text and reply edits made while it was pending",
+      harness.posted()?.body === "First message" &&
+        harness.posted()?.reply_to_seq === 7 &&
+        harness.el.composeText.value === "Next unsent draft" &&
+        harness.state.drafts[1] === "Next unsent draft" &&
+        harness.state.replyTo?.seq === 8,
+      {
+        posted: harness.posted(),
+        draft: harness.el.composeText.value,
+        storedDraft: harness.state.drafts[1],
+        reply: harness.state.replyTo,
+      },
+    );
+  }
+
+  {
+    const harness = makeSendHarness();
+    const pending = harness.sendMessage();
+    harness.resolvePost({ seq: 1 });
+    await pending;
+    check(
+      "a successful post still consumes an unchanged submitted draft and reply",
+      harness.el.composeText.value === "" &&
+        harness.state.drafts[1] === undefined &&
+        harness.state.replyTo === null &&
+        harness.loads.length === 1,
+      {
+        draft: harness.el.composeText.value,
+        storedDraft: harness.state.drafts[1],
+        reply: harness.state.replyTo,
+        loads: harness.loads,
+      },
+    );
+  }
+
+  {
+    let inputHandler;
+    let autosizes = 0;
+    const state = { current: { id: 4 }, draftRevisions: {} };
+    const el = {
+      composeText: {
+        addEventListener: (_event, handler) => {
+          inputHandler = handler;
+        },
+      },
+    };
+    Function(
+      "state",
+      "el",
+      "autosize",
+      `"use strict";\n${viewerSection(
+        'el.composeText.addEventListener("input"',
+        'el.composeText.addEventListener("keydown"',
+      )}`,
+    )(state, el, () => autosizes++);
+    inputHandler();
+    check(
+      "composer input advances the current room draft revision",
+      viewerSource.includes("draftRevisions: {},") &&
+        state.draftRevisions[4] === 1 && autosizes === 1,
+      { revisions: state.draftRevisions, autosizes },
+    );
+  }
   const forgetSource = viewerSection(
     "async function forgetDeletedRoom(roomId)",
     "function offerDelete()",
@@ -204,6 +418,7 @@ check(
       forgetSource.includes("g.room !== roomId") &&
       forgetSource.includes("await forgetSeen(roomId)") &&
       forgetSource.includes("delete state.drafts[roomId]") &&
+      forgetSource.includes("delete state.draftRevisions[roomId]") &&
       forgetSource.includes("localStorage.removeItem(ROOM_KEY)"),
     { section: forgetSource.length },
   );

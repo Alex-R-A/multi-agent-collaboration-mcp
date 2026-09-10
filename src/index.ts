@@ -756,7 +756,10 @@ function issueToolStartTicket(): ToolStartTicket {
     release() {
       if (released) return;
       released = true;
-      resolveNext();
+      // An invalid request can finish before its predecessor reaches a tool
+      // callback. Keep that early release behind the predecessor so a later
+      // ticket cannot bypass either request's place in wire order.
+      void before.then(resolveNext);
     },
   };
 }

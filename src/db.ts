@@ -3003,7 +3003,10 @@ export class ChatStore {
       const ratio = cap / serialized;
       chunk = safeCut(
         chunk,
-        Math.min(chunk.length - 1, Math.max(1, Math.floor(chunk.length * ratio))),
+        Math.min(
+          chunk.length - 1,
+          Math.max(firstCodepointUnits, Math.floor(chunk.length * ratio)),
+        ),
       );
     }
     // Codepoints consumed by this slice (bounded, so counting is cheap).

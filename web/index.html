@@ -1318,6 +1318,7 @@
         markerRetryAt: 0,
         gap: false,
         drafts: {}, // per-room compose drafts, in memory only
+        draftRevisions: {}, // per-room user edits made after a send snapshot
         // Incremented on every openRoom: async completions capture it so a
         // response from a PREVIOUS visit to the same room (A -> B -> A) can
         // be told apart from the current visit (id comparison alone cannot).
@@ -2412,7 +2413,7 @@
             // rendered; anything below the window's floor was pruned. A page
             // the server cut short for SIZE (trimmed) proves nothing about
             // history and must not disable the gap guard.
-            if (rows.length < PAGE && !data.trimmed) state.noOlderHistory = true;
+            state.noOlderHistory = rows.length < PAGE && !data.trimmed;
             updateOlderButton();
             computeGap();
             if (rows.length === 0) {
@@ -3073,6 +3074,8 @@
         const epoch = state.roomEpoch;
         const body = el.composeText.value.trim();
         if (!room || !joinedHere() || !body || state.sending) return;
+        const draftRevision = state.draftRevisions[room.id] ?? 0;
+        const replyTo = state.replyTo;
         let refreshFromTail = false;
         state.sending = true;
         el.send.disabled = true;
@@ -3082,16 +3085,20 @@
             room: room.id,
             agent_id: identity(),
             body,
-            reply_to_seq: state.replyTo ? state.replyTo.seq : null,
+            reply_to_seq: replyTo ? replyTo.seq : null,
           });
-          delete state.drafts[room.id];
+          const draftUnchanged =
+            (state.draftRevisions[room.id] ?? 0) === draftRevision;
+          if (draftUnchanged) delete state.drafts[room.id];
           if (sameView(room, epoch)) {
             // Only touch the shared composer/stream state if the user is
             // still in this room; after a switch, the textarea, reply chip,
             // search mode, and follow flag all belong to the OTHER room.
-            el.composeText.value = "";
-            autosize();
-            clearReply();
+            if (draftUnchanged) {
+              el.composeText.value = "";
+              autosize();
+            }
+            if (state.replyTo === replyTo) clearReply();
             if (state.searchMode) exitSearch();
             refreshFromTail = state.historicalWindow;
             state.historicalWindow = false;
@@ -3266,6 +3273,7 @@
         });
         await forgetSeen(roomId);
         delete state.drafts[roomId];
+        delete state.draftRevisions[roomId];
         try {
           const saved = JSON.parse(localStorage.getItem(ROOM_KEY));
           if (saved?.id === roomId) localStorage.removeItem(ROOM_KEY);
@@ -3476,7 +3484,14 @@
       el.joinChangeBtn.addEventListener("click", startChangingIdentity);
       el.replyTarget.addEventListener("click", clearReply);
       el.send.addEventListener("click", sendMessage);
-      el.composeText.addEventListener("input", autosize);
+      el.composeText.addEventListener("input", () => {
+        const room = state.current;
+        if (room) {
+          state.draftRevisions[room.id] =
+            (state.draftRevisions[room.id] ?? 0) + 1;
+        }
+        autosize();
+      });
       el.composeText.addEventListener("keydown", (e) => {
         if (e.key === "Enter" && !e.shiftKey) {
           e.preventDefault();

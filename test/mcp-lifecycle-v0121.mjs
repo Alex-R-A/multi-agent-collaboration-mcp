@@ -168,6 +168,53 @@ try {
     { invalid: invalid.result, after: client.data(afterInvalid) },
   );
 
+  // An invalid middle request still owns a place in the wire-order chain. Its
+  // early error must not let the following valid call overtake the join ahead
+  // of it. Cover both SDK paths that bypass the registered tool callback.
+  client.sendBatch([
+    client.tool(14, "join_room", { room: "order-b" }),
+    client.tool(15, "missing_tool", {}),
+    client.tool(16, "whoami", {}),
+  ]);
+  const [joinedAfterUnknown, unknown, afterUnknown] = await Promise.all([
+    client.waitFor(14),
+    client.waitFor(15),
+    client.waitFor(16),
+  ]);
+  check(
+    "an unknown middle tool cannot route the following call before an earlier join",
+    client.data(joinedAfterUnknown)?.room_id === roomB &&
+      unknown.result?.isError === true &&
+      client.data(afterUnknown)?.room_id === roomB,
+    {
+      joined: client.data(joinedAfterUnknown),
+      unknown: unknown.result,
+      after: client.data(afterUnknown),
+    },
+  );
+
+  client.sendBatch([
+    client.tool(17, "join_room", { room: "order-a" }),
+    client.tool(18, "whoami", { unknown_key: true }),
+    client.tool(19, "whoami", {}),
+  ]);
+  const [joinedAfterInvalid, invalidMiddle, afterInvalidMiddle] = await Promise.all([
+    client.waitFor(17),
+    client.waitFor(18),
+    client.waitFor(19),
+  ]);
+  check(
+    "a schema-invalid middle call cannot route the following call before an earlier join",
+    client.data(joinedAfterInvalid)?.room_id === roomA &&
+      invalidMiddle.result?.isError === true &&
+      client.data(afterInvalidMiddle)?.room_id === roomA,
+    {
+      joined: client.data(joinedAfterInvalid),
+      invalid: invalidMiddle.result,
+      after: client.data(afterInvalidMiddle),
+    },
+  );
+
   // FIFO covers only the synchronous state-capture prefix: a long wait must
   // not serialize the later join, and it must remain bound to room A.
   const joinStarted = Date.now();

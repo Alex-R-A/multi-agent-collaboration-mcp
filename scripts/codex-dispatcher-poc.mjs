@@ -347,7 +347,8 @@ class Dispatcher {
     this.intervalMs = intervalMs;
     this.timer = null;
     this.running = false;
-    this.delivered = new Set();
+    this.deliveries = new Map();
+    this.maxDeliveryAttempts = 2; // initial attempt plus one retry
     this.dispatches = [];
   }
 
@@ -366,22 +367,48 @@ class Dispatcher {
     if (this.running) return;
     this.running = true;
     try {
-      const matches = this.store
-        .pendingDirected(100)
-        .pending.filter((entry) => entry.agent_id === this.agentId);
+      const matches = [];
+      let after;
+      for (;;) {
+        const page = this.store.pendingDirected(100, after);
+        matches.push(...page.pending.filter((entry) => entry.agent_id === this.agentId));
+        if (!page.next_after) break;
+        after = page.next_after;
+      }
       const liveKeys = new Set(matches.map((entry) => `${entry.room_id}:${entry.oldest_seq}`));
-      for (const key of this.delivered) {
-        if (!liveKeys.has(key)) this.delivered.delete(key);
+      for (const [key, delivery] of this.deliveries) {
+        if (!liveKeys.has(key)) {
+          this.deliveries.delete(key);
+          continue;
+        }
+        const turn = this.worker.completedTurns.get(delivery.turnId);
+        if (!turn || turn.status === "completed") continue;
+        if (delivery.attempts < this.maxDeliveryAttempts) {
+          delivery.turnId = null;
+          continue;
+        }
+        if (!delivery.failureReported) {
+          process.stderr.write(
+            `Delivery failed key=${key} turn=${delivery.turnId} status=${turn.status}; ` +
+              `retry limit reached with unread work\n`,
+          );
+          delivery.failureReported = true;
+        }
       }
       for (const entry of matches) {
         const key = `${entry.room_id}:${entry.oldest_seq}`;
-        if (this.delivered.has(key)) continue;
+        const prior = this.deliveries.get(key);
+        if (prior?.turnId) continue;
         const mode = this.worker.activeTurnId ? "steer" : "start";
         const prompt = deliveryPrompt(entry.room_id);
         const turnId = mode === "steer"
           ? await this.worker.steer(prompt)
           : await this.worker.startTurn(prompt);
-        this.delivered.add(key);
+        this.deliveries.set(key, {
+          attempts: (prior?.attempts ?? 0) + 1,
+          turnId,
+          failureReported: false,
+        });
         this.dispatches.push({ key, mode, turnId, atMs: Date.now() });
         process.stdout.write(
           `Dispatched room=${entry.room_name} seq=${entry.oldest_seq} mode=${mode} turn=${turnId}\n`,

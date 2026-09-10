@@ -233,6 +233,44 @@ function setup(name = "priority-room") {
     tinyPage?.content === "\u{1f600}" && tinyPage.next_offset === 1,
     tinyPage,
   );
+  const escaped = s.postMessage(
+    room,
+    "peer",
+    "\u{1d11e}\u0001tail",
+    "text",
+    null,
+    null,
+    null,
+  );
+  const escapedStarts = [1, 2, 3].map((cap) => s.getMessage(room, escaped.seq, 0, cap));
+  check(
+    "D1 serialized-size correction preserves progress across the first astral codepoint",
+    escapedStarts.every(
+      (page) =>
+        page?.content === "\u{1d11e}" &&
+        page.offset === 0 &&
+        page.next_offset === 1 &&
+        page.truncated === true,
+    ),
+    escapedStarts,
+  );
+  const escapedSecond = s.getMessage(room, escaped.seq, escapedStarts[1].next_offset, 2);
+  check(
+    "D1 a tiny nonzero-offset page advances across an escaped control character",
+    escapedSecond?.content === "\u0001" &&
+      escapedSecond.offset === 1 &&
+      escapedSecond.next_offset === 2 &&
+      escapedSecond.truncated === true,
+    escapedSecond,
+  );
+  const escapedWhole = s.getMessage(room, escaped.seq, 0, 100);
+  check(
+    "D1 an ordinary get_message cap still returns the complete mixed body",
+    escapedWhole?.content === "\u{1d11e}\u0001tail" &&
+      escapedWhole.truncated === undefined &&
+      escapedWhole.next_offset === undefined,
+    escapedWhole,
+  );
   const ascii = s.postMessage(room, "peer", "ab", "text", null, null, null);
   const tinyAscii = s.getMessage(room, ascii.seq, 0, 1);
   check(
