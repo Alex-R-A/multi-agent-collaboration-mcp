@@ -79,6 +79,12 @@ class AppServerClient {
     this.pending = new Map();
     this.listeners = new Set();
     this.stderr = "";
+    this.error = null;
+    this.ended = false;
+    this.closing = false;
+    this.failure = new Promise((resolvePromise) => {
+      this.notifyFailure = resolvePromise;
+    });
     const args = ["app-server"];
     if (mcpDbPath) {
       args.push("-c", `mcp_servers.agent-chat.env.AGENT_CHAT_DB=${JSON.stringify(mcpDbPath)}`);
@@ -95,14 +101,31 @@ class AppServerClient {
     });
     this.lines = readline.createInterface({ input: this.child.stdout });
     this.lines.on("line", (line) => this.receive(line));
-    this.child.once("exit", (code, signal) => {
-      const detail = this.stderr.trim();
-      const error = new Error(
-        `Codex App Server exited (code=${code}, signal=${signal})${detail ? `: ${detail}` : ""}`,
-      );
-      for (const entry of this.pending.values()) entry.reject(error);
-      this.pending.clear();
+    this.child.once("error", (error) => {
+      this.ended = true;
+      this.fail(new Error(`Codex App Server failed to start: ${error.message}`));
     });
+    this.child.stdin.on("error", (error) => {
+      this.fail(new Error(`Codex App Server stdin failed: ${error.message}`));
+    });
+    this.child.once("exit", (code, signal) => {
+      this.ended = true;
+      const detail = this.stderr.trim();
+      this.fail(
+        new Error(`Codex App Server exited (code=${code}, signal=${signal})${detail ? `: ${detail}` : ""}`),
+      );
+    });
+  }
+
+  fail(error) {
+    if (this.error) return;
+    this.error = error;
+    for (const entry of this.pending.values()) {
+      clearTimeout(entry.timer);
+      entry.reject(error);
+    }
+    this.pending.clear();
+    if (!this.closing) this.notifyFailure(error);
   }
 
   receive(line) {
@@ -181,10 +204,12 @@ class AppServerClient {
   }
 
   send(message) {
+    if (this.error) throw this.error;
     this.child.stdin.write(`${JSON.stringify(message)}\n`);
   }
 
   request(method, params = {}, timeoutMs = 30_000) {
+    if (this.error) return Promise.reject(this.error);
     const id = this.nextId++;
     return new Promise((resolvePromise, rejectPromise) => {
       const timer = setTimeout(() => {
@@ -192,7 +217,11 @@ class AppServerClient {
         rejectPromise(new Error(`${method} timed out after ${timeoutMs} ms`));
       }, timeoutMs);
       this.pending.set(id, { method, resolve: resolvePromise, reject: rejectPromise, timer });
-      this.send({ method, id, params });
+      try {
+        this.send({ method, id, params });
+      } catch (error) {
+        this.fail(error);
+      }
     });
   }
 
@@ -217,12 +246,22 @@ class AppServerClient {
   }
 
   async close() {
-    if (this.child.exitCode !== null || this.child.signalCode !== null) return;
+    this.closing = true;
+    this.fail(new Error("Codex App Server client closed"));
+    if (this.ended || this.child.exitCode !== null || this.child.signalCode !== null) return;
+    const exited = new Promise((resolvePromise) => {
+      const onExit = () => {
+        clearTimeout(timer);
+        resolvePromise();
+      };
+      const timer = setTimeout(() => {
+        this.child.off("exit", onExit);
+        resolvePromise();
+      }, 3_000);
+      this.child.once("exit", onExit);
+    });
     this.child.kill("SIGTERM");
-    await Promise.race([
-      new Promise((resolvePromise) => this.child.once("exit", resolvePromise)),
-      new Promise((resolvePromise) => setTimeout(resolvePromise, 3_000)),
-    ]);
+    await exited;
     if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill("SIGKILL");
   }
 }
@@ -239,20 +278,25 @@ class CodexWorker {
     this.turnWaiters = new Map();
     this.agentMessages = new Map();
     this.commandExecutions = new Map();
+    this.retainDiagnostics = ephemeral;
+    this.collectBootstrapText = true;
     this.removeListener = client.onNotification((message) => this.onNotification(message));
   }
 
   onNotification({ method, params }) {
     if (params?.threadId && this.threadId && params.threadId !== this.threadId) return;
     if (method === "turn/started") this.activeTurnId = params.turn.id;
-    if (method === "item/completed" && params?.item?.type === "agentMessage") {
+    if (
+      (this.collectBootstrapText || this.retainDiagnostics) &&
+      method === "item/completed" && params?.item?.type === "agentMessage"
+    ) {
       const turnId = params.turnId;
       const prior = this.agentMessages.get(turnId) ?? [];
       prior.push(params.item.text ?? "");
       this.agentMessages.set(turnId, prior);
     }
     if (
-      (method === "item/started" || method === "item/completed") &&
+      this.retainDiagnostics && (method === "item/started" || method === "item/completed") &&
       params?.item?.type === "commandExecution"
     ) {
       this.commandExecutions.set(params.turnId, params.item);
@@ -261,10 +305,11 @@ class CodexWorker {
       const turn = params.turn;
       if (this.activeTurnId === turn.id) this.activeTurnId = null;
       this.completedTurns.set(turn.id, turn);
-      const resolvePromise = this.turnWaiters.get(turn.id);
-      if (resolvePromise) {
+      const waiter = this.turnWaiters.get(turn.id);
+      if (waiter) {
         this.turnWaiters.delete(turn.id);
-        resolvePromise(turn);
+        clearTimeout(waiter.timer);
+        waiter.resolve(turn);
       }
     }
   }
@@ -292,7 +337,7 @@ class CodexWorker {
       },
       model: this.model,
     });
-    this.activeTurnId = result.turn.id;
+    if (!this.completedTurns.has(result.turn.id)) this.activeTurnId = result.turn.id;
     return result.turn.id;
   }
 
@@ -315,10 +360,7 @@ class CodexWorker {
         this.turnWaiters.delete(turnId);
         rejectPromise(new Error(`turn ${turnId} did not complete after ${timeoutMs} ms`));
       }, timeoutMs);
-      this.turnWaiters.set(turnId, (turn) => {
-        clearTimeout(timer);
-        resolvePromise(turn);
-      });
+      this.turnWaiters.set(turnId, { timer, resolve: resolvePromise, reject: rejectPromise });
     });
   }
 
@@ -330,8 +372,28 @@ class CodexWorker {
     return this.commandExecutions.get(turnId);
   }
 
+  finishBootstrap() {
+    this.collectBootstrapText = false;
+    if (!this.retainDiagnostics) this.agentMessages.clear();
+  }
+
+  pruneCompletedTurns(deliveries) {
+    if (this.retainDiagnostics) return;
+    const referenced = new Set(deliveries.map((delivery) => delivery.turnId));
+    for (const id of this.completedTurns.keys()) {
+      if (!referenced.has(id) && !this.turnWaiters.has(id) && id !== this.activeTurnId) {
+        this.completedTurns.delete(id);
+      }
+    }
+  }
+
   close() {
     this.removeListener();
+    for (const waiter of this.turnWaiters.values()) {
+      clearTimeout(waiter.timer);
+      waiter.reject(new Error("Codex worker closed"));
+    }
+    this.turnWaiters.clear();
   }
 }
 
@@ -340,7 +402,7 @@ function deliveryPrompt(roomId) {
 }
 
 class Dispatcher {
-  constructor({ store, worker, agentId, intervalMs }) {
+  constructor({ store, worker, agentId, intervalMs, retainDiagnostics = false }) {
     this.store = store;
     this.worker = worker;
     this.agentId = agentId;
@@ -350,6 +412,7 @@ class Dispatcher {
     this.deliveries = new Map();
     this.maxDeliveryAttempts = 2; // initial attempt plus one retry
     this.dispatches = [];
+    this.retainDiagnostics = retainDiagnostics;
   }
 
   start() {
@@ -370,8 +433,8 @@ class Dispatcher {
       const matches = [];
       let after;
       for (;;) {
-        const page = this.store.pendingDirected(100, after);
-        matches.push(...page.pending.filter((entry) => entry.agent_id === this.agentId));
+        const page = this.store.pendingDirected(100, after, this.agentId);
+        matches.push(...page.pending);
         if (!page.next_after) break;
         after = page.next_after;
       }
@@ -382,7 +445,7 @@ class Dispatcher {
           continue;
         }
         const turn = this.worker.completedTurns.get(delivery.turnId);
-        if (!turn || turn.status === "completed") continue;
+        if (!turn) continue;
         if (delivery.attempts < this.maxDeliveryAttempts) {
           delivery.turnId = null;
           continue;
@@ -409,7 +472,7 @@ class Dispatcher {
           turnId,
           failureReported: false,
         });
-        this.dispatches.push({ key, mode, turnId, atMs: Date.now() });
+        if (this.retainDiagnostics) this.dispatches.push({ key, mode, turnId, atMs: Date.now() });
         process.stdout.write(
           `Dispatched room=${entry.room_name} seq=${entry.oldest_seq} mode=${mode} turn=${turnId}\n`,
         );
@@ -417,18 +480,28 @@ class Dispatcher {
     } catch (error) {
       process.stderr.write(`Dispatcher error: ${error.message}\n`);
     } finally {
+      this.worker.pruneCompletedTurns?.([...this.deliveries.values()]);
       this.running = false;
     }
   }
 }
 
-async function waitFor(check, description, timeoutMs = 180_000, intervalMs = 100) {
+async function waitFor(check, description, timeoutMs = 180_000, intervalMs = 100, signal) {
   const startedAt = Date.now();
   for (;;) {
+    if (signal?.aborted) throw new Error("dispatcher stopped");
     const value = check();
     if (value) return { value, elapsedMs: Date.now() - startedAt };
     if (Date.now() - startedAt >= timeoutMs) fail(`${description} timed out after ${timeoutMs} ms`);
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, intervalMs));
+    await new Promise((resolvePromise) => {
+      const done = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener("abort", done);
+        resolvePromise();
+      };
+      const timer = setTimeout(done, intervalMs);
+      signal?.addEventListener("abort", done, { once: true });
+    });
   }
 }
 
@@ -483,17 +556,18 @@ function findAcknowledgement(store, roomId, agentId, token) {
     .messages.find((message) => message.from === agentId && String(message.content).includes(token));
 }
 
-async function runSelfTest({ store, worker, dispatcher, roomRow, agentId, senderId }) {
+async function runSelfTest({ store, worker, dispatcher, roomRow, agentId, senderId, signal }) {
   const activeToken = `POC_ACTIVE_${randomUUID().slice(0, 8)}`;
   const taskTurnId = await worker.startTurn(
     "Run a foreground shell command that waits eight seconds and prints foreground-complete. Do not modify files. After it returns, handle any steered Agent Chat notice before completing this turn.",
   );
-  await waitFor(() => worker.commandForTurn(taskTurnId), "foreground command start");
+  await waitFor(() => worker.commandForTurn(taskTurnId), "foreground command start", 180_000, 100, signal);
   const activePostedAt = Date.now();
   postToken(store, roomRow.id, senderId, agentId, activeToken);
   const activeAck = await waitFor(
     () => findAcknowledgement(store, roomRow.id, agentId, activeToken),
     "active-turn acknowledgement",
+    180_000, 100, signal,
   );
   const taskTurn = await worker.waitForTurn(taskTurnId);
   if (taskTurn.status !== "completed") fail(`foreground turn ended with status ${taskTurn.status}`);
@@ -516,6 +590,7 @@ async function runSelfTest({ store, worker, dispatcher, roomRow, agentId, sender
   const idleAck = await waitFor(
     () => findAcknowledgement(store, roomRow.id, agentId, idleToken),
     "idle-turn acknowledgement",
+    180_000, 100, signal,
   );
   const idleDispatch = dispatcher.dispatches.find((entry) => entry.mode === "start");
   if (!idleDispatch) fail("idle message was acknowledged without a recorded turn/start dispatch");
@@ -561,9 +636,11 @@ async function main() {
   });
   let dispatcher;
   let shuttingDown = false;
+  const stopSignal = new AbortController();
   const shutdown = async () => {
     if (shuttingDown) return;
     shuttingDown = true;
+    stopSignal.abort();
     dispatcher?.stop();
     worker.close();
     store.close();
@@ -574,33 +651,41 @@ async function main() {
   process.once("SIGTERM", () => void shutdown().then(() => process.exit(143)));
 
   try {
-    await client.initialize();
-    await worker.start();
-    const { agentId, roomRow } = await bootstrapWorker(worker, store, {
-      room: args.room,
-      model: args.model,
-      modelVersion: args.modelVersion,
-    });
-    process.stdout.write(
-      `Worker ready thread=${worker.threadId} agent=${agentId} room=${roomRow.name}\n`,
-    );
-    dispatcher = new Dispatcher({
-      store,
-      worker,
-      agentId,
-      intervalMs: args.intervalMs,
-    });
-    dispatcher.start();
+    const run = async () => {
+      await client.initialize();
+      await worker.start();
+      const { agentId, roomRow } = await bootstrapWorker(worker, store, {
+        room: args.room,
+        model: args.model,
+        modelVersion: args.modelVersion,
+      });
+      worker.finishBootstrap();
+      process.stdout.write(
+        `Worker ready thread=${worker.threadId} agent=${agentId} room=${roomRow.name}\n`,
+      );
+      dispatcher = new Dispatcher({
+        store,
+        worker,
+        agentId,
+        intervalMs: args.intervalMs,
+        retainDiagnostics: args.selfTest,
+      });
+      dispatcher.start();
 
-    if (args.selfTest) {
-      const senderId = makeSender(store, roomRow.id);
-      await runSelfTest({ store, worker, dispatcher, roomRow, agentId, senderId });
-      return;
-    }
+      if (args.selfTest) {
+        const senderId = makeSender(store, roomRow.id);
+        await runSelfTest({ store, worker, dispatcher, roomRow, agentId, senderId, signal: stopSignal.signal });
+        return;
+      }
 
-    const taskTurnId = await worker.startTurn(args.task);
-    process.stdout.write(`Foreground assignment started turn=${taskTurnId}\n`);
-    await new Promise(() => {});
+      const taskTurnId = await worker.startTurn(args.task);
+      process.stdout.write(`Foreground assignment started turn=${taskTurnId}\n`);
+      await new Promise(() => {});
+    };
+    await Promise.race([
+      run(),
+      client.failure.then((error) => { throw error; }),
+    ]);
   } finally {
     await shutdown();
   }

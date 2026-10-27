@@ -289,6 +289,7 @@ check(
       sending: false,
       drafts: { 1: "First message" },
       draftRevisions: { 1: 0 },
+      pendingSends: {},
       replyTo: submittedReply,
       searchMode: false,
       historicalWindow: false,
@@ -320,6 +321,7 @@ check(
         },
         sameView: (candidate, epoch) =>
           candidate.id === state.current.id && epoch === state.roomEpoch,
+        sameRoom: (candidate) => candidate.id === state.current.id,
         autosize() {},
         clearReply: () => {
           state.replyTo = null;
@@ -429,7 +431,9 @@ check(
     viewerSource.includes("crypto.randomUUID()") &&
     viewerSource.includes("base_name: pending.base_name") &&
     viewerSource.includes("operation_id: pending.operation_id") &&
-    viewerSource.includes("agent_id: identity()") &&
+    /const agentId = identity\(\);[\s\S]+?agent_id: agentId/.test(
+      viewerSection("async function sendMessage()", "function autosize()"),
+    ) &&
     !/postJson\("\/api\/(?:join|leave|post|read)",[\s\S]{0,180}?\bname\s*:/.test(
       viewerSource,
     ) &&

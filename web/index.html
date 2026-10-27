@@ -1319,6 +1319,7 @@
         gap: false,
         drafts: {}, // per-room compose drafts, in memory only
         draftRevisions: {}, // per-room user edits made after a send snapshot
+        pendingSends: {}, // per-room intended sends retained across uncertain retries
         // Incremented on every openRoom: async completions capture it so a
         // response from a PREVIOUS visit to the same room (A -> B -> A) can
         // be told apart from the current visit (id comparison alone cannot).
@@ -1582,8 +1583,8 @@
         return !!room && !!state.current && state.current.id === room.id;
       }
 
-      // Same room AND same visit: guards every async completion that mutates
-      // view or marker state.
+      // Same room AND same visit: guards stream and marker completions.
+      // Submitted composer cleanup separately follows its draft revision.
       function sameView(room, epoch) {
         return sameRoom(room) && epoch === state.roomEpoch;
       }
@@ -1592,13 +1593,13 @@
         const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
         try {
           const r = await fetch(url, { ...options, signal: controller.signal });
-          const data = await r.json().catch(() => ({}));
           if (!r.ok) {
-            const error = new Error(data.error || "HTTP " + r.status);
+            const data = await r.json().catch(() => null);
+            const error = new Error(data?.error || "HTTP " + r.status);
             error.httpStatus = r.status;
             throw error;
           }
-          return data;
+          return await r.json();
         } finally {
           clearTimeout(timeout);
         }
@@ -3074,8 +3075,18 @@
         const epoch = state.roomEpoch;
         const body = el.composeText.value.trim();
         if (!room || !joinedHere() || !body || state.sending) return;
+        const agentId = identity();
         const draftRevision = state.draftRevisions[room.id] ?? 0;
         const replyTo = state.replyTo;
+        const replyToSeq = replyTo ? replyTo.seq : null;
+        let pending = state.pendingSends[room.id];
+        if (
+          !pending || pending.agentId !== agentId || pending.body !== body ||
+          pending.replyToSeq !== replyToSeq
+        ) {
+          pending = { agentId, body, replyToSeq, clientMessageId: crypto.randomUUID() };
+          state.pendingSends[room.id] = pending;
+        }
         let refreshFromTail = false;
         state.sending = true;
         el.send.disabled = true;
@@ -3083,22 +3094,25 @@
         try {
           await postJson("/api/post", {
             room: room.id,
-            agent_id: identity(),
+            agent_id: agentId,
             body,
-            reply_to_seq: replyTo ? replyTo.seq : null,
+            reply_to_seq: replyToSeq,
+            client_message_id: pending.clientMessageId,
           });
+          if (state.pendingSends[room.id] === pending) delete state.pendingSends[room.id];
           const draftUnchanged =
             (state.draftRevisions[room.id] ?? 0) === draftRevision;
-          if (draftUnchanged) delete state.drafts[room.id];
-          if (sameView(room, epoch)) {
-            // Only touch the shared composer/stream state if the user is
-            // still in this room; after a switch, the textarea, reply chip,
-            // search mode, and follow flag all belong to the OTHER room.
+          if (draftUnchanged && identity() === agentId) delete state.drafts[room.id];
+          // A room revisit restores its draft without changing its revision.
+          // Consume that unchanged composer even when its visit epoch changed.
+          if (sameRoom(room) && identity() === agentId) {
             if (draftUnchanged) {
               el.composeText.value = "";
               autosize();
             }
             if (state.replyTo === replyTo) clearReply();
+          }
+          if (sameView(room, epoch) && identity() === agentId) {
             if (state.searchMode) exitSearch();
             refreshFromTail = state.historicalWindow;
             state.historicalWindow = false;
@@ -3166,6 +3180,10 @@
             `/api/me?room=${room.id}&agent_id=${encodeURIComponent(agentId)}`,
           );
           if (me.error) throw new Error(me.error);
+          if (
+            typeof me.joined !== "boolean" ||
+            !Number.isSafeInteger(me.last_read_seq) || me.last_read_seq < 0
+          ) throw new Error("invalid read marker response");
           if (!sameView(room, epoch)) return;
           // The identity may have moved (another tab renaming) between the
           // request and this completion; the epoch bump from the storage
@@ -3177,7 +3195,7 @@
           // marker is monotonic, so the max is the truth; a stale value
           // would resurrect a cleared gap and suspend auto-marking.
           state.marker = me.joined
-            ? state.markerIdent === agentId && state.marker >= 0
+            ? state.markerIdent === agentId && Number.isSafeInteger(state.marker) && state.marker >= 0
               ? Math.max(state.marker, me.last_read_seq)
               : me.last_read_seq
             : -1;
@@ -3221,11 +3239,11 @@
         // Never auto-advance over a gap of unfetched messages, and never
         // before the server-side marker is known (marker is monotonic, so a
         // premature advance is unrecoverable).
-        if (state.marker < 0 || state.gap) return;
+        if (!Number.isSafeInteger(state.marker) || state.marker < 0 || state.gap) return;
         const last = state.msgs.length
           ? state.msgs[state.msgs.length - 1].seq
           : 0;
-        if (last <= state.lastReadSent) return;
+        if (!Number.isSafeInteger(last) || last <= 0 || last <= state.lastReadSent) return;
         state.lastReadSent = last;
         postJson("/api/read", {
           room: room.id,
@@ -3233,11 +3251,16 @@
           seq: last,
         })
           .then((r) => {
-            // A delayed response must not mutate another visit's state.
-            if (sameView(room, epoch)) state.marker = r.last_read_seq;
+            if (!Number.isSafeInteger(r?.last_read_seq) || r.last_read_seq < 0) {
+              throw new Error("invalid read marker response");
+            }
+            if (
+              sameView(room, epoch) && identity() === agentId &&
+              state.markerIdent === agentId && Number.isSafeInteger(state.marker) && state.marker >= 0
+            ) state.marker = Math.max(state.marker, r.last_read_seq);
           })
           .catch(() => {
-            if (sameView(room, epoch)) state.lastReadSent = 0; // retry next batch
+            if (sameView(room, epoch) && identity() === agentId) state.lastReadSent = 0; // retry next batch
           });
       }
 
@@ -3274,6 +3297,7 @@
         await forgetSeen(roomId);
         delete state.drafts[roomId];
         delete state.draftRevisions[roomId];
+        delete state.pendingSends[roomId];
         try {
           const saved = JSON.parse(localStorage.getItem(ROOM_KEY));
           if (saved?.id === roomId) localStorage.removeItem(ROOM_KEY);
@@ -3440,19 +3464,24 @@
         const last = state.msgs.length
           ? state.msgs[state.msgs.length - 1].seq
           : 0;
-        if (!room || !agentId || !joinedHere() || !last) return;
+        if (!room || !agentId || !joinedHere() || !Number.isSafeInteger(last) || last <= 0) return;
         // Same identity guard as maybeMarkRead: never advance a marker whose
         // baseline was fetched for a different (pre-rename) identity.
-        if (state.markerIdent !== agentId) return;
+        if (state.markerIdent !== agentId || !Number.isSafeInteger(state.marker) || state.marker < 0) return;
         try {
           const r = await postJson("/api/read", {
             room: room.id,
             agent_id: agentId,
             seq: last,
           });
-          // A delayed response must not mutate another visit's state.
-          if (!sameView(room, epoch)) return;
-          state.marker = r.last_read_seq;
+          if (!Number.isSafeInteger(r?.last_read_seq) || r.last_read_seq < 0) {
+            throw new Error("invalid read marker response");
+          }
+          if (
+            !sameView(room, epoch) || identity() !== agentId ||
+            state.markerIdent !== agentId || !Number.isSafeInteger(state.marker) || state.marker < 0
+          ) return;
+          state.marker = Math.max(state.marker, r.last_read_seq);
           state.lastReadSent = Math.max(state.lastReadSent, last);
           computeGap();
         } catch {}

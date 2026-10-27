@@ -560,7 +560,7 @@ function joinRoom(d, roomId, form) {
   return tx.immediate();
 }
 
-function postMessage(d, roomId, agentId, body, replyToSeq, mentions) {
+function postMessage(d, roomId, agentId, body, replyToSeq, mentions, clientMessageId) {
   const mentionsJson =
     mentions && mentions.length > 0 ? JSON.stringify(mentions) : null;
   // Same shape as ChatStore.postMessage: validate membership and the reply
@@ -572,6 +572,23 @@ function postMessage(d, roomId, agentId, body, replyToSeq, mentions) {
     const member = webMembership(d, roomId, agentId);
     if (!member) {
       return { error: "join the room first (POST /api/join)" };
+    }
+    // Recover a committed send before checking references that pruning may
+    // since have removed. IMMEDIATE serializes the lookup and eventual insert.
+    if (clientMessageId !== null) {
+      const prior = d.prepare(
+        `SELECT seq, (format = 'text' AND priority = 0 AND body = @body
+                     AND mentions IS @mentions AND reply_to_seq IS @reply
+                     AND supersedes_seq IS NULL) AS same_payload
+         FROM messages
+         WHERE room_id = @room AND agent_id = @agent
+           AND client_message_id = @key`,
+      ).get({ body, mentions: mentionsJson, reply: replyToSeq, room: roomId, agent: agentId, key: clientMessageId });
+      if (prior) {
+        return prior.same_payload === 1
+          ? { seq: prior.seq, deduplicated: true }
+          : { error: "client_message_id is already attached to a different stored payload in this room" };
+      }
     }
     let replyToAgent = null;
     if (replyToSeq !== null) {
@@ -609,9 +626,9 @@ function postMessage(d, roomId, agentId, body, replyToSeq, mentions) {
     // writes). The column is NOT NULL in the current schema, so stamping it is
     // required, not optional.
     d.prepare(
-      `INSERT INTO messages (room_id, seq, agent_id, format, body, body_len, mentions, reply_to_seq, reply_to_agent)
-       VALUES (?, ?, ?, 'text', ?, ?, ?, ?, ?)`,
-    ).run(roomId, next, agentId, body, body.length, mentionsJson, replyToSeq, replyToAgent);
+      `INSERT INTO messages (room_id, seq, agent_id, format, body, body_len, mentions, reply_to_seq, reply_to_agent, client_message_id)
+       VALUES (?, ?, ?, 'text', ?, ?, ?, ?, ?, ?)`,
+    ).run(roomId, next, agentId, body, body.length, mentionsJson, replyToSeq, replyToAgent, clientMessageId);
     // Own rows are excluded from unread delivery. Move only cursors at/after the
     // proven safe floor through this row; a lagging peer remains unread.
     d.prepare(
@@ -951,7 +968,18 @@ async function handlePost(url, req, res) {
         });
       }
     }
-    const r = postMessage(d, roomId, actor, body, replyTo, parseMentions(body));
+    const clientMessageId = payload.client_message_id === undefined ? null : payload.client_message_id;
+    if (
+      payload.client_message_id !== undefined && (
+        typeof clientMessageId !== "string" || clientMessageId.length < 1 ||
+        // oxlint-disable-next-line no-control-regex -- Opaque keys must reject ASCII controls.
+        clientMessageId.length > 200 || /[\u0000-\u001f\u007f]/.test(clientMessageId) ||
+        badChar(clientMessageId)
+      )
+    ) {
+      return sendJson(res, 400, { error: "client_message_id must be 1-200 well-formed characters without controls" });
+    }
+    const r = postMessage(d, roomId, actor, body, replyTo, parseMentions(body), clientMessageId);
     return sendJson(res, r.error ? 400 : 200, r);
   }
   res.writeHead(404, { "Content-Type": "text/plain" });

@@ -206,9 +206,6 @@ try {
           const mentionsHaving = args.mentionsOnly
             ? " HAVING directed > 0"
             : "";
-          const candidateClause = args.mentionsOnly
-            ? " AND (g.mentions IS NOT NULL OR g.reply_to_agent IS NOT NULL)"
-            : "";
           const grouped = db
             .prepare(
               `SELECT g.room_id AS room_id, r.name AS name, COUNT(*) AS unread,
@@ -217,7 +214,7 @@ try {
                JOIN memberships mb ON mb.room_id = g.room_id
                     AND mb.agent_id = ? AND mb.left_at IS NULL
                JOIN rooms r ON r.id = g.room_id
-               WHERE g.seq > mb.last_read_seq AND g.agent_id != ?${candidateClause}
+               WHERE g.seq > mb.last_read_seq AND g.agent_id != ?
                GROUP BY g.room_id, r.name
                ${mentionsHaving}
                ORDER BY directed DESC, unread DESC, g.room_id ASC

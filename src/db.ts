@@ -2967,23 +2967,22 @@ export class ChatStore {
       MAX_GET_MESSAGE_CHARS,
       Math.max(1, Math.floor(maxChars)),
     );
-    // Envelope (author, reply preview, flags) with a 1-char body: cheap and
-    // independent of body size.
+    // Fetch the envelope and full codepoint length once, retaining one body
+    // character. Reuse that length rather than scanning the full body twice.
     const env = this.getRawMessage(roomId, seq, 1);
     if (!env) return undefined;
-    // Total length as a scalar + ONLY the requested window. length(body) and
-    // substr(body, off+1, cap) both operate in codepoints; substr materializes
-    // at most `cap` codepoints in JS no matter how deep the offset is.
+    // substr operates in codepoints and materializes at most `cap` codepoints
+    // in JS no matter how deep the offset is.
     const win = this.db
       .prepare(
-        `SELECT length(body) AS total, substr(body, ?, ?) AS body
+        `SELECT substr(body, ?, ?) AS body
          FROM messages WHERE room_id = ? AND seq = ?`,
       )
       .get(off + 1, cap, roomId, seq) as
-      | { total: number; body: string | null }
+      | { body: string | null }
       | undefined;
     if (!win) return undefined;
-    const total = win.total ?? 0;
+    const total = codepointLen(env);
     let chunk = win.body ?? "";
     // Serialized-size correction: maxChars caps RAW characters, but JSON
     // escaping inflates control-heavy bodies up to 6x on the wire (100k NULs
@@ -3141,7 +3140,7 @@ export class ChatStore {
    * supervisor sweep possible; room_id is the final tie-breaker because one
    * agent can have same-second pending rows in several rooms. Read-only.
    */
-  pendingDirected(limit = 50, after?: PendingCursor): {
+  pendingDirected(limit = 50, after?: PendingCursor, agentId?: string): {
     pending: {
       agent_id: string;
       room_id: number;
@@ -3175,6 +3174,7 @@ export class ChatStore {
          JOIN rooms r ON r.id = mb.room_id
          CROSS JOIN messages g INDEXED BY idx_messages_directed_candidates
          WHERE mb.left_at IS NULL
+           ${agentId === undefined ? "" : "AND mb.agent_id = @target_agent"}
            AND g.room_id = mb.room_id
            AND g.seq > mb.last_read_seq
            AND g.agent_id != mb.agent_id
@@ -3190,9 +3190,11 @@ export class ChatStore {
        ORDER BY oldest_unix ASC, agent_id ASC, room_id ASC
        LIMIT @limit`,
     );
-    const bindings = after
-      ? { ...after, limit: lim + 1 }
-      : { limit: lim + 1 };
+    const bindings = {
+      ...after,
+      limit: lim + 1,
+      ...(agentId === undefined ? {} : { target_agent: agentId }),
+    };
     const rows = statement.all(bindings) as {
       agent_id: string;
       room_id: number;
