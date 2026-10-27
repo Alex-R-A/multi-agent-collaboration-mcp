@@ -1,11 +1,43 @@
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { expect, test } from "vitest";
 import { ChatStore } from "../src/db.ts";
 import { mkAgent, mkRoom } from "./persona-helpers.mjs";
+
+test.each(["", " ", " :memory: "])("anonymous SQLite path %j remains supported", (path) => {
+  const store = new ChatStore(path);
+  try {
+    expect(store.listRooms().rooms).toEqual([]);
+  } finally {
+    store.close();
+  }
+});
+
+if (process.platform !== "win32") {
+  test.each(["unrelated contents", "SQLite format 3"])("invalid database %j leaves file and neighbors untouched", (contents) => {
+    const dir = mkdtempSync(join(tmpdir(), "aichat-invalid-database-"));
+    const path = join(dir, "unrelated.txt");
+    const paths = [path, `${path}-wal`, `${path}-shm`];
+    let store;
+    try {
+      for (const file of paths) {
+        writeFileSync(file, contents);
+        chmodSync(file, 0o644);
+      }
+      expect(() => { store = new ChatStore(path); }).toThrow(/not a database/);
+      for (const file of paths) {
+        expect(statSync(file).mode & 0o777).toBe(0o644);
+        expect(readFileSync(file, "utf8")).toBe(contents);
+      }
+    } finally {
+      store?.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+}
 
 test("an agent-scoped pending sweep preserves global ordering and pagination", () => {
   const store = new ChatStore(":memory:");

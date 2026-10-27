@@ -1,5 +1,5 @@
 import Database from "better-sqlite3";
-import { chmodSync, existsSync, mkdirSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, fchmodSync, mkdirSync, openSync, readSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { assertWellFormedUtf16, assertWellFormedJsonValue } from "./unicode.js";
@@ -758,7 +758,9 @@ export class ChatStore {
 
   constructor(path = resolveDbPath()) {
     this.path = path;
-    if (path !== ":memory:") {
+    // Match better-sqlite3's trimmed filenames and anonymous database forms.
+    const filePath = path.trim();
+    if (filePath !== "" && filePath !== ":memory:") {
       // Owner-only: chat content is not for other local users. Tighten only
       // what is OURS: the database file and its WAL sidecars, and a directory
       // ONLY IF WE CREATED IT. An earlier version chmod'd dirname(path)
@@ -768,22 +770,44 @@ export class ChatStore {
       // returns the FIRST directory it created, or undefined if the path
       // already existed; chmod only that. Best-effort: permissions are a
       // hardening layer, not a startup gate (and a no-op concept on Windows).
-      const created = mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+      const created = mkdirSync(dirname(filePath), { recursive: true, mode: 0o700 });
       if (created) chmodBestEffort(created, 0o700);
-      for (const p of [path, `${path}-wal`, `${path}-shm`]) {
-        if (existsSync(p)) chmodBestEffort(p, 0o600);
+      // Create a missing file privately before SQLite can write anything.
+      // Existing paths are validated before their permissions are changed.
+      try {
+        const fd = openSync(filePath, "wx", 0o600);
+        try {
+          fchmodSync(fd, 0o600);
+        } catch {}
+        closeSync(fd);
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
+        // Even closing an invalid SQLite handle can remove WAL/SHM-named
+        // neighbors. Reject unrelated nonempty files before SQLite sees them.
+        const fd = openSync(filePath, "r");
+        try {
+          const header = Buffer.alloc(16);
+          const bytes = readSync(fd, header, 0, header.length, 0);
+          if (bytes !== 0 && (bytes !== header.length || !header.equals(Buffer.from("SQLite format 3\0")))) {
+            throw new Error("file is not a database");
+          }
+        } finally {
+          closeSync(fd);
+        }
       }
     }
     this.db = new Database(path);
     try {
-      if (path !== ":memory:") {
-        chmodBestEffort(path, 0o600);
-      }
       enableWalWithRetry(this.db);
       this.db.pragma("busy_timeout = 5000");
       this.db.pragma("foreign_keys = ON");
       // Initialize the current schema atomically and serialize concurrent starts.
       this.db.transaction(() => this.initializeSchema()).immediate();
+      if (filePath !== "" && filePath !== ":memory:") {
+        for (const p of [filePath, `${filePath}-wal`, `${filePath}-shm`]) {
+          if (existsSync(p)) chmodBestEffort(p, 0o600);
+        }
+      }
     } catch (error) {
       // A constructor that throws has no caller-visible instance on which to
       // call close(); cover pragma/setup failures as well as schema errors.

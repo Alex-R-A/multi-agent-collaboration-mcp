@@ -82,6 +82,10 @@ class AppServerClient {
     this.error = null;
     this.ended = false;
     this.closing = false;
+    this.closePromise = null;
+    // POSIX descendants stay in this owned group unless they explicitly
+    // detach. Windows retains direct-child cleanup; it does not reap a tree.
+    this.grouped = process.platform !== "win32";
     this.failure = new Promise((resolvePromise) => {
       this.notifyFailure = resolvePromise;
     });
@@ -94,6 +98,7 @@ class AppServerClient {
       cwd,
       env,
       stdio: ["pipe", "pipe", "pipe"],
+      detached: this.grouped,
     });
     this.child.stderr.setEncoding("utf8");
     this.child.stderr.on("data", (chunk) => {
@@ -129,6 +134,7 @@ class AppServerClient {
   }
 
   receive(line) {
+    if (this.error) return;
     let message;
     try {
       message = JSON.parse(line);
@@ -213,8 +219,12 @@ class AppServerClient {
     const id = this.nextId++;
     return new Promise((resolvePromise, rejectPromise) => {
       const timer = setTimeout(() => {
-        this.pending.delete(id);
-        rejectPromise(new Error(`${method} timed out after ${timeoutMs} ms`));
+        // All callers issue control RPCs. A lost response does not prove the
+        // operation failed, so retrying could start or steer accepted work twice.
+        this.fail(new Error(
+          `${method} timed out after ${timeoutMs} ms; operation outcome is unknown, stopping the client instead of retrying`,
+        ));
+        void this.close();
       }, timeoutMs);
       this.pending.set(id, { method, resolve: resolvePromise, reject: rejectPromise, timer });
       try {
@@ -245,24 +255,43 @@ class AppServerClient {
     this.send({ method: "initialized", params: {} });
   }
 
-  async close() {
+  signalOwned(signal) {
+    if (this.grouped && this.child.pid) {
+      try { process.kill(-this.child.pid, signal); } catch {}
+    } else if (!this.ended && this.child.exitCode === null && this.child.signalCode === null) {
+      this.child.kill(signal);
+    }
+  }
+
+  close() {
+    if (this.closePromise) return this.closePromise;
     this.closing = true;
     this.fail(new Error("Codex App Server client closed"));
-    if (this.ended || this.child.exitCode !== null || this.child.signalCode !== null) return;
-    const exited = new Promise((resolvePromise) => {
-      const onExit = () => {
-        clearTimeout(timer);
-        resolvePromise();
-      };
-      const timer = setTimeout(() => {
-        this.child.off("exit", onExit);
-        resolvePromise();
-      }, 3_000);
-      this.child.once("exit", onExit);
-    });
-    this.child.kill("SIGTERM");
-    await exited;
-    if (this.child.exitCode === null && this.child.signalCode === null) this.child.kill("SIGKILL");
+    this.closePromise = (async () => {
+      const exited = this.ended || this.child.exitCode !== null || this.child.signalCode !== null
+        ? null
+        : new Promise((resolvePromise) => {
+          const onExit = () => {
+            clearTimeout(timer);
+            resolvePromise();
+          };
+          const timer = setTimeout(() => {
+            this.child.off("exit", onExit);
+            resolvePromise();
+          }, 3_000);
+          this.child.once("exit", onExit);
+        });
+      // Signal the group even if its direct parent already exited. A surviving
+      // MCP/tool child can still hold resources and our inherited output pipes.
+      this.signalOwned("SIGTERM");
+      if (exited) await exited;
+      this.signalOwned("SIGKILL");
+      this.lines.close();
+      this.child.stdin.destroy();
+      this.child.stdout.destroy();
+      this.child.stderr.destroy();
+    })();
+    return this.closePromise;
   }
 }
 
@@ -274,6 +303,7 @@ class CodexWorker {
     this.ephemeral = ephemeral;
     this.threadId = null;
     this.activeTurnId = null;
+    this.pendingTurnStarts = 0;
     this.completedTurns = new Map();
     this.turnWaiters = new Map();
     this.agentMessages = new Map();
@@ -325,20 +355,25 @@ class CodexWorker {
   }
 
   async startTurn(text) {
-    const result = await this.client.request("turn/start", {
-      threadId: this.threadId,
-      input: [{ type: "text", text }],
-      cwd: this.cwd,
-      approvalPolicy: "on-request",
-      sandboxPolicy: {
-        type: "workspaceWrite",
-        writableRoots: [this.cwd],
-        networkAccess: false,
-      },
-      model: this.model,
-    });
-    if (!this.completedTurns.has(result.turn.id)) this.activeTurnId = result.turn.id;
-    return result.turn.id;
+    this.pendingTurnStarts++;
+    try {
+      const result = await this.client.request("turn/start", {
+        threadId: this.threadId,
+        input: [{ type: "text", text }],
+        cwd: this.cwd,
+        approvalPolicy: "on-request",
+        sandboxPolicy: {
+          type: "workspaceWrite",
+          writableRoots: [this.cwd],
+          networkAccess: false,
+        },
+        model: this.model,
+      });
+      if (!this.completedTurns.has(result.turn.id)) this.activeTurnId = result.turn.id;
+      return result.turn.id;
+    } finally {
+      this.pendingTurnStarts--;
+    }
   }
 
   async steer(text) {
@@ -378,7 +413,9 @@ class CodexWorker {
   }
 
   pruneCompletedTurns(deliveries) {
-    if (this.retainDiagnostics) return;
+    // A completion may precede its start response. Keep that evidence until
+    // every pending start has reconciled it, or the response revives a dead turn.
+    if (this.retainDiagnostics || this.pendingTurnStarts > 0) return;
     const referenced = new Set(deliveries.map((delivery) => delivery.turnId));
     for (const id of this.completedTurns.keys()) {
       if (!referenced.has(id) && !this.turnWaiters.has(id) && id !== this.activeTurnId) {
@@ -670,9 +707,8 @@ async function main() {
         intervalMs: args.intervalMs,
         retainDiagnostics: args.selfTest,
       });
-      dispatcher.start();
-
       if (args.selfTest) {
+        dispatcher.start();
         const senderId = makeSender(store, roomRow.id);
         await runSelfTest({ store, worker, dispatcher, roomRow, agentId, senderId, signal: stopSignal.signal });
         return;
@@ -680,6 +716,7 @@ async function main() {
 
       const taskTurnId = await worker.startTurn(args.task);
       process.stdout.write(`Foreground assignment started turn=${taskTurnId}\n`);
+      dispatcher.start();
       await new Promise(() => {});
     };
     await Promise.race([

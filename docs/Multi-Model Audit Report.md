@@ -1,12 +1,14 @@
 # Multi-Model Audit Report
 
-Audit started from clean commit `bac290d` on `main`. The requested work covers two audit-and-fix rounds. Each round uses five independent reviewers at `ultra`: `gpt-6.1-sol`, `gpt-5.6-sol`, `gpt-6.1-terra`, `gpt-6-astra`, and `gpt-6-sol`. All five selectors were accepted by the built-in launcher. The separate supervisor service was unavailable.
+Both requested audit-and-fix rounds are complete. The audit started from clean commit `bac290d` on `main`; the second round audited first-round commit `c99c9df`. Each round used five independent reviewers at `ultra`: `gpt-6.1-sol`, `gpt-5.6-sol`, `gpt-6.1-terra`, `gpt-6-astra`, and `gpt-6-sol`. All ten reviewer launches accepted the requested selectors. The separate supervisor service was unavailable.
 
 Both rounds use the unchanged [audit prompt](Multi-Model%20Audit%20Prompt.md), SHA-256 `acfa43feb77e6161d9bd8e2ddb012bfa95b5d03d61eb293b33ecf2e51c716abf`. Reviewers initially have read-only assignments. The coordinator checks findings, deduplicates root causes, reviews implementation diffs, and runs verification. Tests and reproductions use isolated databases; no live chat database is used.
 
 ## First round
 
-All five independent reviews completed. Eleven distinct defects or efficiency problems survived counterchecks. A further fast-completion ordering defect was reproduced during lifecycle implementation. The following fixes are implemented.
+All five independent reviews completed. Eleven distinct defects or efficiency problems survived counterchecks. A further fast-completion ordering defect was reproduced during lifecycle implementation. The following fixes are implemented; the completion guard was refined in the second round after another interleaving defeated its initial form.
+
+Source changes are in the [browser](../web/index.html), [HTTP server](../web/server.mjs), [database](../src/db.ts), [CLI probe](../src/check.ts), and [dispatcher](../scripts/codex-dispatcher-poc.mjs).
 
 | Finding | Trigger and impact | Fix | Evidence |
 | --- | --- | --- | --- |
@@ -21,9 +23,27 @@ All five independent reviews completed. Eleven distinct defects or efficiency pr
 | App Server death is not supervised | Missing executable emits an unhandled error; post-bootstrap child exit leaves an incapable dispatcher running. | Propagate one terminal lifecycle failure, reject current/future requests, stop polling, and clean up waits and the child. | Missing-executable and post-bootstrap-exit fixtures execute the actual main path and terminate nonzero without the old hang. |
 | Message paging scans full body length twice | Each body page fetches length in the envelope, then repeats length in the slice query. | Reuse the fetched codepoint count. | Full-method before/after benchmark and equivalent results, plus small-cap astral/control-character reconstruction and terminal-page checks. |
 | Each dispatcher aggregates unrelated agents' pending work | Every tick pages the global pending view before filtering one worker in JavaScript. | Add an optional agent predicate before aggregation and use it in the dispatcher. Preserve the global tool behavior and keyset ordering. | Full-sweep benchmark, real database pagination regressions, and query plans showing the agent membership index replaces the global membership scan. |
-| Fast turn completion leaves a completed turn active | Completion notification arrives before the start response; the response then reinstates the completed active turn. | Keep a completed turn idle when its delayed start response arrives. | Actual worker regression verifies the next directed delivery starts a new turn instead of steering the completed one. |
+| Fast turn completion leaves a completed turn active | Completion notification arrives before the start response; the response then reinstates the completed active turn. | Keep a completed turn idle when its delayed start response arrives. The second round additionally protects completion evidence during pruning. | Actual worker regression verifies the next directed delivery starts a new turn instead of steering the completed one, including an intervening quiet tick after the second-round refinement. |
 
 The custom-database generated-watcher candidate was withdrawn. The source explicitly treats alternate database routing as testing-only and prohibits advertising it in generated commands; the documented installation uses one default database. Changing that behavior would alter the intended product contract.
+
+## Second round
+
+All five fresh reviewers completed the identical assignment on the first-round fixes. Eight additional issue groups and one refinement of the first-round completion guard were addressed, for twenty distinct issue groups overall.
+
+| Finding | Trigger and impact | Fix and evidence |
+| --- | --- | --- |
+| [Reply retry loses its parent](../web/index.html) | A reply commits, its response is lost, and A-to-B-to-A navigation drops the parent. Retrying then uses a different key and inserts another message. | Retain per-room reply intent with drafts. Real HTTP regressions and isolated Chrome preserved the same UUID and parent through the revisit, leaving one stored reply. Explicit reply edits still create new sends. |
+| [Quiet polling fails to retry read receipts](../web/index.html) | A read acknowledgement fails; successful empty polls never retry it, leaving viewed messages unread and blocking conservative pruning. | Reconsider marking on successful quiet polls through the existing guards. Actual-function regressions verify recovery, cessation after success, and hidden/search/identity/follow/gap exclusions. |
+| [Overlong mentions target a shorter identity](../web/server.mjs) | A valid 200-character identity followed by an internal dot/dash and suffix is truncated before punctuation removal, producing an unintended mention. | Parse the full body-bounded token before trimming and enforcing the limit. Real HTTP tests cover dot/dash boundaries, legitimate trailing punctuation, distinct tokens, and the 100-recipient cap. |
+| [Foreground and delivery starts overlap](../scripts/codex-dispatcher-poc.mjs) | Polling starts before the foreground start response, allowing two same-thread start requests while local active state is unset. | Await the foreground start before normal polling. Real-main fixtures hold that response and verify subsequent start versus steer selection for idle and active outcomes. Live server treatment of overlapping starts was not assumed. |
+| [Completion pruning defeats the initial guard](../scripts/codex-dispatcher-poc.mjs) | A quiet tick removes completion evidence while the corresponding start response is pending, resurrecting a completed turn when that response arrives. | Retain evidence while starts are pending, then prune normally. The regression now interposes a quiet tick and verifies a later delivery starts a new turn. This refines the first-round ordering issue. |
+| [Forced shutdown leaves descendants alive](../scripts/codex-dispatcher-poc.mjs) | The direct App Server exits or is killed while MCP/tool descendants retain resources and pipes. | Own and terminate a POSIX process group, even after direct-parent exit. Readiness-barrier subprocess tests cover normal, forced, and already-exited parents. Windows retains direct-child cleanup; independently detached descendants are outside the owned group. |
+| [Collapsed JSON eagerly expands](../web/index.html) | Four hundred legal 2001-character nested JSON bodies expand into over 801 million indented characters before any details is opened. | Count exact formatted length iteratively and defer indentation until expansion. Exact count, 600-character folding, text fallback, complete formatted content, and one-time expansion are tested; Chrome also verified collapsed and expanded DOM text. |
+| [Invalid database startup affects unrelated files](../src/db.ts) | An invalid configured file is chmodded before validation. A direct dependency reproduction also showed SQLite close deleting its WAL/SHM-named neighbors after rejecting it. | Reject nonempty files without the complete SQLite signature before opening SQLite, harden existing files after setup, and create new files privately. Regressions preserve invalid file contents/modes and neighbors, reject a short header prefix, and retain anonymous SQLite paths. Existing private-file/sidecar/parent-directory checks pass. |
+| [Control-RPC timeout blindly retries an uncertain operation](../scripts/codex-dispatcher-poc.mjs) | A timed-out start records no delivery even if the server accepted it, so a subsequent tick can resend it. | Actual-client delayed-response tests confirmed duplicate requests before the fix. Timeouts now fail the client and close it, reject later requests, and ignore late notifications. Tests cover every current control method. Accepted work may be interrupted; restart and outcome review replace blind continuation. |
+
+The proposed catch-up-then-failure execution retry was withdrawn after checking the repository's transport-versus-task contract. A read cursor acknowledges reading; it does not promise task completion. Retrying already-read work could duplicate side effects and would add an unsupported processing guarantee. Stable per-room suppression could also delay genuine new work during an active turn. No execution-obligation layer was added.
 
 ## Measured efficiency
 
@@ -36,13 +56,19 @@ Measurements used the original built database module and the updated module agai
 
 These are workload-specific results, not production-wide speed guarantees. No CPU-profile or RSS claim is made. The filtered query plan uses `idx_memberships_agent_present` with agent and presence predicates; the unfiltered view retains its original semantics.
 
+Three alternating headless Chrome batches rendered five collapsed depth-1000 JSON messages each. Median rendering-function time was 13.6 ms before and 1.3 ms after; the corresponding preformatted text fell from 10,020,005 characters to zero. Opening one new details element still produced the exact 2,004,001-character formatted result and count label. No separate browser warmup or layout/RSS measurement was performed.
+
 ## Costs and preserved behavior
 
 Web sends add a pending record per affected room and one indexed lookup per keyed post. Retry identity lasts for the page lifetime, and database deduplication lasts while the original message remains retained. A changed body, reply, or identity is a new intended send. Successful deliberate identical messages remain distinct.
 
+Reply drafts retain additional metadata per room. Failed read receipts retry only at normal poll cadence and through existing guards. JSON rendering adds a linear size traversal, including extra work for small JSON, to preserve exact folding and count behavior without eagerly creating indentation. Explicitly opening very large JSON can still be expensive; indentation and content were preserved.
+
 A completed but unconsumed dispatcher turn can receive one repeated notice. Terminal failure is reported after the retry bound. Normal-mode unused diagnostics are discarded; bootstrap output, outstanding delivery state, and self-test observations remain available. Mentions-only wake summaries read broadcasts to report truthful totals; quiet intervals retain their existing wake gate.
 
 No schema changes, migrations, dependencies, or live-data repairs are introduced. Length reuse relies on the supported append/delete message model; an application feature allowing in-place body edits would require revisiting snapshot consistency. Nothing further needs deletion beyond the removed redundant body scan and unused normal-mode histories.
+
+Normal polling waits one foreground-start round trip. A control timeout stops the dispatcher and can interrupt work whose acceptance is unknown. POSIX cleanup covers the owned group; Windows remains direct-child-only. Existing database hardening happens after setup, while newly created files start private. Header checks follow the [SQLite file signature](https://www.sqlite.org/fileformat.html); they do not establish full integrity of a file with a valid signature.
 
 ## Verification status
 
@@ -50,4 +76,6 @@ The original baseline passed all 31 test files and 54 Vitest tests. Original lin
 
 The configured Chrome MCP could not start because its existing profile was locked. An isolated headless Chrome profile was used instead, against a disposable server/database. Real UI events verified lost-response retry deduplication, deliberate repeated sends, successful A-to-B-to-A composer cleanup, and edited-draft preservation. Response loss/delay was controlled at fetch completion; the HTTP proxy regression separately drops a real committed response.
 
-The full first-round post-fix suite passed all 33 files and 105 Vitest tests, including the build. The second audit-and-fix round is pending. Live Codex service behavior, Windows process handling, and exhaustive multi-tab/browser/network interleavings remain unverified. Controlled worker fixtures do not establish all live App Server behavior, and passing tests cannot establish absence of further defects.
+The full first-round post-fix suite passed all 33 files and 105 Vitest tests, including the build. The final second-round suite passed all 33 files and 157 Vitest tests, including the build. Second-round web regressions had six failures before implementation, and dispatcher regressions had eleven; both now pass. Final oxlint checked 47 files, including extracted inline browser JavaScript, with the same four baseline warnings and zero errors. Diff whitespace checks pass, and the shared prompt hash remains unchanged.
+
+Second-round Chrome DOM checks also verified the lost-response reply retry and lazy JSON formatting. The headless page reported hidden visibility, so native visible-page quiet read recovery was not completed; guarded production-function regressions cover that behavior. Live Codex service behavior, Windows execution, and exhaustive multi-tab/browser/network interleavings remain unverified. Controlled worker fixtures do not establish all live App Server behavior, and passing tests cannot establish absence of further defects. Existing external client/service processes were not restarted.

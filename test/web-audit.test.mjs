@@ -27,10 +27,12 @@ function compile(name, start, end, bindings) {
 
 function deferred() {
   let resolve;
-  const promise = new Promise((yes) => {
+  let reject;
+  const promise = new Promise((yes, no) => {
     resolve = yes;
+    reject = no;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 function makeSendHarness(postJson) {
@@ -42,6 +44,7 @@ function makeSendHarness(postJson) {
     roomEpoch: 1,
     sending: false,
     drafts: { 1: "First message" },
+    draftReplies: {},
     draftRevisions: { 1: 0 },
     pendingSends: {},
     replyTo: reply,
@@ -54,9 +57,11 @@ function makeSendHarness(postJson) {
     composeText: { value: "First message", focus() {} },
     send: { disabled: false },
     composeError: { textContent: "" },
+    msgs: {}, older: {}, streamWrap: {}, pinned: {}, search: {}, searchBar: {},
+    results: {}, deleteConfirm: {},
   };
   const loads = [];
-  const sendMessage = compile("sendMessage", "async function sendMessage()", "function autosize()", {
+  const bindings = {
     state,
     el,
     crypto: { randomUUID },
@@ -70,21 +75,26 @@ function makeSendHarness(postJson) {
     exitSearch: () => { state.searchMode = false; },
     updateJump() {},
     loadNew: (initial) => loads.push(initial),
+  };
+  const sendMessage = compile("sendMessage", "async function sendMessage()", "function autosize()", bindings);
+  const openRoom = compile("openRoom", "function openRoom(room)", "// The recurring sidebar list", {
+    ...bindings,
+    localStorage: { setItem() {} }, ROOM_KEY: "room",
+    document: { body: { classList: { remove() {} } } },
+    renderRoomHead() {}, renderComposer() {}, renderRooms() {}, computeGap() {},
+    hidePlaceholder() {}, fetchMarker() {}, fetchRoomDetail() {},
   });
-  return { state, el, reply, loads, sendMessage, changeIdentity: (id) => { agentId = id; } };
+  return { state, el, reply, loads, sendMessage, openRoom, changeIdentity: (id) => { agentId = id; } };
 }
 
 test.each([false, true])("a pending send returning to its room preserves edits=%s", async (edited) => {
   const response = deferred();
   const h = makeSendHarness(() => response.promise);
   const sending = h.sendMessage();
-  h.state.current = { id: 2 };
-  h.state.roomEpoch++;
+  h.openRoom({ id: 2 });
   h.el.composeText.value = "Other room draft";
-  h.state.current = { id: 1 };
-  h.state.roomEpoch++;
-  h.el.composeText.value = h.state.drafts[1];
-  h.state.replyTo = null; // openRoom clears reply state on every visit
+  h.openRoom({ id: 1 });
+  h.loads.length = 0;
   h.state.searchMode = true;
   h.state.historicalWindow = true;
   h.state.follow = false;
@@ -119,7 +129,7 @@ test("a successful old-identity send preserves the new identity's composer", asy
   expect(h.state.drafts[1]).toBe("First message");
 });
 
-test("unchanged failed payload retries reuse a key; edited body or reply starts another send", async () => {
+test("unchanged failed payload retries reuse a key; changed body, reply, or identity starts another send", async () => {
   const payloads = [];
   const h = makeSendHarness(async (_url, payload) => {
     payloads.push(payload);
@@ -136,6 +146,28 @@ test("unchanged failed payload retries reuse a key; edited body or reply starts 
   h.state.replyTo = { seq: 8, label: "different parent" };
   await h.sendMessage();
   expect(payloads[3].client_message_id).not.toBe(payloads[2].client_message_id);
+  h.changeIdentity("human-replacement-1");
+  await h.sendMessage();
+  expect(payloads[4].client_message_id).not.toBe(payloads[3].client_message_id);
+});
+
+test("room switching preserves each draft's reply and successful offscreen sends consume theirs", async () => {
+  const response = deferred();
+  const h = makeSendHarness(() => response.promise);
+  const sending = h.sendMessage();
+  h.openRoom({ id: 2 });
+  h.el.composeText.value = "Other room draft";
+  h.state.replyTo = { seq: 9, label: "other room reply" };
+  response.resolve({ seq: 8 });
+  await sending;
+  expect(h.el.composeText.value).toBe("Other room draft");
+  expect(h.state.replyTo.seq).toBe(9);
+  h.openRoom({ id: 1 });
+  expect(h.el.composeText.value).toBe("");
+  expect(h.state.replyTo).toBeNull();
+  h.openRoom({ id: 2 });
+  expect(h.el.composeText.value).toBe("Other room draft");
+  expect(h.state.replyTo.seq).toBe(9);
 });
 
 const requestSourceStart = "async function requestJson(";
@@ -190,15 +222,47 @@ function makeReadHarness() {
   const computeGap = compile("computeGap", "function computeGap()", "async function fetchMarker()", bindings);
   bindings.computeGap = computeGap;
   const maybeMarkRead = compile("maybeMarkRead", "function maybeMarkRead()", "function noteSeen()", bindings);
+  const loadNew = compile("loadNew", "async function loadNew(initial)", "async function loadOlder()", {
+    ...bindings, maybeMarkRead, PAGE: 400,
+    fetchJson: async () => ({ messages: [] }), noteOk() {}, noteFail() {},
+    fetchMarker() {},
+  });
   let markAll;
   const markall = { addEventListener: (_event, handler) => { markAll = handler; } };
   const markBindings = { ...bindings, el: { ...el, markall } };
   Function(...Object.keys(markBindings), section('el.markall.addEventListener("click"', 'el.filter.addEventListener("input"'))(
     ...Object.values(markBindings),
   );
-  return { state, replies, maybeMarkRead, markAll: () => markAll(), computeGap,
+  return { state, replies, maybeMarkRead, markAll: () => markAll(), computeGap, loadNew,
+    document: bindings.document,
     changeIdentity: (id) => { agentId = id; } };
 }
+
+test("successful quiet polling retries a failed read and stops after its acknowledgement", async () => {
+  const h = makeReadHarness();
+  h.maybeMarkRead();
+  h.replies[0].reject(new Error("temporary server failure"));
+  await new Promise((resolve) => setImmediate(resolve));
+  expect(h.state.lastReadSent).toBe(0);
+  await h.loadNew(false);
+  expect(h.replies).toHaveLength(2);
+  h.replies[1].resolve({ last_read_seq: 400 });
+  await Promise.resolve();
+  await h.loadNew(false);
+  expect(h.state.marker).toBe(400);
+  expect(h.replies).toHaveLength(2);
+});
+
+test.each(["hidden", "search", "identity", "not-following", "gap"])("quiet poll retry preserves the %s guard", async (guard) => {
+  const h = makeReadHarness();
+  if (guard === "hidden") h.document.visibilityState = "hidden";
+  if (guard === "search") h.state.searchMode = true;
+  if (guard === "identity") h.changeIdentity("human-replacement-1");
+  if (guard === "not-following") h.state.follow = false;
+  if (guard === "gap") h.state.noOlderHistory = false;
+  await h.loadNew(false);
+  expect(h.replies).toHaveLength(0);
+});
 
 test.each(["automatic", "explicit"])("%s read acknowledgements cannot regress the marker", async (kind) => {
   const h = makeReadHarness();
@@ -323,7 +387,10 @@ async function post(path, payload) {
   return { status: response.status, data: await response.json() };
 }
 
-test("a lost committed HTTP response can be retried once while a deliberate identical send is distinct", async () => {
+test.each([false, true])("a lost committed HTTP response deduplicates after room revisit=%s", async (revisit) => {
+  const parent = revisit
+    ? await post("/api/post", { room, agent_id: human, body: "retry parent" })
+    : null;
   let dropFirst = true;
   const proxy = createServer(async (req, res) => {
     const chunks = [];
@@ -345,7 +412,7 @@ test("a lost committed HTTP response can be retried once while a deliberate iden
   }));
   h.changeIdentity(human);
   h.state.current = { id: room };
-  h.state.replyTo = null;
+  h.state.replyTo = parent ? { seq: parent.data.seq, label: "retry parent" } : null;
   h.el.composeText.value = `lost-response-${randomUUID()}`;
   const body = h.el.composeText.value;
   try {
@@ -353,9 +420,19 @@ test("a lost committed HTTP response can be retried once while a deliberate iden
     expect(h.el.composeError.textContent).not.toBe("");
     expect(h.el.composeText.value).toBe(body);
     expect(store.db.prepare("SELECT COUNT(*) AS c FROM messages WHERE body = ?").get(body).c).toBe(1);
+    const key = h.state.pendingSends[room].clientMessageId;
+    if (revisit) {
+      h.openRoom({ id: room + 1 });
+      h.openRoom({ id: room });
+      expect(h.el.composeText.value).toBe(body);
+      expect(h.state.replyTo?.seq).toBe(parent.data.seq);
+    }
     await h.sendMessage();
     expect(h.el.composeText.value).toBe("");
     expect(store.db.prepare("SELECT COUNT(*) AS c FROM messages WHERE body = ?").get(body).c).toBe(1);
+    const stored = store.db.prepare("SELECT reply_to_seq, client_message_id FROM messages WHERE body = ?").get(body);
+    expect(stored.reply_to_seq).toBe(parent?.data.seq ?? null);
+    expect(stored.client_message_id).toBe(key);
     h.el.composeText.value = body;
     h.state.draftRevisions[room]++;
     await h.sendMessage();
@@ -384,4 +461,109 @@ test("HTTP post idempotency matches the exact payload and precedes pruned-parent
 test.each([null, "", 42, "x".repeat(201), "bad\u0001key", "bad\ud800key"])("invalid HTTP post key %j is rejected", async (client_message_id) => {
   const result = await post("/api/post", { room, agent_id: human, body: "invalid key", client_message_id });
   expect(result.status).toBe(400);
+});
+
+test.each([
+  ["a".repeat(200), ["a".repeat(200)]],
+  ["a".repeat(201), null],
+  ["a".repeat(200) + ".suffix", null],
+  ["a".repeat(200) + "-suffix", null],
+  ["a".repeat(200) + ".---", ["a".repeat(200)]],
+  ["short....---", ["short"]],
+])("HTTP mentions validate the complete token %s", async (token, expected) => {
+  const result = await post("/api/post", { room, agent_id: human, body: `mention @${token}` });
+  expect(result.status).toBe(200);
+  const row = store.db.prepare("SELECT mentions FROM messages WHERE room_id = ? AND seq = ?").get(room, result.data.seq);
+  expect(JSON.parse(row.mentions)).toEqual(expected);
+});
+
+test("HTTP mentions retain distinct tokens in order and cap recipients at 100", async () => {
+  const ids = Array.from({ length: 105 }, (_, index) => `recipient-${index}`);
+  const result = await post("/api/post", {
+    room, agent_id: human, body: ids.flatMap((id) => [`@${id}`, `@${id}.`]).join(" "),
+  });
+  expect(result.status).toBe(200);
+  const row = store.db.prepare("SELECT mentions FROM messages WHERE room_id = ? AND seq = ?").get(room, result.data.seq);
+  expect(JSON.parse(row.mentions)).toEqual(ids.slice(0, 100));
+});
+
+function makeRenderHarness() {
+  const expanded = [];
+  const createElement = (tag) => ({
+    tag, children: [], listeners: {}, textContent: "", open: false,
+    classList: { add() {}, toggle() {} },
+    append(...children) { this.children.push(...children); },
+    addEventListener(event, listener) { this.listeners[event] = listener; },
+  });
+  const json = {
+    parse: JSON.parse,
+    stringify(value, replacer, space) {
+      if (space === 2) expanded.push(value);
+      return JSON.stringify(value, replacer, space);
+    },
+  };
+  const renderBody = compile("renderBody", "function prettyJsonLength(", "// Fetch one anchored page", {
+    document: { createElement }, JSON: json,
+    linkify: (node, text) => { node.textContent = text; },
+  });
+  return { renderBody, expanded, container: createElement("article") };
+}
+
+test("collapsed deep JSON keeps its exact count without constructing indentation until opened", () => {
+  const h = makeRenderHarness();
+  const body = "[".repeat(1000) + "0" + "]".repeat(1000);
+  const expected = JSON.stringify(JSON.parse(body), null, 2);
+  h.renderBody(h.container, { format: "json", body });
+  expect(h.expanded).toHaveLength(0);
+  const [fold] = h.container.children;
+  expect(fold.tag).toBe("details");
+  const [summary, pre] = fold.children;
+  expect(summary.textContent).toBe(`json  /  ${expected.length} chars`);
+  expect(pre.textContent).toBe("");
+  fold.listeners.toggle();
+  expect(h.expanded).toHaveLength(0);
+  fold.open = true;
+  fold.listeners.toggle();
+  expect(pre.textContent).toBe(expected);
+  fold.open = false;
+  fold.listeners.toggle();
+  fold.open = true;
+  fold.listeners.toggle();
+  expect(h.expanded).toHaveLength(1);
+});
+
+const prettyJsonLength = compile("prettyJsonLength", "function prettyJsonLength(", "function renderBody(", {});
+
+test.each([
+  "null", "true", "false", "0", "-0", "1e400", "1e-400", "1.25", '""',
+  '"quote\\\" backslash\\\\ newline\\n control\\u0001 astral\\ud83d\\ude00"',
+  "[]", "{}", "[[],{},null,true,1]", '{"a":1,"b":[2,{"c":"text"}]}',
+  '{"\\n\\\"":true,"__proto__":{"constructor":[]}}',
+])("pretty size equals native serialization for parsed JSON %s", (body) => {
+  const value = JSON.parse(body);
+  expect(prettyJsonLength(value)).toBe(JSON.stringify(value, null, 2).length);
+});
+
+test("pretty size is exact for deep mixed containers and wide arrays", () => {
+  const deep = JSON.parse('{"nested":['.repeat(1000) + '"leaf"' + ']}'.repeat(1000));
+  expect(prettyJsonLength(deep)).toBe(JSON.stringify(deep, null, 2).length);
+  const wide = Array.from({ length: 1000 }, (_, index) => ({ [String(index)]: [index, null, "x\ny"] }));
+  expect(prettyJsonLength(wide)).toBe(JSON.stringify(wide, null, 2).length);
+});
+
+test.each([598, 599])("JSON folding keeps its 600-character boundary for a %i-character string", (length) => {
+  const h = makeRenderHarness();
+  const body = JSON.stringify("x".repeat(length));
+  h.renderBody(h.container, { format: "json", body });
+  const [node] = h.container.children;
+  expect(node.tag).toBe(length === 598 ? "pre" : "details");
+  expect(h.expanded).toHaveLength(length === 598 ? 1 : 0);
+  if (length === 598) expect(node.textContent).toBe(body);
+});
+
+test.each(["{broken", "[1,2", "plain text"])("invalid JSON retains text fallback for %s", (body) => {
+  const h = makeRenderHarness();
+  h.renderBody(h.container, { format: "json", body });
+  expect(h.expanded).toHaveLength(0);
+  expect(h.container.children[0].children[0].textContent).toBe(body);
 });

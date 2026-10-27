@@ -1,6 +1,6 @@
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
-import { spawn } from "node:child_process";
-import { EventEmitter } from "node:events";
+import { spawn, spawnSync } from "node:child_process";
+import { EventEmitter, once } from "node:events";
 import { PassThrough } from "node:stream";
 import { tmpdir } from "node:os";
 import readline from "node:readline";
@@ -28,10 +28,10 @@ return Dispatcher;`,
 const CodexWorker = Function(
   `"use strict";\n${sourceBetween("class CodexWorker", "function deliveryPrompt(roomId)")}\nreturn CodexWorker;`,
 )();
-const makeClient = (child) => Function(
+const makeClient = (child, spawnChild = () => child) => Function(
   "spawn", "readline",
   `"use strict";\n${sourceBetween("class AppServerClient", "class CodexWorker")}\nreturn AppServerClient;`,
-)(() => child, readline);
+)(spawnChild, readline);
 
 function fakeChild() {
   const child = new EventEmitter();
@@ -214,12 +214,18 @@ test("completion before start response leaves the worker idle for directed work"
   const firstStart = worker.startTurn("initial task");
   worker.onNotification({ method: "turn/started", params: { turn: { id: "first" } } });
   worker.onNotification({ method: "turn/completed", params: { turn: { id: "first", status: "completed" } } });
+  let pending = false;
+  const store = { pendingDirected: () => ({ pending: pending ? [{ room_id: 1, room_name: "one", oldest_seq: 1 }] : [] }) };
+  const dispatcher = new Dispatcher({ store, worker, agentId: "target", intervalMs: 1_000 });
+  vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+  await dispatcher.tick();
+  expect(worker.completedTurns.has("first")).toBe(true);
   resolveStart({ turn: { id: "first" } });
   await firstStart;
   expect(worker.activeTurnId).toBeNull();
-  const store = { pendingDirected: () => ({ pending: [{ room_id: 1, room_name: "one", oldest_seq: 1 }] }) };
-  const dispatcher = new Dispatcher({ store, worker, agentId: "target", intervalMs: 1_000 });
-  vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+  await dispatcher.tick();
+  expect(worker.completedTurns.size).toBe(0);
+  pending = true;
   await dispatcher.tick();
   expect(methods).toEqual(["turn/start", "turn/start"]);
   worker.close();
@@ -318,11 +324,12 @@ test("close clears its timer when the child exits immediately", async () => {
   expect(vi.getTimerCount()).toBe(0);
 });
 
-function runDispatcher(env) {
+function runDispatcher(env, onChild = () => {}) {
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(process.execPath, [join(ROOT, "scripts/codex-dispatcher-poc.mjs"), "--room", "lifecycle", "--task", "test"], {
       cwd: ROOT, env, stdio: ["ignore", "pipe", "pipe"],
     });
+    onChild(child);
     let stdout = "";
     let stderr = "";
     child.stdout.on("data", (chunk) => { stdout += chunk; });
@@ -390,6 +397,186 @@ readline.createInterface({ input: process.stdin }).on("line", (line) => {
     expect(result.stdout).toContain("Foreground assignment started");
     expect(result.stderr).toContain("Codex App Server exited");
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test.each(["initialize", "thread/start", "turn/start", "turn/steer"])("a timed-out %s terminates the client and rejects later control requests", async (method) => {
+  vi.useFakeTimers();
+  const child = fakeChild();
+  const Client = makeClient(child);
+  const client = new Client({ cwd: ROOT, env: {} });
+  const requests = [];
+  child.stdin.on("data", (chunk) => requests.push(JSON.parse(chunk.toString())));
+  const request = client.request(method, {}, 5);
+  const rejected = expect(request).rejects.toThrow(`${method} timed out`);
+  await vi.advanceTimersByTimeAsync(5);
+  await rejected;
+  try {
+    expect(client.error?.message).toContain(`${method} timed out`);
+    expect((await client.failure).message).toContain(`${method} timed out`);
+    await expect(client.request("turn/start")).rejects.toThrow(`${method} timed out`);
+    expect(requests).toHaveLength(1);
+    expect(child.signalCode).toBe("SIGTERM");
+    expect(vi.getTimerCount()).toBe(0);
+  } finally {
+    await client.close();
+  }
+});
+
+test("a lost start response cannot be blindly retried or revived by a late notification", async () => {
+  vi.useFakeTimers();
+  const child = fakeChild();
+  const Client = makeClient(child);
+  const client = new Client({ cwd: ROOT, env: {} });
+  const request = client.request.bind(client);
+  client.request = (method, params) => request(method, params, 5);
+  const requests = [];
+  child.stdin.on("data", (chunk) => requests.push(JSON.parse(chunk.toString())));
+  const worker = new CodexWorker(client, { cwd: ROOT, model: "test", ephemeral: false });
+  worker.threadId = "thread";
+  const dispatcher = new Dispatcher({
+    store: { pendingDirected: () => ({ pending: [{ room_id: 1, room_name: "one", oldest_seq: 1 }] }) },
+    worker, agentId: "target", intervalMs: 500,
+  });
+  vi.spyOn(process.stderr, "write").mockImplementation(() => true);
+  try {
+    const firstTick = dispatcher.tick();
+    await vi.advanceTimersByTimeAsync(5);
+    await firstTick;
+    expect(client.error?.message).toContain("turn/start timed out");
+    expect(dispatcher.deliveries.size).toBe(0);
+    client.receive(JSON.stringify({ method: "turn/started", params: { threadId: "thread", turn: { id: "unknown-first" } } }));
+    await dispatcher.tick();
+    expect(worker.activeTurnId).toBeNull();
+    expect(requests.map((entry) => entry.method)).toEqual(["turn/start"]);
+  } finally {
+    worker.close();
+    await client.close();
+  }
+});
+
+test.each([false, true])("real main holds foreground startup before dispatching directed work, active=%s", async (active) => {
+  const dir = mkdtempSync(join(tmpdir(), "dispatcher-start-order-"));
+  let processChild;
+  let resultPromise;
+  try {
+    const path = join(dir, "chat.db");
+    const store = new ChatStore(path);
+    try {
+      const room = mkRoom(store, "lifecycle");
+      const workerId = mkAgent(store, "z-worker");
+      const sender = mkAgent(store, "sender");
+      store.joinRoom(room.id, workerId);
+      store.joinRoom(room.id, sender);
+      store.postMessage(room.id, sender, "initial directed work", "text", [workerId], null, null);
+    } finally {
+      store.close();
+    }
+    const trace = join(dir, "trace.jsonl");
+    const release = join(dir, "release");
+    const executable = join(dir, "codex");
+    writeFileSync(executable, `#!${process.execPath}
+import { appendFileSync, existsSync } from "node:fs";
+import readline from "node:readline";
+let bootstrapped = false;
+const send = (value, callback) => process.stdout.write(JSON.stringify(value) + "\\n", callback);
+const record = (value) => appendFileSync(${JSON.stringify(trace)}, JSON.stringify(value) + "\\n");
+readline.createInterface({ input: process.stdin }).on("line", (line) => {
+  const request = JSON.parse(line);
+  if (request.method === "initialize") send({ id: request.id, result: {} });
+  if (request.method === "thread/start") send({ id: request.id, result: { thread: { id: "thread" } } });
+  if (request.method === "turn/start" && !bootstrapped) {
+    bootstrapped = true;
+    send({ method: "item/completed", params: { threadId: "thread", turnId: "bootstrap", item: { type: "agentMessage", text: "AGENT_CHAT_PERSONA=z-worker" } } });
+    send({ method: "turn/completed", params: { threadId: "thread", turn: { id: "bootstrap", status: "completed" } } });
+    send({ id: request.id, result: { turn: { id: "bootstrap" } } });
+  } else if (request.method === "turn/start" && request.params.input[0].text === "test") {
+    send({ method: "turn/started", params: { threadId: "thread", turn: { id: "foreground" } } });
+    if (!${active}) send({ method: "turn/completed", params: { threadId: "thread", turn: { id: "foreground", status: "completed" } } });
+    record({ kind: "foreground-held", method: request.method });
+    const timer = setInterval(() => {
+      if (!existsSync(${JSON.stringify(release)})) return;
+      clearInterval(timer);
+      send({ id: request.id, result: { turn: { id: "foreground" } } });
+    }, 10);
+  } else if (request.method === "turn/start" || request.method === "turn/steer") {
+    record({ kind: "delivery", method: request.method, expectedTurnId: request.params.expectedTurnId });
+    send({ id: request.id, result: { turn: { id: "delivery" } } }, () => {
+      if (existsSync(${JSON.stringify(release)})) process.exit(7);
+    });
+  }
+});
+`);
+    chmodSync(executable, 0o700);
+    resultPromise = runDispatcher({ ...process.env, PATH: dir, AGENT_CHAT_DB: path }, (child) => { processChild = child; });
+    const entries = () => readFileSync(trace, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+    await vi.waitFor(() => expect(entries().some((entry) => entry.kind === "foreground-held")).toBe(true), { timeout: 3_000, interval: 10 });
+    expect(entries().map((entry) => entry.kind)).toEqual(["foreground-held"]);
+    writeFileSync(release, "release");
+    const result = await resultPromise;
+    expect(result.timedOut).toBe(false);
+    expect(entries()).toEqual([
+      { kind: "foreground-held", method: "turn/start" },
+      { kind: "delivery", method: active ? "turn/steer" : "turn/start", ...(active ? { expectedTurnId: "foreground" } : {}) },
+    ]);
+    expect(result.stdout).toContain("Foreground assignment started turn=foreground");
+  } finally {
+    if (processChild?.exitCode === null && processChild?.signalCode === null) processChild.kill("SIGTERM");
+    if (resultPromise) await resultPromise;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+function processRunning(pid) {
+  try {
+    process.kill(pid, 0);
+  } catch {
+    return false;
+  }
+  // An orphan may briefly remain a zombie until its new parent reaps it.
+  // Zombies have terminated; treating kill(pid, 0) as liveness misreports them.
+  const state = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8", timeout: 1_000 });
+  if (state.error) throw state.error;
+  return state.status === 0 && !state.stdout.trim().startsWith("Z");
+}
+
+test.skipIf(process.platform === "win32").each(["normal", "forced", "already-exited"])("owned process-group cleanup terminates a ready descendant on %s close", async (mode) => {
+  const dir = mkdtempSync(join(tmpdir(), "dispatcher-owned-group-"));
+  let client;
+  let descendant;
+  try {
+    const fixture = join(dir, "fixture.mjs");
+    writeFileSync(fixture, `import { spawn } from "node:child_process";
+const descendant = spawn(process.execPath, ["-e", "process.on('SIGTERM', () => {}); process.send('ready'); setInterval(() => {}, 1000);"], { stdio: ["ignore", "ignore", "ignore", "ipc"] });
+if (${JSON.stringify(mode)} === "forced") process.on("SIGTERM", () => {});
+descendant.once("message", () => {
+  process.stdout.write(JSON.stringify({ method: "fixture/ready", params: { pid: descendant.pid } }) + "\\n", () => {
+    if (${JSON.stringify(mode)} === "already-exited") process.exit(0);
+  });
+});
+setInterval(() => {}, 1000);
+`);
+    const Client = makeClient(null, (_command, _args, options) => spawn(process.execPath, [fixture], options));
+    client = new Client({ cwd: dir, env: { ...process.env, AGENT_CHAT_DB: join(dir, "unused.db") } });
+    const exited = once(client.child, "exit");
+    descendant = await new Promise((resolve) => client.onNotification((message) => resolve(message.params.pid)));
+    expect(processRunning(descendant)).toBe(true);
+    if (mode === "already-exited") await exited;
+    await client.close();
+    await exited;
+    await vi.waitFor(() => expect(processRunning(descendant)).toBe(false), { timeout: 2_000, interval: 10 });
+    if (mode === "forced") expect(client.child.signalCode).toBe("SIGKILL");
+  } finally {
+    if (descendant) {
+      try { process.kill(descendant, "SIGKILL"); } catch {}
+    }
+    if (client?.child.exitCode === null && client?.child.signalCode === null) {
+      const exited = once(client.child, "exit");
+      client.child.kill("SIGKILL");
+      await exited;
+    }
+    if (client) await client.close();
     rmSync(dir, { recursive: true, force: true });
   }
 });

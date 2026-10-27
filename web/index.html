@@ -1318,6 +1318,7 @@
         markerRetryAt: 0,
         gap: false,
         drafts: {}, // per-room compose drafts, in memory only
+        draftReplies: {}, // matching reply intent, including uncertain sends
         draftRevisions: {}, // per-room user edits made after a send snapshot
         pendingSends: {}, // per-room intended sends retained across uncertain retries
         // Incremented on every openRoom: async completions capture it so a
@@ -2035,6 +2036,34 @@
         el.stream.scrollTop = el.stream.scrollHeight;
       }
 
+      // Exact JSON.stringify(value, null, 2).length for JSON.parse output,
+      // without allocating indentation. Iteration also avoids a recursive
+      // size walk overflowing on a deeply nested but compact message.
+      function prettyJsonLength(value) {
+        let length = 0;
+        const pending = [{ value, depth: 0 }];
+        while (pending.length) {
+          const { value: node, depth } = pending.pop();
+          if (node === null || typeof node !== "object") {
+            length += JSON.stringify(node).length;
+            continue;
+          }
+          const array = Array.isArray(node);
+          const keys = array ? null : Object.keys(node);
+          const count = array ? node.length : keys.length;
+          length += 2; // opening and closing brackets/braces
+          if (count === 0) continue;
+          // Each entry has a newline, indentation, and (except the last) a
+          // comma. The closing newline cancels that last absent comma.
+          length += count * (2 * (depth + 1) + 2) + 2 * depth;
+          for (let i = count - 1; i >= 0; i--) {
+            if (!array) length += JSON.stringify(keys[i]).length + 2; // colon + space
+            pending.push({ value: array ? node[i] : node[keys[i]], depth: depth + 1 });
+          }
+        }
+        return length;
+      }
+
       function renderBody(container, m) {
         if (m.format === "json") {
           let parsed;
@@ -2044,18 +2073,25 @@
             parsed = undefined;
           }
           if (parsed !== undefined) {
-            const pretty = JSON.stringify(parsed, null, 2);
+            const prettyLength = prettyJsonLength(parsed);
             const pre = document.createElement("pre");
             pre.className = "json";
-            pre.textContent = pretty;
-            if (pretty.length > 600) {
+            if (prettyLength > 600) {
               const fold = document.createElement("details");
               fold.className = "json-fold";
               const sum = document.createElement("summary");
-              sum.textContent = "json  /  " + pretty.length + " chars";
+              sum.textContent = "json  /  " + prettyLength + " chars";
+              let expanded = false;
+              fold.addEventListener("toggle", () => {
+                if (!fold.open || expanded) return;
+                pre.textContent = JSON.stringify(parsed, null, 2);
+                parsed = undefined;
+                expanded = true;
+              });
               fold.append(sum, pre);
               container.append(fold);
             } else {
+              pre.textContent = JSON.stringify(parsed, null, 2);
               container.append(pre);
             }
             return;
@@ -2446,6 +2482,11 @@
               state.newCount += rows.length;
               updateJump();
             }
+          } else {
+            // A failed acknowledgement must retry even if no further message
+            // arrives. The existing visibility, identity, follow, and gap
+            // guards still decide whether this already-rendered tail is read.
+            maybeMarkRead();
           }
           // Retry marker bootstrap only while it is unknown for this identity;
           // fetchMarker owns the in-flight guard and five-second backoff.
@@ -3103,6 +3144,9 @@
           const draftUnchanged =
             (state.draftRevisions[room.id] ?? 0) === draftRevision;
           if (draftUnchanged && identity() === agentId) delete state.drafts[room.id];
+          if (identity() === agentId && state.draftReplies[room.id] === replyTo) {
+            delete state.draftReplies[room.id];
+          }
           // A room revisit restores its draft without changing its revision.
           // Consume that unchanged composer even when its visit epoch changed.
           if (sameRoom(room) && identity() === agentId) {
@@ -3296,6 +3340,7 @@
         });
         await forgetSeen(roomId);
         delete state.drafts[roomId];
+        delete state.draftReplies[roomId];
         delete state.draftRevisions[roomId];
         delete state.pendingSends[roomId];
         try {
@@ -3353,8 +3398,12 @@
       // ---- room switching ---------------------------------------------------
 
       function openRoom(room) {
-        // Preserve the draft being typed in the room we are leaving.
-        if (state.current) state.drafts[state.current.id] = el.composeText.value;
+        // Keep body and reply together: dropping the parent changes an
+        // uncertain send's payload and defeats its retained idempotency key.
+        if (state.current) {
+          state.drafts[state.current.id] = el.composeText.value;
+          state.draftReplies[state.current.id] = state.replyTo;
+        }
         state.searchController?.abort();
         state.searchController = null;
         state.current = room;
@@ -3362,7 +3411,7 @@
         state.newCount = 0;
         state.follow = true;
         state.historicalWindow = false;
-        state.replyTo = null;
+        state.replyTo = state.draftReplies[room.id] ?? null;
         state.lastReadSent = 0;
         state.marker = -1;
         state.markerIdent = null;

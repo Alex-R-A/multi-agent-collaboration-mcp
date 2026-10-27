@@ -737,10 +737,10 @@ function leaveRoom(d, roomId, agentId) {
 // "ask @bob." tags bob, not "bob.".
 function parseMentions(body) {
   const out = [];
-  // Capture up to 201 chars, strip trailing punctuation, THEN length-check:
-  // capping the regex at 200 made a 201-char id silently tag its first-200
-  // prefix, a nonexistent identity.
-  for (const m of body.matchAll(/@([\w][\w.-]{0,200})/g)) {
+  // Read the complete token before stripping trailing punctuation. Capping
+  // first could turn a long name's internal dot/dash into trailing punctuation
+  // and incorrectly tag its 200-character prefix. The body is already bounded.
+  for (const m of body.matchAll(/@(\w[\w.-]*)/g)) {
     const id = m[1].replace(/[.-]+$/, "");
     if (!id || id.length > 200 || out.includes(id)) continue;
     out.push(id);

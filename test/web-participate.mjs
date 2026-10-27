@@ -153,9 +153,10 @@ check(
     ) || []
   ).length;
   check(
-    "loadNew visit-gates both frames and marks read after realizing the scroll",
+    "loadNew keeps both visit-gated frames and retries read marking on a quiet poll",
     framedMarks === 2 &&
-      (loadNewSource.match(/maybeMarkRead\(\);/g) || []).length === 2 &&
+      (loadNewSource.match(/maybeMarkRead\(\);/g) || []).length === 3 &&
+      /\} else \{\s*\/\/ A failed acknowledgement[\s\S]*?maybeMarkRead\(\);\s*\}/.test(loadNewSource) &&
       !/maybeMarkRead\(\);\s*noteSeen\(\);/.test(loadNewSource),
     { framedMarks },
   );
@@ -288,6 +289,7 @@ check(
       roomEpoch: 1,
       sending: false,
       drafts: { 1: "First message" },
+      draftReplies: {},
       draftRevisions: { 1: 0 },
       pendingSends: {},
       replyTo: submittedReply,
@@ -420,6 +422,7 @@ check(
       forgetSource.includes("g.room !== roomId") &&
       forgetSource.includes("await forgetSeen(roomId)") &&
       forgetSource.includes("delete state.drafts[roomId]") &&
+      forgetSource.includes("delete state.draftReplies[roomId]") &&
       forgetSource.includes("delete state.draftRevisions[roomId]") &&
       forgetSource.includes("localStorage.removeItem(ROOM_KEY)"),
     { section: forgetSource.length },
