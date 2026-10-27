@@ -8,6 +8,7 @@ import { join, resolve } from "node:path";
 import readline from "node:readline";
 
 import { ChatStore } from "../dist/db.js";
+import { windowsJobLaunch } from "./windows-job.mjs";
 
 const USAGE = `Usage:
   node scripts/codex-dispatcher-poc.mjs --self-test [--model MODEL] [--model-version VERSION]
@@ -83,8 +84,8 @@ class AppServerClient {
     this.ended = false;
     this.closing = false;
     this.closePromise = null;
-    // POSIX descendants stay in this owned group unless they explicitly
-    // detach. Windows retains direct-child cleanup; it does not reap a tree.
+    // POSIX owns a process group. Windows owns a wrapper whose non-inherited
+    // job handle terminates its tree when the wrapper exits or is killed.
     this.grouped = process.platform !== "win32";
     this.failure = new Promise((resolvePromise) => {
       this.notifyFailure = resolvePromise;
@@ -94,11 +95,13 @@ class AppServerClient {
       args.push("-c", `mcp_servers.agent-chat.env.AGENT_CHAT_DB=${JSON.stringify(mcpDbPath)}`);
     }
     args.push("--listen", "stdio://");
-    this.child = spawn("codex", args, {
+    const launch = this.grouped ? { file: "codex", args } : windowsJobLaunch("codex", args);
+    this.child = spawn(launch.file, launch.args, {
       cwd,
       env,
       stdio: ["pipe", "pipe", "pipe"],
       detached: this.grouped,
+      windowsHide: true,
     });
     this.child.stderr.setEncoding("utf8");
     this.child.stderr.on("data", (chunk) => {

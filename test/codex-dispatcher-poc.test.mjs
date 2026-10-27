@@ -7,6 +7,7 @@ import readline from "node:readline";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { ChatStore } from "../dist/db.js";
+import { windowsJobLaunch } from "../scripts/windows-job.mjs";
 import { mkAgent, mkRoom } from "./persona-helpers.mjs";
 import { afterEach, expect, test, vi } from "vitest";
 
@@ -28,10 +29,12 @@ return Dispatcher;`,
 const CodexWorker = Function(
   `"use strict";\n${sourceBetween("class CodexWorker", "function deliveryPrompt(roomId)")}\nreturn CodexWorker;`,
 )();
-const makeClient = (child, spawnChild = () => child) => Function(
-  "spawn", "readline",
+const makeClient = (child, spawnChild = () => child, platform = process.platform, launchWindows = windowsJobLaunch) => Function(
+  "spawn", "readline", "process", "windowsJobLaunch",
   `"use strict";\n${sourceBetween("class AppServerClient", "class CodexWorker")}\nreturn AppServerClient;`,
-)(spawnChild, readline);
+)(spawnChild, readline, new Proxy(process, {
+  get: (target, key) => key === "platform" ? platform : Reflect.get(target, key),
+}), launchWindows);
 
 function fakeChild() {
   const child = new EventEmitter();
@@ -324,6 +327,53 @@ test("close clears its timer when the child exits immediately", async () => {
   expect(vi.getTimerCount()).toBe(0);
 });
 
+test("Windows client owns the job wrapper and preserves App Server arguments", async () => {
+  const child = fakeChild();
+  const spawnChild = vi.fn(() => child);
+  const wrapped = { file: "C:\\Windows\\powershell.exe", args: ["encoded-launch"] };
+  const launchWindows = vi.fn(() => wrapped);
+  const Client = makeClient(child, spawnChild, "win32", launchWindows);
+  const env = { AGENT_CHAT_DB: "unused" };
+  const db = "C:\\chat's work\\data.db";
+  const client = new Client({ cwd: ROOT, env, mcpDbPath: db });
+  try {
+    expect(launchWindows).toHaveBeenCalledWith("codex", [
+      "app-server", "-c", `mcp_servers.agent-chat.env.AGENT_CHAT_DB=${JSON.stringify(db)}`,
+      "--listen", "stdio://",
+    ]);
+    expect(spawnChild).toHaveBeenCalledWith(wrapped.file, wrapped.args, {
+      cwd: ROOT, env, stdio: ["pipe", "pipe", "pipe"], detached: false, windowsHide: true,
+    });
+    await client.close();
+    expect(child.signalCode).toBe("SIGTERM");
+    expect(client.close()).toBe(client.closePromise);
+  } finally {
+    await client.close();
+  }
+});
+
+test("Windows launcher keeps paths and metacharacters out of PowerShell source", () => {
+  vi.stubEnv("SystemRoot", "C:\\Windows");
+  const args = ["", "two words", "quote\"", "trailing\\", "$(bad); & ` ' \u03bb"];
+  try {
+    const launch = windowsJobLaunch("C:\\space's dir\\codex.exe", args);
+    expect(launch.file).toBe("C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe");
+    expect(launch.args.slice(0, -1)).toEqual(["-NoLogo", "-NoProfile", "-NonInteractive", "-EncodedCommand"]);
+    const script = Buffer.from(launch.args.at(-1), "base64").toString("utf16le");
+    const encodedConfig = script.match(/FromBase64String\('([A-Za-z0-9+/=]+)'\)/)?.[1];
+    expect(encodedConfig).toBeDefined();
+    const config = JSON.parse(Buffer.from(encodedConfig, "base64").toString("utf8"));
+    expect(config).toEqual({
+      source: join(ROOT, "scripts", "windows-job.cs"),
+      command: "C:\\space's dir\\codex.exe", arguments: args,
+    });
+    expect(script).not.toContain("$(bad)");
+    expect(script).not.toContain("space's dir");
+  } finally {
+    vi.unstubAllEnvs();
+  }
+});
+
 function runDispatcher(env, onChild = () => {}) {
   return new Promise((resolvePromise, rejectPromise) => {
     const child = spawn(process.execPath, [join(ROOT, "scripts/codex-dispatcher-poc.mjs"), "--room", "lifecycle", "--task", "test"], {
@@ -534,6 +584,7 @@ function processRunning(pid) {
   } catch {
     return false;
   }
+  if (process.platform === "win32") return true;
   // An orphan may briefly remain a zombie until its new parent reaps it.
   // Zombies have terminated; treating kill(pid, 0) as liveness misreports them.
   const state = spawnSync("ps", ["-o", "stat=", "-p", String(pid)], { encoding: "utf8", timeout: 1_000 });
@@ -577,6 +628,92 @@ setInterval(() => {}, 1000);
       await exited;
     }
     if (client) await client.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test.skipIf(process.platform !== "win32")("Windows job preserves raw stdio, argument boundaries and native exit status", async () => {
+  const args = ["", "two words", "a\"b", "slash\\", "quoted\\\"tail\\", "$(bad); & ` ' \u03bb"];
+  const stderr = Buffer.from([0, 13, 10, 255, 128, 65]);
+  const input = Buffer.from([0, 10, 13, 34, 255, 128, 32]);
+  const program = `process.stdout.write(JSON.stringify(process.argv.slice(1)) + "\\n");
+process.stdin.on("data", (chunk) => process.stdout.write(chunk));
+process.stdin.on("end", () => process.stdout.end(() => process.stderr.end(Buffer.from(${JSON.stringify([...stderr])}), () => process.exit(23))));`;
+  const launch = windowsJobLaunch(process.execPath, ["-e", program, ...args]);
+  const child = spawn(launch.file, launch.args, { stdio: ["pipe", "pipe", "pipe"], windowsHide: true });
+  const stdout = [];
+  const errors = [];
+  child.stdout.on("data", (chunk) => stdout.push(chunk));
+  child.stderr.on("data", (chunk) => errors.push(chunk));
+  const closed = once(child, "close");
+  const timer = setTimeout(() => child.kill("SIGKILL"), 10_000);
+  try {
+    child.stdin.end(input);
+    expect(await closed).toEqual([23, null]);
+    expect(Buffer.concat(stdout)).toEqual(Buffer.concat([Buffer.from(`${JSON.stringify(args)}\n`), input]));
+    expect(Buffer.concat(errors)).toEqual(stderr);
+  } finally {
+    clearTimeout(timer);
+    if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    await closed;
+  }
+});
+
+test.skipIf(process.platform !== "win32").each(["normal", "forced", "already-exited"])("Windows job terminates nested ready descendants on %s close", async (mode) => {
+  const dir = mkdtempSync(join(tmpdir(), "dispatcher-windows-job-"));
+  let client;
+  let closed;
+  try {
+    const fixture = join(dir, "fixture.mjs");
+    const leaf = "process.send('ready'); setTimeout(() => process.exit(0), 20000); setInterval(() => {}, 1000);";
+    const middle = `const { spawn } = require("node:child_process");
+const leaf = spawn(process.execPath, ["-e", ${JSON.stringify(leaf)}], { detached: true, stdio: ["ignore", "ignore", "ignore", "ipc"] });
+leaf.once("message", () => { process.send({ middle: process.pid, leaf: leaf.pid }); leaf.disconnect(); leaf.unref(); });
+setTimeout(() => process.exit(0), 20000);`;
+    writeFileSync(fixture, `import { spawn } from "node:child_process";
+const middle = spawn(process.execPath, ["-e", ${JSON.stringify(middle)}], { detached: true, stdio: ["ignore", "ignore", "ignore", "ipc"] });
+middle.once("message", (pids) => {
+  middle.disconnect(); middle.unref();
+  process.stdout.write(JSON.stringify({ method: "fixture/ready", params: pids }) + "\\n");
+});
+process.stdin.on("data", () => process.exit(23));
+setTimeout(() => process.exit(0), 20000);
+`);
+    const launchWindows = vi.fn(() => windowsJobLaunch(process.execPath, [fixture]));
+    const spawnChild = (file, args, options) => {
+      // An unwired client must fail before it can launch a real Codex session.
+      expect(file).toMatch(/WindowsPowerShell.*powershell\.exe$/);
+      return spawn(file, args, options);
+    };
+    const Client = makeClient(null, spawnChild, "win32", launchWindows);
+    client = new Client({ cwd: dir, env: { ...process.env } });
+    const exited = once(client.child, "exit");
+    closed = once(client.child, "close");
+    let pids;
+    client.onNotification(({ params }) => { pids = params; });
+    await vi.waitFor(() => {
+      if (client.error) throw client.error;
+      expect(pids).toBeDefined();
+    }, { timeout: 10_000, interval: 20 });
+    expect(launchWindows).toHaveBeenCalledOnce();
+    expect(processRunning(pids.middle)).toBe(true);
+    expect(processRunning(pids.leaf)).toBe(true);
+    if (mode === "already-exited") {
+      client.child.stdin.write("exit\n");
+      expect(await exited).toEqual([23, null]);
+    } else if (mode === "forced") {
+      client.child.kill("SIGKILL");
+      await exited;
+    }
+    await client.close();
+    await exited;
+    await vi.waitFor(() => {
+      expect(processRunning(pids.middle)).toBe(false);
+      expect(processRunning(pids.leaf)).toBe(false);
+    }, { timeout: 3_000, interval: 20 });
+  } finally {
+    if (client) await client.close();
+    if (closed) await closed;
     rmSync(dir, { recursive: true, force: true });
   }
 });
